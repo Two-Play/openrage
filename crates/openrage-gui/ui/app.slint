@@ -14,6 +14,8 @@ export struct TreeRow {
 }
 
 export struct FileRow {
+    mark-color: color,
+    dim: bool,
     name: string,
     badge: string,
     tint: color,
@@ -95,6 +97,7 @@ component TreeItem inherits Rectangle {
 }
 
 component FileItem inherits Rectangle {
+    opacity: item.dim ? 0.5 : 1.0;
     in property <FileRow> item;
     // Search results show a stretching location column instead of the fixed type column.
     in property <bool> wide-kind;
@@ -107,6 +110,12 @@ component FileItem inherits Rectangle {
     area := TouchArea {
         clicked => { root.select(); }
         double-clicked => { root.open(); }
+    }
+    // Mod status stripe (added/new green, changed orange, removed red).
+    Rectangle {
+        x: 0;
+        width: 3px;
+        background: item.mark-color;
     }
     HorizontalLayout {
         padding-left: 6px;
@@ -211,6 +220,9 @@ export component AppWindow inherits Window {
 
     // Search
     in property <bool> search-mode;
+    in property <bool> show-language: true;
+    in property <bool> mods-available;
+    in-out property <bool> mods-overlay;
     in property <string> search-summary;
     in property <[string]> languages;
     in-out property <int> language-index;
@@ -246,6 +258,8 @@ export component AppWindow inherits Window {
     callback sort-by(int);
     callback filter-edited(string);
     callback search(string);
+    callback overlay-toggled(bool);
+    callback show-changes();
     callback language-picked(int);
     callback extract-selected();
     callback cancel-task();
@@ -294,6 +308,16 @@ export component AppWindow inherits Window {
                 text <=> root.filter;
                 placeholder-text: @tr("Filter list");
                 edited(text) => { root.filter-edited(text); }
+            }
+            if root.mods-available: Button {
+                text: @tr("Mods");
+                checkable: true;
+                checked <=> root.mods-overlay;
+                clicked => { root.overlay-toggled(self.checked); }
+            }
+            if root.mods-available: Button {
+                text: @tr("Changes");
+                clicked => { root.show-changes(); }
             }
             Button {
                 text: @tr("Extract…");
@@ -344,7 +368,7 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                         color: Palette.foreground;
                     }
-                    ComboBox {
+                    if root.show-language: ComboBox {
                         width: 170px;
                         model: root.languages;
                         current-index <=> root.language-index;

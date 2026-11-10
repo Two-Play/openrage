@@ -15,6 +15,7 @@ rage-core.workspace = true
 rage-crypto.workspace = true
 rage-rpf.workspace = true
 rage-index.workspace = true
+rage-mods.workspace = true
 anyhow.workspace = true
 rfd = "0.15"
 slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "renderer-software", "accessibility"] }

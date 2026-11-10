@@ -24,7 +24,8 @@ use rage_rpf::vfs::{self, Node};
 use rage_rpf::{EntryId, EntryKind, Rpf7, RpfError};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel, Weak};
 
-use browser::{History, Item, ItemKind, Listing, Location, Tree};
+use browser::{History, Item, ItemKind, Listing, Location, Mark, Tree};
+use rage_mods::{ChangeKind, CompareMode, Origin};
 
 slint::include_modules!();
 
@@ -49,6 +50,9 @@ struct App {
     /// Text language for search hits in localized files (None = all).
     language: Option<String>,
     search_generation: Arc<AtomicU64>,
+    /// Show the game as it sees itself with the OpenIV `mods` folder applied.
+    overlay: bool,
+    diff_generation: Arc<AtomicU64>,
     index_running: bool,
 }
 
@@ -84,6 +88,8 @@ fn main() -> anyhow::Result<()> {
             busy: false,
             language: game_language_from_locale().map(str::to_owned),
             search_generation: Arc::new(AtomicU64::new(0)),
+            overlay: false,
+            diff_generation: Arc::new(AtomicU64::new(0)),
             index_running: false,
         })
     });
@@ -140,7 +146,7 @@ fn wire_callbacks(ui: &AppWindow) {
         with_ui(&w, |ui| {
             with_app(|a| {
                 if let Some(dir) = a.game_dir.clone() {
-                    a.tree.toggle(i as usize, &dir, a.keys.clone());
+                    a.tree.toggle(i as usize, &dir, a.keys.clone(), a.overlay);
                 }
             });
             refresh_tree(ui, None);
@@ -163,7 +169,8 @@ fn wire_callbacks(ui: &AppWindow) {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
                 if let Some(vpath) = &item.vpath {
-                    return Some(vpath.clone()); // search hit: jump to its location
+                    // Search hit or change: jump to its location (removed entries: their folder).
+                    return if item.mark == Some(Mark::Removed) { browser::parent(vpath) } else { Some(vpath.clone()) };
                 }
                 item.kind.is_container().then(|| browser::join(&listing.vpath, &item.name))
             });
@@ -218,6 +225,17 @@ fn wire_callbacks(ui: &AppWindow) {
         })
     });
     let w = ui.as_weak();
+    ui.on_overlay_toggled(move |on| {
+        with_ui(&w, |ui| {
+            with_app(|a| a.overlay = on);
+            let current = with_app(|a| a.listing.as_ref().map(|l| l.vpath.clone())).unwrap_or_default();
+            rebuild_tree(ui);
+            navigate(ui, &current, false);
+        })
+    });
+    let w = ui.as_weak();
+    ui.on_show_changes(move || with_ui(&w, |ui| navigate(ui, browser::CHANGES_PATH, true)));
+    let w = ui.as_weak();
     ui.on_extract_selected(move || with_ui(&w, start_extract));
     ui.on_cancel_task(|| with_app(|a| a.cancel.store(true, Ordering::Relaxed)));
     let w = ui.as_weak();
@@ -271,9 +289,13 @@ fn with_ui(w: &Weak<AppWindow>, f: impl FnOnce(&AppWindow)) {
 // Browsing
 
 fn start_browsing(ui: &AppWindow) {
+    let mods = with_app(|a| a.game_dir.as_deref().and_then(rage_mods::mods_dir).is_some());
+    with_app(|a| a.overlay = mods);
+    ui.set_mods_available(mods);
+    ui.set_mods_overlay(mods);
+    rebuild_tree(ui);
     let title = with_app(|a| {
         let dir = a.game_dir.clone().expect("game dir");
-        a.tree = Tree::build(&dir, a.keys.clone());
         a.history = History::default();
         let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         format!("OpenRAGE — {name}")
@@ -287,13 +309,28 @@ fn start_browsing(ui: &AppWindow) {
     }
 }
 
+fn rebuild_tree(ui: &AppWindow) {
+    with_app(|a| {
+        if let Some(dir) = a.game_dir.clone() {
+            a.tree = Tree::build(&dir, a.keys.clone(), a.overlay);
+        }
+    });
+    refresh_tree(ui, None);
+}
+
 fn navigate(ui: &AppWindow, path: &str, record: bool) {
     if let Some(query) = browser::search_query(path) {
         start_search(ui, query.to_owned(), record);
         return;
     }
-    let Some((dir, keys)) = with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone()))) else { return };
-    match browser::list(&dir, path, keys.clone()) {
+    if path.trim() == browser::CHANGES_PATH {
+        start_changes(ui, record);
+        return;
+    }
+    let Some((dir, keys, overlay)) = with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone(), a.overlay))) else {
+        return;
+    };
+    match browser::list(&dir, path, keys.clone(), overlay) {
         Ok((listing, select)) => {
             let vpath = listing.vpath.clone();
             with_app(|a| {
@@ -307,13 +344,14 @@ fn navigate(ui: &AppWindow, path: &str, record: bool) {
             ui.set_filter(SharedString::new());
             ui.set_search_mode(false);
             ui.set_address(vpath.clone().into());
-            let tree_idx = with_app(|a| a.tree.reveal(&vpath, &dir, keys));
+            let tree_idx = with_app(|a| a.tree.reveal(&vpath, &dir, keys, overlay));
             refresh_tree(ui, tree_idx);
             refresh_files(ui, select.as_deref());
             if select.is_none() {
                 show_folder_info(ui);
             }
             ui.set_status(SharedString::new());
+            start_folder_diff(ui);
         }
         Err(RpfError::KeysRequired(_)) => show_setup(ui, true),
         Err(e) => ui.set_status(format!("{e}").into()),
@@ -397,9 +435,27 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
     }
 }
 
+fn mark_color(mark: Option<Mark>) -> slint::Color {
+    let rgb = |v: u32| slint::Color::from_rgb_u8((v >> 16) as u8, (v >> 8) as u8, v as u8);
+    match mark {
+        None => slint::Color::from_argb_u8(0, 0, 0, 0),
+        Some(Mark::Added | Mark::New) => rgb(0x22A06B),
+        Some(Mark::Changed | Mark::Replaced) => rgb(0xE8A317),
+        Some(Mark::ContainsMods) => rgb(0x4F8DE8),
+        Some(Mark::Removed) => rgb(0xDC2626),
+    }
+}
+
 fn file_row(item: &Item) -> FileRow {
     let (badge, tint) = badges::badge(&item.name, item.kind);
+    let info = match (item.mark, item.info.is_empty()) {
+        (Some(m), true) => m.label().to_owned(),
+        (Some(m), false) if item.vpath.is_none() => format!("{} · {}", m.label(), item.info),
+        _ => item.info.clone(),
+    };
     FileRow {
+        mark_color: mark_color(item.mark),
+        dim: item.mark == Some(Mark::Removed),
         name: item.name.clone().into(),
         badge: badge.into(),
         tint,
@@ -412,7 +468,7 @@ fn file_row(item: &Item) -> FileRow {
         } else {
             human_size(item.size).into()
         },
-        info: item.info.clone().into(),
+        info: info.into(),
     }
 }
 
@@ -420,7 +476,7 @@ fn show_folder_info(ui: &AppWindow) {
     let text = with_app(|a| {
         let l = a.listing.as_ref()?;
         let place = match &l.location {
-            Location::Search { summary, .. } => return Some(summary.clone()),
+            Location::Search { summary, .. } | Location::Changes { summary } => return Some(summary.clone()),
             Location::Disk(p) => format!("Folder on disk\n{}", p.display()),
             Location::Archive(rpf, _) => {
                 format!(
@@ -432,7 +488,12 @@ fn show_folder_info(ui: &AppWindow) {
             }
         };
         let shown = if l.vpath.is_empty() { "(game folder)".to_owned() } else { l.vpath.clone() };
-        Some(format!("{shown}\n{place}"))
+        let origin = match l.origin {
+            Origin::Mods => "\nFrom the mods folder (replaces the game's version)",
+            Origin::Merged => "\nGame folder merged with its mods counterpart",
+            Origin::Base => "",
+        };
+        Some(format!("{shown}\n{place}{origin}"))
     });
     ui.set_info_text(text.unwrap_or_default().into());
     ui.set_preview_text(SharedString::new());
@@ -452,6 +513,8 @@ enum PreviewSource {
         game_dir: PathBuf,
         vpath: String,
         query: Option<String>,
+        /// Resolve through the mods overlay.
+        overlay: bool,
     },
 }
 
@@ -462,13 +525,32 @@ fn select_row(ui: &AppWindow, row: usize) {
         a.selected = Some(idx);
         let item = listing.items[idx].clone();
         let source = match (&listing.location, item.entry) {
+            (_, None) if item.mark == Some(Mark::Removed) => {
+                // Removed by the mod: show the original.
+                let vpath = item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name));
+                a.game_dir.clone().map(|game_dir| PreviewSource::Virtual {
+                    game_dir,
+                    vpath,
+                    query: None,
+                    overlay: false,
+                })
+            }
+            (Location::Changes { .. }, _) => {
+                let vpath = item.vpath.clone().unwrap_or_default();
+                a.game_dir.clone().map(|game_dir| PreviewSource::Virtual {
+                    game_dir,
+                    vpath,
+                    query: None,
+                    overlay: true,
+                })
+            }
             (Location::Search { query, .. }, _) => {
                 let vpath = item.vpath.clone().unwrap_or_default();
                 let query = (item.info == "text").then(|| match rage_index::parse_hash(query) {
                     Some(h) => format!("0x{h:08X}"),
                     None => query.clone(),
                 });
-                a.game_dir.clone().map(|game_dir| PreviewSource::Virtual { game_dir, vpath, query })
+                a.game_dir.clone().map(|game_dir| PreviewSource::Virtual { game_dir, vpath, query, overlay: false })
             }
             (Location::Disk(dir), _) if item.kind == ItemKind::Archive => {
                 Some(PreviewSource::DiskArchive(dir.join(&item.name)))
@@ -526,7 +608,11 @@ fn select_row(ui: &AppWindow, row: usize) {
 /// Returns (additional info lines, preview body).
 fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (String, String) {
     match source {
-        PreviewSource::Virtual { game_dir, vpath, query } => match vfs::resolve(&game_dir, &vpath, keys.clone()) {
+        PreviewSource::Virtual { game_dir, vpath, query, overlay } => match if overlay {
+            rage_mods::resolve(&game_dir, &vpath, keys.clone()).map(|(n, _)| n)
+        } else {
+            vfs::resolve(&game_dir, &vpath, keys.clone())
+        } {
             Ok(Node::ArchiveFile(rpf, id)) => {
                 let (mut extra, body) = load_preview(PreviewSource::Entry(Arc::clone(&rpf), id), keys);
                 if let Some(q) = query {
@@ -714,6 +800,7 @@ fn show_search_results(ui: &AppWindow, query: String, results: rage_index::Searc
             .into(),
             entry: None,
             vpath: Some(h.vpath.clone()),
+            mark: None,
         })
         .collect();
     let mut summary = match results.hash {
@@ -739,6 +826,7 @@ fn show_search_results(ui: &AppWindow, query: String, results: rage_index::Searc
         }
         a.listing = Some(Listing {
             vpath: vpath.clone(),
+            origin: Origin::Base,
             location: Location::Search { query: query.clone(), summary: summary.clone() },
             items,
         });
@@ -748,6 +836,169 @@ fn show_search_results(ui: &AppWindow, query: String, results: rage_index::Searc
     ui.set_filter(SharedString::new());
     ui.set_address(vpath.into());
     ui.set_search_mode(true);
+    ui.set_show_language(true);
+    ui.set_search_summary(summary.into());
+    ui.set_tree_selected(-1);
+    refresh_files(ui, None);
+    show_folder_info(ui);
+    ui.set_status(SharedString::new());
+    update_nav_buttons(ui);
+}
+
+// ---------------------------------------------------------------------------
+// Mods
+
+/// Marks the entries of a folder inside a modded archive (added / changed /
+/// removed relative to the original). Runs in the background.
+fn start_folder_diff(ui: &AppWindow) {
+    let Some((vpath, rpf, dir, game_dir, keys, generation, counter)) = with_app(|a| {
+        let l = a.listing.as_ref()?;
+        let Location::Archive(rpf, dir) = &l.location else { return None };
+        if !a.overlay || l.origin != Origin::Mods {
+            return None;
+        }
+        let generation = a.diff_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        Some((
+            l.vpath.clone(),
+            Arc::clone(rpf),
+            *dir,
+            a.game_dir.clone()?,
+            a.keys.clone(),
+            generation,
+            Arc::clone(&a.diff_generation),
+        ))
+    }) else {
+        return;
+    };
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let diff = match vfs::resolve(&game_dir, &vpath, keys) {
+            Ok(Node::ArchiveDir(base, bdir)) => {
+                Some(rage_mods::compare_folders(&rpf, dir, &base, bdir, CompareMode::Quick))
+            }
+            _ => None, // not in the game at all: everything here is new
+        };
+        if counter.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if counter.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let applied = with_app(|a| {
+                let l = a.listing.as_mut().filter(|l| l.vpath == vpath)?;
+                match &diff {
+                    Some(d) => {
+                        for item in &mut l.items {
+                            item.mark = match d.marks.get(&item.name.to_ascii_lowercase()) {
+                                Some(rage_mods::Mark::Added) => Some(Mark::Added),
+                                Some(rage_mods::Mark::Changed) => Some(Mark::Changed),
+                                _ => None,
+                            };
+                        }
+                        for r in &d.removed {
+                            l.items.push(Item {
+                                name: r.name.clone(),
+                                kind: if r.is_dir { ItemKind::Dir } else { ItemKind::File },
+                                size: r.size,
+                                info: String::new(),
+                                entry: None,
+                                vpath: None,
+                                mark: Some(Mark::Removed),
+                            });
+                        }
+                    }
+                    None => l.items.iter_mut().for_each(|i| i.mark = Some(Mark::New)),
+                }
+                Some(a.selected.map(|s| l.items[s].name.clone()))
+            });
+            if let Some(selected) = applied {
+                refresh_files(&ui, None);
+                if let Some(name) = selected {
+                    let row = with_app(|a| {
+                        let l = a.listing.as_ref()?;
+                        a.visible.iter().position(|&i| l.items[i].name == name)
+                    });
+                    ui.set_file_selected(row.map_or(-1, |r| r as i32));
+                }
+            }
+        });
+    });
+}
+
+fn start_changes(ui: &AppWindow, record: bool) {
+    let Some((game_dir, keys)) = with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone()))) else { return };
+    if rage_mods::mods_dir(&game_dir).is_none() {
+        ui.set_status("This game has no mods folder.".into());
+        return;
+    }
+    ui.set_status("Comparing mods with the original files…".into());
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let mut last = Instant::now();
+        let changes = rage_mods::list_changes(&game_dir, keys, CompareMode::Quick, &mut |i, n, p| {
+            if last.elapsed() > Duration::from_millis(150) {
+                last = Instant::now();
+                let msg = format!("Comparing {}/{n}: {p}", i + 1);
+                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+            }
+        });
+        let ms = started.elapsed().as_millis();
+        let _ = weak.upgrade_in_event_loop(move |ui| show_changes(&ui, changes, ms, record));
+    });
+}
+
+fn show_changes(ui: &AppWindow, changes: Vec<rage_mods::Change>, ms: u128, record: bool) {
+    let files = with_app(|a| a.game_dir.as_deref().map(rage_mods::scan).unwrap_or_default());
+    let items: Vec<Item> = changes
+        .iter()
+        .map(|c| Item {
+            name: c.vpath.rsplit('/').next().unwrap_or_default().to_owned(),
+            kind: if c.is_dir {
+                ItemKind::Dir
+            } else if c.vpath.to_ascii_lowercase().ends_with(".rpf") {
+                ItemKind::Archive
+            } else {
+                ItemKind::File
+            },
+            size: c.size,
+            info: c.kind.label().into(),
+            entry: None,
+            vpath: Some(c.vpath.clone()),
+            mark: Some(match c.kind {
+                ChangeKind::Added => Mark::Added,
+                ChangeKind::NewFile => Mark::New,
+                ChangeKind::Removed => Mark::Removed,
+                ChangeKind::Modified => Mark::Changed,
+                ChangeKind::ReplacedFile | ChangeKind::IdenticalCopy => Mark::Replaced,
+            }),
+        })
+        .collect();
+    let identical = changes.iter().filter(|c| c.kind == ChangeKind::IdenticalCopy).count();
+    let mut summary = format!("{} changes from {} files in the mods folder · {ms} ms", items.len(), files.len());
+    if identical > 0 {
+        let noun = if identical == 1 { "copy" } else { "copies" };
+        summary.push_str(&format!(" · {identical} unchanged {noun} of game files (can be deleted)"));
+    }
+    let vpath = browser::CHANGES_PATH.to_owned();
+    with_app(|a| {
+        if record {
+            a.history.push(&vpath);
+        }
+        a.listing = Some(Listing {
+            vpath: vpath.clone(),
+            origin: Origin::Base,
+            location: Location::Changes { summary: summary.clone() },
+            items,
+        });
+        a.selected = None;
+        a.filter.clear();
+    });
+    ui.set_filter(SharedString::new());
+    ui.set_address(vpath.into());
+    ui.set_search_mode(true);
+    ui.set_show_language(false);
     ui.set_search_summary(summary.into());
     ui.set_tree_selected(-1);
     refresh_files(ui, None);
@@ -764,7 +1015,7 @@ fn start_extract(ui: &AppWindow) {
         let listing = a.listing.as_ref().ok_or("nothing to extract")?;
         let item = a.selected.map(|s| &listing.items[s]);
         match (&listing.location, item) {
-            (Location::Search { .. }, Some(item)) => {
+            (Location::Search { .. } | Location::Changes { .. }, Some(item)) if item.mark != Some(Mark::Removed) => {
                 let dir = a.game_dir.clone().ok_or("no game directory")?;
                 match vfs::resolve(&dir, item.vpath.as_deref().unwrap_or_default(), a.keys.clone()) {
                     Ok(Node::ArchiveFile(rpf, id) | Node::ArchiveDir(rpf, id)) => Ok((rpf, id)),
