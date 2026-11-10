@@ -1,11 +1,13 @@
 //! Export of drawables as binary glTF 2.0 (`.glb`), with textures embedded as PNG.
 //!
-//! GTA V is Z-up (x right, y forward); glTF is Y-up (x right, -z forward), so
-//! positions and normals are converted as `(x, y, z) → (x, z, -y)`.
+//! GTA V is Z-up (x right, y forward); glTF is Y-up (x right, -z forward). The
+//! scene's root node converts `(x, y, z) → (x, z, -y)`, so vertex data and part
+//! placements stay in the game's coordinates.
 
 use std::fmt::Write;
 
 use crate::drawable::Drawable;
+use crate::math::Mat4;
 use crate::texture::Texture;
 
 fn esc(s: &str) -> String {
@@ -81,83 +83,144 @@ impl Builder {
     }
 }
 
-/// Writes a drawable as `.glb`. `lookup` resolves texture names (embedded
-/// dictionary, a `.ytd` next to the model, …); missing textures leave the
-/// material untextured.
+/// A placed mesh in a scene.
+pub struct Node {
+    pub name: String,
+    /// Index into the scene's meshes.
+    pub mesh: usize,
+    /// Placement in the game's coordinates (Z-up).
+    pub transform: Mat4,
+}
+
+/// Game Z-up → glTF Y-up: `(x, y, z) → (x, z, -y)`, applied by the root node.
+const Z_UP_TO_Y_UP: Mat4 = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+fn matrix_json(m: &Mat4) -> String {
+    m.iter().map(|v| format!("{}", finite(*v))).collect::<Vec<_>>().join(",")
+}
+
+/// Writes a single drawable as `.glb`.
 pub fn write_glb<'a>(d: &Drawable, name: &str, lookup: &dyn Fn(&str) -> Option<&'a Texture>) -> Vec<u8> {
+    let node = Node { name: name.to_owned(), mesh: 0, transform: crate::math::IDENTITY };
+    write_glb_scene(name, &[(name, d)], &[node], &|_, t| lookup(t))
+}
+
+/// Writes drawables placed by `nodes` as one `.glb` scene. `lookup` resolves
+/// texture names per drawable (embedded dictionary, a `.ytd` next to the
+/// model, …); missing textures leave the material untextured. Drawables no
+/// node uses are left out.
+pub fn write_glb_scene<'a>(
+    name: &str,
+    drawables: &[(&str, &Drawable)],
+    nodes: &[Node],
+    lookup: &dyn Fn(usize, &str) -> Option<&'a Texture>,
+) -> Vec<u8> {
     let mut b = Builder::default();
     let mut materials = Vec::new();
     let mut images = Vec::new();
     let mut textures = Vec::new();
     let mut image_of: Vec<(String, usize)> = Vec::new();
+    let mut meshes_json = Vec::new();
+    // glTF mesh index per drawable (only drawables that nodes use).
+    let mut mesh_of: Vec<Option<usize>> = vec![None; drawables.len()];
 
-    for (si, shader) in d.shaders.iter().enumerate() {
-        let tex_name = shader.base_texture().map(str::to_owned);
-        let mut pbr = String::from("\"metallicFactor\":0,\"roughnessFactor\":0.8");
-        if let Some(tn) = &tex_name {
-            let existing = image_of.iter().find(|(n, _)| n.eq_ignore_ascii_case(tn)).map(|(_, i)| *i);
-            let tex_index = existing.or_else(|| {
-                let t = lookup(tn)?;
-                let rgba = t.to_rgba()?;
-                let png = crate::png(t.width, t.height, &rgba).ok()?;
-                let view = b.view(&png, None);
-                images.push(format!("{{\"name\":\"{}\",\"bufferView\":{view},\"mimeType\":\"image/png\"}}", esc(tn)));
-                textures.push(format!("{{\"source\":{},\"sampler\":0}}", images.len() - 1));
-                image_of.push((tn.clone(), textures.len() - 1));
-                Some(textures.len() - 1)
-            });
-            if let Some(ti) = tex_index {
-                pbr.push_str(&format!(",\"baseColorTexture\":{{\"index\":{ti}}}"));
-            }
-        }
-        let label = tex_name.unwrap_or_else(|| format!("shader_{si}"));
-        materials.push(format!(
-            "{{\"name\":\"{}\",\"pbrMetallicRoughness\":{{{pbr}}},\"alphaMode\":\"MASK\",\"alphaCutoff\":0.3,\"doubleSided\":true}}",
-            esc(&label)
-        ));
-    }
-
-    let mut primitives = Vec::new();
-    for mesh in &d.meshes {
-        if mesh.positions.is_empty() || mesh.indices.is_empty() {
+    for (di, (dname, d)) in drawables.iter().enumerate() {
+        if !nodes.iter().any(|n| n.mesh == di) {
             continue;
         }
-        let positions: Vec<[f32; 3]> = mesh.positions.iter().map(|p| [p[0], p[2], -p[1]]).collect();
-        let mut attrs = format!("\"POSITION\":{}", b.floats(&positions, "VEC3", true));
-        if mesh.normals.len() == mesh.positions.len() {
-            let normals: Vec<[f32; 3]> = mesh
-                .normals
-                .iter()
-                .map(|n| {
-                    let v = [n[0], n[2], -n[1]];
-                    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-                    if len > 1e-6 { [v[0] / len, v[1] / len, v[2] / len] } else { [0.0, 1.0, 0.0] }
-                })
-                .collect();
-            attrs.push_str(&format!(",\"NORMAL\":{}", b.floats(&normals, "VEC3", false)));
+        let first_material = materials.len();
+        for (si, shader) in d.shaders.iter().enumerate() {
+            let tex_name = shader.base_texture().map(str::to_owned);
+            let mut pbr = String::from("\"metallicFactor\":0,\"roughnessFactor\":0.8");
+            if let Some(tn) = &tex_name {
+                let existing = image_of.iter().find(|(n, _)| n.eq_ignore_ascii_case(tn)).map(|(_, i)| *i);
+                let tex_index = existing.or_else(|| {
+                    let t = lookup(di, tn)?;
+                    let rgba = t.to_rgba()?;
+                    let png = crate::png(t.width, t.height, &rgba).ok()?;
+                    let view = b.view(&png, None);
+                    images
+                        .push(format!("{{\"name\":\"{}\",\"bufferView\":{view},\"mimeType\":\"image/png\"}}", esc(tn)));
+                    textures.push(format!("{{\"source\":{},\"sampler\":0}}", images.len() - 1));
+                    image_of.push((tn.clone(), textures.len() - 1));
+                    Some(textures.len() - 1)
+                });
+                if let Some(ti) = tex_index {
+                    pbr.push_str(&format!(",\"baseColorTexture\":{{\"index\":{ti}}}"));
+                }
+            }
+            let label = tex_name.unwrap_or_else(|| format!("{dname}_shader_{si}"));
+            materials.push(format!(
+                "{{\"name\":\"{}\",\"pbrMetallicRoughness\":{{{pbr}}},\"alphaMode\":\"MASK\",\"alphaCutoff\":0.3,\"doubleSided\":true}}",
+                esc(&label)
+            ));
         }
-        if mesh.uvs.len() == mesh.positions.len() {
-            attrs.push_str(&format!(",\"TEXCOORD_0\":{}", b.floats(&mesh.uvs, "VEC2", false)));
+
+        let mut primitives = Vec::new();
+        for mesh in &d.meshes {
+            if mesh.positions.is_empty() || mesh.indices.is_empty() {
+                continue;
+            }
+            let mut attrs = format!("\"POSITION\":{}", b.floats(&mesh.positions, "VEC3", true));
+            if mesh.normals.len() == mesh.positions.len() {
+                let normals: Vec<[f32; 3]> = mesh
+                    .normals
+                    .iter()
+                    .map(|n| {
+                        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                        if len > 1e-6 { [n[0] / len, n[1] / len, n[2] / len] } else { [0.0, 0.0, 1.0] }
+                    })
+                    .collect();
+                attrs.push_str(&format!(",\"NORMAL\":{}", b.floats(&normals, "VEC3", false)));
+            }
+            if mesh.uvs.len() == mesh.positions.len() {
+                attrs.push_str(&format!(",\"TEXCOORD_0\":{}", b.floats(&mesh.uvs, "VEC2", false)));
+            }
+            if mesh.colors.len() == mesh.positions.len() {
+                attrs.push_str(&format!(",\"COLOR_0\":{}", b.floats(&mesh.colors, "VEC4", false)));
+            }
+            let idx = b.indices(&mesh.indices);
+            let material = if (mesh.shader as usize) < d.shaders.len() {
+                format!(",\"material\":{}", first_material + mesh.shader as usize)
+            } else {
+                String::new()
+            };
+            primitives.push(format!("{{\"attributes\":{{{attrs}}},\"indices\":{idx}{material}}}"));
         }
-        if mesh.colors.len() == mesh.positions.len() {
-            attrs.push_str(&format!(",\"COLOR_0\":{}", b.floats(&mesh.colors, "VEC4", false)));
+        if primitives.is_empty() {
+            continue;
         }
-        let idx = b.indices(&mesh.indices);
-        let material = if (mesh.shader as usize) < materials.len() {
-            format!(",\"material\":{}", mesh.shader)
-        } else {
-            String::new()
-        };
-        primitives.push(format!("{{\"attributes\":{{{attrs}}},\"indices\":{idx}{material}}}"));
+        mesh_of[di] = Some(meshes_json.len());
+        meshes_json.push(format!("{{\"name\":\"{}\",\"primitives\":[{}]}}", esc(dname), primitives.join(",")));
     }
+
+    // Node 0 is the root converting to Y-up; part nodes are its children.
+    let mut nodes_json = Vec::new();
+    let mut children = Vec::new();
+    for n in nodes {
+        let Some(mesh) = mesh_of.get(n.mesh).copied().flatten() else { continue };
+        children.push((nodes_json.len() + 1).to_string());
+        nodes_json.push(format!(
+            "{{\"name\":\"{}\",\"mesh\":{mesh},\"matrix\":[{}]}}",
+            esc(&n.name),
+            matrix_json(&n.transform)
+        ));
+    }
+    let root = format!(
+        "{{\"name\":\"{}\",\"matrix\":[{}],\"children\":[{}]}}",
+        esc(name),
+        matrix_json(&Z_UP_TO_Y_UP),
+        children.join(",")
+    );
 
     let mut json = String::new();
     let _ = write!(
         json,
         "{{\"asset\":{{\"version\":\"2.0\",\"generator\":\"OpenRAGE\"}},\"scene\":0,\"scenes\":[{{\"nodes\":[0]}}],\
-         \"nodes\":[{{\"name\":\"{n}\",\"mesh\":0}}],\"meshes\":[{{\"name\":\"{n}\",\"primitives\":[{}]}}]",
-        primitives.join(","),
-        n = esc(name)
+         \"nodes\":[{root}{}{}],\"meshes\":[{}]",
+        if nodes_json.is_empty() { "" } else { "," },
+        nodes_json.join(","),
+        meshes_json.join(",")
     );
     if !materials.is_empty() {
         let _ = write!(json, ",\"materials\":[{}]", materials.join(","));
@@ -224,7 +287,8 @@ mod tests {
         let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
         let json = std::str::from_utf8(&glb[20..20 + json_len]).unwrap();
         assert!(json.contains("\"POSITION\"") && json.contains("\"NORMAL\"") && json.contains("\"material\":0"));
-        // Z-up → Y-up: the vertex at y=1 ends up at z=-1.
-        assert!(json.contains("\"min\":[0,0,-1]"), "{json}");
+        // Vertices stay in game coordinates; the root node converts Z-up → Y-up.
+        assert!(json.contains("\"min\":[0,0,0],\"max\":[1,1,0]"), "{json}");
+        assert!(json.contains("\"matrix\":[1,0,0,0,0,0,-1,0,0,1,0,0,0,0,0,1]"), "{json}");
     }
 }

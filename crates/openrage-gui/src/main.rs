@@ -1860,10 +1860,7 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let result = openrage_app::models::load(&game_dir, keys, &vpath).map(|loaded| {
-            let materials = match loaded.drawables.first() {
-                Some((_, d)) => openrage_app::render::Materials::new(d, &|t| loaded.texture(d, t)),
-                None => openrage_app::render::Materials::new(&Default::default(), &|_| None),
-            };
+            let materials = openrage_app::render::Materials::new(&loaded);
             let name = loaded.drawables.first().map(|(n, _)| n.clone()).unwrap_or_default();
             ModelPreview { loaded, materials, name }
         });
@@ -1878,33 +1875,25 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
             match result {
                 Ok(m) => {
                     let mut meta = info.clone();
-                    let single = m.loaded.drawables.len() == 1;
-                    for (name, d) in &m.loaded.drawables {
-                        let textured = d
+                    let l = &m.loaded;
+                    let (mut meshes, mut shaders, mut textured) = (0, 0, 0);
+                    for (_, d) in l.visible_parts() {
+                        meshes += d.meshes.len();
+                        shaders += d.shaders.len();
+                        textured += d
                             .shaders
                             .iter()
-                            .filter(|s| s.base_texture().is_some_and(|t| m.loaded.texture(d, t).is_some()))
+                            .filter(|s| s.base_texture().is_some_and(|t| l.texture(d, t).is_some()))
                             .count();
-                        if single {
-                            meta.push(kv("Meshes", d.meshes.len()));
-                            meta.push(kv("Vertices", grouped(d.vertex_count())));
-                            meta.push(kv("Triangles", grouped(d.triangle_count())));
-                            meta.push(kv("Textured", format!("{textured} of {} shaders", d.shaders.len())));
-                        } else {
-                            meta.push(kv(
-                                name,
-                                format!(
-                                    "{} meshes · {} triangles · {textured}/{} textured",
-                                    d.meshes.len(),
-                                    grouped(d.triangle_count()),
-                                    d.shaders.len()
-                                ),
-                            ));
-                        }
                     }
-                    if !single {
-                        meta.push(note("The preview shows the first drawable of the dictionary."));
+                    let shown = l.parts.iter().filter(|p| p.visible).count();
+                    if l.parts.len() > 1 {
+                        meta.push(kv("Parts", format!("{shown} shown of {}", l.parts.len())));
                     }
+                    meta.push(kv("Meshes", meshes));
+                    meta.push(kv("Vertices", grouped(l.vertex_count())));
+                    meta.push(kv("Triangles", grouped(l.triangle_count())));
+                    meta.push(kv("Textured", format!("{textured} of {shaders} shaders")));
                     set_meta(&ui, &meta);
                     with_app(|a| {
                         a.model = Some(Arc::new(m));
@@ -1928,8 +1917,7 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
 
 /// Renders a model into an image of `w × h` pixels.
 fn render_image(model: &ModelPreview, view: openrage_app::render::View, w: usize, h: usize) -> Option<slint::Image> {
-    let (_, d) = model.loaded.drawables.first()?;
-    let rgba = openrage_app::render::render(d, &model.materials, view, w, h);
+    let rgba = openrage_app::render::render(&model.loaded, &model.materials, view, w, h);
     let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w as u32, h as u32);
     Some(slint::Image::from_rgba8(buffer))
 }
@@ -1979,8 +1967,8 @@ fn save_glb(model: Arc<ModelPreview>, main: Weak<AppWindow>) {
         else {
             return;
         };
-        let result = openrage_app::models::to_glb(&model.loaded, 0)
-            .ok_or_else(|| "the model has no drawable".to_owned())
+        let result = openrage_app::models::to_glb(&model.loaded, &model.name)
+            .ok_or_else(|| "nothing visible to export".to_owned())
             .and_then(|glb| std::fs::write(&path, glb).map_err(|e| e.to_string()));
         let msg = match result {
             Ok(()) => format!("Exported {}", path.display()),
