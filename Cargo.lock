@@ -3399,6 +3399,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "png",
  "rage-core",
  "rage-crypto",
  "rage-formats",

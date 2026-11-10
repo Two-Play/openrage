@@ -79,9 +79,26 @@ enum Command {
         /// Instead of archives, check every texture dictionary: parse it and decode all textures.
         #[arg(long)]
         textures: bool,
+        /// Instead of archives, parse every model (.ydr, .yft, .ydd).
+        #[arg(long, conflicts_with = "textures")]
+        models: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
         #[arg(long, requires = "textures")]
         rebuild: bool,
+    },
+    /// Show a model (.ydr, .yft, .ydd) and optionally export it as glTF (.glb).
+    Model {
+        /// Virtual path of the model.
+        path: String,
+        /// Write the model (the first drawable of a .ydd) as .glb.
+        #[arg(long)]
+        export: Option<PathBuf>,
+        /// Render a preview image (PNG).
+        #[arg(long)]
+        render: Option<PathBuf>,
+        /// Camera angle around the model for --render, in degrees.
+        #[arg(long, default_value_t = -130.0, allow_hyphen_values = true)]
+        yaw: f32,
     },
     /// List the textures of a texture dictionary (.ytd) and optionally export them.
     Textures {
@@ -219,13 +236,17 @@ fn run() -> Result<()> {
         Command::Info { path } => cmd_info(&game_dir, &path, keys),
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
+        Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
-        Command::Verify { path, textures: true, rebuild } => cmd_verify_textures(&game_dir, &path, rebuild, keys),
+        Command::Verify { path, textures: true, rebuild, .. } => cmd_verify_textures(&game_dir, &path, rebuild, keys),
         Command::Textures { path, sets, removes, .. } if !sets.is_empty() || !removes.is_empty() => {
             cmd_edit_textures(&game_dir, &path, &sets, &removes, keys)
         }
         Command::Textures { path, export, png, .. } => cmd_textures(&game_dir, &path, export.as_deref(), png, keys),
         Command::Index => cmd_index(&game_dir, keys),
+        Command::Model { path, export, render, yaw } => {
+            cmd_model(&game_dir, &path, export.as_deref(), render.as_deref(), yaw, keys)
+        }
         Command::Put { file, target } => cmd_put(&game_dir, &file, &target, keys),
         Command::Rm { path } => cmd_edit(&game_dir, &path, Op::Remove, &format!("Removed {path}"), keys),
         Command::Mv { from, to } => cmd_mv(&game_dir, &from, &to, keys),
@@ -784,6 +805,104 @@ fn cmd_undo(game_dir: &Path) -> Result<()> {
     match install::undo_last(game_dir)? {
         Some(e) => outln!("Undone: {} ({})", e.description, e.archive),
         None => outln!("Nothing to undo."),
+    }
+    Ok(())
+}
+
+fn cmd_model(
+    game_dir: &Path,
+    path: &str,
+    export: Option<&Path>,
+    render: Option<&Path>,
+    yaw: f32,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
+    let model = openrage_app::models::load(game_dir, keys, path)?;
+    for (name, d) in &model.drawables {
+        outln!(
+            "{name}: {} meshes, {} vertices, {} triangles, {} shaders",
+            d.meshes.len(),
+            d.vertex_count(),
+            d.triangle_count(),
+            d.shaders.len()
+        );
+        for (i, s) in d.shaders.iter().enumerate() {
+            let base = s.base_texture().unwrap_or("-");
+            let found = if base == "-" || model.texture(d, base).is_some() { "" } else { " (not found)" };
+            outln!("  shader {i:>2} {:08x}  base {base}{found}  [{}]", s.name_hash, s.textures.join(", "));
+        }
+    }
+    for (name, dict) in &model.external {
+        outln!("textures from {name}: {}", dict.textures.len());
+    }
+    if let Some(out) = export {
+        let glb = openrage_app::models::to_glb(&model, 0).context("model has no drawable")?;
+        fs::write(out, &glb).with_context(|| format!("writing {}", out.display()))?;
+        outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
+    }
+    if let Some(out) = render {
+        use openrage_app::render;
+        let (_, d) = model.drawables.first().context("model has no drawable")?;
+        let materials = render::Materials::new(d, &|t| model.texture(d, t));
+        let view = render::View { yaw: yaw.to_radians(), ..Default::default() };
+        let started = Instant::now();
+        let rgba = render::render(d, &materials, view, 960, 600);
+        let ms = started.elapsed().as_millis();
+        fs::write(out, rage_formats::png(960, 600, &rgba)?)?;
+        outln!("Rendered {} in {ms} ms", out.display());
+    }
+    Ok(())
+}
+
+fn cmd_verify_models(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    use rage_formats::drawable;
+    let starts = archive_roots(game_dir, within, keys)?;
+    let started = Instant::now();
+    let all: Vec<(usize, usize, Vec<String>)> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let (mut models, mut tris, mut errors) = (0usize, 0usize, Vec::new());
+            let mut nested = Vec::new();
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    let n = a.entry(id).name.to_ascii_lowercase();
+                    if !openrage_app::models::is_model(&n) || a.entry(id).resource_version().is_none() {
+                        return;
+                    }
+                    models += 1;
+                    let parsed = a.read_resource(id).map_err(|e| e.to_string()).and_then(|r| {
+                        let r = if n.ends_with(".ydd") {
+                            drawable::parse_ydd(&r).map(|v| v.into_iter().map(|(_, d)| d).collect::<Vec<_>>())
+                        } else if n.ends_with(".yft") {
+                            drawable::parse_yft(&r).map(|d| vec![d])
+                        } else {
+                            drawable::parse_ydr(&r).map(|d| vec![d])
+                        };
+                        r.map_err(|e| e.to_string())
+                    });
+                    match parsed {
+                        Ok(ds) => tris += ds.iter().map(|d| d.triangle_count()).sum::<usize>(),
+                        Err(e) => errors.push(format!("{p}: {e}")),
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (models, tris, errors)
+        })
+        .collect();
+    let (models, tris): (usize, usize) = all.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    let errors: Vec<&String> = all.iter().flat_map(|x| &x.2).collect();
+    for e in errors.iter().take(40) {
+        outln!("FAIL {e}");
+    }
+    outln!("{models} models, {tris} triangles, {} errors ({:.1}s)", errors.len(), started.elapsed().as_secs_f32());
+    if !errors.is_empty() {
+        bail!("{} errors", errors.len());
     }
     Ok(())
 }

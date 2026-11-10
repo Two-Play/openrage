@@ -82,7 +82,11 @@ pub fn parse(res: &Resource) -> Result<TextureDictionary, ResourceError> {
 }
 
 fn parse_layout(res: &Resource, enhanced: bool) -> Result<TextureDictionary, ResourceError> {
-    let root = Resource::ROOT;
+    parse_at(res, Resource::ROOT, enhanced)
+}
+
+/// Reads a texture dictionary located at `root` (e.g. one embedded in a drawable).
+pub fn parse_at(res: &Resource, root: u64, enhanced: bool) -> Result<TextureDictionary, ResourceError> {
     let list = res.u64(root + 0x30)?;
     let count = res.u16(root + 0x38)? as u64;
     if count > 4096 {
