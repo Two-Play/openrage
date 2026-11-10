@@ -327,7 +327,8 @@ mod tests {
 
             // Same shape: in place.
             let flags = |i: usize| u32::from_le_bytes(file[8 + i * 4..12 + i * 4].try_into().unwrap());
-            let r = apply(&res, flags(0), flags(1), &back, &[Edit::Set(texture("ALPHA", 8, Format::BC1_UNORM, 9))]).unwrap();
+            let r = apply(&res, flags(0), flags(1), &back, &[Edit::Set(texture("ALPHA", 8, Format::BC1_UNORM, 9))])
+                .unwrap();
             assert!(r.in_place);
             let d2 = parse(&Resource::from_rsc7(&r.file).unwrap()).unwrap();
             assert_eq!(d2.textures.iter().find(|t| t.name == "alpha").unwrap().data[0], 9);
