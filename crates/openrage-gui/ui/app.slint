@@ -15,6 +15,17 @@ export struct TreeRow {
     tint: color,
 }
 
+export struct InfoRow {
+    // Empty key: a note spanning the whole row.
+    key: string,
+    value: string,
+}
+
+export struct Crumb {
+    label: string,
+    path: string,
+}
+
 export struct FileRow {
     // Mod status: 0 none, 1 added/new, 2 changed, 3 contains mods, 4 removed.
     mark: int,
@@ -477,6 +488,8 @@ export component AppWindow inherits Window {
 
     // Navigation
     in-out property <string> address;
+    in property <[Crumb]> crumbs;
+    in-out property <bool> address-editing;
     in property <bool> can-back;
     in property <bool> can-forward;
     in property <bool> can-up;
@@ -507,7 +520,7 @@ export component AppWindow inherits Window {
     // Info + preview
     in property <string> info-title;
     in property <string> info-path;
-    in property <string> info-details;
+    in property <[InfoRow]> info-rows;
     in property <string> info-icon: "folder";
     in property <color> info-tint: #b8902a;
     in property <string> preview-text;
@@ -517,10 +530,6 @@ export component AppWindow inherits Window {
     in property <bool> model-mode;
     out property <length> preview-area-width;
     out property <length> preview-area-height;
-    // Large viewer for models and images (double-click).
-    in-out property <bool> viewer-open;
-    out property <length> viewer-area-width;
-    out property <length> viewer-area-height;
     in property <bool> texture-mode;
     // Editing archives (written into the mods folder)
     in property <bool> archive-mode;
@@ -617,9 +626,6 @@ export component AppWindow inherits Window {
     preview-area-height: preview-area.height;
     changed preview-area-width => { root.model-resized(); }
     changed preview-area-height => { root.model-resized(); }
-    changed viewer-area-width => { root.model-resized(); }
-    changed viewer-area-height => { root.model-resized(); }
-    changed viewer-open => { root.model-resized(); }
     changed theme-mode => { root.apply-theme(); }
     init => { root.apply-theme(); }
 
@@ -855,7 +861,7 @@ export component AppWindow inherits Window {
                 title: @tr("Edit address");
                 icon: @image-url("icons/menu/rename.svg");
                 shortcut: @keys(Control + L);
-                activated => { address-edit.focus(); }
+                activated => { root.address-editing = true; }
             }
             MenuItem {
                 title: @tr("Search");
@@ -913,12 +919,77 @@ export component AppWindow inherits Window {
                         clicked => { root.go-up(); }
                     }
                 }
-                address-edit := LineEdit {
+                // Breadcrumbs; click the free space (or Ctrl+L) to type a path.
+                Rectangle {
                     horizontal-stretch: 1;
-                    text <=> root.address;
-                    placeholder-text: @tr("Path, e.g. x64e.rpf/levels/gta5/vehicles.rpf");
-                    accessible-label: @tr("Address");
-                    accepted(text) => { root.navigate(text); }
+                    min-height: 32px;
+                    if root.address-editing: FocusScope {
+                        KeyBinding {
+                            keys: @keys(Escape);
+                            activated => { root.address-editing = false; }
+                        }
+                        LineEdit {
+                            text <=> root.address;
+                            placeholder-text: @tr("Path, e.g. x64e.rpf/levels/gta5/vehicles.rpf");
+                            accessible-label: @tr("Address");
+                            accepted(text) => {
+                                root.address-editing = false;
+                                root.navigate(text);
+                            }
+                            changed has-focus => {
+                                if (!self.has-focus) {
+                                    root.address-editing = false;
+                                }
+                            }
+                            init => { self.focus(); }
+                        }
+                    }
+                    if !root.address-editing: Rectangle {
+                        border-radius: Theme.radius;
+                        border-width: 1px;
+                        border-color: edit-area.has-hover ? Theme.text-faint : Theme.border;
+                        background: Theme.background;
+                        accessible-role: AccessibleRole.list;
+                        accessible-label: @tr("Location");
+                        edit-area := TouchArea {
+                            mouse-cursor: text;
+                            clicked => { root.address-editing = true; }
+                        }
+                        HorizontalLayout {
+                            padding-left: Theme.space-xs;
+                            padding-right: Theme.space-xs;
+                            alignment: start;
+                            for c[i] in root.crumbs: HorizontalLayout {
+                                if i > 0: Text {
+                                    text: "›";
+                                    vertical-alignment: center;
+                                    color: Theme.text-faint;
+                                }
+                                Rectangle {
+                                    max-width: 240px;
+                                    border-radius: Theme.radius-s;
+                                    background: crumb-area.has-hover ? Theme.hover : transparent;
+                                    accessible-role: button;
+                                    accessible-label: c.label;
+                                    accessible-action-default => { root.navigate(c.path); }
+                                    crumb-area := TouchArea {
+                                        clicked => { root.navigate(c.path); }
+                                    }
+                                    HorizontalLayout {
+                                        padding-left: 6px;
+                                        padding-right: 6px;
+                                        Text {
+                                            text: c.label;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                            font-weight: i == root.crumbs.length - 1 ? 600 : 400;
+                                            color: i == root.crumbs.length - 1 ? Theme.text : Theme.text-muted;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Rectangle {
                     width: 16px;
@@ -1410,10 +1481,35 @@ export component AppWindow inherits Window {
                         color: Theme.text-muted;
                     }
                 }
-                if root.info-details != "": Text {
-                    text: root.info-details;
-                    wrap: word-wrap;
-                    color: Theme.text;
+                if root.info-rows.length > 0: Rectangle {
+                    border-radius: Theme.radius;
+                    background: Theme.surface;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    VerticalLayout {
+                        padding: Theme.space-m;
+                        padding-top: Theme.space-s;
+                        padding-bottom: Theme.space-s;
+                        spacing: Theme.space-xs;
+                        for r in root.info-rows: HorizontalLayout {
+                            spacing: Theme.space-m;
+                            if r.key != "": Text {
+                                width: 120px;
+                                text: r.key;
+                                font-size: Theme.font-small;
+                                color: Theme.text-muted;
+                                overflow: elide;
+                                vertical-alignment: top;
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: r.value;
+                                wrap: word-wrap;
+                                color: r.key == "" ? Theme.text-muted : r.key == "Error" ? Theme.danger : Theme.text;
+                                font-size: r.key == "" ? Theme.font-small : Theme.font-body;
+                            }
+                        }
+                    }
                 }
 
                 // Actions for the selection
@@ -1541,99 +1637,6 @@ export component AppWindow inherits Window {
                 }
             }
         }
-    }
-
-    // Large viewer for the selected model or image
-    if root.viewer-open: Rectangle {
-        background: Theme.background;
-        TouchArea { }
-        scope := FocusScope {
-            KeyBinding {
-                keys: @keys(Escape);
-                activated => { root.viewer-open = false; }
-            }
-            VerticalLayout {
-                Rectangle {
-                    background: Theme.surface;
-                    HorizontalLayout {
-                        padding: Theme.space-s;
-                        padding-left: Theme.space-l;
-                        spacing: Theme.space-s;
-                        FormatIcon {
-                            y: (parent.height - self.height) / 2;
-                            width: 20px;
-                            height: 20px;
-                            name: root.info-icon;
-                            tint: root.info-tint;
-                        }
-                        VerticalLayout {
-                            horizontal-stretch: 1;
-                            alignment: center;
-                            Text {
-                                text: root.info-title;
-                                font-size: Theme.font-title;
-                                font-weight: 600;
-                                overflow: elide;
-                                color: Theme.text;
-                            }
-                            Text {
-                                text: root.model-mode ? @tr("Drag to rotate · scroll to zoom · Esc to close") : @tr("Esc to close");
-                                font-size: Theme.font-small;
-                                color: Theme.text-muted;
-                            }
-                        }
-                        if root.model-mode: Button {
-                            text: @tr("Export glTF…");
-                            icon: @image-url("icons/export.svg");
-                            colorize-icon: true;
-                            enabled: !root.busy;
-                            clicked => { root.export-gltf(); }
-                        }
-                        if root.texture-mode: Button {
-                            text: @tr("Save PNG…");
-                            icon: @image-url("icons/image.svg");
-                            colorize-icon: true;
-                            enabled: !root.busy;
-                            clicked => { root.save-png(); }
-                        }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/close.svg");
-                            label: @tr("Close viewer (Esc)");
-                            clicked => { root.viewer-open = false; }
-                        }
-                    }
-                }
-                Rectangle {
-                    height: 1px;
-                    background: Theme.border;
-                }
-                viewer-area := Rectangle {
-                    vertical-stretch: 1;
-                    background: Theme.surface-raised;
-                    init => {
-                        root.viewer-area-width = self.width;
-                        root.viewer-area-height = self.height;
-                    }
-                    changed width => { root.viewer-area-width = self.width; }
-                    changed height => { root.viewer-area-height = self.height; }
-                    if root.has-image: Image {
-                        x: Theme.space-l;
-                        y: Theme.space-l;
-                        width: parent.width - 2 * Theme.space-l;
-                        height: parent.height - 2 * Theme.space-l;
-                        source: root.preview-image;
-                        image-fit: contain;
-                        image-rendering: root.model-mode ? smooth : pixelated;
-                    }
-                    if root.model-mode: ModelControls {
-                        orbit(dx, dy) => { root.model-orbit(dx, dy); }
-                        zoom(d) => { root.model-zoom(d); }
-                    }
-                }
-            }
-        }
-        init => { scope.focus(); }
     }
 
     // OpenIV package preview
@@ -1962,6 +1965,195 @@ export component AppWindow inherits Window {
                 primary: true;
                 enabled: !root.setup-running && root.setup-game-dir != "";
                 clicked => { root.setup-run(); }
+            }
+        }
+    }
+}
+
+// Separate window showing a model (orbit) or an image; opened by double-click.
+export component ViewerWindow inherits Window {
+    title: root.heading + " — OpenRAGE";
+    icon: @image-url("icon.png");
+    preferred-width: 1100px;
+    preferred-height: 760px;
+    min-width: 480px;
+    min-height: 360px;
+    background: Theme.background;
+    default-font-size: Theme.font-body;
+
+    in-out property <int> theme-mode;
+    in property <string> heading;
+    in property <string> path;
+    in property <string> icon-name;
+    in property <color> tint;
+    in property <image> image;
+    in property <bool> model-mode;
+    in property <[InfoRow]> rows;
+    in property <string> mono-font: "monospace";
+    in-out property <bool> show-info: true;
+    out property <length> area-width: area.width;
+    out property <length> area-height: area.height;
+
+    callback orbit(length, length);
+    callback zoom(float);
+    callback resized();
+    callback reset-view();
+    callback export-gltf();
+    callback save-png();
+    callback close-viewer();
+
+    changed area-width => { root.resized(); }
+    changed area-height => { root.resized(); }
+    changed theme-mode => { root.apply-theme(); }
+    init => {
+        root.apply-theme();
+        scope.focus();
+    }
+
+    function apply-theme() {
+        Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+
+    scope := FocusScope {
+        KeyBinding {
+            keys: @keys(Escape);
+            activated => { root.close-viewer(); }
+        }
+        KeyBinding {
+            keys: @keys(I);
+            activated => { root.show-info = !root.show-info; }
+        }
+        KeyBinding {
+            keys: @keys(R);
+            enabled: root.model-mode;
+            activated => { root.reset-view(); }
+        }
+        VerticalLayout {
+            Rectangle {
+                background: Theme.surface;
+                HorizontalLayout {
+                    padding: Theme.space-s;
+                    padding-left: Theme.space-l;
+                    spacing: Theme.space-s;
+                    FormatIcon {
+                        y: (parent.height - self.height) / 2;
+                        width: 20px;
+                        height: 20px;
+                        name: root.icon-name;
+                        tint: root.tint;
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        Text {
+                            text: root.heading;
+                            font-size: Theme.font-title;
+                            font-weight: 600;
+                            overflow: elide;
+                            color: Theme.text;
+                        }
+                        Text {
+                            text: root.path;
+                            font-family: root.mono-font;
+                            font-size: Theme.font-small;
+                            overflow: elide;
+                            color: Theme.text-muted;
+                        }
+                    }
+                    if root.model-mode: Button {
+                        text: @tr("Reset view");
+                        clicked => { root.reset-view(); }
+                    }
+                    if root.model-mode: Button {
+                        text: @tr("Export glTF…");
+                        icon: @image-url("icons/export.svg");
+                        colorize-icon: true;
+                        clicked => { root.export-gltf(); }
+                    }
+                    if !root.model-mode: Button {
+                        text: @tr("Save PNG…");
+                        icon: @image-url("icons/image.svg");
+                        colorize-icon: true;
+                        clicked => { root.save-png(); }
+                    }
+                    IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: @image-url("icons/data.svg");
+                        label: @tr("Show details (I)");
+                        active: root.show-info;
+                        clicked => { root.show-info = !root.show-info; }
+                    }
+                }
+            }
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+            HorizontalLayout {
+                vertical-stretch: 1;
+                area := Rectangle {
+                    horizontal-stretch: 1;
+                    background: Theme.surface-raised;
+                    clip: true;
+                    Image {
+                        x: Theme.space-l;
+                        y: Theme.space-l;
+                        width: parent.width - 2 * Theme.space-l;
+                        height: parent.height - 2 * Theme.space-l;
+                        source: root.image;
+                        image-fit: contain;
+                        image-rendering: root.model-mode ? smooth : pixelated;
+                        accessible-role: AccessibleRole.image;
+                        accessible-label: root.heading;
+                    }
+                    if root.model-mode: ModelControls {
+                        orbit(dx, dy) => { root.orbit(dx, dy); }
+                        zoom(d) => { root.zoom(d); }
+                        double-clicked => { root.reset-view(); }
+                    }
+                    Text {
+                        x: Theme.space-m;
+                        y: parent.height - self.height - Theme.space-s;
+                        text: root.model-mode ? @tr("Drag to rotate · scroll to zoom · R or double-click resets · Esc closes") : @tr("Esc closes");
+                        font-size: Theme.font-small;
+                        color: Theme.text-faint;
+                    }
+                }
+                if root.show-info: Rectangle {
+                    width: 1px;
+                    background: Theme.border;
+                }
+                if root.show-info: Rectangle {
+                    width: 300px;
+                    background: Theme.surface;
+                    VerticalLayout {
+                        padding: Theme.space-l;
+                        spacing: Theme.space-s;
+                        alignment: start;
+                        Text {
+                            text: @tr("Details");
+                            font-weight: 600;
+                            color: Theme.text;
+                        }
+                        for r in root.rows: HorizontalLayout {
+                            spacing: Theme.space-m;
+                            if r.key != "": Text {
+                                width: 100px;
+                                text: r.key;
+                                font-size: Theme.font-small;
+                                color: Theme.text-muted;
+                                overflow: elide;
+                            }
+                            Text {
+                                horizontal-stretch: 1;
+                                text: r.value;
+                                wrap: word-wrap;
+                                color: r.key == "" ? Theme.text-muted : Theme.text;
+                                font-size: r.key == "" ? Theme.font-small : Theme.font-body;
+                            }
+                        }
+                    }
+                }
             }
         }
     }

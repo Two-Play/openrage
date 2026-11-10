@@ -45,7 +45,9 @@ cargo run --release -p openrage-gui            # or: openrage-gui <virtual path>
 On first start a setup dialog detects Steam installations and derives the keys. The explorer shows a folder tree in which archives (including nested ones) behave like folders, a sortable file list with format icons (textures, models, maps, data, audio, scripts …), and a preview pane (text with a fixed-width font, hex dump for binaries and resource pages, resource version and page sizes). Extraction runs in the background and can be cancelled; its output matches OpenIV's.
 
 * **Menus and context menus:** every action is in the menu bar (File, Edit, View, Go, Help) with its keyboard shortcut; right-click a file for the actions that apply to it (open, view, extract, export, replace, rename, delete, copy name/path).
-* **Double-click** opens folders, archives and texture dictionaries, and shows models and textures in a large **viewer** (also Ctrl+Enter; Esc closes it).
+* **Double-click** opens folders, archives and texture dictionaries; models and textures open in their own **viewer window** (also Ctrl+Enter) with a details panel. Several viewers can be open at once, e.g. to compare models.
+* **Address bar** with clickable breadcrumbs like a file manager; click the free space (or Ctrl+L) to type a path.
+* The info panel shows metadata as a table (type, size, version, format, mip levels, meshes, triangles …).
 * **Keyboard:** arrow keys, Page Up/Down, Home/End and Enter in the list; Backspace or Alt+Up goes up; Ctrl+L address, Ctrl+F search, F2 rename, Delete, Ctrl+Z undo. Help → Keyboard shortcuts (F1) lists them all.
 * **Edit mode, like OpenIV:** OpenRAGE starts read-only. **Read-only → Editing** in the toolbar (or Edit → Unlock editing…) asks once per session; only then can archives, textures and packages be changed. The bar above the list says whether you are looking at an original game archive (changes are copied to `mods`) or the copy in `mods`.
 * **Light and dark mode:** follows the system, or pick one under View → Theme (the sun/moon button switches quickly). The choice is remembered.
