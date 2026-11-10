@@ -3401,8 +3401,10 @@ dependencies = [
  "clap",
  "openrage-app",
  "rage-crypto",
+ "rage-formats",
  "rage-index",
  "rage-mods",
+ "rage-resource",
  "rage-rpf",
  "rayon",
 ]
@@ -3415,6 +3417,7 @@ dependencies = [
  "openrage-app",
  "rage-core",
  "rage-crypto",
+ "rage-formats",
  "rage-index",
  "rage-mods",
  "rage-rpf",
@@ -3539,6 +3542,12 @@ checksum = "1567535334d6ba2d3cde19221ba9a7bd0fabb3cbd99046ddfb10ae061cfcc889"
 dependencies = [
  "icu_properties",
 ]
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "percent-encoding"
@@ -3858,6 +3867,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rage-formats"
+version = "0.1.0"
+dependencies = [
+ "png",
+ "rage-resource",
+ "texture2ddecoder",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "rage-index"
 version = "0.1.0"
 dependencies = [
@@ -3879,12 +3898,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rage-resource"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "rage-rpf"
 version = "0.1.0"
 dependencies = [
  "flate2",
  "rage-core",
  "rage-crypto",
+ "rage-resource",
  "thiserror 2.0.21",
 ]
 
@@ -4771,6 +4799,15 @@ name = "text-size"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f18aa187839b2bdb1ad2fa35ead8c4c2976b64e4363c386d45ac0f7ee85c9233"
+
+[[package]]
+name = "texture2ddecoder"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "427ae8ec7f2f0fdd3146b77cfa44bea880caf066f7e55398a8467afe2645c832"
+dependencies = [
+ "paste",
+]
 
 [[package]]
 name = "thiserror"

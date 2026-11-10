@@ -172,7 +172,9 @@ fn wire_callbacks(ui: &AppWindow) {
                     // Search hit or change: jump to its location (removed entries: their folder).
                     return if item.mark == Some(Mark::Removed) { browser::parent(vpath) } else { Some(vpath.clone()) };
                 }
-                item.kind.is_container().then(|| browser::join(&listing.vpath, &item.name))
+                let opens = item.kind.is_container()
+                    || (item.kind == ItemKind::Resource && browser::is_texture_dict(&item.name));
+                opens.then(|| browser::join(&listing.vpath, &item.name))
             });
             if let Some(p) = target {
                 navigate(ui, &p, true);
@@ -237,6 +239,8 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_show_changes(move || with_ui(&w, |ui| navigate(ui, browser::CHANGES_PATH, true)));
     let w = ui.as_weak();
     ui.on_extract_selected(move || with_ui(&w, start_extract));
+    let w = ui.as_weak();
+    ui.on_save_png(move || with_ui(&w, |ui| export_textures(ui, true)));
     ui.on_cancel_task(|| with_app(|a| a.cancel.store(true, Ordering::Relaxed)));
     let w = ui.as_weak();
     ui.on_open_setup(move || with_ui(&w, |ui| show_setup(ui, true)));
@@ -428,8 +432,10 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
     ui.set_sort_descending(with_app(|a| a.sort_descending));
     ui.set_file_selected(selected_row.map_or(-1, |r| r as i32));
     ui.set_can_extract(with_app(|a| {
-        matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Archive(..))) || a.selected.is_some()
+        matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Archive(..) | Location::Textures { .. }))
+            || a.selected.is_some()
     }));
+    ui.set_can_png(with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { .. }))));
     if let (Some(row), Some(_)) = (selected_row, select) {
         select_row(ui, row);
     }
@@ -477,6 +483,12 @@ fn show_folder_info(ui: &AppWindow) {
         let l = a.listing.as_ref()?;
         let place = match &l.location {
             Location::Search { summary, .. } | Location::Changes { summary } => return Some(summary.clone()),
+            Location::Textures { dict, .. } => {
+                format!(
+                    "Texture dictionary · {} textures\nExtract… exports DDS files like OpenIV; Save PNG… exports images.",
+                    dict.textures.len()
+                )
+            }
             Location::Disk(p) => format!("Folder on disk\n{}", p.display()),
             Location::Archive(rpf, _) => {
                 format!(
@@ -497,6 +509,7 @@ fn show_folder_info(ui: &AppWindow) {
     });
     ui.set_info_text(text.unwrap_or_default().into());
     ui.set_preview_text(SharedString::new());
+    ui.set_has_image(false);
     ui.set_preview_loading(false);
 }
 
@@ -508,6 +521,8 @@ enum PreviewSource {
     DiskFile(PathBuf),
     DiskArchive(PathBuf),
     Entry(Arc<Rpf7>, EntryId),
+    /// A texture of an opened texture dictionary (index into its textures).
+    Texture(Arc<rage_formats::ytd::TextureDictionary>, usize),
     /// A search hit; resolved in the worker. `query` is set for text hits to show the matching line.
     Virtual {
         game_dir: PathBuf,
@@ -552,6 +567,7 @@ fn select_row(ui: &AppWindow, row: usize) {
                 });
                 a.game_dir.clone().map(|game_dir| PreviewSource::Virtual { game_dir, vpath, query, overlay: false })
             }
+            (Location::Textures { dict, .. }, _) => Some(PreviewSource::Texture(Arc::clone(dict), idx)),
             (Location::Disk(dir), _) if item.kind == ItemKind::Archive => {
                 Some(PreviewSource::DiskArchive(dir.join(&item.name)))
             }
@@ -579,6 +595,7 @@ fn select_row(ui: &AppWindow, row: usize) {
     }
     ui.set_info_text(info.clone().into());
     ui.set_preview_text(SharedString::new());
+    ui.set_has_image(false);
     let Some(source) = source else {
         ui.set_preview_loading(false);
         return;
@@ -588,10 +605,12 @@ fn select_row(ui: &AppWindow, row: usize) {
     let counter = with_app(|a| Arc::clone(&a.preview_generation));
     let weak = ui.as_weak();
     std::thread::spawn(move || {
-        let (extra, body) = load_preview(source, keys);
+        let (extra, body, image) = load_preview(source, keys);
         if counter.load(Ordering::SeqCst) != generation {
             return; // a newer selection superseded this one
         }
+        let image =
+            image.map(|(w, h, rgba)| slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h));
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if counter.load(Ordering::SeqCst) != generation {
                 return;
@@ -600,13 +619,77 @@ fn select_row(ui: &AppWindow, row: usize) {
                 ui.set_info_text(format!("{info}\n{extra}").into());
             }
             ui.set_preview_text(body.into());
+            match image {
+                Some(buffer) => {
+                    ui.set_preview_image(slint::Image::from_rgba8(buffer));
+                    ui.set_has_image(true);
+                }
+                None => ui.set_has_image(false),
+            }
             ui.set_preview_loading(false);
         });
     });
 }
 
+/// Decoded RGBA image: (width, height, pixels).
+type Rgba = (u32, u32, Vec<u8>);
+
+fn texture_info(t: &rage_formats::texture::Texture) -> String {
+    format!(
+        "{}×{} · {} · {} mip levels · {} · {}",
+        t.width,
+        t.height,
+        t.format.name(),
+        t.levels,
+        t.usage_name(),
+        human_size(t.data.len() as u64)
+    )
+}
+
+fn texture_image(t: &rage_formats::texture::Texture) -> Option<Rgba> {
+    t.to_rgba().map(|rgba| (t.width, t.height, rgba))
+}
+
+/// Preview with an optional image: textures and texture dictionaries show a picture.
+fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (String, String, Option<Rgba>) {
+    match source {
+        PreviewSource::Texture(dict, idx) => match dict.textures.get(idx) {
+            Some(t) => {
+                let image = texture_image(t);
+                let note =
+                    if image.is_none() { "\nNo preview decoder for this format (DDS export works)." } else { "" };
+                (format!("{}{note}", texture_info(t)), String::new(), image)
+            }
+            None => (String::new(), String::new(), None),
+        },
+        PreviewSource::Entry(rpf, id) if browser::is_texture_dict(&rpf.entry(id).name) => {
+            match rpf
+                .read_resource(id)
+                .map_err(|e| e.to_string())
+                .and_then(|r| rage_formats::ytd::parse(&r).map_err(|e| e.to_string()))
+            {
+                Ok(dict) => {
+                    let names: Vec<&str> = dict.textures.iter().take(8).map(|t| t.name.as_str()).collect();
+                    let more = if dict.textures.len() > 8 { ", …" } else { "" };
+                    let info = format!(
+                        "Texture dictionary · {} textures (double-click to open)\n{}{more}",
+                        dict.textures.len(),
+                        names.join(", ")
+                    );
+                    (info, String::new(), dict.textures.first().and_then(texture_image))
+                }
+                Err(e) => (format!("Error: {e}"), String::new(), None),
+            }
+        }
+        other => {
+            let (extra, body) = load_preview_text(other, keys);
+            (extra, body, None)
+        }
+    }
+}
+
 /// Returns (additional info lines, preview body).
-fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (String, String) {
+fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (String, String) {
     match source {
         PreviewSource::Virtual { game_dir, vpath, query, overlay } => match if overlay {
             rage_mods::resolve(&game_dir, &vpath, keys.clone()).map(|(n, _)| n)
@@ -614,7 +697,7 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (String, 
             vfs::resolve(&game_dir, &vpath, keys.clone())
         } {
             Ok(Node::ArchiveFile(rpf, id)) => {
-                let (mut extra, body) = load_preview(PreviewSource::Entry(Arc::clone(&rpf), id), keys);
+                let (mut extra, body) = load_preview_text(PreviewSource::Entry(Arc::clone(&rpf), id), keys);
                 if let Some(q) = query {
                     let name = rpf.entry(id).name.clone();
                     let line = rpf
@@ -630,9 +713,10 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (String, 
             }
             Ok(Node::ArchiveDir(rpf, id)) if id == Rpf7::ROOT => (archive_info(&rpf), String::new()),
             Ok(Node::ArchiveDir(..)) | Ok(Node::Dir(_)) => (String::new(), String::new()),
-            Ok(Node::PlainFile(p)) => load_preview(PreviewSource::DiskFile(p), keys),
+            Ok(Node::PlainFile(p)) => load_preview_text(PreviewSource::DiskFile(p), keys),
             Err(e) => (format!("Error: {e}"), String::new()),
         },
+        PreviewSource::Texture(..) => (String::new(), String::new()),
         PreviewSource::DiskFile(path) => {
             let mut data = Vec::new();
             match File::open(&path).and_then(|f| f.take(1 << 20).read_to_end(&mut data)) {
@@ -1010,7 +1094,67 @@ fn show_changes(ui: &AppWindow, changes: Vec<rage_mods::Change>, ms: u128, recor
 // ---------------------------------------------------------------------------
 // Extraction
 
+/// Exports the selected texture, or all textures of the open dictionary, as DDS or PNG.
+fn export_textures(ui: &AppWindow, png: bool) {
+    let Some((dict, selected, dict_name)) = with_app(|a| {
+        let l = a.listing.as_ref()?;
+        let Location::Textures { dict, .. } = &l.location else { return None };
+        let name = l.vpath.rsplit('/').next().unwrap_or("textures").trim_end_matches(".ytd").to_owned();
+        Some((Arc::clone(dict), a.selected, name))
+    }) else {
+        return;
+    };
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let title = if png { "Save PNG to folder" } else { "Export DDS to folder" };
+        let Some(out) = rfd::FileDialog::new().set_title(title).pick_folder() else { return };
+        // Exporting a whole dictionary goes into its own subfolder, like OpenIV.
+        let (out, picked): (PathBuf, Vec<usize>) = match selected {
+            Some(i) => (out, vec![i]),
+            None => (out.join(&dict_name), (0..dict.textures.len()).collect()),
+        };
+        let mut written = 0;
+        let mut problems = Vec::new();
+        if let Err(e) = std::fs::create_dir_all(&out) {
+            problems.push(e.to_string());
+        }
+        for i in picked {
+            let t = &dict.textures[i];
+            let Some(name) = vfs::safe_relative_path(&t.name) else {
+                problems.push(format!("{}: unsafe name", t.name));
+                continue;
+            };
+            let result = if png {
+                match t.to_rgba() {
+                    Some(rgba) => {
+                        rage_formats::png(t.width, t.height, &rgba).map_err(|e| e.to_string()).and_then(|b| {
+                            std::fs::write(out.join(&name).with_extension("png"), b).map_err(|e| e.to_string())
+                        })
+                    }
+                    None => Err(format!("no PNG decoder for {}", t.format.name())),
+                }
+            } else {
+                std::fs::write(out.join(&name).with_extension("dds"), rage_formats::dds::to_dds(t))
+                    .map_err(|e| e.to_string())
+            };
+            match result {
+                Ok(()) => written += 1,
+                Err(e) => problems.push(format!("{}: {e}", t.name)),
+            }
+        }
+        let mut msg = format!("Exported {written} texture(s) to {}", out.display());
+        if let Some(first) = problems.first() {
+            msg.push_str(&format!(" — {} problem(s), first: {first}", problems.len()));
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+    });
+}
+
 fn start_extract(ui: &AppWindow) {
+    if with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { .. }))) {
+        export_textures(ui, false);
+        return;
+    }
     let target = with_app(|a| -> Result<(Arc<Rpf7>, EntryId), String> {
         let listing = a.listing.as_ref().ok_or("nothing to extract")?;
         let item = a.selected.map(|s| &listing.items[s]);

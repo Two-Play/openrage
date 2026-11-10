@@ -75,6 +75,20 @@ enum Command {
         /// Limit the check to this virtual path.
         #[arg(default_value = "")]
         path: String,
+        /// Instead of archives, check every texture dictionary: parse it and decode all textures.
+        #[arg(long)]
+        textures: bool,
+    },
+    /// List the textures of a texture dictionary (.ytd) and optionally export them.
+    Textures {
+        /// Virtual path of the .ytd file.
+        path: String,
+        /// Export all textures into this folder (DDS, like OpenIV).
+        #[arg(long)]
+        export: Option<PathBuf>,
+        /// Export PNG images instead of DDS (top mip level only).
+        #[arg(long)]
+        png: bool,
     },
     /// Build or update the search index (only changed archives are re-read).
     Index,
@@ -157,7 +171,9 @@ fn run() -> Result<()> {
         Command::Info { path } => cmd_info(&game_dir, &path, keys),
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
-        Command::Verify { path } => cmd_verify(&game_dir, &path, keys),
+        Command::Verify { path, textures: false } => cmd_verify(&game_dir, &path, keys),
+        Command::Verify { path, textures: true } => cmd_verify_textures(&game_dir, &path, keys),
+        Command::Textures { path, export, png } => cmd_textures(&game_dir, &path, export.as_deref(), png, keys),
         Command::Index => cmd_index(&game_dir, keys),
         Command::Mods { changes, deep } => cmd_mods(&game_dir, changes, deep, keys),
         Command::Repack { archive, out, sets, removes } => cmd_repack(&game_dir, &archive, &out, &sets, &removes, keys),
@@ -342,6 +358,142 @@ fn cmd_repack(
     let bytes = repack(&rpf, &edits)?;
     fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
     outln!("Wrote {} ({}) with {} edits.", out.display(), human(bytes.len() as u64), edits.len());
+    Ok(())
+}
+
+fn load_ytd(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<rage_formats::ytd::TextureDictionary> {
+    let Node::ArchiveFile(rpf, id) = vfs::resolve(game_dir, path, keys)? else {
+        bail!("{path} is not a file inside an archive")
+    };
+    let res = rpf.read_resource(id)?;
+    Ok(rage_formats::ytd::parse(&res)?)
+}
+
+fn cmd_textures(
+    game_dir: &Path,
+    path: &str,
+    export: Option<&Path>,
+    png: bool,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
+    let dict = load_ytd(game_dir, path, keys)?;
+    for t in &dict.textures {
+        outln!(
+            "{:<32} {:>5}x{:<5} {:<14} mips {:>2}  {:>8}  {}",
+            t.name,
+            t.width,
+            t.height,
+            t.format.name(),
+            t.levels,
+            human(t.data.len() as u64),
+            t.usage_name()
+        );
+    }
+    for e in &dict.errors {
+        eprintln!("warning: {e}");
+    }
+    let Some(dir) = export else { return Ok(()) };
+    fs::create_dir_all(dir)?;
+    let mut written = 0;
+    for t in &dict.textures {
+        let Some(name) = vfs::safe_relative_path(&t.name) else {
+            eprintln!("warning: skipped unsafe texture name {:?}", t.name);
+            continue;
+        };
+        let (target, bytes) = if png {
+            let Some(rgba) = t.to_rgba() else {
+                eprintln!("warning: {}: no PNG decoder for {}", t.name, t.format.name());
+                continue;
+            };
+            (dir.join(name).with_extension("png"), rage_formats::png(t.width, t.height, &rgba)?)
+        } else {
+            (dir.join(name).with_extension("dds"), rage_formats::dds::to_dds(t))
+        };
+        fs::write(&target, bytes).with_context(|| format!("writing {}", target.display()))?;
+        written += 1;
+    }
+    outln!("Exported {written} textures to {}", dir.display());
+    Ok(())
+}
+
+fn cmd_verify_textures(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    #[derive(Default)]
+    struct Stats {
+        dicts: usize,
+        textures: usize,
+        decoded: usize,
+        undecodable: std::collections::BTreeMap<String, usize>,
+        errors: Vec<String>,
+    }
+    let starts = archive_roots(game_dir, within, keys)?;
+    let started = Instant::now();
+    let all: Vec<Stats> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let mut s = Stats::default();
+            let mut nested_errors = Vec::new();
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    if !a.entry(id).name.to_ascii_lowercase().ends_with(".ytd")
+                        || a.entry(id).resource_version().is_none()
+                    {
+                        return;
+                    }
+                    s.dicts += 1;
+                    let dict = match a
+                        .read_resource(id)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|r| Ok(rage_formats::ytd::parse(&r)?))
+                    {
+                        Ok(d) => d,
+                        Err(e) => return s.errors.push(format!("{p}: {e:#}")),
+                    };
+                    s.errors.extend(dict.errors.iter().map(|e| format!("{p}: {e}")));
+                    for t in &dict.textures {
+                        s.textures += 1;
+                        match t.to_rgba() {
+                            Some(_) => s.decoded += 1,
+                            None => *s.undecodable.entry(t.format.name()).or_default() += 1,
+                        }
+                    }
+                },
+                &mut |e| nested_errors.push(e.to_string()),
+            );
+            s.errors.extend(nested_errors);
+            s
+        })
+        .collect();
+    let mut total = Stats::default();
+    for s in all {
+        total.dicts += s.dicts;
+        total.textures += s.textures;
+        total.decoded += s.decoded;
+        total.errors.extend(s.errors);
+        for (k, v) in s.undecodable {
+            *total.undecodable.entry(k).or_default() += v;
+        }
+    }
+    for e in total.errors.iter().take(50) {
+        outln!("FAIL {e}");
+    }
+    for (format, n) in &total.undecodable {
+        outln!("no preview decoder: {n} textures in {format}");
+    }
+    outln!(
+        "{} texture dictionaries, {} textures, {} decoded, {} errors ({:.1}s)",
+        total.dicts,
+        total.textures,
+        total.decoded,
+        total.errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !total.errors.is_empty() {
+        bail!("{} errors", total.errors.len());
+    }
     Ok(())
 }
 
