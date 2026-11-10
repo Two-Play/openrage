@@ -73,17 +73,32 @@ pub fn resolve(root: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
     Ok(Node::ArchiveDir(archive, cur))
 }
 
-/// Finds `name` inside `dir`, ignoring ASCII case (game files keep Windows casing on Linux).
+/// Finds `name` inside `dir`, ignoring ASCII case (game files keep Windows
+/// casing on Linux). Returns the entry with its casing *on disk*, also on
+/// case-insensitive file systems, preferring an exact match.
 pub fn match_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {
-    let direct = if dir.as_os_str().is_empty() { PathBuf::from(name) } else { dir.join(name) };
-    if direct.exists() {
-        return Some(direct);
+    let listing_dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+    let direct = || {
+        let p = if dir.as_os_str().is_empty() { PathBuf::from(name) } else { dir.join(name) };
+        p.exists().then_some(p)
+    };
+    // Special components (root, prefixes, `..`) are not directory entries.
+    if name.is_empty() || name == "." || name == ".." || name.contains([':', '/', '\\']) {
+        return direct();
     }
-    std::fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
-        .map(|e| e.path())
+    let Ok(entries) = std::fs::read_dir(listing_dir) else { return direct() };
+    let mut fallback = None;
+    for e in entries.flatten() {
+        let file_name = e.file_name();
+        let entry_name = file_name.to_string_lossy();
+        if entry_name == name {
+            return Some(dir.join(&file_name));
+        }
+        if fallback.is_none() && entry_name.eq_ignore_ascii_case(name) {
+            fallback = Some(dir.join(&file_name));
+        }
+    }
+    fallback.or_else(direct)
 }
 
 /// Resolves a `/`-separated relative path below `root` case-insensitively.

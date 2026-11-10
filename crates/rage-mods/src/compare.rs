@@ -41,7 +41,9 @@ pub enum Mark {
 #[derive(Debug, Clone)]
 pub struct RemovedEntry {
     pub name: String,
+    /// Folder or nested archive.
     pub is_dir: bool,
+    pub is_archive: bool,
     pub size: u64,
 }
 
@@ -142,6 +144,7 @@ pub fn compare_folders(m: &Rpf7, mdir: EntryId, b: &Rpf7, bdir: EntryId, mode: C
             diff.removed.push(RemovedEntry {
                 name: e.name.clone(),
                 is_dir: e.is_dir() || e.is_archive(),
+                is_archive: e.is_archive(),
                 size: e.size(),
             });
         }

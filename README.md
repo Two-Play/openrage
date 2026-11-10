@@ -8,11 +8,11 @@ An open-source explorer and modding toolkit for games built on Rockstar's RAGE e
 
 | Game | Archives | Formats |
 |---|---|---|
-| GTA V (Legacy & Enhanced) | ✅ RPF7 read, incl. nested archives; OpenIV-style writer (experimental) | ✅ textures (YTD): view, DDS/PNG export, replace/add/remove · resources as RSC7 files |
+| GTA V (Legacy & Enhanced) | ✅ RPF7 read, incl. nested archives; edit in place in the mods folder, with undo | ✅ textures (YTD): view, DDS/PNG export, replace/add/remove · resources as RSC7 files |
 | GTA IV | planned (RPF3) | – |
 | Red Dead Redemption 2 | planned (RPF8) | – |
 
-Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** writing/replacing archive contents → **5** models (YDR/YFT → glTF) → **6** GTA IV → **7** RDR2.
+Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives (in progress: in-place editing + undo done; `.oiv` packages next) → **5** models (YDR/YFT → glTF) → **6** GTA IV → **7** RDR2.
 
 ## Build
 
@@ -62,6 +62,12 @@ Texture dictionaries (`.ytd`) open like folders: double-click one (or type its p
 
 Both layouts are supported: GTA V Legacy (resource version 13, Direct3D 9 formats) and GTA V Enhanced (version 5, DXGI formats such as BC7). All 341,000+ textures of GTA V Enhanced decode.
 
+### Editing archives
+
+Inside an archive, **Import…** (or dropping files onto the list, where the platform supports it), **Replace…**, **Rename…**, **New folder…** and **Delete** change the game the OpenIV way: the archive is copied to the `mods` folder once and then edited **in place** — new data is appended and only the table of contents is rewritten, so a change to a 2 GB archive takes milliseconds. Changes inside nested archives rebuild just that nested archive. Your game files are never touched.
+
+Every change is recorded in `mods/.openrage/journal` and can be reverted with **Undo**, step by step, back to the original files (OpenIV has no undo).
+
 ### Mods folder (OpenIV compatible)
 
 OpenRAGE understands the `mods` folder used by OpenIV.asi, where a file at `mods/<path>` replaces `<path>` in the game. It never changes that layout — it only shows what it means:
@@ -91,6 +97,12 @@ openrage search Pegassi --lang american        # game text in another language (
 openrage textures x64e.rpf/levels/gta5/vehicles.rpf/adder.ytd                 # list textures
 openrage textures …/adder.ytd --export out/ [--png]                            # DDS (default) or PNG
 openrage textures …/blips.ytd --set radar_darts=new.dds --remove radar_taco_van   # written into mods/
+openrage put new.meta x64e.rpf/data/            # import into an archive (mods folder)
+openrage mv x64e.rpf/a.xml x64e.rpf/b.xml       # rename / move inside an archive
+openrage rm x64e.rpf/levels/gta5/paths.rpf       # remove a file or folder
+openrage mkdir x64e.rpf/my_folder
+openrage history                               # changes made to the mods folder
+openrage undo                                  # revert the newest change
 openrage verify --textures [--rebuild]         # decode (and rebuild) every texture dictionary
 openrage mods                                  # files in the OpenIV mods folder
 openrage mods --changes [--deep]               # every added/removed/modified entry

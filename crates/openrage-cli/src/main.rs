@@ -20,6 +20,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use openrage_app::config::Config;
 use openrage_app::extract::{extract_entry, human_size as human};
+use openrage_app::install::{self, Op};
 use openrage_app::setup::{self, KeySource};
 use rage_crypto::GtaVKeys;
 use rage_rpf::vfs::{self, Node};
@@ -123,6 +124,23 @@ enum Command {
         #[arg(long)]
         deep: bool,
     },
+    /// Put a local file into an archive (written into the mods folder, like OpenIV).
+    Put {
+        /// Local file.
+        file: PathBuf,
+        /// Target virtual path inside an archive; a trailing `/` keeps the file name.
+        target: String,
+    },
+    /// Remove a file or folder from an archive (in the mods folder).
+    Rm { path: String },
+    /// Rename or move a file or folder inside its archive (in the mods folder).
+    Mv { from: String, to: String },
+    /// Create a folder inside an archive (in the mods folder).
+    Mkdir { path: String },
+    /// Show the changes made to the mods folder, newest first.
+    History,
+    /// Undo the newest change to the mods folder.
+    Undo,
     /// Rewrite an archive with replaced/added/removed entries, OpenIV style (experimental).
     #[command(hide = true)]
     Repack {
@@ -188,6 +206,12 @@ fn run() -> Result<()> {
         }
         Command::Textures { path, export, png, .. } => cmd_textures(&game_dir, &path, export.as_deref(), png, keys),
         Command::Index => cmd_index(&game_dir, keys),
+        Command::Put { file, target } => cmd_put(&game_dir, &file, &target, keys),
+        Command::Rm { path } => cmd_edit(&game_dir, &path, Op::Remove, &format!("Removed {path}"), keys),
+        Command::Mv { from, to } => cmd_mv(&game_dir, &from, &to, keys),
+        Command::Mkdir { path } => cmd_edit(&game_dir, &path, Op::CreateDir, &format!("Created folder {path}"), keys),
+        Command::History => cmd_history(&game_dir),
+        Command::Undo => cmd_undo(&game_dir),
         Command::Mods { changes, deep } => cmd_mods(&game_dir, changes, deep, keys),
         Command::Repack { archive, out, sets, removes } => cmd_repack(&game_dir, &archive, &out, &sets, &removes, keys),
         Command::Search { query, limit, lang } => {
@@ -593,6 +617,80 @@ fn cmd_verify_textures(game_dir: &Path, within: &str, rebuild: bool, keys: Optio
     );
     if !total.errors.is_empty() {
         bail!("{} errors", total.errors.len());
+    }
+    Ok(())
+}
+
+fn report(applied: &install::Applied, started: Instant) {
+    if applied.created {
+        outln!("Copied the archive into the mods folder first.");
+    }
+    outln!(
+        "Written to {} ({} appended{}, {:.2}s). Undo with `openrage undo`.",
+        applied.path.display(),
+        human(applied.stats.appended),
+        if applied.stats.relocated > 0 {
+            format!(", {} entries relocated", applied.stats.relocated)
+        } else {
+            String::new()
+        },
+        started.elapsed().as_secs_f32()
+    );
+}
+
+fn cmd_edit(game_dir: &Path, path: &str, op: Op, description: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let started = Instant::now();
+    let applied = install::apply_at(game_dir, keys, path, op, description)?;
+    report(&applied, started);
+    Ok(())
+}
+
+fn cmd_put(game_dir: &Path, file: &Path, target: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let data = fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    let name = file.file_name().context("file has no name")?.to_string_lossy();
+    let target = if target.ends_with('/') { format!("{target}{name}") } else { target.to_owned() };
+    cmd_edit(game_dir, &target, Op::Set(data), &format!("Imported {name} into {target}"), keys)
+}
+
+fn cmd_mv(game_dir: &Path, from: &str, to: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let a = install::split(game_dir, from).context("source is not inside an archive")?;
+    // `to` may be a full virtual path or a path inside the same archive.
+    let to_inner = match install::split(game_dir, to) {
+        Some(b) if b.archive.eq_ignore_ascii_case(&a.archive) => b.inner,
+        Some(_) => bail!("cannot move between archives"),
+        None => to.trim_start_matches('/').to_owned(),
+    };
+    let started = Instant::now();
+    let applied = install::apply(
+        game_dir,
+        keys,
+        &a.archive,
+        &[(a.inner.clone(), Op::Rename(to_inner.clone()))],
+        &format!("Moved {} to {to_inner}", a.inner),
+    )?;
+    report(&applied, started);
+    Ok(())
+}
+
+fn cmd_history(game_dir: &Path) -> Result<()> {
+    let Some(mods) = rage_mods::mods_dir(game_dir) else {
+        outln!("No mods folder.");
+        return Ok(());
+    };
+    let entries = openrage_app::journal::Journal::new(&mods).entries()?;
+    if entries.is_empty() {
+        outln!("No recorded changes.");
+    }
+    for e in entries {
+        outln!("#{:<4} {}  {}", e.id, e.archive, e.description);
+    }
+    Ok(())
+}
+
+fn cmd_undo(game_dir: &Path) -> Result<()> {
+    match install::undo_last(game_dir)? {
+        Some(e) => outln!("Undone: {} ({})", e.description, e.archive),
+        None => outln!("Nothing to undo."),
     }
     Ok(())
 }
