@@ -137,6 +137,9 @@ enum Command {
     Mv { from: String, to: String },
     /// Create a folder inside an archive (in the mods folder).
     Mkdir { path: String },
+    /// OpenIV packages (.oiv): show, install into the mods folder, uninstall.
+    #[command(subcommand)]
+    Oiv(OivCommand),
     /// Show the changes made to the mods folder, newest first.
     History,
     /// Undo the newest change to the mods folder.
@@ -163,6 +166,23 @@ enum Command {
         #[arg(long, default_value = "")]
         r#in: String,
     },
+}
+
+#[derive(Subcommand)]
+enum OivCommand {
+    /// Show a package and what installing it would change (nothing is written).
+    Info { file: PathBuf },
+    /// Install a package into the mods folder.
+    Install {
+        file: PathBuf,
+        /// Install without asking.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// List installed packages.
+    List,
+    /// Undo everything a package installed.
+    Uninstall { name: String },
 }
 
 fn main() {
@@ -211,6 +231,7 @@ fn run() -> Result<()> {
         Command::Mv { from, to } => cmd_mv(&game_dir, &from, &to, keys),
         Command::Mkdir { path } => cmd_edit(&game_dir, &path, Op::CreateDir, &format!("Created folder {path}"), keys),
         Command::History => cmd_history(&game_dir),
+        Command::Oiv(cmd) => cmd_oiv(&game_dir, cmd, keys),
         Command::Undo => cmd_undo(&game_dir),
         Command::Mods { changes, deep } => cmd_mods(&game_dir, changes, deep, keys),
         Command::Repack { archive, out, sets, removes } => cmd_repack(&game_dir, &archive, &out, &sets, &removes, keys),
@@ -669,6 +690,78 @@ fn cmd_mv(game_dir: &Path, from: &str, to: &str, keys: Option<Arc<GtaVKeys>>) ->
         &format!("Moved {} to {to_inner}", a.inner),
     )?;
     report(&applied, started);
+    Ok(())
+}
+
+fn print_report(report: &openrage_app::oiv::install::Report) {
+    for s in &report.steps {
+        let detail = if s.detail.is_empty() { String::new() } else { format!("  ({})", s.detail) };
+        outln!("  {:<8} {}{detail}", s.action, s.target);
+    }
+    for w in &report.warnings {
+        outln!("  warning: {w}");
+    }
+    for b in &report.blockers {
+        outln!("  BLOCKED: {b}");
+    }
+}
+
+fn cmd_oiv(game_dir: &Path, cmd: OivCommand, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    use openrage_app::oiv::{Package, install};
+    match cmd {
+        OivCommand::Info { file } => {
+            let pkg = Package::open(&file)?;
+            let m = &pkg.metadata;
+            outln!("{} {} by {} (format {})", m.name, m.version, m.author, pkg.format_version);
+            if !m.description.is_empty() {
+                outln!("{}", m.description);
+            }
+            outln!("\nChanges:");
+            print_report(&install::preview(game_dir, keys, &pkg)?);
+        }
+        OivCommand::Install { file, yes } => {
+            let pkg = Package::open(&file)?;
+            let report = install::preview(game_dir, keys.clone(), &pkg)?;
+            outln!("{} {}:", pkg.metadata.name, pkg.metadata.version);
+            print_report(&report);
+            if !report.blockers.is_empty() {
+                bail!("the package cannot be installed");
+            }
+            if !yes {
+                eprint!("Install into the mods folder? [y/N] ");
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    outln!("Cancelled.");
+                    return Ok(());
+                }
+            }
+            let started = Instant::now();
+            install::install(game_dir, keys, &pkg)?;
+            outln!(
+                "Installed \"{}\" in {:.1}s. Remove it with `openrage oiv uninstall \"{}\"`.",
+                install::group_name(&pkg),
+                started.elapsed().as_secs_f32(),
+                install::group_name(&pkg)
+            );
+        }
+        OivCommand::List => {
+            let groups = rage_mods::mods_dir(game_dir)
+                .map(|m| openrage_app::journal::Journal::new(&m).groups())
+                .transpose()?
+                .unwrap_or_default();
+            if groups.is_empty() {
+                outln!("No packages installed with OpenRAGE.");
+            }
+            for (name, n) in groups {
+                outln!("{name}  ({n} recorded changes)");
+            }
+        }
+        OivCommand::Uninstall { name } => {
+            let undone = install::uninstall(game_dir, &name)?;
+            outln!("Uninstalled \"{name}\" ({} changes undone).", undone.len());
+        }
+    }
     Ok(())
 }
 

@@ -239,6 +239,18 @@ export component AppWindow inherits Window {
     in property <bool> entry-selected;
     in property <bool> can-undo;
     in property <string> undo-label;
+    // OpenIV package dialog
+    in-out property <bool> oiv-visible;
+    in property <string> oiv-title;
+    in property <string> oiv-subtitle;
+    in property <string> oiv-description;
+    in property <string> oiv-changes;
+    in property <string> oiv-problems;
+    in property <bool> oiv-can-install;
+    in property <bool> oiv-running;
+    // Journal / history view
+    in property <bool> history-mode;
+    in property <string> history-group;
     // Text prompt (rename, new folder)
     in-out property <bool> prompt-visible;
     in property <string> prompt-title;
@@ -283,6 +295,10 @@ export component AppWindow inherits Window {
     callback archive-delete();
     callback files-dropped(data-transfer);
     callback undo();
+    callback install-oiv();
+    callback oiv-confirm();
+    callback show-history();
+    callback uninstall-group();
     callback prompt-accepted(string);
     callback texture-replace();
     callback texture-add();
@@ -344,6 +360,15 @@ export component AppWindow inherits Window {
                 text: @tr("Changes");
                 clicked => { root.show-changes(); }
             }
+            Button {
+                text: @tr("Install .oiv…");
+                enabled: !root.busy;
+                clicked => { root.install-oiv(); }
+            }
+            Button {
+                text: @tr("History");
+                clicked => { root.show-history(); }
+            }
             if root.can-undo: Button {
                 text: @tr("Undo");
                 enabled: !root.busy;
@@ -389,6 +414,27 @@ export component AppWindow inherits Window {
             // File list
             VerticalLayout {
                 horizontal-stretch: 1;
+                if root.history-mode: HorizontalLayout {
+                    padding: 6px;
+                    spacing: 6px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: @tr("Changes made to the mods folder, newest first. Everything can be undone.");
+                        vertical-alignment: center;
+                        overflow: elide;
+                        color: Palette.foreground.with-alpha(0.8);
+                    }
+                    Button {
+                        text: @tr("Undo newest");
+                        enabled: root.can-undo && !root.busy;
+                        clicked => { root.undo(); }
+                    }
+                    Button {
+                        text: root.history-group == "" ? @tr("Uninstall package") : @tr("Uninstall “{}”", root.history-group);
+                        enabled: root.history-group != "" && !root.busy;
+                        clicked => { root.uninstall-group(); }
+                    }
+                }
                 if root.archive-mode: HorizontalLayout {
                     padding: 6px;
                     spacing: 6px;
@@ -627,6 +673,88 @@ export component AppWindow inherits Window {
             if root.busy: Button {
                 text: @tr("Cancel");
                 clicked => { root.cancel-task(); }
+            }
+        }
+    }
+
+    // OpenIV package preview
+    if root.oiv-visible: Rectangle {
+        background: #00000080;
+        TouchArea { }
+        Rectangle {
+            width: min(760px, root.width - 40px);
+            height: min(620px, root.height - 40px);
+            border-radius: 8px;
+            background: Palette.background;
+            border-width: 1px;
+            border-color: Palette.border;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+                Text {
+                    text: root.oiv-title;
+                    font-size: 18px;
+                    font-weight: 700;
+                    overflow: elide;
+                    color: Palette.foreground;
+                }
+                Text {
+                    text: root.oiv-subtitle;
+                    color: Palette.foreground.with-alpha(0.75);
+                }
+                Text {
+                    text: root.oiv-description;
+                    wrap: word-wrap;
+                    max-height: 80px;
+                    overflow: elide;
+                    color: Palette.foreground;
+                }
+                Text {
+                    text: @tr("Changes (written to the mods folder; can be uninstalled from History):");
+                    font-weight: 600;
+                    color: Palette.foreground;
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: Palette.alternate-background;
+                    border-radius: 4px;
+                    ScrollView {
+                        content-width: max(self.visible-width, changes.preferred-width + 16px);
+                        content-height: max(self.visible-height, changes.preferred-height + 16px);
+                        changes := Text {
+                            x: 8px;
+                            y: 8px;
+                            text: root.oiv-changes;
+                            font-family: root.mono-font;
+                            font-size: 12px;
+                            color: Palette.foreground;
+                        }
+                    }
+                }
+                if root.oiv-problems != "": Text {
+                    text: root.oiv-problems;
+                    wrap: word-wrap;
+                    color: root.oiv-can-install ? #d6a12a : #e5484d;
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 6px;
+                    if root.oiv-running: Spinner {
+                        width: 24px;
+                        indeterminate: true;
+                    }
+                    Button {
+                        text: @tr("Cancel");
+                        enabled: !root.oiv-running;
+                        clicked => { root.oiv-visible = false; }
+                    }
+                    Button {
+                        text: @tr("Install");
+                        primary: true;
+                        enabled: root.oiv-can-install && !root.oiv-running;
+                        clicked => { root.oiv-confirm(); }
+                    }
+                }
             }
         }
     }

@@ -13,3 +13,8 @@ rage-mods.workspace = true
 rage-formats.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
+roxmltree.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
