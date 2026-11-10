@@ -60,6 +60,7 @@ fn edits_go_to_mods_and_can_be_undone() {
         .map(|e| match e.kind {
             Kind::Created => "created",
             Kind::Edited { .. } => "edited",
+            Kind::FileWritten { .. } => "file",
         })
         .collect();
     assert_eq!(kinds, ["edited", "edited", "created"]);

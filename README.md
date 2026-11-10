@@ -12,7 +12,7 @@ An open-source explorer and modding toolkit for games built on Rockstar's RAGE e
 | GTA IV | planned (RPF3) | – |
 | Red Dead Redemption 2 | planned (RPF8) | – |
 
-Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives (in progress: in-place editing + undo done; `.oiv` packages next) → **5** models (YDR/YFT → glTF) → **6** GTA IV → **7** RDR2.
+Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF) → **6** GTA IV → **7** RDR2.
 
 ## Build
 
@@ -68,6 +68,12 @@ Inside an archive, **Import…** (or dropping files onto the list, where the pla
 
 Every change is recorded in `mods/.openrage/journal` and can be reverted with **Undo**, step by step, back to the original files (OpenIV has no undo).
 
+### OpenIV packages (`.oiv`)
+
+**Install .oiv…** (or `openrage-gui package.oiv`) shows the package — name, author, description — and exactly what installing it would change, before anything is written. Packages of format 2.x are supported: files added to or deleted from the game and from archives (also nested ones), new archives and DLC packs (`createIfNotExist`), text edits (`add`, `insert`, `replace`, `delete` with Equal/StartWith/Mask) and XML edits by XPath (`add` First/Last/Before/After, `replace`, `remove`) that keep the file's formatting. Changes go to the `mods` folder; loose files that are new (such as `.asi` plugins) go to the game folder, as loaders expect them there.
+
+Every installed package can be **uninstalled** from **History** (or `openrage oiv uninstall`) — OpenIV cannot do that. Not supported yet: `<pso>` edits (they need a PSO converter; such packages are refused with an explanation). `<defragmentation>` is skipped, as it only saves disk space.
+
 ### Mods folder (OpenIV compatible)
 
 OpenRAGE understands the `mods` folder used by OpenIV.asi, where a file at `mods/<path>` replaces `<path>` in the game. It never changes that layout — it only shows what it means:
@@ -101,6 +107,9 @@ openrage put new.meta x64e.rpf/data/            # import into an archive (mods f
 openrage mv x64e.rpf/a.xml x64e.rpf/b.xml       # rename / move inside an archive
 openrage rm x64e.rpf/levels/gta5/paths.rpf       # remove a file or folder
 openrage mkdir x64e.rpf/my_folder
+openrage oiv info mod.oiv                      # what a package would change
+openrage oiv install mod.oiv                   # install into the mods folder
+openrage oiv list / oiv uninstall "Name 1.0"   # installed packages, uninstall
 openrage history                               # changes made to the mods folder
 openrage undo                                  # revert the newest change
 openrage verify --textures [--rebuild]         # decode (and rebuild) every texture dictionary

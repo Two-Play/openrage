@@ -66,6 +66,8 @@ pub struct Item {
     /// Full virtual path, set for search hits (which come from many places).
     pub vpath: Option<String>,
     pub mark: Option<Mark>,
+    /// Shown in the location column instead of the path (history entries).
+    pub detail: Option<String>,
 }
 
 /// Where a listing comes from.
@@ -82,6 +84,8 @@ pub enum Location {
     Changes {
         summary: String,
     },
+    /// The change journal of the mods folder.
+    History,
     /// An opened texture dictionary (`.ytd`); items are its textures in order.
     Textures {
         dict: Arc<rage_formats::ytd::TextureDictionary>,
@@ -95,6 +99,8 @@ pub fn is_texture_dict(name: &str) -> bool {
 
 /// The virtual path of the mod change list.
 pub const CHANGES_PATH: &str = "!mods";
+/// The virtual path of the change journal.
+pub const HISTORY_PATH: &str = "!history";
 
 /// Virtual paths starting with `?` are searches.
 pub fn search_query(vpath: &str) -> Option<&str> {
@@ -267,6 +273,7 @@ fn list_textures(vpath: String, rpf: Arc<Rpf7>, id: EntryId, origin: Origin) -> 
             entry: None,
             vpath: None,
             mark: None,
+            detail: None,
         })
         .collect();
     Ok(Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict) }, items })
@@ -285,7 +292,7 @@ fn list_disk(vpath: String, dir: PathBuf, origin: Origin) -> Result<Listing, Rpf
             ItemKind::File
         };
         let size = if meta.is_dir() { 0 } else { meta.len() };
-        items.push(Item { name, kind, size, info: String::new(), entry: None, vpath: None, mark: None });
+        items.push(Item { name, kind, size, info: String::new(), entry: None, vpath: None, mark: None, detail: None });
     }
     Ok(Listing { vpath, origin, location: Location::Disk(dir), items })
 }
@@ -312,7 +319,16 @@ fn list_archive(vpath: String, rpf: Arc<Rpf7>, dir: EntryId, origin: Origin) -> 
                     (ItemKind::Resource, e.resource_version().map(|v| format!("v{v}")).unwrap_or_default())
                 }
             };
-            Item { name: e.name.clone(), kind, size: e.size(), info, entry: Some(id), vpath: None, mark: None }
+            Item {
+                name: e.name.clone(),
+                kind,
+                size: e.size(),
+                info,
+                entry: Some(id),
+                vpath: None,
+                mark: None,
+                detail: None,
+            }
         })
         .collect();
     Listing { vpath, origin, location: Location::Archive(rpf, dir), items }

@@ -25,6 +25,8 @@ dirs = "6"
 flate2 = "1"
 rayon = "1"
 rusqlite = { version = "0.41", features = ["bundled"] }
+roxmltree = "0.21"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 sha1 = "0.10"
 thiserror = "2"
 

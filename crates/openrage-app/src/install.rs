@@ -74,7 +74,7 @@ pub struct Applied {
     pub stats: CommitStats,
 }
 
-fn mods_dir_or_create(game_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn mods_dir_or_create(game_dir: &Path) -> Result<PathBuf> {
     match rage_mods::mods_dir(game_dir) {
         Some(m) => Ok(m),
         None => {
@@ -199,8 +199,20 @@ pub fn apply(
     ops: &[(String, Op)],
     description: &str,
 ) -> Result<Applied> {
+    apply_grouped(game_dir, keys, archive, ops, description, None)
+}
+
+/// Like [`apply`], recording the journal entries under `group` (e.g. a package).
+pub fn apply_grouped(
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    archive: &str,
+    ops: &[(String, Op)],
+    description: &str,
+    group: Option<&str>,
+) -> Result<Applied> {
     let mods = mods_dir_or_create(game_dir)?;
-    let journal = Journal::new(&mods);
+    let journal = Journal::new(&mods).grouped(group);
     let (path, rel, created) = ensure_in_mods(game_dir, &mods, archive, &journal)?;
     let mut editor = ArchiveEditor::open(&path, keys.clone())?;
     let temp_root = mods.join(".openrage").join("tmp");
@@ -224,6 +236,21 @@ pub fn apply_at(
 ) -> Result<Applied> {
     let Some(target) = split(game_dir, vpath) else { bail!("{vpath} is not inside an archive") };
     apply(game_dir, keys, &target.archive, &[(target.inner, op)], description)
+}
+
+/// Creates a new, empty top-level archive in the mods folder (e.g. a new DLC pack).
+pub fn create_archive(game_dir: &Path, archive: &str, description: &str, group: Option<&str>) -> Result<PathBuf> {
+    let mods = mods_dir_or_create(game_dir)?;
+    let dest = mods.join(archive.replace('\\', "/"));
+    if dest.exists() {
+        bail!("{} already exists", dest.display());
+    }
+    if let Some(dir) = dest.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(&dest, rage_rpf::ArchiveWriter::new().build()?)?;
+    Journal::new(&mods).grouped(group).record_created(archive, description)?;
+    Ok(dest)
 }
 
 /// Undoes the newest change in the mods folder.
