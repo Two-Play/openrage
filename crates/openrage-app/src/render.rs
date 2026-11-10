@@ -120,6 +120,7 @@ pub fn bounds(model: &LoadedModel, visible: &[bool]) -> Option<([f32; 3], [f32; 
 
 /// Camera for `view` looking at the visible parts: eye position, forward,
 /// right and up vectors, distance and vertical field of view.
+#[derive(Debug, Clone, Copy)]
 pub struct Camera {
     pub eye: [f32; 3],
     pub forward: [f32; 3],
@@ -153,14 +154,37 @@ pub fn render(
     width: usize,
     height: usize,
 ) -> Vec<u8> {
+    // Bounds from the vertices (more reliable than stored bounds).
+    match bounds(model, visible) {
+        Some((lo, hi)) => render_camera(model, visible, materials, &orbit_camera(lo, hi, view), width, height),
+        None => vec![0u8; width.max(1) * height.max(1) * 4],
+    }
+}
+
+/// First-person camera at `eye` looking along `yaw`/`pitch` (radians);
+/// `radius` is the model's size, for the clipping planes.
+pub fn fly_camera(eye: [f32; 3], yaw: f32, pitch: f32, radius: f32) -> Camera {
+    let (cp, sp, cy, sy) = (pitch.cos(), pitch.sin(), yaw.cos(), yaw.sin());
+    let forward = norm([cp * cy, cp * sy, sp]);
+    let right = norm(cross(forward, [0.0, 0.0, 1.0]));
+    let up = cross(right, forward);
+    Camera { eye, forward, right, up, distance: radius.max(0.01), radius: radius.max(0.01), fov: 60f32.to_radians() }
+}
+
+/// Renders from any camera (see [`orbit_camera`], [`fly_camera`]).
+pub fn render_camera(
+    model: &LoadedModel,
+    visible: &[bool],
+    materials: &Materials,
+    camera: &Camera,
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
     let (w, h) = (width.max(1), height.max(1));
     // Transparent background: the UI (or the PNG viewer) shows through.
     let mut color = vec![0u8; w * h * 4];
     let mut depth = vec![f32::INFINITY; w * h];
-
-    // Bounds from the vertices (more reliable than stored bounds).
-    let Some((lo, hi)) = bounds(model, visible) else { return color };
-    let Camera { eye, forward, right, up, distance, fov, .. } = orbit_camera(lo, hi, view);
+    let Camera { eye, forward, right, up, distance, fov, .. } = *camera;
     // Fit the field of view to the shorter side so tall previews do not crop.
     let focal = (w.min(h) as f32 / 2.0) / (fov / 2.0).tan();
     let near = distance * 0.01;

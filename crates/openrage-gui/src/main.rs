@@ -160,6 +160,11 @@ fn debug_snapshot(ui: &AppWindow) {
         if std::env::var("OPENRAGE_VIEWER").is_ok() {
             open_viewer(&ui);
         }
+        if std::env::var("OPENRAGE_FLY").is_ok()
+            && let Some(v) = viewer::newest()
+        {
+            v.invoke_toggle_fly();
+        }
         if std::env::var("OPENRAGE_EDIT").is_ok() {
             ui.set_edit_mode(true);
         }
@@ -1926,19 +1931,23 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
 /// one, else with the software renderer.
 fn render_image(
     model: &Arc<ModelPreview>,
-    view: openrage_app::render::View,
+    camera: impl FnOnce([f32; 3], [f32; 3]) -> openrage_app::render::Camera,
     w: usize,
     h: usize,
 ) -> Option<slint::Image> {
     let visible = model.visible.read().ok()?.clone();
-    let (lo, hi) = openrage_app::render::bounds(&model.loaded, &visible)?;
-    let camera = openrage_app::render::orbit_camera(lo, hi, view);
+    let Some((lo, hi)) = openrage_app::render::bounds(&model.loaded, &visible) else {
+        // Nothing shown: an empty (transparent) image.
+        let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w as u32, h as u32);
+        return Some(slint::Image::from_rgba8_premultiplied(buffer));
+    };
+    let camera = camera(lo, hi);
     if std::env::var_os("OPENRAGE_SOFTWARE_RENDERER").is_none()
         && let Some(img) = gpu::render(model, &visible, &camera, w as u32, h as u32)
     {
         return Some(img);
     }
-    let rgba = openrage_app::render::render(&model.loaded, &visible, &model.materials, view, w, h);
+    let rgba = openrage_app::render::render_camera(&model.loaded, &visible, &model.materials, &camera, w, h);
     let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w as u32, h as u32);
     Some(slint::Image::from_rgba8(buffer))
 }
@@ -1948,7 +1957,7 @@ fn render_model(ui: &AppWindow) {
     let Some((model, view)) = with_app(|a| a.model.clone().map(|m| (m, a.model_view))) else { return };
     let w = (ui.get_preview_area_width() - 16.0).max(64.0) as usize;
     let h = (ui.get_preview_area_height() - 16.0).max(64.0) as usize;
-    if let Some(img) = render_image(&model, view, w, h) {
+    if let Some(img) = render_image(&model, |lo, hi| openrage_app::render::orbit_camera(lo, hi, view), w, h) {
         ui.set_preview_image(img);
         ui.set_has_image(true);
     }

@@ -2,7 +2,7 @@
 // All user-visible strings go through @tr() so the UI can be translated.
 // Spacing, sizes and colors come from the Theme tokens (theme.slint).
 
-import { Button, LineEdit, ComboBox, ScrollView, ListView, Palette, Spinner } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ComboBox, ScrollView, ListView, Palette, Spinner } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 
 export struct TreeRow {
@@ -19,6 +19,11 @@ export struct InfoRow {
     // Empty key: a note spanning the whole row.
     key: string,
     value: string,
+}
+
+export struct PartRow {
+    name: string,
+    visible: bool,
 }
 
 export struct Crumb {
@@ -387,6 +392,7 @@ component ContextBar inherits Rectangle {
 component ModelControls inherits TouchArea {
     callback orbit(length, length);
     callback zoom(float);
+    callback pressed-down();
     property <length> last-x;
     property <length> last-y;
     mouse-cursor: self.pressed ? MouseCursor.grabbing : MouseCursor.grab;
@@ -394,6 +400,7 @@ component ModelControls inherits TouchArea {
         if (e.kind == PointerEventKind.down) {
             self.last-x = self.mouse-x;
             self.last-y = self.mouse-y;
+            root.pressed-down();
         }
     }
     moved => {
@@ -1991,6 +1998,9 @@ export component ViewerWindow inherits Window {
     in property <[InfoRow]> rows;
     in property <string> mono-font: "monospace";
     in-out property <bool> show-info: true;
+    // First-person camera (WASD + mouse) instead of orbiting.
+    in property <bool> fly-mode;
+    in property <[PartRow]> parts;
     out property <length> area-width: area.width;
     out property <length> area-height: area.height;
 
@@ -2001,6 +2011,12 @@ export component ViewerWindow inherits Window {
     callback export-gltf();
     callback save-png();
     callback close-viewer();
+    callback toggle-fly();
+    callback key-down(string, bool);
+    callback key-up(string, bool);
+    callback focus-lost();
+    callback part-toggled(int, bool);
+    callback all-parts(bool);
 
     changed area-width => { root.resized(); }
     changed area-height => { root.resized(); }
@@ -2015,18 +2031,24 @@ export component ViewerWindow inherits Window {
     }
 
     scope := FocusScope {
-        KeyBinding {
-            keys: @keys(Escape);
-            activated => { root.close-viewer(); }
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.close-viewer();
+            } else if (e.text == "i" || e.text == "I") {
+                root.show-info = !root.show-info;
+            } else {
+                root.key-down(e.text, e.modifiers.shift);
+            }
+            return accept;
         }
-        KeyBinding {
-            keys: @keys(I);
-            activated => { root.show-info = !root.show-info; }
+        key-released(e) => {
+            root.key-up(e.text, e.modifiers.shift);
+            return accept;
         }
-        KeyBinding {
-            keys: @keys(R);
-            enabled: root.model-mode;
-            activated => { root.reset-view(); }
+        changed has-focus => {
+            if (!self.has-focus) {
+                root.focus-lost();
+            }
         }
         VerticalLayout {
             Rectangle {
@@ -2058,6 +2080,16 @@ export component ViewerWindow inherits Window {
                             font-size: Theme.font-small;
                             overflow: elide;
                             color: Theme.text-muted;
+                        }
+                    }
+                    if root.model-mode: Button {
+                        text: @tr("Fly (F)");
+                        checkable: true;
+                        checked: root.fly-mode;
+                        clicked => {
+                            self.checked = root.fly-mode;
+                            root.toggle-fly();
+                            scope.focus();
                         }
                     }
                     if root.model-mode: Button {
@@ -2110,11 +2142,14 @@ export component ViewerWindow inherits Window {
                         orbit(dx, dy) => { root.orbit(dx, dy); }
                         zoom(d) => { root.zoom(d); }
                         double-clicked => { root.reset-view(); }
+                        pressed-down => { scope.focus(); }
                     }
                     Text {
                         x: Theme.space-m;
                         y: parent.height - self.height - Theme.space-s;
-                        text: root.model-mode ? @tr("Drag to rotate · scroll to zoom · R or double-click resets · Esc closes") : @tr("Esc closes");
+                        text: !root.model-mode ? @tr("Esc closes")
+                            : root.fly-mode ? @tr("W A S D move · Q E down/up · Shift faster · drag to look · F orbits · Esc closes")
+                            : @tr("Drag to rotate · scroll to zoom · F flies · R or double-click resets · Esc closes");
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
                     }
@@ -2129,7 +2164,6 @@ export component ViewerWindow inherits Window {
                     VerticalLayout {
                         padding: Theme.space-l;
                         spacing: Theme.space-s;
-                        alignment: start;
                         Text {
                             text: @tr("Details");
                             font-weight: 600;
@@ -2151,6 +2185,36 @@ export component ViewerWindow inherits Window {
                                 color: r.key == "" ? Theme.text-muted : Theme.text;
                                 font-size: r.key == "" ? Theme.font-small : Theme.font-body;
                             }
+                        }
+                        if root.model-mode && root.parts.length > 1: HorizontalLayout {
+                            padding-top: Theme.space-m;
+                            spacing: Theme.space-s;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: @tr("Parts");
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                color: Theme.text;
+                            }
+                            Button {
+                                text: @tr("All");
+                                clicked => { root.all-parts(true); }
+                            }
+                            Button {
+                                text: @tr("None");
+                                clicked => { root.all-parts(false); }
+                            }
+                        }
+                        if root.model-mode && root.parts.length > 1: ListView {
+                            vertical-stretch: 1;
+                            for p[i] in root.parts: CheckBox {
+                                text: p.name;
+                                checked: p.visible;
+                                toggled => { root.part-toggled(i, self.checked); }
+                            }
+                        }
+                        Rectangle {
+                            vertical-stretch: root.model-mode && root.parts.length > 1 ? 0 : 1;
                         }
                     }
                 }
