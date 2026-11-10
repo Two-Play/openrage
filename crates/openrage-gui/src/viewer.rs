@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use openrage_app::render::{self, Camera, View};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 
-use crate::{AppWindow, ModelPreview, PartRow, ViewerWindow};
+use crate::{AppWindow, MaterialRow, ModelPreview, PartRow, ViewerWindow};
 
 pub enum Content {
     Model(Arc<ModelPreview>),
@@ -27,8 +27,17 @@ struct Fly {
     pitch: f32,
 }
 
+/// What a row of the parts list stands for.
+#[derive(Clone)]
+enum PartEntry {
+    Part(usize),
+    Group(Vec<usize>),
+}
+
 struct State {
     content: Content,
+    /// Rows of the parts list.
+    entries: Vec<(String, i32, PartEntry)>,
     view: View,
     fly: Option<Fly>,
     /// Movement keys held down (lower-case), and whether Shift is held.
@@ -49,8 +58,8 @@ impl State {
     /// Size of the shown parts (for camera speed and clipping).
     fn bounds(&self) -> Option<([f32; 3], [f32; 3])> {
         let m = self.model()?;
-        let visible = m.visible.read().ok()?.clone();
-        render::bounds(&m.loaded, &visible)
+        let look = m.look.read().ok()?;
+        render::bounds(&m.loaded, &look.parts)
     }
 
     fn camera(&self, lo: [f32; 3], hi: [f32; 3]) -> Camera {
@@ -90,11 +99,16 @@ pub fn open(ui: &AppWindow, content: Content) {
         n.set(n.get() + 1);
         n.get()
     });
+    let entries = match &content {
+        Content::Model(m) => part_entries(&m.loaded),
+        Content::Image(_) => Vec::new(),
+    };
     if let Content::Model(m) = &content {
-        set_parts(&win, m);
+        refresh_lists(&win, m, &entries);
     }
     let state = Rc::new(RefCell::new(State {
         content,
+        entries,
         view: View::default(),
         fly: None,
         keys: HashSet::new(),
@@ -181,24 +195,51 @@ pub fn open(ui: &AppWindow, content: Content) {
     });
     let (w, s) = (win.as_weak(), Rc::clone(&state));
     let main = ui.as_weak();
-    win.on_part_toggled(move |i, on| {
-        if let Some(m) = s.borrow().model()
-            && let Ok(mut v) = m.visible.write()
-            && let Some(flag) = v.get_mut(i as usize)
-        {
-            *flag = on;
-        }
-        parts_changed(&w, &s, &main);
+    win.on_part_toggled(move |row, on| {
+        let st = s.borrow();
+        let parts = match st.entries.get(row as usize) {
+            Some((_, _, PartEntry::Part(p))) => vec![*p],
+            Some((_, _, PartEntry::Group(ps))) => ps.clone(),
+            None => return,
+        };
+        change_look(&st, |look| parts.iter().for_each(|&p| look.parts[p] = on));
+        drop(st);
+        look_changed(&w, &s, &main);
     });
     let (w, s) = (win.as_weak(), Rc::clone(&state));
     let main = ui.as_weak();
     win.on_all_parts(move |on| {
-        if let Some(m) = s.borrow().model()
-            && let Ok(mut v) = m.visible.write()
-        {
-            v.iter_mut().for_each(|f| *f = on);
-        }
-        parts_changed(&w, &s, &main);
+        change_look(&s.borrow(), |look| look.parts.iter_mut().for_each(|v| *v = on));
+        look_changed(&w, &s, &main);
+    });
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let main = ui.as_weak();
+    win.on_material_visible(move |i, on| {
+        change_look(&s.borrow(), |look| {
+            if let Some(m) = look.materials.get_mut(i as usize) {
+                m.visible = on;
+            }
+        });
+        look_changed(&w, &s, &main);
+    });
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let main = ui.as_weak();
+    win.on_material_color(move |i, c| {
+        set_tint(&s.borrow(), i, Some([c.red(), c.green(), c.blue()].map(|v| v as f32 / 255.0)));
+        look_changed(&w, &s, &main);
+    });
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let main = ui.as_weak();
+    win.on_material_hex(move |i, text| {
+        let Some(rgb) = parse_hex(&text) else { return };
+        set_tint(&s.borrow(), i, Some(rgb));
+        look_changed(&w, &s, &main);
+    });
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let main = ui.as_weak();
+    win.on_material_reset(move |i| {
+        set_tint(&s.borrow(), i, None);
+        look_changed(&w, &s, &main);
     });
     let (w, s) = (win.as_weak(), Rc::clone(&state));
     win.on_resized(move || render(&w, &s));
@@ -311,29 +352,124 @@ fn tick(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>) {
     render(w, state);
 }
 
-/// Shows the parts of a model as check boxes.
-fn set_parts(win: &ViewerWindow, model: &ModelPreview) {
-    let visible = model.visible.read().map(|v| v.clone()).unwrap_or_default();
-    let rows: Vec<PartRow> = model
-        .loaded
-        .parts
-        .iter()
-        .zip(visible)
-        .map(|(p, visible)| PartRow { name: p.name.clone().into(), visible })
-        .collect();
-    win.set_parts(ModelRc::new(VecModel::from(rows)));
+/// Rows of the parts list: groups (wheels, ped components, …) with their
+/// parts below; a group of one part is a single row.
+fn part_entries(model: &openrage_app::models::LoadedModel) -> Vec<(String, i32, PartEntry)> {
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for (i, p) in model.parts.iter().enumerate() {
+        if p.group.is_empty() {
+            groups.push((String::new(), vec![i]));
+        } else if let Some(g) = groups.iter_mut().find(|(name, _)| *name == p.group) {
+            g.1.push(i);
+        } else {
+            groups.push((p.group.clone(), vec![i]));
+        }
+    }
+    let mut out = Vec::new();
+    for (group, mut members) in groups {
+        members.sort_by(|a, b| model.parts[*a].name.cmp(&model.parts[*b].name));
+        match members.as_slice() {
+            [single] => {
+                let name = &model.parts[*single].name;
+                let label =
+                    if group.is_empty() || group == *name { name.clone() } else { format!("{group} · {name}") };
+                out.push((label, 0, PartEntry::Part(*single)));
+            }
+            _ => {
+                out.push((group, 0, PartEntry::Group(members.clone())));
+                for m in members {
+                    out.push((model.parts[m].name.clone(), 1, PartEntry::Part(m)));
+                }
+            }
+        }
+    }
+    out
 }
 
-/// After parts were shown or hidden: refresh the list, this viewer and the
-/// main preview (they share the visibility).
-fn parts_changed(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>, main: &slint::Weak<AppWindow>) {
-    if let (Some(win), Some(m)) = (w.upgrade(), state.borrow().model().cloned()) {
-        let current = win.get_parts();
-        let visible = m.visible.read().map(|v| v.clone()).unwrap_or_default();
-        let unchanged =
-            current.row_count() == visible.len() && current.iter().zip(&visible).all(|(r, v)| r.visible == *v);
-        if !unchanged {
-            set_parts(&win, &m);
+/// Fills the parts and materials lists from the model's current look.
+fn refresh_lists(win: &ViewerWindow, model: &ModelPreview, entries: &[(String, i32, PartEntry)]) {
+    let Ok(look) = model.look.read() else { return };
+    let parts: Vec<PartRow> = entries
+        .iter()
+        .map(|(name, level, entry)| {
+            let (visible, count) = match entry {
+                PartEntry::Part(p) => (look.parts.get(*p).copied().unwrap_or(false), 0),
+                PartEntry::Group(ps) => (ps.iter().any(|&p| look.parts[p]), ps.len() as i32),
+            };
+            PartRow { name: name.clone().into(), visible, level: *level, count }
+        })
+        .collect();
+    let rgb = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let materials: Vec<MaterialRow> = model
+        .loaded
+        .materials
+        .iter()
+        .zip(&look.materials)
+        .map(|(slot, m)| MaterialRow {
+            label: slot.label.clone().into(),
+            visible: m.visible,
+            color: slint::Color::from_rgb_u8(rgb(m.tint[0]), rgb(m.tint[1]), rgb(m.tint[2])),
+            paint: slot.paint,
+            textured: slot.textured,
+        })
+        .collect();
+    update_model(win.get_parts(), parts, |m| win.set_parts(m));
+    update_model(win.get_materials(), materials, |m| win.set_materials(m));
+}
+
+/// Updates rows in place (keeps the list's scroll position) or replaces the model.
+fn update_model<T: Clone + PartialEq + 'static>(current: ModelRc<T>, rows: Vec<T>, set: impl FnOnce(ModelRc<T>)) {
+    if current.row_count() == rows.len() {
+        for (i, row) in rows.into_iter().enumerate() {
+            if current.row_data(i).as_ref() != Some(&row) {
+                current.set_row_data(i, row);
+            }
+        }
+    } else {
+        set(ModelRc::new(VecModel::from(rows)));
+    }
+}
+
+fn change_look(state: &State, f: impl FnOnce(&mut openrage_app::models::Look)) {
+    if let Some(m) = state.model()
+        && let Ok(mut look) = m.look.write()
+    {
+        f(&mut look);
+    }
+}
+
+/// Sets a material's colour (`None`: back to its default).
+fn set_tint(state: &State, material: i32, rgb: Option<[f32; 3]>) {
+    let Some(m) = state.model() else { return };
+    let default = m.loaded.default_look();
+    change_look(state, |look| {
+        let i = material as usize;
+        if let (Some(slot), Some(def)) = (look.materials.get_mut(i), default.materials.get(i)) {
+            slot.tint = match rgb {
+                Some([r, g, b]) => [r, g, b, 1.0],
+                None => def.tint,
+            };
+        }
+    });
+}
+
+/// `#RRGGBB` or `RRGGBB` → colour.
+fn parse_hex(text: &str) -> Option<[f32; 3]> {
+    let t = text.trim().trim_start_matches('#');
+    if t.len() != 6 {
+        return None;
+    }
+    let v = u32::from_str_radix(t, 16).ok()?;
+    Some([(v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF].map(|c| c as f32 / 255.0))
+}
+
+/// After the look changed: refresh the lists, this viewer and the main preview
+/// (they share the look).
+fn look_changed(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>, main: &slint::Weak<AppWindow>) {
+    if let Some(win) = w.upgrade() {
+        let st = state.borrow();
+        if let Some(m) = st.model() {
+            refresh_lists(&win, m, &st.entries);
         }
     }
     render(w, state);

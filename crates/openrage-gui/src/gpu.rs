@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::sync::{Arc, Weak};
 
-use openrage_app::models::LoadedModel;
+use openrage_app::models::{LoadedModel, Look};
 use openrage_app::render::{Camera, Materials};
 use rage_formats::math;
 use wgpu::util::DeviceExt;
@@ -26,6 +26,8 @@ struct Globals {
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var samp: sampler;
+// Material colour, multiplied with the texture.
+@group(2) @binding(0) var<uniform> tint: vec4<f32>;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -60,7 +62,7 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
     n = normalize(n);
     // Headlight plus a little sky light; double-sided.
     let light = 0.25 + 0.65 * abs(dot(n, globals.forward.xyz)) + 0.1 * max(n.z, 0.0);
-    return vec4<f32>(base.rgb * light, 1.0);
+    return vec4<f32>(base.rgb * tint.rgb * light, 1.0);
 }
 "#;
 
@@ -85,13 +87,18 @@ struct Gpu {
     pipeline: wgpu::RenderPipeline,
     globals_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
+    tint_layout: wgpu::BindGroupLayout,
+    /// Stride of the per-draw colours in the tint buffer.
+    tint_stride: u64,
     sampler: wgpu::Sampler,
-    /// Light grey 1×1 texture for untextured meshes.
+    /// White 1×1 texture for untextured meshes (their colour is the tint).
     plain: wgpu::BindGroup,
 }
 
 struct Draw {
     part: usize,
+    drawable: usize,
+    shader: u16,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     count: u32,
@@ -182,9 +189,23 @@ fn init() -> Option<Gpu> {
             },
         ],
     });
+    let tint_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("tint"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: wgpu::BufferSize::new(16),
+            },
+            count: None,
+        }],
+    });
+    let tint_stride = (device.limits().min_uniform_buffer_offset_alignment as u64).max(16);
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("model"),
-        bind_group_layouts: &[Some(&globals_layout), Some(&texture_layout)],
+        bind_group_layouts: &[Some(&globals_layout), Some(&texture_layout), Some(&tint_layout)],
         immediate_size: 0,
     });
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -229,8 +250,8 @@ fn init() -> Option<Gpu> {
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
-    let plain = texture_bind_group_raw(&device, &queue, &texture_layout, &sampler, 1, 1, &[184, 184, 189, 255]);
-    Some(Gpu { device, queue, pipeline, globals_layout, texture_layout, sampler, plain })
+    let plain = texture_bind_group_raw(&device, &queue, &texture_layout, &sampler, 1, 1, &[255, 255, 255, 255]);
+    Some(Gpu { device, queue, pipeline, globals_layout, texture_layout, tint_layout, tint_stride, sampler, plain })
 }
 
 fn texture_bind_group_raw(
@@ -317,6 +338,8 @@ fn upload(gpu: &Gpu, model: &LoadedModel, materials: &Materials) -> (Vec<Draw>, 
             };
             draws.push(Draw {
                 part: part_index,
+                drawable: part.drawable,
+                shader: mesh.shader,
                 vertices: gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
                     contents: bytemuck::cast_slice(&vertices),
@@ -407,7 +430,7 @@ fn view_projection(cam: &Camera, w: u32, h: u32, near: f32, far: f32) -> [f32; 1
 /// premultiplied RGBA image, or `None` without a usable GPU.
 pub fn render(
     preview: &Arc<crate::ModelPreview>,
-    visible: &[bool],
+    look: &Look,
     camera: &Camera,
     w: u32,
     h: u32,
@@ -451,6 +474,36 @@ pub fn render(
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals_buffer.as_entire_binding() }],
         });
 
+        // Shown draws with their colours (hidden parts and materials left out).
+        let shown: Vec<(&Draw, [f32; 4])> = model
+            .draws
+            .iter()
+            .filter(|d| look.parts.get(d.part).copied().unwrap_or(false))
+            .filter_map(|d| Some((d, preview.loaded.tint(look, d.drawable, d.shader)?)))
+            .collect();
+        let stride = gpu.tint_stride as usize;
+        let mut tints = vec![0u8; stride * shown.len().max(1)];
+        for (i, (_, tint)) in shown.iter().enumerate() {
+            tints[i * stride..i * stride + 16].copy_from_slice(bytemuck::cast_slice(tint));
+        }
+        let tint_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tints"),
+            contents: &tints,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let tint_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &gpu.tint_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &tint_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(16),
+                }),
+            }],
+        });
+
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -475,8 +528,9 @@ pub fn render(
             });
             pass.set_pipeline(&gpu.pipeline);
             pass.set_bind_group(0, &globals_group, &[]);
-            for d in model.draws.iter().filter(|d| visible.get(d.part).copied().unwrap_or(false)) {
+            for (i, (d, _)) in shown.iter().enumerate() {
                 pass.set_bind_group(1, &model.textures[d.texture], &[]);
+                pass.set_bind_group(2, &tint_group, &[(i * stride) as u32]);
                 pass.set_vertex_buffer(0, d.vertices.slice(..));
                 pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..d.count, 0, 0..1);

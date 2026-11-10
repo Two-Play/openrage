@@ -840,12 +840,28 @@ fn cmd_model(
     for p in &model.parts {
         let [x, y, z] = [p.transform[12], p.transform[13], p.transform[14]];
         let mark = if p.visible { "*" } else { " " };
-        outln!("  {mark} {:<20} at ({x:.2}, {y:.2}, {z:.2})  {}", p.name, model.drawables[p.drawable].0);
+        outln!(
+            "  {mark} {:<20} {:<12} at ({x:.2}, {y:.2}, {z:.2})  {}",
+            p.name,
+            p.group,
+            model.drawables[p.drawable].0
+        );
+    }
+    outln!("{} materials:", model.materials.len());
+    for m in &model.materials {
+        let kind = if m.paint {
+            "paint"
+        } else if m.textured {
+            "textured"
+        } else {
+            "plain"
+        };
+        outln!("  {:<24} {kind}", m.label);
     }
     let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("model");
     if let Some(out) = export {
-        let glb = openrage_app::models::to_glb(&model, stem, &model.default_visibility())
-            .context("model has nothing to export")?;
+        let glb =
+            openrage_app::models::to_glb(&model, stem, &model.default_look()).context("model has nothing to export")?;
         fs::write(out, &glb).with_context(|| format!("writing {}", out.display()))?;
         outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
     }
@@ -854,7 +870,7 @@ fn cmd_model(
         let materials = render::Materials::new(&model);
         let view = render::View { yaw: yaw.to_radians(), ..Default::default() };
         let started = Instant::now();
-        let rgba = render::render(&model, &model.default_visibility(), &materials, view, 960, 600);
+        let rgba = render::render(&model, &model.default_look(), &materials, view, 960, 600);
         let ms = started.elapsed().as_millis();
         fs::write(out, rage_formats::png(960, 600, &rgba)?)?;
         outln!("Rendered {} in {ms} ms", out.display());

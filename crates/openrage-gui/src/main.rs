@@ -37,8 +37,8 @@ slint::include_modules!();
 /// A loaded model ready to be rendered.
 struct ModelPreview {
     loaded: openrage_app::models::LoadedModel,
-    /// Which parts are shown (shared by the preview and viewer windows).
-    visible: std::sync::RwLock<Vec<bool>>,
+    /// Shown parts and material colours (shared by the preview and viewer windows).
+    look: std::sync::RwLock<openrage_app::models::Look>,
     materials: openrage_app::render::Materials,
     name: String,
 }
@@ -159,6 +159,20 @@ fn debug_snapshot(ui: &AppWindow) {
         let Some(ui) = weak.upgrade() else { return };
         if std::env::var("OPENRAGE_VIEWER").is_ok() {
             open_viewer(&ui);
+        }
+        if let Some(v) = viewer::newest() {
+            if let Ok(tab) = std::env::var("OPENRAGE_TAB") {
+                v.set_panel_tab(tab.parse().unwrap_or(0));
+            }
+            if let Ok(hex) = std::env::var("OPENRAGE_PAINT") {
+                use slint::Model;
+                let rows = v.get_materials();
+                for i in 0..rows.row_count() {
+                    if rows.row_data(i).is_some_and(|r| r.label == "Primary paint") {
+                        v.invoke_material_hex(i as i32, hex.clone().into());
+                    }
+                }
+            }
         }
         if std::env::var("OPENRAGE_FLY").is_ok()
             && let Some(v) = viewer::newest()
@@ -1872,8 +1886,8 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
         let result = openrage_app::models::load(&game_dir, keys, &vpath).map(|loaded| {
             let materials = openrage_app::render::Materials::new(&loaded);
             let name = loaded.drawables.first().map(|(n, _)| n.clone()).unwrap_or_default();
-            let visible = std::sync::RwLock::new(loaded.default_visibility());
-            ModelPreview { loaded, visible, materials, name }
+            let look = std::sync::RwLock::new(loaded.default_look());
+            ModelPreview { loaded, look, materials, name }
         });
         if counter.load(Ordering::SeqCst) != generation {
             return;
@@ -1935,19 +1949,19 @@ fn render_image(
     w: usize,
     h: usize,
 ) -> Option<slint::Image> {
-    let visible = model.visible.read().ok()?.clone();
-    let Some((lo, hi)) = openrage_app::render::bounds(&model.loaded, &visible) else {
+    let look = model.look.read().ok()?.clone();
+    let Some((lo, hi)) = openrage_app::render::bounds(&model.loaded, &look.parts) else {
         // Nothing shown: an empty (transparent) image.
         let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w as u32, h as u32);
         return Some(slint::Image::from_rgba8_premultiplied(buffer));
     };
     let camera = camera(lo, hi);
     if std::env::var_os("OPENRAGE_SOFTWARE_RENDERER").is_none()
-        && let Some(img) = gpu::render(model, &visible, &camera, w as u32, h as u32)
+        && let Some(img) = gpu::render(model, &look, &camera, w as u32, h as u32)
     {
         return Some(img);
     }
-    let rgba = openrage_app::render::render_camera(&model.loaded, &visible, &model.materials, &camera, w, h);
+    let rgba = openrage_app::render::render_camera(&model.loaded, &look, &model.materials, &camera, w, h);
     let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w as u32, h as u32);
     Some(slint::Image::from_rgba8(buffer))
 }
@@ -1997,8 +2011,8 @@ fn save_glb(model: Arc<ModelPreview>, main: Weak<AppWindow>) {
         else {
             return;
         };
-        let visible = model.visible.read().map(|v| v.clone()).unwrap_or_default();
-        let result = openrage_app::models::to_glb(&model.loaded, &model.name, &visible)
+        let look = model.look.read().map(|l| l.clone()).unwrap_or_else(|_| model.loaded.default_look());
+        let result = openrage_app::models::to_glb(&model.loaded, &model.name, &look)
             .ok_or_else(|| "nothing visible to export".to_owned())
             .and_then(|glb| std::fs::write(&path, glb).map_err(|e| e.to_string()));
         let msg = match result {

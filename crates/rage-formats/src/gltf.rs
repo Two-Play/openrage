@@ -102,18 +102,20 @@ fn matrix_json(m: &Mat4) -> String {
 /// Writes a single drawable as `.glb`.
 pub fn write_glb<'a>(d: &Drawable, name: &str, lookup: &dyn Fn(&str) -> Option<&'a Texture>) -> Vec<u8> {
     let node = Node { name: name.to_owned(), mesh: 0, transform: crate::math::IDENTITY };
-    write_glb_scene(name, &[(name, d)], &[node], &|_, t| lookup(t))
+    write_glb_scene(name, &[(name, d)], &[node], &|_, t| lookup(t), &|_, _| Some([1.0; 4]))
 }
 
 /// Writes drawables placed by `nodes` as one `.glb` scene. `lookup` resolves
 /// texture names per drawable (embedded dictionary, a `.ytd` next to the
 /// model, …); missing textures leave the material untextured. Drawables no
-/// node uses are left out.
+/// node uses are left out. `material` gives a shader's colour factor per
+/// drawable and shader index, `None` to leave its meshes out.
 pub fn write_glb_scene<'a>(
     name: &str,
     drawables: &[(&str, &Drawable)],
     nodes: &[Node],
     lookup: &dyn Fn(usize, &str) -> Option<&'a Texture>,
+    material: &dyn Fn(usize, usize) -> Option<[f32; 4]>,
 ) -> Vec<u8> {
     let mut b = Builder::default();
     let mut materials = Vec::new();
@@ -132,6 +134,10 @@ pub fn write_glb_scene<'a>(
         for (si, shader) in d.shaders.iter().enumerate() {
             let tex_name = shader.base_texture().map(str::to_owned);
             let mut pbr = String::from("\"metallicFactor\":0,\"roughnessFactor\":0.8");
+            if let Some(tint) = material(di, si).filter(|t| *t != [1.0; 4]) {
+                let [r, g, b, a] = tint.map(finite);
+                pbr.push_str(&format!(",\"baseColorFactor\":[{r},{g},{b},{a}]"));
+            }
             if let Some(tn) = &tex_name {
                 let existing = image_of.iter().find(|(n, _)| n.eq_ignore_ascii_case(tn)).map(|(_, i)| *i);
                 let tex_index = existing.or_else(|| {
@@ -158,7 +164,7 @@ pub fn write_glb_scene<'a>(
 
         let mut primitives = Vec::new();
         for mesh in &d.meshes {
-            if mesh.positions.is_empty() || mesh.indices.is_empty() {
+            if mesh.positions.is_empty() || mesh.indices.is_empty() || material(di, mesh.shader as usize).is_none() {
                 continue;
             }
             let mut attrs = format!("\"POSITION\":{}", b.floats(&mesh.positions, "VEC3", true));

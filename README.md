@@ -77,7 +77,8 @@ Selecting a model (`.ydr` drawable, `.yft` fragment such as a vehicle, `.ydd` dr
 Double-click opens the model in a **viewer window** (rendered on the GPU via wgpu — Vulkan, DirectX 12, Metal or OpenGL — with a software fallback):
 
 * **Orbit** (drag, wheel) or **Fly** (F): W A S D to move, Q/E down/up, Shift faster, drag to look around.
-* **Parts:** show or hide every part (wheels, ped components and their variants); preview and export follow.
+* **Parts:** grouped (body, wheels, ped components with their variants); show or hide groups or single parts.
+* **Materials:** every shader with a readable name (primary paint, glass, tyres, interior, …); hide it or give it a colour — paint the car. Preview and glTF export follow.
 * **Export glTF…** writes a binary glTF 2.0 file (`.glb`) with one node per shown part and the textures embedded, which Blender and other tools open directly (Z-up is converted to glTF's Y-up).
 
 All 168,000+ models of GTA V Enhanced load, as do the Legacy formats. Not yet: animations and skinning poses, vehicle mods and tuning parts, map placements (ymap/ytyp).

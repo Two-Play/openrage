@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use rage_formats::math;
 
-use crate::models::LoadedModel;
+use crate::models::{LoadedModel, Look};
 
 /// Camera angles in radians and zoom (1 = whole model in view).
 #[derive(Debug, Clone, Copy)]
@@ -148,15 +148,15 @@ pub fn orbit_camera(lo: [f32; 3], hi: [f32; 3], view: View) -> Camera {
 /// `width × height` with a transparent background.
 pub fn render(
     model: &LoadedModel,
-    visible: &[bool],
+    look: &Look,
     materials: &Materials,
     view: View,
     width: usize,
     height: usize,
 ) -> Vec<u8> {
     // Bounds from the vertices (more reliable than stored bounds).
-    match bounds(model, visible) {
-        Some((lo, hi)) => render_camera(model, visible, materials, &orbit_camera(lo, hi, view), width, height),
+    match bounds(model, &look.parts) {
+        Some((lo, hi)) => render_camera(model, look, materials, &orbit_camera(lo, hi, view), width, height),
         None => vec![0u8; width.max(1) * height.max(1) * 4],
     }
 }
@@ -174,7 +174,7 @@ pub fn fly_camera(eye: [f32; 3], yaw: f32, pitch: f32, radius: f32) -> Camera {
 /// Renders from any camera (see [`orbit_camera`], [`fly_camera`]).
 pub fn render_camera(
     model: &LoadedModel,
-    visible: &[bool],
+    look: &Look,
     materials: &Materials,
     camera: &Camera,
     width: usize,
@@ -196,8 +196,9 @@ pub fn render_camera(
         (w as f32 / 2.0 + dot(r, right) * focal / z, h as f32 / 2.0 - dot(r, up) * focal / z, z)
     };
 
-    for (part, d) in model.shown(visible) {
+    for (part, d) in model.shown(&look.parts) {
         for mesh in &d.meshes {
+            let Some(tint) = model.tint(look, part.drawable, mesh.shader) else { continue };
             let img = materials.image(part.drawable, mesh.shader);
             let has_uv = mesh.uvs.len() == mesh.positions.len();
             let has_n = mesh.normals.len() == mesh.positions.len();
@@ -243,7 +244,7 @@ pub fn render_camera(
                         }
                         // Perspective-correct weights.
                         let (q0, q1, q2) = (w0 * iza * z, w1 * izb * z, w2 * izc * z);
-                        let mut base = [0.72f32, 0.72, 0.74, 1.0];
+                        let mut base = [1.0f32; 4];
                         if let (Some(img), true) = (img, has_uv) {
                             let u = q0 * mesh.uvs[a][0] + q1 * mesh.uvs[b][0] + q2 * mesh.uvs[c][0];
                             let v = q0 * mesh.uvs[a][1] + q1 * mesh.uvs[b][1] + q2 * mesh.uvs[c][1];
@@ -252,6 +253,9 @@ pub fn render_camera(
                                 continue; // alpha cut-out
                             }
                             base = [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0];
+                        }
+                        for k in 0..3 {
+                            base[k] *= tint[k];
                         }
                         let n = if has_n {
                             let (na, nb, nc) = (normals[a], normals[b], normals[c]);

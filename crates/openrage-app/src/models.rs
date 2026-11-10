@@ -19,6 +19,8 @@ use rage_rpf::vfs::Node;
 #[derive(Debug, Clone)]
 pub struct Part {
     pub name: String,
+    /// Logical group shown together (e.g. "Wheels", "Hair"); empty for none.
+    pub group: String,
     /// Index into [`LoadedModel::drawables`].
     pub drawable: usize,
     /// Model-space placement.
@@ -34,7 +36,40 @@ pub struct LoadedModel {
     pub parts: Vec<Part>,
     /// Texture dictionaries found next to the model (`<name>.ytd`, `vehshare.ytd`).
     pub external: Vec<(String, TextureDictionary)>,
+    /// Materials: shaders with the same name across all drawables.
+    pub materials: Vec<MaterialSlot>,
+    /// Material index per drawable and shader.
+    shader_material: Vec<Vec<usize>>,
 }
+
+/// A material of a model: every shader with this name, in any part.
+#[derive(Debug, Clone)]
+pub struct MaterialSlot {
+    pub name_hash: u32,
+    /// Readable name ("Primary paint", "Glass", `normal_spec`, …).
+    pub label: String,
+    /// Takes its colour from the paint (vehicle_paint*).
+    pub paint: bool,
+    /// At least one of its shaders has a colour texture.
+    pub textured: bool,
+}
+
+/// How a model is shown: which parts, and per material whether it is shown
+/// and its colour (multiplied with the texture; the colour itself without one).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Look {
+    pub parts: Vec<bool>,
+    pub materials: Vec<MaterialLook>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaterialLook {
+    pub visible: bool,
+    pub tint: [f32; 4],
+}
+
+/// Colour of untextured surfaces (light grey).
+pub const PLAIN: [f32; 4] = [0.72, 0.72, 0.74, 1.0];
 
 impl LoadedModel {
     /// Finds a texture by name: embedded in the drawable first, then next to the model.
@@ -46,6 +81,63 @@ impl LoadedModel {
     /// The default visibility of every part.
     pub fn default_visibility(&self) -> Vec<bool> {
         self.parts.iter().map(|p| p.visible).collect()
+    }
+
+    /// Default parts, every material shown in its own colours.
+    pub fn default_look(&self) -> Look {
+        Look {
+            parts: self.default_visibility(),
+            materials: self
+                .materials
+                .iter()
+                .map(|m| MaterialLook { visible: true, tint: if m.textured { [1.0; 4] } else { PLAIN } })
+                .collect(),
+        }
+    }
+
+    /// Material index of a drawable's shader.
+    pub fn material_index(&self, drawable: usize, shader: u16) -> Option<usize> {
+        self.shader_material.get(drawable)?.get(shader as usize).copied()
+    }
+
+    /// Colour of a drawable's shader under `look`, `None` if it is hidden.
+    pub fn tint(&self, look: &Look, drawable: usize, shader: u16) -> Option<[f32; 4]> {
+        match self.material_index(drawable, shader).and_then(|m| look.materials.get(m)) {
+            Some(m) if !m.visible => None,
+            Some(m) => Some(m.tint),
+            None => Some([1.0; 4]),
+        }
+    }
+
+    /// Groups materials of all drawables by shader name.
+    fn collect_materials(&mut self) {
+        let mut materials: Vec<MaterialSlot> = Vec::new();
+        let mut shader_material = Vec::new();
+        for (_, d) in &self.drawables {
+            let mut per_shader = Vec::new();
+            for shader in &d.shaders {
+                let textured = shader.base_texture().is_some_and(|t| self.texture(d, t).is_some());
+                let index = match materials.iter().position(|m| m.name_hash == shader.name_hash) {
+                    Some(i) => {
+                        materials[i].textured |= textured;
+                        i
+                    }
+                    None => {
+                        materials.push(MaterialSlot {
+                            name_hash: shader.name_hash,
+                            label: rage_formats::shaders::label(shader.name_hash),
+                            paint: rage_formats::shaders::is_paint(shader.name_hash),
+                            textured,
+                        });
+                        materials.len() - 1
+                    }
+                };
+                per_shader.push(index);
+            }
+            shader_material.push(per_shader);
+        }
+        self.materials = materials;
+        self.shader_material = shader_material;
     }
 
     /// Parts shown by `visible` (one flag per part) with their drawables.
@@ -113,7 +205,13 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
     let skeleton = body.skeleton.clone().unwrap_or_default();
     let world = skeleton.world_transforms();
     let mut drawables = vec![(name.to_owned(), body)];
-    let mut parts = vec![Part { name: name.to_owned(), drawable: 0, transform: math::IDENTITY, visible: true }];
+    let mut parts = vec![Part {
+        name: name.to_owned(),
+        group: "Body".into(),
+        drawable: 0,
+        transform: math::IDENTITY,
+        visible: true,
+    }];
     let mut wheels: Vec<(String, usize)> = Vec::new();
     for child in children {
         let bone = skeleton.find_tag(child.bone_tag);
@@ -125,7 +223,8 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
         if bone_name.starts_with("wheel_") {
             wheels.push((bone_name.clone(), index));
         }
-        parts.push(Part { name: bone_name, drawable: index, transform, visible: true });
+        let group = if bone_name.starts_with("wheel_") { "Wheels" } else { "Parts" };
+        parts.push(Part { name: bone_name, group: group.into(), drawable: index, transform, visible: true });
     }
     // Copy wheels to the wheel bones that have no drawable of their own.
     if !wheels.is_empty() {
@@ -149,7 +248,13 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
             if is_right(&n) != is_right(&src_name) {
                 transform = math::mul(&transform, &math::rotation_z(std::f32::consts::PI));
             }
-            parts.push(Part { name: bone.name.clone(), drawable: src, transform, visible: true });
+            parts.push(Part {
+                name: bone.name.clone(),
+                group: "Wheels".into(),
+                drawable: src,
+                transform,
+                visible: true,
+            });
         }
     }
     (drawables, parts)
@@ -185,13 +290,20 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
         let parts = default_visibility(&names)
             .into_iter()
             .enumerate()
-            .map(|(i, visible)| Part { name: names[i].clone(), drawable: i, transform: math::IDENTITY, visible })
+            .map(|(i, visible)| Part {
+                name: names[i].clone(),
+                group: ped_group(&names[i]),
+                drawable: i,
+                transform: math::IDENTITY,
+                visible,
+            })
             .collect();
         (drawables, parts)
     } else if lower.ends_with(".yft") {
         fragment_parts(drawable::parse_fragment(&res)?, &stem)
     } else if lower.ends_with(".ydr") {
-        let part = Part { name: stem.clone(), drawable: 0, transform: math::IDENTITY, visible: true };
+        let part =
+            Part { name: stem.clone(), group: String::new(), drawable: 0, transform: math::IDENTITY, visible: true };
         (vec![(stem.clone(), drawable::parse_ydr(&res)?)], vec![part])
     } else {
         bail!("{name} is not a model (.ydr, .yft, .ydd)");
@@ -214,18 +326,50 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
             external.push((c, dict));
         }
     }
-    Ok(LoadedModel { drawables, parts, external })
+    let mut model = LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new() };
+    model.collect_materials();
+    Ok(model)
 }
 
-/// Exports the parts shown by `visible` as `.glb` (one node per part).
-pub fn to_glb(model: &LoadedModel, name: &str, visible: &[bool]) -> Option<Vec<u8>> {
+/// Group of a ped component (`uppr_001_u` → "Upper body"); other drawables none.
+fn ped_group(name: &str) -> String {
+    if !ped_component_names().values().any(|v| v == name) {
+        return String::new();
+    }
+    let label = match name.split('_').next().unwrap_or_default() {
+        "head" => "Head",
+        "berd" => "Beard / mask",
+        "hair" => "Hair",
+        "uppr" => "Upper body",
+        "lowr" => "Legs",
+        "hand" => "Hands",
+        "feet" => "Feet",
+        "teef" => "Teeth",
+        "accs" => "Accessories",
+        "task" => "Gear",
+        "decl" => "Decals",
+        "jbib" => "Jacket",
+        other => other,
+    };
+    label.to_owned()
+}
+
+/// Exports the model as shown by `look` as `.glb` (one node per part,
+/// material colours as base colour factors, hidden materials left out).
+pub fn to_glb(model: &LoadedModel, name: &str, look: &Look) -> Option<Vec<u8>> {
     let meshes: Vec<(&str, &Drawable)> = model.drawables.iter().map(|(n, d)| (n.as_str(), d)).collect();
     let nodes: Vec<rage_formats::gltf::Node> = model
-        .shown(visible)
+        .shown(&look.parts)
         .map(|(p, _)| rage_formats::gltf::Node { name: p.name.clone(), mesh: p.drawable, transform: p.transform })
         .collect();
     if nodes.is_empty() {
         return None;
     }
-    Some(rage_formats::gltf::write_glb_scene(name, &meshes, &nodes, &|d, t| model.texture(&model.drawables[d].1, t)))
+    Some(rage_formats::gltf::write_glb_scene(
+        name,
+        &meshes,
+        &nodes,
+        &|d, t| model.texture(&model.drawables[d].1, t),
+        &|d, s| model.tint(look, d, s as u16),
+    ))
 }

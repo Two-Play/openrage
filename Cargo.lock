@@ -3922,6 +3922,7 @@ name = "rage-formats"
 version = "0.1.0"
 dependencies = [
  "png",
+ "rage-core",
  "rage-resource",
  "texture2ddecoder",
  "thiserror 2.0.21",

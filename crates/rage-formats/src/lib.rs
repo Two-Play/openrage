@@ -8,6 +8,7 @@ pub mod dds;
 pub mod drawable;
 pub mod gltf;
 pub mod math;
+pub mod shaders;
 pub mod texture;
 pub mod ytd;
 pub mod ytd_write;

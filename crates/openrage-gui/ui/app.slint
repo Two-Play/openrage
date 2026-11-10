@@ -2,7 +2,7 @@
 // All user-visible strings go through @tr() so the UI can be translated.
 // Spacing, sizes and colors come from the Theme tokens (theme.slint).
 
-import { Button, CheckBox, LineEdit, ComboBox, ScrollView, ListView, Palette, Spinner } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ComboBox, ScrollView, ListView, Palette, Spinner, TabWidget } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 
 export struct TreeRow {
@@ -24,6 +24,18 @@ export struct InfoRow {
 export struct PartRow {
     name: string,
     visible: bool,
+    // 0: group or single part, 1: part inside a group.
+    level: int,
+    // Number of parts in a group (0 for a part row).
+    count: int,
+}
+
+export struct MaterialRow {
+    label: string,
+    visible: bool,
+    color: color,
+    paint: bool,
+    textured: bool,
 }
 
 export struct Crumb {
@@ -2001,6 +2013,9 @@ export component ViewerWindow inherits Window {
     // First-person camera (WASD + mouse) instead of orbiting.
     in property <bool> fly-mode;
     in property <[PartRow]> parts;
+    in property <[MaterialRow]> materials;
+    in-out property <int> panel-tab;
+    property <int> editing-material: -1;
     out property <length> area-width: area.width;
     out property <length> area-height: area.height;
 
@@ -2017,6 +2032,10 @@ export component ViewerWindow inherits Window {
     callback focus-lost();
     callback part-toggled(int, bool);
     callback all-parts(bool);
+    callback material-visible(int, bool);
+    callback material-color(int, color);
+    callback material-hex(int, string);
+    callback material-reset(int);
 
     changed area-width => { root.resized(); }
     changed area-height => { root.resized(); }
@@ -2159,62 +2178,205 @@ export component ViewerWindow inherits Window {
                     background: Theme.border;
                 }
                 if root.show-info: Rectangle {
-                    width: 300px;
+                    width: 320px;
                     background: Theme.surface;
-                    VerticalLayout {
-                        padding: Theme.space-l;
-                        spacing: Theme.space-s;
-                        Text {
-                            text: @tr("Details");
-                            font-weight: 600;
-                            color: Theme.text;
-                        }
-                        for r in root.rows: HorizontalLayout {
-                            spacing: Theme.space-m;
-                            if r.key != "": Text {
-                                width: 100px;
-                                text: r.key;
-                                font-size: Theme.font-small;
-                                color: Theme.text-muted;
-                                overflow: elide;
-                            }
-                            Text {
-                                horizontal-stretch: 1;
-                                text: r.value;
-                                wrap: word-wrap;
-                                color: r.key == "" ? Theme.text-muted : Theme.text;
-                                font-size: r.key == "" ? Theme.font-small : Theme.font-body;
-                            }
-                        }
-                        if root.model-mode && root.parts.length > 1: HorizontalLayout {
-                            padding-top: Theme.space-m;
-                            spacing: Theme.space-s;
-                            Text {
-                                horizontal-stretch: 1;
-                                text: @tr("Parts");
-                                font-weight: 600;
-                                vertical-alignment: center;
-                                color: Theme.text;
-                            }
-                            Button {
-                                text: @tr("All");
-                                clicked => { root.all-parts(true); }
-                            }
-                            Button {
-                                text: @tr("None");
-                                clicked => { root.all-parts(false); }
+                    TabWidget {
+                        current-index <=> root.panel-tab;
+                        Tab {
+                            title: @tr("Details");
+                            VerticalLayout {
+                                padding: Theme.space-l;
+                                spacing: Theme.space-s;
+                                alignment: start;
+                                for r in root.rows: HorizontalLayout {
+                                    spacing: Theme.space-m;
+                                    if r.key != "": Text {
+                                        width: 100px;
+                                        text: r.key;
+                                        font-size: Theme.font-small;
+                                        color: Theme.text-muted;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: r.value;
+                                        wrap: word-wrap;
+                                        color: r.key == "" ? Theme.text-muted : Theme.text;
+                                        font-size: r.key == "" ? Theme.font-small : Theme.font-body;
+                                    }
+                                }
                             }
                         }
-                        if root.model-mode && root.parts.length > 1: ListView {
-                            vertical-stretch: 1;
-                            for p[i] in root.parts: CheckBox {
-                                text: p.name;
-                                checked: p.visible;
-                                toggled => { root.part-toggled(i, self.checked); }
+                        Tab {
+                            title: @tr("Parts");
+                            VerticalLayout {
+                                padding: Theme.space-m;
+                                spacing: Theme.space-s;
+                                HorizontalLayout {
+                                    spacing: Theme.space-s;
+                                    alignment: end;
+                                    Button {
+                                        text: @tr("Show all");
+                                        clicked => { root.all-parts(true); }
+                                    }
+                                    Button {
+                                        text: @tr("Hide all");
+                                        clicked => { root.all-parts(false); }
+                                    }
+                                }
+                                ListView {
+                                    vertical-stretch: 1;
+                                    for p[i] in root.parts: Rectangle {
+                                        height: 30px;
+                                        border-radius: Theme.radius-s;
+                                        background: row-ta.has-hover ? Theme.hover : transparent;
+                                        row-ta := TouchArea {
+                                            clicked => { root.part-toggled(i, !p.visible); }
+                                        }
+                                        HorizontalLayout {
+                                            padding-left: Theme.space-s + p.level * 22px;
+                                            padding-right: Theme.space-s;
+                                            spacing: Theme.space-s;
+                                            CheckBox {
+                                                checked: p.visible;
+                                                toggled => { root.part-toggled(i, self.checked); }
+                                            }
+                                            Text {
+                                                horizontal-stretch: 1;
+                                                text: p.name;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                font-weight: p.count > 0 ? 600 : 400;
+                                                color: Theme.text;
+                                            }
+                                            if p.count > 0: Text {
+                                                text: p.count;
+                                                vertical-alignment: center;
+                                                font-size: Theme.font-small;
+                                                color: Theme.text-faint;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
-                        Rectangle {
-                            vertical-stretch: root.model-mode && root.parts.length > 1 ? 0 : 1;
+                        Tab {
+                            title: @tr("Materials");
+                            VerticalLayout {
+                                padding: Theme.space-m;
+                                spacing: Theme.space-s;
+                                Text {
+                                    text: @tr("Click a colour to paint a material; untick to hide it.");
+                                    wrap: word-wrap;
+                                    font-size: Theme.font-small;
+                                    color: Theme.text-muted;
+                                }
+                                ListView {
+                                    vertical-stretch: 1;
+                                    for m[i] in root.materials: Rectangle {
+                                        height: 34px;
+                                        HorizontalLayout {
+                                            padding-left: Theme.space-s;
+                                            padding-right: Theme.space-s;
+                                            spacing: Theme.space-s;
+                                            CheckBox {
+                                                checked: m.visible;
+                                                toggled => { root.material-visible(i, self.checked); }
+                                            }
+                                            VerticalLayout {
+                                                horizontal-stretch: 1;
+                                                alignment: center;
+                                                Text {
+                                                    text: m.label;
+                                                    overflow: elide;
+                                                    color: Theme.text;
+                                                }
+                                                if m.paint || m.textured: Text {
+                                                    text: m.paint ? @tr("paint") : @tr("textured");
+                                                    font-size: Theme.font-small;
+                                                    color: Theme.text-faint;
+                                                }
+                                            }
+                                            Rectangle {
+                                                y: (parent.height - self.height) / 2;
+                                                width: 36px;
+                                                height: 22px;
+                                                border-radius: Theme.radius-s;
+                                                border-width: 1px;
+                                                border-color: swatch-ta.has-hover ? Theme.text : Theme.border;
+                                                background: m.color;
+                                                accessible-role: button;
+                                                accessible-label: @tr("Colour of {}", m.label);
+                                                swatch-ta := TouchArea {
+                                                    clicked => {
+                                                        root.editing-material = i;
+                                                        color-popup.show();
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    color-popup := PopupWindow {
+        x: root.width - 340px;
+        y: 110px;
+        width: 300px;
+        Rectangle {
+            background: Theme.background;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 16px;
+            drop-shadow-color: #00000040;
+            VerticalLayout {
+                padding: Theme.space-m;
+                spacing: Theme.space-s;
+                Text {
+                    text: root.editing-material >= 0 && root.editing-material < root.materials.length ? root.materials[root.editing-material].label : "";
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                GridLayout {
+                    spacing: 6px;
+                    for c[i] in [#0d1116, #2b2d33, #8c9095, #e8e8e8, #b5121b, #f0362a, #f78616, #f2c40c, #6fb52c, #14632f, #1e4fa1, #4ba7e3, #5b2580, #e47fae, #5c4433, #b8914d]: Rectangle {
+                        col: Math.mod(i, 8);
+                        row: floor(i / 8);
+                        width: 28px;
+                        height: 28px;
+                        border-radius: Theme.radius-s;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: c;
+                        TouchArea {
+                            clicked => {
+                                root.material-color(root.editing-material, c);
+                                color-popup.close();
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Theme.space-s;
+                    hex := LineEdit {
+                        placeholder-text: "#RRGGBB";
+                        accepted(text) => {
+                            root.material-hex(root.editing-material, text);
+                            color-popup.close();
+                        }
+                    }
+                    Button {
+                        text: @tr("Reset");
+                        clicked => {
+                            root.material-reset(root.editing-material);
+                            color-popup.close();
                         }
                     }
                 }
