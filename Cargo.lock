@@ -3402,6 +3402,7 @@ dependencies = [
  "openrage-app",
  "rage-crypto",
  "rage-index",
+ "rage-mods",
  "rage-rpf",
  "rayon",
 ]
@@ -3415,6 +3416,7 @@ dependencies = [
  "rage-core",
  "rage-crypto",
  "rage-index",
+ "rage-mods",
  "rage-rpf",
  "rfd",
  "slint",
@@ -3866,6 +3868,14 @@ dependencies = [
  "rayon",
  "rusqlite",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "rage-mods"
+version = "0.1.0"
+dependencies = [
+ "rage-crypto",
+ "rage-rpf",
 ]
 
 [[package]]

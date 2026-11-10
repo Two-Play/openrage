@@ -184,3 +184,56 @@ fn entry_kinds_are_detected() {
     assert_eq!(labels, ["dir", "dir", "file", "rpf", "resource"]);
     assert!(matches!(rpf.entry(2).kind, EntryKind::Binary { encrypted: false, .. }));
 }
+
+#[test]
+fn writer_round_trip_including_raw_copies() {
+    use rage_rpf::{ArchiveWriter, RawEntry};
+
+    // Copy everything from the sample archive raw, then modify it like a mod would.
+    let path = write_temp("writer-src", &sample_archive());
+    let src = Rpf7::open(&path, None).unwrap();
+    let mut w = ArchiveWriter::new();
+    let mut copied = 0;
+    vfs::walk(
+        &src,
+        Rpf7::ROOT,
+        "",
+        false,
+        &mut |a, id, p| {
+            if !a.entry(id).is_dir() {
+                w.add_raw(p, a.read_raw_entry(id).unwrap());
+                copied += 1;
+            }
+        },
+        &mut |e| panic!("{e}"),
+    );
+    assert_eq!(copied, 3);
+    w.add_file("hello.txt", b"replaced".to_vec()).unwrap();
+    w.add_file("new/dir/added.meta", b"<Item>NEW</Item>".repeat(20)).unwrap();
+    assert_eq!(w.remove("inner.rpf"), 1);
+    let rsc = src.read(src.find_child(src.find_child(Rpf7::ROOT, "data").unwrap(), "thing.ymt").unwrap()).unwrap();
+    w.add_resource_file("data/copy.ymt", rsc).unwrap();
+    w.add_raw("x", RawEntry::Binary { data: vec![], compressed: false, size: 0, encrypted: false });
+    assert_eq!(w.remove("X"), 1, "removal is case-insensitive");
+
+    let out = write_temp("writer-out", &w.build().unwrap());
+    let rpf = Rpf7::open(&out, None).expect("written archive opens");
+    assert_eq!(rpf.encryption(), rage_rpf::Encryption::Open);
+    let mut seen = Vec::new();
+    vfs::walk(&rpf, Rpf7::ROOT, "", true, &mut |_, _, p| seen.push(p.to_owned()), &mut |e| panic!("{e}"));
+    // Depth-first walk over sorted children.
+    assert_eq!(seen, ["data", "data/copy.ymt", "data/thing.ymt", "hello.txt", "new", "new/dir", "new/dir/added.meta"]);
+
+    let read = |p: &str| match vfs::resolve(out.parent().unwrap(), &format!("sample.rpf/{p}"), None).unwrap() {
+        Node::ArchiveFile(a, id) => a.read(id).unwrap(),
+        _ => panic!("{p} is not a file"),
+    };
+    assert_eq!(read("hello.txt"), b"replaced");
+    assert_eq!(read("new/dir/added.meta"), b"<Item>NEW</Item>".repeat(20));
+    let data = rpf.find_child(Rpf7::ROOT, "data").unwrap();
+    for name in ["thing.ymt", "copy.ymt"] {
+        let id = rpf.find_child(data, name).unwrap();
+        assert_eq!(rpf.read_resource_pages(id).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(rpf.entry(id).resource_version(), Some(0x23));
+    }
+}

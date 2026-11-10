@@ -1,0 +1,10 @@
+[package]
+name = "rage-mods"
+description = "OpenIV-compatible mods folder support: overlay view and change detection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rage-crypto.workspace = true
+rage-rpf.workspace = true

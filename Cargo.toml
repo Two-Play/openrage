@@ -14,6 +14,7 @@ rage-core = { path = "crates/rage-core" }
 rage-crypto = { path = "crates/rage-crypto" }
 rage-rpf = { path = "crates/rage-rpf" }
 rage-index = { path = "crates/rage-index" }
+rage-mods = { path = "crates/rage-mods" }
 
 aes = "0.8"
 anyhow = "1"

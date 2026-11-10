@@ -89,6 +89,31 @@ enum Command {
         #[arg(long)]
         lang: Option<String>,
     },
+    /// Show the OpenIV `mods` folder: which files replace game files, and what changed inside them.
+    Mods {
+        /// List every added, removed and modified entry inside the modded archives.
+        #[arg(long)]
+        changes: bool,
+        /// Compare the contents of every entry (slower; default compares metadata
+        /// and the contents of entries up to 256 KiB).
+        #[arg(long)]
+        deep: bool,
+    },
+    /// Rewrite an archive with replaced/added/removed entries, OpenIV style (experimental).
+    #[command(hide = true)]
+    Repack {
+        /// Archive to rewrite (virtual path).
+        archive: String,
+        /// Output file.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// `inner/path=local_file`; may reach into nested archives. RSC7 files become resources.
+        #[arg(long = "set")]
+        sets: Vec<String>,
+        /// Inner path to remove.
+        #[arg(long = "remove")]
+        removes: Vec<String>,
+    },
     /// Search all archives of the game for entries whose name contains PATTERN.
     Find {
         pattern: String,
@@ -134,6 +159,8 @@ fn run() -> Result<()> {
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path } => cmd_verify(&game_dir, &path, keys),
         Command::Index => cmd_index(&game_dir, keys),
+        Command::Mods { changes, deep } => cmd_mods(&game_dir, changes, deep, keys),
+        Command::Repack { archive, out, sets, removes } => cmd_repack(&game_dir, &archive, &out, &sets, &removes, keys),
         Command::Search { query, limit, lang } => {
             let lang = match lang.as_deref() {
                 Some("all") => None,
@@ -258,6 +285,63 @@ fn cmd_extract(game_dir: &Path, path: &str, out: &Path, expand: bool, keys: Opti
         summary.target.display(),
         if summary.failures.is_empty() { String::new() } else { format!(" ({} failures)", summary.failures.len()) }
     );
+    Ok(())
+}
+
+fn cmd_mods(game_dir: &Path, changes: bool, deep: bool, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let Some(mods) = rage_mods::mods_dir(game_dir) else {
+        outln!("No mods folder in {}.", game_dir.display());
+        return Ok(());
+    };
+    let files = rage_mods::scan(game_dir);
+    outln!("{} files in {}", files.len(), mods.display());
+    for f in &files {
+        let kind = match f.kind {
+            rage_mods::ModFileKind::Replaces => "replaces",
+            rage_mods::ModFileKind::New => "new",
+        };
+        outln!("{kind:<9} {:>8}  {}", human(f.size), f.rel);
+    }
+    if !changes {
+        return Ok(());
+    }
+    let mode = if deep { rage_mods::CompareMode::Deep } else { rage_mods::CompareMode::Quick };
+    let started = Instant::now();
+    let list =
+        rage_mods::list_changes(game_dir, keys, mode, &mut |i, n, p| eprintln!("  [{}/{n}] comparing {p}", i + 1));
+    outln!();
+    for c in &list {
+        let slash = if c.is_dir { "/" } else { "" };
+        outln!("{:<15} {:>8}  {}{slash}", c.kind.label(), human(c.size), c.vpath);
+    }
+    eprintln!("{} changes ({:.1}s)", list.len(), started.elapsed().as_secs_f32());
+    Ok(())
+}
+
+fn cmd_repack(
+    game_dir: &Path,
+    archive: &str,
+    out: &Path,
+    sets: &[String],
+    removes: &[String],
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
+    use openrage_app::repack::{Edit, repack};
+    let rpf = match vfs::resolve(game_dir, archive, keys)? {
+        Node::ArchiveDir(rpf, id) if id == Rpf7::ROOT => rpf,
+        _ => bail!("{archive} is not an archive"),
+    };
+    let mut edits = std::collections::BTreeMap::new();
+    for s in sets {
+        let (inner, file) = s.split_once('=').context("--set expects inner/path=local_file")?;
+        edits.insert(inner.to_owned(), Edit::Set(fs::read(file).with_context(|| format!("reading {file}"))?));
+    }
+    for r in removes {
+        edits.insert(r.clone(), Edit::Remove);
+    }
+    let bytes = repack(&rpf, &edits)?;
+    fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
+    outln!("Wrote {} ({}) with {} edits.", out.display(), human(bytes.len() as u64), edits.len());
     Ok(())
 }
 

@@ -14,6 +14,7 @@ rage-crypto.workspace = true
 openrage-app = { path = "../openrage-app" }
 rage-rpf.workspace = true
 rage-index.workspace = true
+rage-mods.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 rayon.workspace = true

@@ -12,7 +12,7 @@ An open-source explorer and modding toolkit for games built on Rockstar's RAGE e
 | GTA IV | planned (RPF3) | – |
 | Red Dead Redemption 2 | planned (RPF8) | – |
 
-Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (in progress: explorer and search done; mods overlay next) → **3** textures (YTD) → **4** writing/replacing archive contents → **5** models (YDR/YFT → glTF) → **6** GTA IV → **7** RDR2.
+Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) → **4** writing/replacing archive contents → **5** models (YDR/YFT → glTF) → **6** GTA IV → **7** RDR2.
 
 ## Build
 
@@ -54,6 +54,14 @@ OpenRAGE keeps a search index of the whole game (built once in about 30 seconds,
 
 Typing `?query` into the address bar searches as well; Back returns to the results.
 
+### Mods folder (OpenIV compatible)
+
+OpenRAGE understands the `mods` folder used by OpenIV.asi, where a file at `mods/<path>` replaces `<path>` in the game. It never changes that layout — it only shows what it means:
+
+* **Mods** (toolbar toggle) shows the game the way it sees itself: replaced files are marked *mod*, files only in `mods` *new*, and folders containing mods *has mods*.
+* Inside a modded archive every folder is compared with the original: entries are marked *added* (green), *changed* (orange) or *removed* (red, shown greyed out with a preview of the original).
+* **Changes** lists every difference of all mods at once, across nested archives — including complete copies of game archives that contain no change at all and can simply be deleted.
+
 ## CLI usage
 
 Paths are virtual: archives — including archives inside archives — behave like directories.
@@ -72,6 +80,8 @@ openrage index                                 # build / update the search index
 openrage search weapon_pistol                  # names + full text, shows matching lines
 openrage search 0xB779A091                     # hash lookup
 openrage search Pegassi --lang american        # game text in another language (or `all`)
+openrage mods                                  # files in the OpenIV mods folder
+openrage mods --changes [--deep]               # every added/removed/modified entry
 ```
 
 ## Project layout
@@ -80,8 +90,9 @@ openrage search Pegassi --lang american        # game text in another language (
 |---|---|
 | `rage-core` | shared primitives: hashing (joaat), positional I/O |
 | `rage-crypto` | AES / NG ciphers, key discovery in the user's executable, key cache |
-| `rage-rpf` | RPF7 reader and a virtual file system over nested archives |
+| `rage-rpf` | RPF7 reader and OpenIV-style writer, virtual file system over nested archives |
 | `rage-index` | SQLite search index: names, hash dictionary, FTS5 full text, incremental updates |
+| `rage-mods` | OpenIV `mods` folder: overlay resolution, folder comparison, change lists |
 | `openrage-app` | settings, key setup, game detection and extraction shared by CLI and GUI |
 | `openrage-cli` | the `openrage` command-line tool |
 | `openrage-gui` | the Slint explorer (`openrage-gui`) |

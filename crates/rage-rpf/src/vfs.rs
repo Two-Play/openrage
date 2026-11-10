@@ -73,7 +73,8 @@ pub fn resolve(root: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
     Ok(Node::ArchiveDir(archive, cur))
 }
 
-fn match_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {
+/// Finds `name` inside `dir`, ignoring ASCII case (game files keep Windows casing on Linux).
+pub fn match_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {
     let direct = if dir.as_os_str().is_empty() { PathBuf::from(name) } else { dir.join(name) };
     if direct.exists() {
         return Some(direct);
@@ -83,6 +84,11 @@ fn match_case_insensitive(dir: &Path, name: &str) -> Option<PathBuf> {
         .flatten()
         .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
         .map(|e| e.path())
+}
+
+/// Resolves a `/`-separated relative path below `root` case-insensitively.
+pub fn find_case_insensitive(root: &Path, rel: &str) -> Option<PathBuf> {
+    rel.split('/').filter(|s| !s.is_empty()).try_fold(root.to_path_buf(), |dir, seg| match_case_insensitive(&dir, seg))
 }
 
 /// Depth-first walk over a directory inside an archive.

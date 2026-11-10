@@ -7,6 +7,8 @@
 mod error;
 mod rpf7;
 pub mod vfs;
+pub mod writer;
 
 pub use error::RpfError;
 pub use rpf7::{Encryption, Entry, EntryId, EntryKind, Rpf7};
+pub use writer::{ArchiveWriter, RawEntry};

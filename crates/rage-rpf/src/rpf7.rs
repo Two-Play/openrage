@@ -419,6 +419,27 @@ impl Rpf7 {
         }
     }
 
+    /// Returns an entry's stored bytes unchanged (still compressed/encrypted),
+    /// for copying it into another archive.
+    pub fn read_raw_entry(&self, id: EntryId) -> Result<crate::writer::RawEntry, RpfError> {
+        use crate::writer::RawEntry;
+        match self.entries[id].kind {
+            EntryKind::Directory { .. } => Err(RpfError::NotFound(self.path_of(id))),
+            EntryKind::Binary { offset, stored_size, size, encrypted } => {
+                let on_disk = if stored_size == 0 { size } else { stored_size };
+                let data = self.read_raw(id, offset, on_disk as u64)?;
+                if encrypted && self.encryption == Encryption::Aes {
+                    // Raw AES data cannot be moved into an OPEN archive (it would be read as NG).
+                    return Err(RpfError::NotAnArchive(format!("{} (AES-encrypted entry)", self.path_of(id))));
+                }
+                Ok(RawEntry::Binary { data, compressed: stored_size > 0, size, encrypted })
+            }
+            EntryKind::Resource { offset, size, system_flags, graphics_flags } => {
+                Ok(RawEntry::Resource { data: self.read_raw(id, offset, size as u64)?, system_flags, graphics_flags })
+            }
+        }
+    }
+
     /// Reads a resource and returns its inflated page data (system + graphics pages).
     pub fn read_resource_pages(&self, id: EntryId) -> Result<Vec<u8>, RpfError> {
         let container = self.read(id)?;

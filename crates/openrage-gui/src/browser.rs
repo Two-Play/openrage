@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rage_crypto::GtaVKeys;
+use rage_mods::Origin;
 use rage_rpf::vfs::{self, Node};
 use rage_rpf::{EntryId, EntryKind, Rpf7, RpfError};
 
@@ -22,6 +23,36 @@ impl ItemKind {
     }
 }
 
+/// How an item relates to the mods folder (overlay view only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    /// A game file replaced by a file in `mods`.
+    Replaced,
+    /// Exists only in `mods`.
+    New,
+    /// A game folder with modded files somewhere below it.
+    ContainsMods,
+    /// Inside a modded archive: not in the original.
+    Added,
+    /// Inside a modded archive: differs from the original.
+    Changed,
+    /// In the original, but removed by the mod (shown greyed out).
+    Removed,
+}
+
+impl Mark {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Replaced => "mod",
+            Self::New => "new",
+            Self::ContainsMods => "has mods",
+            Self::Added => "added",
+            Self::Changed => "changed",
+            Self::Removed => "removed",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Item {
     pub name: String,
@@ -32,6 +63,7 @@ pub struct Item {
     pub entry: Option<EntryId>,
     /// Full virtual path, set for search hits (which come from many places).
     pub vpath: Option<String>,
+    pub mark: Option<Mark>,
 }
 
 /// Where a listing comes from.
@@ -44,7 +76,14 @@ pub enum Location {
         query: String,
         summary: String,
     },
+    /// All changes made by the mods folder.
+    Changes {
+        summary: String,
+    },
 }
+
+/// The virtual path of the mod change list.
+pub const CHANGES_PATH: &str = "!mods";
 
 /// Virtual paths starting with `?` are searches.
 pub fn search_query(vpath: &str) -> Option<&str> {
@@ -54,19 +93,21 @@ pub fn search_query(vpath: &str) -> Option<&str> {
 pub struct Listing {
     /// Normalized virtual path (`/`-separated, no leading or trailing slash).
     pub vpath: String,
+    /// Where the listed folder comes from in the overlay view.
+    pub origin: Origin,
     pub location: Location,
     pub items: Vec<Item>,
 }
 
 pub fn normalize(vpath: &str) -> String {
-    if vpath.starts_with('?') {
+    if vpath.starts_with('?') || vpath.starts_with('!') {
         return vpath.trim().to_owned();
     }
     vpath.replace('\\', "/").split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("/")
 }
 
 pub fn parent(vpath: &str) -> Option<String> {
-    if vpath.is_empty() || vpath.starts_with('?') {
+    if vpath.is_empty() || vpath.starts_with('?') || vpath.starts_with('!') {
         return None;
     }
     Some(vpath.rsplit_once('/').map(|(p, _)| p.to_owned()).unwrap_or_default())
@@ -105,6 +146,9 @@ pub fn short_location(path: &str, max_chars: usize) -> String {
         Some(name) => {
             let rest = path.split_once(&format!("/{name}/")).map_or("", |(_, r)| r);
             let rest = rest.strip_prefix("dlc.rpf/").or_else(|| rest.strip_prefix("dlc1.rpf/")).unwrap_or(rest);
+            if rest.is_empty() {
+                return format!("{name} (DLC pack)");
+            }
             format!("{name}: {}", shorten_front(rest, max_chars.saturating_sub(name.len() + 2).max(12)))
         }
         None => shorten_front(path, max_chars),
@@ -117,20 +161,63 @@ fn last_segment(vpath: &str) -> String {
 
 /// Lists a virtual path. If the path names a file, its folder is listed and
 /// the file name is returned so the caller can select it.
-pub fn list(game_dir: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Result<(Listing, Option<String>), RpfError> {
+///
+/// With `overlay`, the game is shown as it sees itself with OpenIV.asi: files
+/// in `mods` replace game files, and game folders merge with their `mods` counterpart.
+pub fn list(
+    game_dir: &Path,
+    vpath: &str,
+    keys: Option<Arc<GtaVKeys>>,
+    overlay: bool,
+) -> Result<(Listing, Option<String>), RpfError> {
     let vpath = normalize(vpath);
-    match vfs::resolve(game_dir, &vpath, keys.clone())? {
-        Node::Dir(dir) => Ok((list_disk(vpath, dir)?, None)),
-        Node::ArchiveDir(rpf, dir) => Ok((list_archive(vpath, rpf, dir), None)),
+    let (node, origin) = if overlay {
+        rage_mods::resolve(game_dir, &vpath, keys.clone())?
+    } else {
+        (vfs::resolve(game_dir, &vpath, keys.clone())?, Origin::Base)
+    };
+    match node {
+        Node::Dir(dir) => {
+            let mut listing = list_disk(vpath, dir, origin)?;
+            if overlay {
+                merge_mods(game_dir, &mut listing);
+            }
+            Ok((listing, None))
+        }
+        Node::ArchiveDir(rpf, dir) => Ok((list_archive(vpath, rpf, dir, origin), None)),
         Node::ArchiveFile(..) | Node::PlainFile(_) => {
             let name = last_segment(&vpath);
-            let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys)?;
+            let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys, overlay)?;
             Ok((listing, Some(name)))
         }
     }
 }
 
-fn list_disk(vpath: String, dir: PathBuf) -> Result<Listing, RpfError> {
+/// Adds the `mods` counterpart of a disk folder to its listing and marks items.
+fn merge_mods(game_dir: &Path, listing: &mut Listing) {
+    let Some(mods) = rage_mods::mods_dir(game_dir) else { return };
+    if listing.vpath.is_empty() {
+        listing.items.retain(|i| !i.name.eq_ignore_ascii_case(rage_mods::overlay::MODS_FOLDER));
+    }
+    if listing.origin == Origin::Mods {
+        listing.items.iter_mut().for_each(|i| i.mark = Some(Mark::New));
+        return;
+    }
+    let Some(mod_dir) = vfs::find_case_insensitive(&mods, &listing.vpath).filter(|p| p.is_dir()) else { return };
+    let Ok(Listing { items: mod_items, .. }) = list_disk(listing.vpath.clone(), mod_dir, Origin::Mods) else { return };
+    for m in mod_items {
+        match listing.items.iter_mut().find(|i| i.name.eq_ignore_ascii_case(&m.name)) {
+            Some(existing) if m.kind == ItemKind::Dir => existing.mark = Some(Mark::ContainsMods),
+            Some(existing) => {
+                existing.size = m.size;
+                existing.mark = Some(Mark::Replaced);
+            }
+            None => listing.items.push(Item { mark: Some(Mark::New), ..m }),
+        }
+    }
+}
+
+fn list_disk(vpath: String, dir: PathBuf, origin: Origin) -> Result<Listing, RpfError> {
     let mut items = Vec::new();
     for entry in fs::read_dir(&dir)?.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
@@ -143,12 +230,12 @@ fn list_disk(vpath: String, dir: PathBuf) -> Result<Listing, RpfError> {
             ItemKind::File
         };
         let size = if meta.is_dir() { 0 } else { meta.len() };
-        items.push(Item { name, kind, size, info: String::new(), entry: None, vpath: None });
+        items.push(Item { name, kind, size, info: String::new(), entry: None, vpath: None, mark: None });
     }
-    Ok(Listing { vpath, location: Location::Disk(dir), items })
+    Ok(Listing { vpath, origin, location: Location::Disk(dir), items })
 }
 
-fn list_archive(vpath: String, rpf: Arc<Rpf7>, dir: EntryId) -> Listing {
+fn list_archive(vpath: String, rpf: Arc<Rpf7>, dir: EntryId, origin: Origin) -> Listing {
     let items = rpf
         .children(dir)
         .map(|id| {
@@ -170,10 +257,10 @@ fn list_archive(vpath: String, rpf: Arc<Rpf7>, dir: EntryId) -> Listing {
                     (ItemKind::Resource, e.resource_version().map(|v| format!("v{v}")).unwrap_or_default())
                 }
             };
-            Item { name: e.name.clone(), kind, size: e.size(), info, entry: Some(id), vpath: None }
+            Item { name: e.name.clone(), kind, size: e.size(), info, entry: Some(id), vpath: None, mark: None }
         })
         .collect();
-    Listing { vpath, location: Location::Archive(rpf, dir), items }
+    Listing { vpath, origin, location: Location::Archive(rpf, dir), items }
 }
 
 /// Sort columns: 0 name, 1 type, 2 size, 3 info. Containers always come first.
@@ -212,8 +299,8 @@ pub struct Tree {
     pub nodes: Vec<TreeNode>,
 }
 
-fn containers(game_dir: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Vec<(String, ItemKind)> {
-    let Ok((listing, None)) = list(game_dir, vpath, keys) else { return Vec::new() };
+fn containers(game_dir: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>, overlay: bool) -> Vec<(String, ItemKind)> {
+    let Ok((listing, None)) = list(game_dir, vpath, keys, overlay) else { return Vec::new() };
     let mut out: Vec<(String, ItemKind)> =
         listing.items.into_iter().filter(|i| i.kind.is_container()).map(|i| (i.name, i.kind)).collect();
     out.sort_by(|a, b| {
@@ -223,8 +310,8 @@ fn containers(game_dir: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Vec<
 }
 
 impl Tree {
-    pub fn build(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> Self {
-        let nodes = containers(game_dir, "", keys)
+    pub fn build(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, overlay: bool) -> Self {
+        let nodes = containers(game_dir, "", keys, overlay)
             .into_iter()
             .map(|(name, kind)| TreeNode {
                 vpath: name.clone(),
@@ -238,17 +325,17 @@ impl Tree {
         Self { nodes }
     }
 
-    pub fn toggle(&mut self, idx: usize, game_dir: &Path, keys: Option<Arc<GtaVKeys>>) {
-        if self.nodes[idx].expanded { self.collapse(idx) } else { self.expand(idx, game_dir, keys) }
+    pub fn toggle(&mut self, idx: usize, game_dir: &Path, keys: Option<Arc<GtaVKeys>>, overlay: bool) {
+        if self.nodes[idx].expanded { self.collapse(idx) } else { self.expand(idx, game_dir, keys, overlay) }
     }
 
-    fn expand(&mut self, idx: usize, game_dir: &Path, keys: Option<Arc<GtaVKeys>>) {
+    fn expand(&mut self, idx: usize, game_dir: &Path, keys: Option<Arc<GtaVKeys>>, overlay: bool) {
         let node = &self.nodes[idx];
         if node.expanded || !node.expandable {
             return;
         }
         let (depth, vpath) = (node.depth + 1, node.vpath.clone());
-        let children: Vec<TreeNode> = containers(game_dir, &vpath, keys)
+        let children: Vec<TreeNode> = containers(game_dir, &vpath, keys, overlay)
             .into_iter()
             .map(|(name, kind)| TreeNode {
                 vpath: join(&vpath, &name),
@@ -273,7 +360,13 @@ impl Tree {
     }
 
     /// Expands the ancestors of `vpath` and returns the node index for it, if shown.
-    pub fn reveal(&mut self, vpath: &str, game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> Option<usize> {
+    pub fn reveal(
+        &mut self,
+        vpath: &str,
+        game_dir: &Path,
+        keys: Option<Arc<GtaVKeys>>,
+        overlay: bool,
+    ) -> Option<usize> {
         let segments: Vec<&str> = vpath.split('/').filter(|s| !s.is_empty()).collect();
         let mut found = None;
         let mut prefix = String::new();
@@ -282,7 +375,7 @@ impl Tree {
             let idx = self.nodes.iter().position(|n| n.vpath.eq_ignore_ascii_case(&prefix))?;
             found = Some(idx);
             if i + 1 < segments.len() {
-                self.expand(idx, game_dir, keys.clone());
+                self.expand(idx, game_dir, keys.clone(), overlay);
             }
         }
         found
@@ -350,6 +443,7 @@ mod tests {
             "mpheist4: x64/data/lang/germandlc.rpf"
         );
         assert_eq!(short_location("common.rpf/data/ai", 40), "common.rpf/data/ai");
+        assert_eq!(short_location("update/x64/dlcpacks/mytest", 40), "mytest (DLC pack)");
         assert_eq!(
             shorten_front("update/x64/dlcpacks/mpbeach/dlc.rpf/common/data", 30),
             "…/mpbeach/dlc.rpf/common/data"
