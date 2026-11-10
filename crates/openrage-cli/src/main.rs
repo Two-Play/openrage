@@ -78,6 +78,9 @@ enum Command {
         /// Instead of archives, check every texture dictionary: parse it and decode all textures.
         #[arg(long)]
         textures: bool,
+        /// With --textures: also rebuild every dictionary and check that it reads back identically.
+        #[arg(long, requires = "textures")]
+        rebuild: bool,
     },
     /// List the textures of a texture dictionary (.ytd) and optionally export them.
     Textures {
@@ -89,6 +92,13 @@ enum Command {
         /// Export PNG images instead of DDS (top mip level only).
         #[arg(long)]
         png: bool,
+        /// Replace or add a texture from a DDS file: `name=file.dds` (repeatable).
+        /// The changed dictionary is written into the mods folder, like OpenIV.
+        #[arg(long = "set", value_name = "NAME=DDS")]
+        sets: Vec<String>,
+        /// Remove a texture (repeatable); also written into the mods folder.
+        #[arg(long = "remove", value_name = "NAME")]
+        removes: Vec<String>,
     },
     /// Build or update the search index (only changed archives are re-read).
     Index,
@@ -171,9 +181,12 @@ fn run() -> Result<()> {
         Command::Info { path } => cmd_info(&game_dir, &path, keys),
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
-        Command::Verify { path, textures: false } => cmd_verify(&game_dir, &path, keys),
-        Command::Verify { path, textures: true } => cmd_verify_textures(&game_dir, &path, keys),
-        Command::Textures { path, export, png } => cmd_textures(&game_dir, &path, export.as_deref(), png, keys),
+        Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
+        Command::Verify { path, textures: true, rebuild } => cmd_verify_textures(&game_dir, &path, rebuild, keys),
+        Command::Textures { path, sets, removes, .. } if !sets.is_empty() || !removes.is_empty() => {
+            cmd_edit_textures(&game_dir, &path, &sets, &removes, keys)
+        }
+        Command::Textures { path, export, png, .. } => cmd_textures(&game_dir, &path, export.as_deref(), png, keys),
         Command::Index => cmd_index(&game_dir, keys),
         Command::Mods { changes, deep } => cmd_mods(&game_dir, changes, deep, keys),
         Command::Repack { archive, out, sets, removes } => cmd_repack(&game_dir, &archive, &out, &sets, &removes, keys),
@@ -342,7 +355,7 @@ fn cmd_repack(
     removes: &[String],
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
-    use openrage_app::repack::{Edit, repack};
+    use openrage_app::repack::{Edit, repack_into};
     let rpf = match vfs::resolve(game_dir, archive, keys)? {
         Node::ArchiveDir(rpf, id) if id == Rpf7::ROOT => rpf,
         _ => bail!("{archive} is not an archive"),
@@ -355,9 +368,11 @@ fn cmd_repack(
     for r in removes {
         edits.insert(r.clone(), Edit::Remove);
     }
-    let bytes = repack(&rpf, &edits)?;
-    fs::write(out, &bytes).with_context(|| format!("writing {}", out.display()))?;
-    outln!("Wrote {} ({}) with {} edits.", out.display(), human(bytes.len() as u64), edits.len());
+    let mut file =
+        std::io::BufWriter::new(fs::File::create(out).with_context(|| format!("creating {}", out.display()))?);
+    let written = repack_into(&rpf, &edits, &mut file)?;
+    std::io::Write::flush(&mut file)?;
+    outln!("Wrote {} ({}) with {} edits.", out.display(), human(written), edits.len());
     Ok(())
 }
 
@@ -416,7 +431,35 @@ fn cmd_textures(
     Ok(())
 }
 
-fn cmd_verify_textures(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+fn cmd_edit_textures(
+    game_dir: &Path,
+    path: &str,
+    sets: &[String],
+    removes: &[String],
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
+    use rage_formats::ytd_write::Edit;
+    let mut edits = Vec::new();
+    for s in sets {
+        let (name, file) = s.split_once('=').context("--set expects name=file.dds")?;
+        edits.push(Edit::Set(openrage_app::textures::texture_from_dds(name, Path::new(file))?));
+    }
+    edits.extend(removes.iter().map(|r| Edit::Remove(r.clone())));
+    let started = Instant::now();
+    let (result, written) = openrage_app::textures::edit_textures(game_dir, keys, path, &edits)?;
+    outln!(
+        "{}: {} replaced/added ({} new), {} removed — {}",
+        path,
+        result.replaced + result.added,
+        result.added,
+        result.removed,
+        if result.in_place { "pixel data replaced in place" } else { "dictionary rebuilt" }
+    );
+    outln!("Written to {} ({:.1}s)", written.display(), started.elapsed().as_secs_f32());
+    Ok(())
+}
+
+fn cmd_verify_textures(game_dir: &Path, within: &str, rebuild: bool, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     #[derive(Default)]
     struct Stats {
         dicts: usize,
@@ -453,6 +496,63 @@ fn cmd_verify_textures(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>
                         Err(e) => return s.errors.push(format!("{p}: {e:#}")),
                     };
                     s.errors.extend(dict.errors.iter().map(|e| format!("{p}: {e}")));
+                    if rebuild && dict.errors.is_empty() {
+                        let check = rage_formats::ytd_write::rebuild(&dict)
+                            .and_then(|file| rage_resource::Resource::from_rsc7(&file))
+                            .and_then(|res| rage_formats::ytd::parse(&res));
+                        match check {
+                            Ok(back) => {
+                                let mut a: Vec<_> = dict
+                                    .textures
+                                    .iter()
+                                    .map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data))
+                                    .collect();
+                                let mut b: Vec<_> = back
+                                    .textures
+                                    .iter()
+                                    .map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data))
+                                    .collect();
+                                a.sort_by(|x, y| x.0.cmp(y.0));
+                                b.sort_by(|x, y| x.0.cmp(y.0));
+                                if a != b || !back.errors.is_empty() {
+                                    s.errors.push(format!("{p}: rebuilt dictionary differs from the original"));
+                                }
+                                // Structures must match byte for byte, apart from pointers.
+                                let pointers: &[(usize, usize)] = match dict.layout {
+                                    rage_formats::ytd::Layout::Legacy => &[(0x28, 0x30), (0x70, 0x78)],
+                                    rage_formats::ytd::Layout::Enhanced => &[(0x28, 0x40)],
+                                };
+                                let masked = |t: &[u8]| {
+                                    let mut t = t.to_vec();
+                                    for &(from, to) in pointers {
+                                        t[from..to].fill(0);
+                                    }
+                                    t
+                                };
+                                for (t, st) in dict.textures.iter().zip(&dict.stored) {
+                                    let Some(j) = back.textures.iter().position(|x| x.name == t.name) else { continue };
+                                    let (x, y) = (masked(&st.template), masked(&back.stored[j].template));
+                                    if x != y {
+                                        let diffs: Vec<String> = (0..x.len())
+                                            .filter(|&i| x[i] != y[i])
+                                            .map(|i| format!("{i:#x}: {:02x}→{:02x}", x[i], y[i]))
+                                            .collect();
+                                        s.errors.push(format!(
+                                            "{p}/{}: rebuilt texture structure differs ({}x{} {} mips {}; {})",
+                                            t.name,
+                                            t.width,
+                                            t.height,
+                                            t.format.name(),
+                                            t.levels,
+                                            diffs.join(", ")
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
+                        }
+                    }
                     for t in &dict.textures {
                         s.textures += 1;
                         match t.to_rgba() {

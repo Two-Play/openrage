@@ -9,5 +9,7 @@ license.workspace = true
 rage-core.workspace = true
 rage-crypto.workspace = true
 rage-rpf.workspace = true
+rage-mods.workspace = true
+rage-formats.workspace = true
 anyhow.workspace = true
 dirs.workspace = true

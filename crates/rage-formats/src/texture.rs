@@ -62,6 +62,30 @@ impl Format {
         })
     }
 
+    /// The Direct3D 9 code GTA V Legacy uses for this format, if it has one.
+    pub fn to_d3d9(self) -> Option<u32> {
+        Some(match self {
+            Self::B8G8R8A8_UNORM => 21,
+            Self::B8G8R8X8_UNORM => 22,
+            Self::B5G5R5A1_UNORM => 25,
+            Self::A8_UNORM => 28,
+            Self::R8G8B8A8_UNORM => 32,
+            Self::R8_UNORM => 50,
+            Self::BC1_UNORM => 0x3154_5844,
+            Self::BC2_UNORM => 0x3354_5844,
+            Self::BC3_UNORM => 0x3554_5844,
+            Self::BC4_UNORM => 0x3149_5441,
+            Self::BC5_UNORM => 0x3249_5441,
+            Self::BC7_UNORM => 0x2037_4342,
+            _ => return None,
+        })
+    }
+
+    /// Bytes per block (compressed) or per pixel (uncompressed).
+    pub fn block_or_pixel_bytes(self) -> u32 {
+        self.block_bytes().map_or_else(|| self.bits_per_pixel().map_or(8, |b| (b / 8).max(1)) as u32, |b| b as u32)
+    }
+
     /// Bytes per 4×4 block for block-compressed formats.
     pub fn block_bytes(self) -> Option<usize> {
         match self.0 {

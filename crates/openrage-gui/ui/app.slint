@@ -233,7 +233,8 @@ export component AppWindow inherits Window {
     in property <string> preview-text;
     in property <image> preview-image;
     in property <bool> has-image;
-    in property <bool> can-png;
+    in property <bool> texture-mode;
+    in property <bool> texture-selected;
     in property <bool> preview-loading;
 
     // Status / background task
@@ -266,6 +267,9 @@ export component AppWindow inherits Window {
     callback language-picked(int);
     callback extract-selected();
     callback save-png();
+    callback texture-replace();
+    callback texture-add();
+    callback texture-remove();
     callback cancel-task();
     callback open-setup();
     callback setup-browse-game();
@@ -328,11 +332,7 @@ export component AppWindow inherits Window {
                 enabled: root.can-extract && !root.busy;
                 clicked => { root.extract-selected(); }
             }
-            if root.can-png: Button {
-                text: @tr("Save PNG…");
-                enabled: !root.busy;
-                clicked => { root.save-png(); }
-            }
+
             Button {
                 text: @tr("Setup");
                 clicked => { root.open-setup(); }
@@ -367,6 +367,37 @@ export component AppWindow inherits Window {
             // File list
             VerticalLayout {
                 horizontal-stretch: 1;
+                if root.texture-mode: HorizontalLayout {
+                    padding: 6px;
+                    spacing: 6px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: @tr("Texture dictionary — changes are written to the mods folder, like OpenIV.");
+                        vertical-alignment: center;
+                        overflow: elide;
+                        color: Palette.foreground.with-alpha(0.8);
+                    }
+                    Button {
+                        text: @tr("Replace…");
+                        enabled: root.texture-selected && !root.busy;
+                        clicked => { root.texture-replace(); }
+                    }
+                    Button {
+                        text: @tr("Add…");
+                        enabled: !root.busy;
+                        clicked => { root.texture-add(); }
+                    }
+                    Button {
+                        text: @tr("Remove");
+                        enabled: root.texture-selected && !root.busy;
+                        clicked => { root.texture-remove(); }
+                    }
+                    Button {
+                        text: @tr("Save PNG…");
+                        enabled: !root.busy;
+                        clicked => { root.save-png(); }
+                    }
+                }
                 if root.search-mode: HorizontalLayout {
                     padding: 6px;
                     spacing: 8px;

@@ -4,8 +4,10 @@
 pub mod config;
 pub mod detect;
 pub mod extract;
+pub mod install;
 pub mod repack;
 pub mod setup;
+pub mod textures;
 
 use std::sync::Arc;
 

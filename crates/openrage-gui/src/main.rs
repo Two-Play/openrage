@@ -241,6 +241,12 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_extract_selected(move || with_ui(&w, start_extract));
     let w = ui.as_weak();
     ui.on_save_png(move || with_ui(&w, |ui| export_textures(ui, true)));
+    let w = ui.as_weak();
+    ui.on_texture_replace(move || with_ui(&w, |ui| edit_texture(ui, TextureAction::Replace)));
+    let w = ui.as_weak();
+    ui.on_texture_add(move || with_ui(&w, |ui| edit_texture(ui, TextureAction::Add)));
+    let w = ui.as_weak();
+    ui.on_texture_remove(move || with_ui(&w, |ui| edit_texture(ui, TextureAction::Remove)));
     ui.on_cancel_task(|| with_app(|a| a.cancel.store(true, Ordering::Relaxed)));
     let w = ui.as_weak();
     ui.on_open_setup(move || with_ui(&w, |ui| show_setup(ui, true)));
@@ -435,7 +441,9 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
         matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Archive(..) | Location::Textures { .. }))
             || a.selected.is_some()
     }));
-    ui.set_can_png(with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { .. }))));
+    let texture_mode = with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { .. })));
+    ui.set_texture_mode(texture_mode);
+    ui.set_texture_selected(texture_mode && selected_row.is_some());
     if let (Some(row), Some(_)) = (selected_row, select) {
         select_row(ui, row);
     }
@@ -587,6 +595,7 @@ fn select_row(ui: &AppWindow, row: usize) {
     };
     ui.set_file_selected(row as i32);
     ui.set_can_extract(true);
+    ui.set_texture_selected(item.kind == ItemKind::Texture);
 
     let mut info =
         format!("{}\n{}\n{} · {}", item.name, vpath, badges::type_name(&item.name, item.kind), human_size(item.size));
@@ -1147,6 +1156,86 @@ fn export_textures(ui: &AppWindow, png: bool) {
             msg.push_str(&format!(" — {} problem(s), first: {first}", problems.len()));
         }
         let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+    });
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextureAction {
+    Replace,
+    Add,
+    Remove,
+}
+
+/// Replaces, adds or removes a texture of the open dictionary and writes the
+/// result into the mods folder (in the background).
+fn edit_texture(ui: &AppWindow, action: TextureAction) {
+    let Some((game_dir, keys, ytd, selected)) = with_app(|a| {
+        let l = a.listing.as_ref()?;
+        if !matches!(l.location, Location::Textures { .. }) {
+            return None;
+        }
+        let selected = a.selected.map(|s| l.items[s].name.clone());
+        Some((a.game_dir.clone()?, a.keys.clone(), l.vpath.clone(), selected))
+    }) else {
+        return;
+    };
+    if action != TextureAction::Add && selected.is_none() {
+        ui.set_status("Select a texture first.".into());
+        return;
+    }
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        use rage_formats::ytd_write::Edit;
+        let edit = match action {
+            TextureAction::Remove => Edit::Remove(selected.clone().unwrap_or_default()),
+            TextureAction::Replace | TextureAction::Add => {
+                let title =
+                    if action == TextureAction::Replace { "Replace texture with DDS" } else { "Add texture from DDS" };
+                let Some(file) =
+                    rfd::FileDialog::new().set_title(title).add_filter("DDS texture", &["dds"]).pick_file()
+                else {
+                    return;
+                };
+                let name = match action {
+                    TextureAction::Replace => selected.clone().unwrap_or_default(),
+                    _ => file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                };
+                match openrage_app::textures::texture_from_dds(&name, &file) {
+                    Ok(t) => Edit::Set(t),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+                        return;
+                    }
+                }
+            }
+        };
+        let _ = weak.upgrade_in_event_loop(|ui| {
+            set_busy(&ui, true, "Writing the changed dictionary into the mods folder…".into())
+        });
+        let started = Instant::now();
+        let result = openrage_app::textures::edit_textures(&game_dir, keys, &ytd, &[edit]);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            let msg = match &result {
+                Ok((r, path)) => format!(
+                    "{} — written to {} in {:.1}s",
+                    if r.in_place { "Texture replaced in place" } else { "Dictionary rebuilt" },
+                    path.display(),
+                    started.elapsed().as_secs_f32()
+                ),
+                Err(e) => format!("Could not change the dictionary: {e:#}"),
+            };
+            set_busy(&ui, false, String::new());
+            if result.is_ok() {
+                // The change lives in the mods folder: show the game as it sees itself.
+                with_app(|a| a.overlay = true);
+                ui.set_mods_available(true);
+                ui.set_mods_overlay(true);
+                rebuild_tree(&ui);
+                navigate(&ui, &ytd, false);
+            }
+            ui.set_status(msg.into());
+        });
     });
 }
 
