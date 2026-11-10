@@ -844,7 +844,8 @@ fn cmd_model(
     }
     let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("model");
     if let Some(out) = export {
-        let glb = openrage_app::models::to_glb(&model, stem).context("model has nothing to export")?;
+        let glb = openrage_app::models::to_glb(&model, stem, &model.default_visibility())
+            .context("model has nothing to export")?;
         fs::write(out, &glb).with_context(|| format!("writing {}", out.display()))?;
         outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
     }
@@ -853,7 +854,7 @@ fn cmd_model(
         let materials = render::Materials::new(&model);
         let view = render::View { yaw: yaw.to_radians(), ..Default::default() };
         let started = Instant::now();
-        let rgba = render::render(&model, &materials, view, 960, 600);
+        let rgba = render::render(&model, &model.default_visibility(), &materials, view, 960, 600);
         let ms = started.elapsed().as_millis();
         fs::write(out, rage_formats::png(960, 600, &rgba)?)?;
         outln!("Rendered {} in {ms} ms", out.display());

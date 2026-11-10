@@ -101,10 +101,10 @@ fn norm(a: V3) -> V3 {
     [a[0] / l, a[1] / l, a[2] / l]
 }
 
-/// Model-space bounds of the visible parts, `None` if there is nothing to show.
-pub fn bounds(model: &LoadedModel) -> Option<([f32; 3], [f32; 3])> {
+/// Model-space bounds of the shown parts, `None` if there is nothing to show.
+pub fn bounds(model: &LoadedModel, visible: &[bool]) -> Option<([f32; 3], [f32; 3])> {
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-    for (part, d) in model.visible_parts() {
+    for (part, d) in model.shown(visible) {
         for p in d.meshes.iter().flat_map(|m| &m.positions) {
             let p = math::transform_point(&part.transform, *p);
             for i in 0..3 {
@@ -143,16 +143,23 @@ pub fn orbit_camera(lo: [f32; 3], hi: [f32; 3], view: View) -> Camera {
     Camera { eye, forward, right, up, distance, radius, fov }
 }
 
-/// Renders the visible parts of `model` into an RGBA image of `width × height`
-/// with a transparent background.
-pub fn render(model: &LoadedModel, materials: &Materials, view: View, width: usize, height: usize) -> Vec<u8> {
+/// Renders the parts of `model` shown by `visible` into an RGBA image of
+/// `width × height` with a transparent background.
+pub fn render(
+    model: &LoadedModel,
+    visible: &[bool],
+    materials: &Materials,
+    view: View,
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
     let (w, h) = (width.max(1), height.max(1));
     // Transparent background: the UI (or the PNG viewer) shows through.
     let mut color = vec![0u8; w * h * 4];
     let mut depth = vec![f32::INFINITY; w * h];
 
     // Bounds from the vertices (more reliable than stored bounds).
-    let Some((lo, hi)) = bounds(model) else { return color };
+    let Some((lo, hi)) = bounds(model, visible) else { return color };
     let Camera { eye, forward, right, up, distance, fov, .. } = orbit_camera(lo, hi, view);
     // Fit the field of view to the shorter side so tall previews do not crop.
     let focal = (w.min(h) as f32 / 2.0) / (fov / 2.0).tan();
@@ -165,7 +172,7 @@ pub fn render(model: &LoadedModel, materials: &Materials, view: View, width: usi
         (w as f32 / 2.0 + dot(r, right) * focal / z, h as f32 / 2.0 - dot(r, up) * focal / z, z)
     };
 
-    for (part, d) in model.visible_parts() {
+    for (part, d) in model.shown(visible) {
         for mesh in &d.meshes {
             let img = materials.image(part.drawable, mesh.shader);
             let has_uv = mesh.uvs.len() == mesh.positions.len();

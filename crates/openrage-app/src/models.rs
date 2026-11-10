@@ -43,17 +43,26 @@ impl LoadedModel {
         drawable.textures.as_ref().and_then(find).or_else(|| self.external.iter().find_map(|(_, d)| find(d)))
     }
 
-    /// Visible parts with their drawables.
-    pub fn visible_parts(&self) -> impl Iterator<Item = (&Part, &Drawable)> {
-        self.parts.iter().filter(|p| p.visible).filter_map(|p| Some((p, &self.drawables.get(p.drawable)?.1)))
+    /// The default visibility of every part.
+    pub fn default_visibility(&self) -> Vec<bool> {
+        self.parts.iter().map(|p| p.visible).collect()
     }
 
-    pub fn triangle_count(&self) -> usize {
-        self.visible_parts().map(|(_, d)| d.triangle_count()).sum()
+    /// Parts shown by `visible` (one flag per part) with their drawables.
+    pub fn shown<'a>(&'a self, visible: &'a [bool]) -> impl Iterator<Item = (&'a Part, &'a Drawable)> + 'a {
+        self.parts
+            .iter()
+            .zip(visible)
+            .filter(|(_, v)| **v)
+            .filter_map(|(p, _)| Some((p, &self.drawables.get(p.drawable)?.1)))
     }
 
-    pub fn vertex_count(&self) -> usize {
-        self.visible_parts().map(|(_, d)| d.vertex_count()).sum()
+    pub fn triangle_count(&self, visible: &[bool]) -> usize {
+        self.shown(visible).map(|(_, d)| d.triangle_count()).sum()
+    }
+
+    pub fn vertex_count(&self, visible: &[bool]) -> usize {
+        self.shown(visible).map(|(_, d)| d.vertex_count()).sum()
     }
 }
 
@@ -208,18 +217,15 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
     Ok(LoadedModel { drawables, parts, external })
 }
 
-/// Exports the visible parts of a model as `.glb` (one node per part).
-pub fn to_glb(model: &LoadedModel, name: &str) -> Option<Vec<u8>> {
-    let used: Vec<usize> = model.parts.iter().filter(|p| p.visible).map(|p| p.drawable).collect();
-    if used.is_empty() {
-        return None;
-    }
+/// Exports the parts shown by `visible` as `.glb` (one node per part).
+pub fn to_glb(model: &LoadedModel, name: &str, visible: &[bool]) -> Option<Vec<u8>> {
     let meshes: Vec<(&str, &Drawable)> = model.drawables.iter().map(|(n, d)| (n.as_str(), d)).collect();
     let nodes: Vec<rage_formats::gltf::Node> = model
-        .parts
-        .iter()
-        .filter(|p| p.visible)
-        .map(|p| rage_formats::gltf::Node { name: p.name.clone(), mesh: p.drawable, transform: p.transform })
+        .shown(visible)
+        .map(|(p, _)| rage_formats::gltf::Node { name: p.name.clone(), mesh: p.drawable, transform: p.transform })
         .collect();
+    if nodes.is_empty() {
+        return None;
+    }
     Some(rage_formats::gltf::write_glb_scene(name, &meshes, &nodes, &|d, t| model.texture(&model.drawables[d].1, t)))
 }
