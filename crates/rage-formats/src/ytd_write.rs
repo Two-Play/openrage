@@ -346,7 +346,7 @@ mod tests {
             assert_eq!(names(&d3), ["alpha", "gamma"]);
             let alpha = d3.textures.iter().find(|t| t.name == "alpha").unwrap();
             assert_eq!((alpha.width, alpha.format, alpha.usage), (16, Format::BC3_UNORM, 20));
-            assert!(matches!(apply(&res, 0, 0, &back, &[Edit::Remove("nope".into())]), Err(_)));
+            assert!(apply(&res, 0, 0, &back, &[Edit::Remove("nope".into())]).is_err());
         }
     }
 }
