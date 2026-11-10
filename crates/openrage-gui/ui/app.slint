@@ -48,6 +48,7 @@ component IconButton inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
     in property <bool> active;
+    in property <color> tint: Theme.text;
     callback clicked();
     width: 30px;
     height: 30px;
@@ -61,7 +62,7 @@ component IconButton inherits Rectangle {
         width: 18px;
         height: 18px;
         source: root.icon;
-        colorize: root.enabled ? Theme.text : Theme.text-faint;
+        colorize: root.enabled ? root.tint : Theme.text-faint;
         image-rendering: smooth;
     }
     ta := TouchArea {
@@ -103,14 +104,40 @@ component TreeItem inherits Rectangle {
     in property <bool> selected;
     callback toggle();
     callback activate();
+    callback action(string);
     height: Theme.row-height;
     border-radius: Theme.radius-s;
     background: selected ? Theme.selection : area.has-hover ? Theme.hover : transparent;
     accessible-role: list-item;
     accessible-label: item.name;
-    area := TouchArea {
-        clicked => { root.activate(); }
-        double-clicked => { root.toggle(); }
+    ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: @tr("Open");
+                icon: @image-url("icons/menu/open.svg");
+                activated => { root.activate(); }
+            }
+            if item.expandable: MenuItem {
+                title: item.expanded ? @tr("Collapse") : @tr("Expand");
+                icon: @image-url("icons/menu/chevrons.svg");
+                activated => { root.toggle(); }
+            }
+            MenuItem {
+                title: @tr("Extract…");
+                icon: @image-url("icons/menu/extract.svg");
+                activated => { root.action("extract"); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: @tr("Copy path");
+                icon: @image-url("icons/menu/copy.svg");
+                activated => { root.action("copy-path"); }
+            }
+        }
+        area := TouchArea {
+            clicked => { root.activate(); }
+            double-clicked => { root.toggle(); }
+        }
     }
     HorizontalLayout {
         padding-left: Theme.space-xs + item.depth * 14px;
@@ -153,6 +180,7 @@ component FileItem inherits Rectangle {
     in property <bool> archive-mode;
     in property <bool> texture-mode;
     in property <bool> history-mode;
+    in property <bool> can-edit;
     callback select();
     callback open();
     callback action(string);
@@ -168,48 +196,63 @@ component FileItem inherits Rectangle {
         Menu {
             if item.can-open: MenuItem {
                 title: @tr("Open");
+                icon: @image-url("icons/menu/open.svg");
                 activated => { root.action("open"); }
             }
             if item.can-view: MenuItem {
                 title: @tr("Open in viewer");
+                icon: @image-url("icons/menu/expand.svg");
                 activated => { root.action("view"); }
             }
             if !root.history-mode: MenuItem {
                 title: @tr("Extract…");
+                icon: @image-url("icons/menu/extract.svg");
                 activated => { root.action("extract"); }
             }
             if item.is-model: MenuItem {
                 title: @tr("Export glTF…");
+                icon: @image-url("icons/menu/export.svg");
                 activated => { root.action("gltf"); }
             }
             if root.texture-mode: MenuItem {
                 title: @tr("Save PNG…");
+                icon: @image-url("icons/menu/image.svg");
                 activated => { root.action("png"); }
             }
             if root.archive-mode || root.texture-mode: MenuSeparator { }
             if root.archive-mode || root.texture-mode: MenuItem {
                 title: @tr("Replace…");
+                icon: @image-url("icons/menu/replace.svg");
+                enabled: root.can-edit;
                 activated => { root.action("replace"); }
             }
             if root.archive-mode: MenuItem {
                 title: @tr("Rename…");
+                icon: @image-url("icons/menu/rename.svg");
+                enabled: root.can-edit;
                 activated => { root.action("rename"); }
             }
             if root.archive-mode || root.texture-mode: MenuItem {
                 title: root.texture-mode ? @tr("Remove") : @tr("Delete");
+                icon: @image-url("icons/menu/trash.svg");
+                enabled: root.can-edit;
                 activated => { root.action("delete"); }
             }
             if root.history-mode: MenuItem {
                 title: @tr("Uninstall package");
+                icon: @image-url("icons/menu/trash.svg");
+                enabled: root.can-edit;
                 activated => { root.action("uninstall"); }
             }
             MenuSeparator { }
             MenuItem {
                 title: @tr("Copy name");
+                icon: @image-url("icons/menu/copy.svg");
                 activated => { root.action("copy-name"); }
             }
             MenuItem {
                 title: @tr("Copy path");
+                icon: @image-url("icons/menu/copy.svg");
                 activated => { root.action("copy-path"); }
             }
         }
@@ -481,6 +524,11 @@ export component AppWindow inherits Window {
     in property <bool> texture-mode;
     // Editing archives (written into the mods folder)
     in property <bool> archive-mode;
+    // Edit mode (like OpenIV): changes are only possible after unlocking.
+    in-out property <bool> edit-mode;
+    in-out property <bool> unlock-visible;
+    // The current archive or folder comes from the mods folder.
+    in property <bool> in-mods;
     in property <bool> entry-selected;
     in property <bool> can-undo;
     in property <string> undo-label;
@@ -524,6 +572,7 @@ export component AppWindow inherits Window {
     callback go-up();
     callback tree-toggle(int);
     callback tree-activate(int);
+    callback tree-action(int, string);
     callback file-select(int);
     callback file-open(int);
     callback row-action(int, string);
@@ -578,9 +627,18 @@ export component AppWindow inherits Window {
     property <length> preview-width: 460px;
     property <bool> has-selection: root.file-selected >= 0;
     property <bool> can-view: root.model-mode || root.has-image;
+    property <bool> can-edit: root.edit-mode && !root.busy;
 
     function apply-theme() {
         Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+
+    function toggle-edit-mode() {
+        if (root.edit-mode) {
+            root.edit-mode = false;
+        } else {
+            root.unlock-visible = true;
+        }
     }
 
     function set-theme(mode: int) {
@@ -605,7 +663,7 @@ export component AppWindow inherits Window {
     }
 
     function delete-selected() {
-        if (root.busy) {
+        if (!root.can-edit) {
             return;
         }
         if (root.archive-mode && root.entry-selected) {
@@ -616,6 +674,9 @@ export component AppWindow inherits Window {
     }
 
     function replace-selected() {
+        if (!root.can-edit) {
+            return;
+        }
         if (root.archive-mode && root.entry-selected) {
             root.archive-replace();
         } else if (root.texture-mode && root.texture-selected) {
@@ -628,29 +689,34 @@ export component AppWindow inherits Window {
             title: @tr("File");
             MenuItem {
                 title: @tr("Install package (.oiv)…");
+                icon: @image-url("icons/menu/package.svg");
                 shortcut: @keys(Control + O);
                 enabled: !root.busy;
                 activated => { root.install-oiv(); }
             }
             MenuItem {
                 title: @tr("Extract…");
+                icon: @image-url("icons/menu/extract.svg");
                 shortcut: @keys(Control + E);
                 enabled: root.can-extract && !root.busy;
                 activated => { root.extract-selected(); }
             }
             MenuItem {
                 title: @tr("Export glTF…");
+                icon: @image-url("icons/menu/export.svg");
                 enabled: root.model-mode && !root.busy;
                 activated => { root.export-gltf(); }
             }
             MenuItem {
                 title: @tr("Save PNG…");
+                icon: @image-url("icons/menu/image.svg");
                 enabled: root.texture-mode && !root.busy;
                 activated => { root.save-png(); }
             }
             MenuSeparator { }
             MenuItem {
                 title: @tr("Game setup…");
+                icon: @image-url("icons/menu/settings.svg");
                 activated => { root.open-setup(); }
             }
             MenuSeparator { }
@@ -663,15 +729,23 @@ export component AppWindow inherits Window {
         Menu {
             title: @tr("Edit");
             MenuItem {
+                title: root.edit-mode ? @tr("Lock editing") : @tr("Unlock editing…");
+                icon: root.edit-mode ? @image-url("icons/menu/lock.svg") : @image-url("icons/menu/unlock.svg");
+                activated => { root.toggle-edit-mode(); }
+            }
+            MenuSeparator { }
+            MenuItem {
                 title: root.can-undo ? @tr("Undo: {}", root.undo-label) : @tr("Undo");
+                icon: @image-url("icons/menu/undo.svg");
                 shortcut: @keys(Control + Z);
-                enabled: root.can-undo && !root.busy;
+                enabled: root.can-undo && root.can-edit;
                 activated => { root.undo(); }
             }
             MenuSeparator { }
             MenuItem {
                 title: root.texture-mode ? @tr("Add texture…") : @tr("Import files…");
-                enabled: (root.archive-mode || root.texture-mode) && !root.busy;
+                icon: @image-url("icons/menu/import.svg");
+                enabled: (root.archive-mode || root.texture-mode) && root.can-edit;
                 activated => {
                     if (root.texture-mode) {
                         root.texture-add();
@@ -682,24 +756,28 @@ export component AppWindow inherits Window {
             }
             MenuItem {
                 title: @tr("Replace…");
-                enabled: ((root.archive-mode && root.entry-selected) || (root.texture-mode && root.texture-selected)) && !root.busy;
+                icon: @image-url("icons/menu/replace.svg");
+                enabled: ((root.archive-mode && root.entry-selected) || (root.texture-mode && root.texture-selected)) && root.can-edit;
                 activated => { root.replace-selected(); }
             }
             MenuItem {
                 title: @tr("Rename…");
+                icon: @image-url("icons/menu/rename.svg");
                 shortcut: @keys(F2);
-                enabled: root.archive-mode && root.entry-selected && !root.busy;
+                enabled: root.archive-mode && root.entry-selected && root.can-edit;
                 activated => { root.archive-rename(); }
             }
             MenuItem {
                 title: @tr("New folder…");
+                icon: @image-url("icons/menu/new-folder.svg");
                 shortcut: @keys(Control + Shift + N);
-                enabled: root.archive-mode && !root.busy;
+                enabled: root.archive-mode && root.can-edit;
                 activated => { root.archive-new-folder(); }
             }
             MenuItem {
                 title: root.texture-mode ? @tr("Remove texture") : @tr("Delete");
-                enabled: ((root.archive-mode && root.entry-selected) || (root.texture-mode && root.texture-selected)) && !root.busy;
+                icon: @image-url("icons/menu/trash.svg");
+                enabled: ((root.archive-mode && root.entry-selected) || (root.texture-mode && root.texture-selected)) && root.can-edit;
                 activated => { root.delete-selected(); }
             }
         }
@@ -707,6 +785,7 @@ export component AppWindow inherits Window {
             title: @tr("View");
             MenuItem {
                 title: @tr("Open in viewer");
+                icon: @image-url("icons/menu/expand.svg");
                 shortcut: @keys(Control + Return);
                 enabled: root.can-view;
                 activated => { root.open-viewer(); }
@@ -727,6 +806,7 @@ export component AppWindow inherits Window {
             }
             MenuItem {
                 title: @tr("History");
+                icon: @image-url("icons/menu/history.svg");
                 shortcut: @keys(Control + H);
                 activated => { root.show-history(); }
             }
@@ -751,18 +831,21 @@ export component AppWindow inherits Window {
             title: @tr("Go");
             MenuItem {
                 title: @tr("Back");
+                icon: @image-url("icons/menu/back.svg");
                 shortcut: @keys(Alt + LeftArrow);
                 enabled: root.can-back;
                 activated => { root.go-back(); }
             }
             MenuItem {
                 title: @tr("Forward");
+                icon: @image-url("icons/menu/forward.svg");
                 shortcut: @keys(Alt + RightArrow);
                 enabled: root.can-forward;
                 activated => { root.go-forward(); }
             }
             MenuItem {
                 title: @tr("Up");
+                icon: @image-url("icons/menu/up.svg");
                 shortcut: @keys(Alt + UpArrow);
                 enabled: root.can-up;
                 activated => { root.go-up(); }
@@ -770,16 +853,19 @@ export component AppWindow inherits Window {
             MenuSeparator { }
             MenuItem {
                 title: @tr("Edit address");
+                icon: @image-url("icons/menu/rename.svg");
                 shortcut: @keys(Control + L);
                 activated => { address-edit.focus(); }
             }
             MenuItem {
                 title: @tr("Search");
+                icon: @image-url("icons/menu/search.svg");
                 shortcut: @keys(Control + F);
                 activated => { search-edit.focus(); }
             }
             MenuItem {
                 title: @tr("Filter list");
+                icon: @image-url("icons/menu/search.svg");
                 shortcut: @keys(Control + Shift + F);
                 activated => { filter-edit.focus(); }
             }
@@ -834,6 +920,16 @@ export component AppWindow inherits Window {
                     accessible-label: @tr("Address");
                     accepted(text) => { root.navigate(text); }
                 }
+                Rectangle {
+                    width: 16px;
+                    Image {
+                        width: 16px;
+                        height: 16px;
+                        source: @image-url("icons/search.svg");
+                        colorize: Theme.text-muted;
+                        accessible-role: none;
+                    }
+                }
                 search-edit := LineEdit {
                     width: 280px;
                     placeholder-text: @tr("Search names, hashes, text… (Ctrl+F)");
@@ -861,18 +957,38 @@ export component AppWindow inherits Window {
                 }
                 Button {
                     text: @tr("History");
+                    icon: @image-url("icons/history.svg");
+                    colorize-icon: true;
                     clicked => { root.show-history(); }
                 }
                 VSeparator {
                     y: (parent.height - self.height) / 2;
                 }
                 Button {
+                    text: root.edit-mode ? @tr("Editing") : @tr("Read-only");
+                    icon: root.edit-mode ? @image-url("icons/unlock.svg") : @image-url("icons/lock.svg");
+                    colorize-icon: true;
+                    checkable: true;
+                    checked: root.edit-mode;
+                    clicked => {
+                        self.checked = root.edit-mode;
+                        root.toggle-edit-mode();
+                    }
+                    Tooltip {
+                        text: @markdown("\{@tr("Edit mode: changes to archives are only possible when unlocked")}");
+                    }
+                }
+                Button {
                     text: @tr("Extract…");
+                    icon: @image-url("icons/extract.svg");
+                    colorize-icon: true;
                     enabled: root.can-extract && !root.busy;
                     clicked => { root.extract-selected(); }
                 }
                 Button {
                     text: @tr("Install .oiv…");
+                    icon: @image-url("icons/package.svg");
+                    colorize-icon: true;
                     enabled: !root.busy;
                     clicked => { root.install-oiv(); }
                 }
@@ -911,6 +1027,7 @@ export component AppWindow inherits Window {
                             selected: i == root.tree-selected;
                             toggle => { root.tree-toggle(i); }
                             activate => { root.tree-activate(i); }
+                            action(a) => { root.tree-action(i, a); }
                         }
                     }
                 }
@@ -958,82 +1075,126 @@ export component AppWindow inherits Window {
                 }
 
                 if root.history-mode: ContextBar {
+                    if !root.edit-mode: Button {
+                        text: @tr("Unlock editing…");
+                        icon: @image-url("icons/unlock.svg");
+                        colorize-icon: true;
+                        clicked => { root.unlock-visible = true; }
+                    }
                     title: @tr("History");
                     description: @tr("Changes made to the mods folder, newest first. Everything can be undone.");
                     Button {
                         text: @tr("Undo newest");
-                        enabled: root.can-undo && !root.busy;
+                        icon: @image-url("icons/undo.svg");
+                        colorize-icon: true;
+                        enabled: root.can-undo && root.can-edit;
                         clicked => { root.undo(); }
                     }
                     Button {
                         text: root.history-group == "" ? @tr("Uninstall package") : @tr("Uninstall “{}”", root.history-group);
+                        icon: @image-url("icons/remove.svg");
+                        colorize-icon: true;
                         primary: root.history-group != "";
-                        enabled: root.history-group != "" && !root.busy;
+                        enabled: root.history-group != "" && root.can-edit;
                         clicked => { root.uninstall-group(); }
                     }
                 }
                 if root.archive-mode: ContextBar {
-                    title: @tr("Archive");
-                    description: @tr("Changes go to the mods folder and can be undone.");
-                    Button {
+                    title: root.in-mods ? @tr("Archive in the mods folder") : @tr("Original game archive");
+                    description: !root.edit-mode ? @tr("Read-only. Unlock editing to change it.")
+                        : root.in-mods ? @tr("Changes apply to this copy and can be undone.")
+                        : @tr("Changes are copied to the mods folder; the game file stays untouched.");
+                    background: root.edit-mode && !root.in-mods ? Theme.warning.with-alpha(0.14) : Theme.accent-subtle;
+                    if !root.edit-mode: Button {
+                        text: @tr("Unlock editing…");
+                        icon: @image-url("icons/unlock.svg");
+                        colorize-icon: true;
+                        clicked => { root.unlock-visible = true; }
+                    }
+                    if root.edit-mode: Button {
                         text: @tr("Import…");
+                        icon: @image-url("icons/import.svg");
+                        colorize-icon: true;
                         primary: true;
-                        enabled: !root.busy;
+                        enabled: root.can-edit;
                         clicked => { root.archive-import(); }
                     }
-                    Button {
-                        text: @tr("New folder…");
-                        enabled: !root.busy;
+                    if root.edit-mode: IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: @image-url("icons/new-folder.svg");
+                        label: @tr("New folder… (Ctrl+Shift+N)");
+                        enabled: root.can-edit;
                         clicked => { root.archive-new-folder(); }
                     }
-                    Button {
-                        text: @tr("Replace…");
-                        enabled: root.entry-selected && !root.busy;
+                    if root.edit-mode: IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: @image-url("icons/replace.svg");
+                        label: @tr("Replace…");
+                        enabled: root.entry-selected && root.can-edit;
                         clicked => { root.archive-replace(); }
                     }
-                    Button {
-                        text: @tr("Rename…");
-                        enabled: root.entry-selected && !root.busy;
+                    if root.edit-mode: IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: @image-url("icons/rename.svg");
+                        label: @tr("Rename… (F2)");
+                        enabled: root.entry-selected && root.can-edit;
                         clicked => { root.archive-rename(); }
                     }
-                    VSeparator {
+                    if root.edit-mode: VSeparator {
                         y: (parent.height - self.height) / 2;
                     }
-                    Button {
-                        text: @tr("Delete");
+                    if root.edit-mode: IconButton {
+                        y: (parent.height - self.height) / 2;
                         icon: @image-url("icons/trash.svg");
-                        colorize-icon: false;
-                        enabled: root.entry-selected && !root.busy;
+                        tint: Theme.danger;
+                        label: @tr("Delete (Del)");
+                        enabled: root.entry-selected && root.can-edit;
                         clicked => { root.archive-delete(); }
                     }
                 }
                 if root.texture-mode: ContextBar {
                     title: @tr("Texture dictionary");
-                    description: @tr("Changes are written to the mods folder, like OpenIV.");
-                    Button {
-                        text: @tr("Add…");
-                        primary: true;
-                        enabled: !root.busy;
-                        clicked => { root.texture-add(); }
-                    }
-                    Button {
-                        text: @tr("Replace…");
-                        enabled: root.texture-selected && !root.busy;
-                        clicked => { root.texture-replace(); }
-                    }
+                    description: !root.edit-mode ? @tr("Read-only. Unlock editing to change textures.")
+                        : root.in-mods ? @tr("Changes apply to the copy in the mods folder.")
+                        : @tr("Changes are copied to the mods folder; the game file stays untouched.");
+                    background: root.edit-mode && !root.in-mods ? Theme.warning.with-alpha(0.14) : Theme.accent-subtle;
                     Button {
                         text: @tr("Save PNG…");
+                        icon: @image-url("icons/image.svg");
+                        colorize-icon: true;
                         enabled: !root.busy;
                         clicked => { root.save-png(); }
                     }
-                    VSeparator {
+                    if !root.edit-mode: Button {
+                        text: @tr("Unlock editing…");
+                        icon: @image-url("icons/unlock.svg");
+                        colorize-icon: true;
+                        clicked => { root.unlock-visible = true; }
+                    }
+                    if root.edit-mode: Button {
+                        text: @tr("Add…");
+                        icon: @image-url("icons/plus.svg");
+                        colorize-icon: true;
+                        primary: true;
+                        enabled: root.can-edit;
+                        clicked => { root.texture-add(); }
+                    }
+                    if root.edit-mode: IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: @image-url("icons/replace.svg");
+                        label: @tr("Replace…");
+                        enabled: root.texture-selected && root.can-edit;
+                        clicked => { root.texture-replace(); }
+                    }
+                    if root.edit-mode: VSeparator {
                         y: (parent.height - self.height) / 2;
                     }
-                    Button {
-                        text: @tr("Remove");
+                    if root.edit-mode: IconButton {
+                        y: (parent.height - self.height) / 2;
                         icon: @image-url("icons/trash.svg");
-                        colorize-icon: false;
-                        enabled: root.texture-selected && !root.busy;
+                        tint: Theme.danger;
+                        label: @tr("Remove (Del)");
+                        enabled: root.texture-selected && root.can-edit;
                         clicked => { root.texture-remove(); }
                     }
                 }
@@ -1150,7 +1311,7 @@ export component AppWindow inherits Window {
                             }
                             Rectangle {
                                 drop := DropArea {
-                                    enabled: root.archive-mode && !root.busy;
+                                    enabled: root.archive-mode && root.can-edit;
                                     can-drop(event) => { return DragAction.copy; }
                                     dropped(event) => {
                                         root.files-dropped(event.data);
@@ -1167,6 +1328,7 @@ export component AppWindow inherits Window {
                                         archive-mode: root.archive-mode;
                                         texture-mode: root.texture-mode;
                                         history-mode: root.history-mode;
+                                        can-edit: root.can-edit;
                                         select => {
                                             list-scope.focus();
                                             root.file-select(i);
@@ -1265,11 +1427,15 @@ export component AppWindow inherits Window {
                     }
                     if root.model-mode: Button {
                         text: @tr("Export glTF…");
+                        icon: @image-url("icons/export.svg");
+                        colorize-icon: true;
                         enabled: !root.busy;
                         clicked => { root.export-gltf(); }
                     }
                     if root.texture-mode: Button {
                         text: @tr("Save PNG…");
+                        icon: @image-url("icons/image.svg");
+                        colorize-icon: true;
                         enabled: !root.busy;
                         clicked => { root.save-png(); }
                     }
@@ -1418,11 +1584,15 @@ export component AppWindow inherits Window {
                         }
                         if root.model-mode: Button {
                             text: @tr("Export glTF…");
+                            icon: @image-url("icons/export.svg");
+                            colorize-icon: true;
                             enabled: !root.busy;
                             clicked => { root.export-gltf(); }
                         }
                         if root.texture-mode: Button {
                             text: @tr("Save PNG…");
+                            icon: @image-url("icons/image.svg");
+                            colorize-icon: true;
                             enabled: !root.busy;
                             clicked => { root.save-png(); }
                         }
@@ -1515,6 +1685,28 @@ export component AppWindow inherits Window {
                 }
             }
         }
+        if !root.edit-mode: Rectangle {
+            border-radius: Theme.radius;
+            background: Theme.accent-subtle;
+            HorizontalLayout {
+                padding: Theme.space-s;
+                padding-left: Theme.space-m;
+                spacing: Theme.space-s;
+                Text {
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    text: @tr("Installing needs edit mode.");
+                    color: Theme.text;
+                }
+                Button {
+                    text: @tr("Unlock editing…");
+                    icon: @image-url("icons/unlock.svg");
+                    colorize-icon: true;
+                    clicked => { root.unlock-visible = true; }
+                }
+            }
+        }
         HorizontalLayout {
             alignment: end;
             spacing: Theme.space-s;
@@ -1530,7 +1722,7 @@ export component AppWindow inherits Window {
             Button {
                 text: @tr("Install");
                 primary: true;
-                enabled: root.oiv-can-install && !root.oiv-running;
+                enabled: root.oiv-can-install && !root.oiv-running && root.edit-mode;
                 clicked => { root.oiv-confirm(); }
             }
         }
@@ -1616,6 +1808,58 @@ export component AppWindow inherits Window {
         }
         Rectangle {
             vertical-stretch: 1;
+        }
+    }
+
+    // Edit mode warning
+    if root.unlock-visible: Dialog {
+        title: @tr("Unlock editing?");
+        panel-width: 520px;
+        panel-height: 300px;
+        close => { root.unlock-visible = false; }
+        Text {
+            wrap: word-wrap;
+            color: Theme.text;
+            text: @tr("Edit mode lets OpenRAGE change archives, textures and install packages.");
+        }
+        VerticalLayout {
+            spacing: Theme.space-xs;
+            Text {
+                wrap: word-wrap;
+                color: Theme.text-muted;
+                text: @tr("• Game files are never changed: an archive is copied to the mods folder before its first change.");
+            }
+            Text {
+                wrap: word-wrap;
+                color: Theme.text-muted;
+                text: @tr("• Every change is recorded in History and can be undone.");
+            }
+            Text {
+                wrap: word-wrap;
+                color: Theme.text-muted;
+                text: @tr("• Online play with modified files can get your account banned.");
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: Theme.space-s;
+            Button {
+                text: @tr("Cancel");
+                clicked => { root.unlock-visible = false; }
+            }
+            Button {
+                text: @tr("Unlock editing");
+                icon: @image-url("icons/unlock.svg");
+                colorize-icon: true;
+                primary: true;
+                clicked => {
+                    root.edit-mode = true;
+                    root.unlock-visible = false;
+                }
+            }
         }
     }
 

@@ -137,7 +137,8 @@ fn main() -> anyhow::Result<()> {
 
 /// Development aid (debug builds only): `OPENRAGE_SNAPSHOT=out.png` saves an
 /// image of this window after a few seconds and quits; `OPENRAGE_THEME`
-/// (`light`/`dark`) and `OPENRAGE_VIEWER=1` set up the state to capture.
+/// (`light`/`dark`), `OPENRAGE_VIEWER`, `OPENRAGE_EDIT` and `OPENRAGE_UNLOCK`
+/// set up the state to capture.
 #[cfg(debug_assertions)]
 fn debug_snapshot(ui: &AppWindow) {
     if let Ok(theme) = std::env::var("OPENRAGE_THEME") {
@@ -149,6 +150,12 @@ fn debug_snapshot(ui: &AppWindow) {
         let Some(ui) = weak.upgrade() else { return };
         if std::env::var("OPENRAGE_VIEWER").is_ok() {
             ui.set_viewer_open(true);
+        }
+        if std::env::var("OPENRAGE_EDIT").is_ok() {
+            ui.set_edit_mode(true);
+        }
+        if std::env::var("OPENRAGE_UNLOCK").is_ok() {
+            ui.set_unlock_visible(true);
         }
         let weak = ui.as_weak();
         slint::Timer::single_shot(Duration::from_secs(2), move || {
@@ -202,6 +209,26 @@ fn wire_callbacks(ui: &AppWindow) {
                 }
             });
             refresh_tree(ui, None);
+        })
+    });
+    let w = ui.as_weak();
+    ui.on_tree_action(move |i, action| {
+        with_ui(&w, |ui| {
+            let Some(vpath) = with_app(|a| a.tree.nodes.get(i as usize).map(|n| n.vpath.clone())) else { return };
+            match action.as_str() {
+                "extract" => {
+                    navigate(ui, &vpath, true);
+                    start_extract(ui);
+                }
+                "copy-path" => {
+                    let msg = match copy_to_clipboard(&vpath) {
+                        Ok(()) => format!("Copied {vpath}"),
+                        Err(e) => format!("Cannot copy to the clipboard: {e}"),
+                    };
+                    ui.set_status(msg.into());
+                }
+                _ => {}
+            }
         })
     });
     let w = ui.as_weak();
@@ -681,6 +708,7 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
         ui.set_history_group(SharedString::new());
     }
     let archive_mode = with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Archive(..))));
+    ui.set_in_mods(with_app(|a| a.listing.as_ref().is_some_and(|l| l.origin != Origin::Base)));
     ui.set_archive_mode(archive_mode);
     ui.set_entry_selected(archive_mode && selected_row.is_some());
     if let (Some(row), Some(_)) = (selected_row, select) {
