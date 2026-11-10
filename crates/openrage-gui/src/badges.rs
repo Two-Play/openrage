@@ -1,4 +1,4 @@
-//! File-type badges and human-readable type names.
+//! File-type icons and human-readable type names.
 
 use slint::Color;
 
@@ -8,31 +8,39 @@ const fn rgb(hex: u32) -> Color {
     Color::from_rgb_u8((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
 
+/// Tint for generic items.
+pub const NEUTRAL: Color = rgb(0x7C8592);
+
 fn extension(name: &str) -> String {
     name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default()
 }
 
-/// Short label and color for the badge shown before a name.
-pub fn badge(name: &str, kind: ItemKind) -> (String, Color) {
+/// Icon (a name known to the UI's `Icons.get`) and tint for a file, so
+/// formats can be told apart at a glance. The tints are mid-tone colors that
+/// stay readable on light and dark backgrounds.
+pub fn icon(name: &str, kind: ItemKind) -> (&'static str, Color) {
     match kind {
-        ItemKind::Dir => return ("DIR".into(), rgb(0xB8902A)),
-        ItemKind::Archive => return ("RPF".into(), rgb(0xD9822B)),
-        ItemKind::Texture => return ("TEX".into(), rgb(0x8E5BD6)),
+        ItemKind::Dir => return ("folder", rgb(0xC7962C)),
+        ItemKind::Archive => return ("archive", rgb(0xD9822B)),
+        ItemKind::Texture => return ("texture", rgb(0x9061D8)),
         _ => {}
     }
-    let ext = extension(name);
-    let color = match ext.as_str() {
-        "ytd" | "dds" | "png" => rgb(0x8E5BD6),
-        "ydr" | "ydd" | "yft" | "ypt" => rgb(0x3B82F6),
-        "ybn" | "ynv" | "ynd" | "yvr" | "ywr" => rgb(0x0F9F8F),
-        "ymap" | "ytyp" | "ymt" | "ymf" | "meta" | "xml" | "dat" | "ide" | "ipl" | "txt" | "json" => rgb(0x22A06B),
-        "ycd" | "yed" | "yld" | "awc" | "rel" | "dat151" | "dat54" => rgb(0xDB2777),
-        "ysc" => rgb(0xDC2626),
-        "gxt2" => rgb(0x4F6BD8),
-        _ => rgb(0x6B7280),
-    };
-    let label = if ext.is_empty() { "FILE".into() } else { ext.to_ascii_uppercase().chars().take(4).collect() };
-    (label, color)
+    match extension(name).as_str() {
+        "ytd" | "dds" | "png" | "jpg" | "bmp" | "tga" => ("texture", rgb(0x9061D8)),
+        "ydr" | "ydd" | "yft" | "yld" => ("model", rgb(0x3B82F6)),
+        "ypt" => ("particles", rgb(0xE0679B)),
+        "ybn" => ("collision", rgb(0x14A08F)),
+        "ynv" | "ynd" | "yvr" | "ywr" | "nod" => ("path", rgb(0x14A08F)),
+        "ymap" | "ytyp" | "ipl" | "ide" => ("map", rgb(0x2FA866)),
+        "ymt" | "ymf" | "meta" | "xml" | "dat" | "json" | "pso" => ("data", rgb(0x2FA866)),
+        "txt" | "log" | "ini" | "cfg" => ("text", rgb(0x7C8592)),
+        "ycd" | "yed" => ("anim", rgb(0xDB4F8A)),
+        "awc" | "rel" | "dat151" | "dat54" | "dat4" | "dat10" | "dat15" | "dat16" | "dat22" => ("audio", rgb(0xDB4F8A)),
+        "ysc" | "asi" | "dll" | "lua" | "cs" => ("script", rgb(0xE05252)),
+        "gxt2" => ("lang", rgb(0x5B76DE)),
+        "oiv" | "zip" | "7z" | "rar" => ("package", rgb(0xD9822B)),
+        _ => ("file", NEUTRAL),
+    }
 }
 
 /// Descriptive type column text.

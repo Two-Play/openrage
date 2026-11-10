@@ -114,6 +114,7 @@ fn main() -> anyhow::Result<()> {
     });
 
     ui.set_mono_font(mono_font().into());
+    ui.set_theme_mode(with_app(|a| theme_mode(a.cfg.theme.as_deref())));
     let languages: Vec<SharedString> =
         std::iter::once("All languages".into()).chain(LANGUAGES.iter().map(|l| capitalize(l).into())).collect();
     ui.set_languages(ModelRc::new(VecModel::from(languages)));
@@ -128,8 +129,40 @@ fn main() -> anyhow::Result<()> {
     } else {
         show_setup(&ui, false);
     }
+    #[cfg(debug_assertions)]
+    debug_snapshot(&ui);
     ui.run()?;
     Ok(())
+}
+
+/// Development aid (debug builds only): `OPENRAGE_SNAPSHOT=out.png` saves an
+/// image of this window after a few seconds and quits; `OPENRAGE_THEME`
+/// (`light`/`dark`) and `OPENRAGE_VIEWER=1` set up the state to capture.
+#[cfg(debug_assertions)]
+fn debug_snapshot(ui: &AppWindow) {
+    if let Ok(theme) = std::env::var("OPENRAGE_THEME") {
+        ui.set_theme_mode(theme_mode(Some(&theme)));
+    }
+    let Ok(path) = std::env::var("OPENRAGE_SNAPSHOT") else { return };
+    let weak = ui.as_weak();
+    slint::Timer::single_shot(Duration::from_secs(5), move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if std::env::var("OPENRAGE_VIEWER").is_ok() {
+            ui.set_viewer_open(true);
+        }
+        let weak = ui.as_weak();
+        slint::Timer::single_shot(Duration::from_secs(2), move || {
+            let Some(ui) = weak.upgrade() else { return };
+            match ui.window().take_snapshot() {
+                Ok(img) => {
+                    let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
+                        .map(|png| std::fs::write(&path, png));
+                }
+                Err(e) => eprintln!("snapshot failed: {e}"),
+            }
+            let _ = slint::quit_event_loop();
+        });
+    });
 }
 
 fn wire_callbacks(ui: &AppWindow) {
@@ -184,6 +217,18 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_file_open(move |i| {
         with_ui(&w, |ui| {
+            let viewable = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(i as usize)?];
+                Some(is_viewable(item) && !is_openable(item))
+            });
+            if viewable == Some(true) {
+                if ui.get_file_selected() != i {
+                    select_row(ui, i as usize);
+                }
+                ui.set_viewer_open(true);
+                return;
+            }
             let target = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
@@ -283,6 +328,19 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_export_gltf(move || with_ui(&w, export_gltf));
     let w = ui.as_weak();
+    ui.on_open_viewer(move || with_ui(&w, |ui| ui.set_viewer_open(true)));
+    let w = ui.as_weak();
+    ui.on_row_action(move |i, action| with_ui(&w, |ui| row_action(ui, i as usize, &action)));
+    ui.on_theme_changed(|mode| {
+        with_app(|a| {
+            a.cfg.theme = Some(theme_name(mode).to_owned());
+            let _ = a.cfg.save();
+        })
+    });
+    ui.on_quit(|| {
+        let _ = slint::quit_event_loop();
+    });
+    let w = ui.as_weak();
     ui.on_save_png(move || with_ui(&w, |ui| export_textures(ui, true)));
     let w = ui.as_weak();
     ui.on_archive_import(move || with_ui(&w, |ui| archive_import(ui, None)));
@@ -350,6 +408,82 @@ fn wire_callbacks(ui: &AppWindow) {
     });
     let w = ui.as_weak();
     ui.on_setup_run(move || with_ui(&w, run_setup));
+}
+
+fn theme_name(mode: i32) -> &'static str {
+    match mode {
+        1 => "light",
+        2 => "dark",
+        _ => "system",
+    }
+}
+
+fn theme_mode(name: Option<&str>) -> i32 {
+    match name {
+        Some("light") => 1,
+        Some("dark") => 2,
+        _ => 0,
+    }
+}
+
+/// Context-menu action on a file row.
+fn row_action(ui: &AppWindow, row: usize, action: &str) {
+    if ui.get_file_selected() != row as i32 {
+        select_row(ui, row);
+    }
+    match action {
+        "open" => ui.invoke_file_open(row as i32),
+        "view" => ui.set_viewer_open(true),
+        "extract" => ui.invoke_extract_selected(),
+        "gltf" => {
+            if with_app(|a| a.model.is_some()) {
+                ui.invoke_export_gltf();
+            } else {
+                ui.set_status("The model is still loading.".into());
+            }
+        }
+        "png" => ui.invoke_save_png(),
+        "replace" if ui.get_texture_mode() => ui.invoke_texture_replace(),
+        "replace" => ui.invoke_archive_replace(),
+        "rename" => ui.invoke_archive_rename(),
+        "delete" if ui.get_texture_mode() => ui.invoke_texture_remove(),
+        "delete" => ui.invoke_archive_delete(),
+        "uninstall" => ui.invoke_uninstall_group(),
+        "copy-name" | "copy-path" => {
+            let text = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(row)?];
+                Some(if action == "copy-name" {
+                    item.name.clone()
+                } else {
+                    item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name))
+                })
+            });
+            if let Some(text) = text {
+                let msg = match copy_to_clipboard(&text) {
+                    Ok(()) => format!("Copied {text}"),
+                    Err(e) => format!("Cannot copy to the clipboard: {e}"),
+                };
+                ui.set_status(msg.into());
+            }
+        }
+        _ => {}
+    }
+}
+
+thread_local! {
+    // Kept alive: on X11 the clipboard content disappears with its owner.
+    static CLIPBOARD: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), arboard::Error> {
+    CLIPBOARD.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.is_none() {
+            *c = Some(arboard::Clipboard::new()?);
+        }
+        c.as_mut().map_or(Ok(()), |c| c.set_text(text))
+    })
 }
 
 fn capitalize(s: &str) -> String {
@@ -452,6 +586,7 @@ fn navigate(ui: &AppWindow, path: &str, record: bool) {
             ui.set_address(vpath.clone().into());
             let tree_idx = with_app(|a| a.tree.reveal(&vpath, &dir, keys, overlay));
             refresh_tree(ui, tree_idx);
+            ui.set_location_title(with_app(|a| a.listing.as_ref().map(location_title)).unwrap_or_default().into());
             refresh_files(ui, select.as_deref());
             if select.is_none() {
                 show_folder_info(ui);
@@ -479,14 +614,14 @@ fn refresh_tree(ui: &AppWindow, selected: Option<usize>) {
             .nodes
             .iter()
             .map(|n| {
-                let (badge, tint) = badges::badge(&n.name, n.kind);
+                let (icon, tint) = badges::icon(&n.name, n.kind);
                 TreeRow {
                     name: n.name.clone().into(),
                     path: n.vpath.clone().into(),
                     depth: n.depth as i32,
                     expandable: n.expandable,
                     expanded: n.expanded,
-                    badge: badge.into(),
+                    icon: icon.into(),
                     tint,
                 }
             })
@@ -553,30 +688,50 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
     }
 }
 
-fn mark_color(mark: Option<Mark>) -> slint::Color {
-    let rgb = |v: u32| slint::Color::from_rgb_u8((v >> 16) as u8, (v >> 8) as u8, v as u8);
+/// Mod status as the UI's mark index (see `Theme.mark-color`).
+fn mark_index(mark: Option<Mark>) -> i32 {
     match mark {
-        None => slint::Color::from_argb_u8(0, 0, 0, 0),
-        Some(Mark::Added | Mark::New) => rgb(0x22A06B),
-        Some(Mark::Changed | Mark::Replaced) => rgb(0xE8A317),
-        Some(Mark::ContainsMods) => rgb(0x4F8DE8),
-        Some(Mark::Removed) => rgb(0xDC2626),
+        None => 0,
+        Some(Mark::Added | Mark::New) => 1,
+        Some(Mark::Changed | Mark::Replaced) => 2,
+        Some(Mark::ContainsMods) => 3,
+        Some(Mark::Removed) => 4,
     }
 }
 
+fn is_model_item(item: &Item) -> bool {
+    item.kind == ItemKind::Resource && openrage_app::models::is_model(&item.name) && item.mark != Some(Mark::Removed)
+}
+
+/// Items with a large view: models, textures and images.
+fn is_viewable(item: &Item) -> bool {
+    let lower = item.name.to_ascii_lowercase();
+    is_model_item(item) || item.kind == ItemKind::Texture || [".ytd", ".dds", ".png"].iter().any(|e| lower.ends_with(e))
+}
+
+/// Double-click navigates into it (or, for search hits and changes, to it).
+fn is_openable(item: &Item) -> bool {
+    item.vpath.is_some()
+        || item.kind.is_container()
+        || (item.kind == ItemKind::Resource && browser::is_texture_dict(&item.name))
+}
+
 fn file_row(item: &Item) -> FileRow {
-    let (badge, tint) = badges::badge(&item.name, item.kind);
+    let (icon, tint) = badges::icon(&item.name, item.kind);
     let info = match (item.mark, item.info.is_empty()) {
         (Some(m), true) => m.label().to_owned(),
         (Some(m), false) if item.vpath.is_none() => format!("{} · {}", m.label(), item.info),
         _ => item.info.clone(),
     };
     FileRow {
-        mark_color: mark_color(item.mark),
+        mark: mark_index(item.mark),
         dim: item.mark == Some(Mark::Removed),
         name: item.name.clone().into(),
-        badge: badge.into(),
+        icon: icon.into(),
         tint,
+        can_open: is_openable(item),
+        can_view: is_viewable(item),
+        is_model: is_model_item(item),
         kind: match &item.vpath {
             Some(_) if item.detail.is_some() => item.detail.clone().unwrap_or_default().into(),
             Some(vpath) => browser::short_location(&browser::parent(vpath).unwrap_or_default(), 40).into(),
@@ -591,22 +746,60 @@ fn file_row(item: &Item) -> FileRow {
     }
 }
 
+/// Heading of the file list: the folder's name, or what the list shows.
+fn location_title(l: &Listing) -> String {
+    match &l.location {
+        Location::Search { query, .. } => format!("Search: {query}"),
+        Location::Changes { .. } => "Mod changes".into(),
+        Location::History => "History".into(),
+        _ => l.vpath.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("Game folder").to_owned(),
+    }
+}
+
+/// Fills the info panel header and details.
+fn set_info(ui: &AppWindow, title: &str, path: &str, details: &str, icon: (&str, slint::Color)) {
+    ui.set_info_title(title.into());
+    ui.set_info_path(path.into());
+    ui.set_info_details(details.into());
+    ui.set_info_icon(icon.0.into());
+    ui.set_info_tint(icon.1);
+}
+
 fn show_folder_info(ui: &AppWindow) {
-    let text = with_app(|a| {
+    let info = with_app(|a| {
         let l = a.listing.as_ref()?;
+        let name = location_title(l);
+        let folder_icon = if l.vpath.to_ascii_lowercase().ends_with(".rpf") {
+            badges::icon(&name, ItemKind::Archive)
+        } else {
+            badges::icon(&name, ItemKind::Dir)
+        };
         let place = match &l.location {
-            Location::Search { summary, .. } | Location::Changes { summary } => return Some(summary.clone()),
+            Location::Search { query, summary } => {
+                return Some((format!("Search: {query}"), String::new(), summary.clone(), ("search", badges::NEUTRAL)));
+            }
+            Location::Changes { summary } => {
+                return Some(("Mod changes".into(), String::new(), summary.clone(), badges::icon("", ItemKind::Dir)));
+            }
             Location::History => {
-                return Some(
+                return Some((
+                    "History".into(),
+                    String::new(),
                     "Every change OpenRAGE made to the mods folder. Select a package entry to uninstall the whole package."
                         .into(),
-                );
+                    badges::icon("x.oiv", ItemKind::File),
+                ));
             }
             Location::Textures { dict, .. } => {
-                format!(
-                    "Texture dictionary · {} textures\nExtract… exports DDS files like OpenIV; Save PNG… exports images.",
-                    dict.textures.len()
-                )
+                return Some((
+                    name.clone(),
+                    l.vpath.clone(),
+                    format!(
+                        "Texture dictionary · {} textures\nExtract… exports DDS files like OpenIV; Save PNG… exports images.",
+                        dict.textures.len()
+                    ),
+                    badges::icon(&name, ItemKind::Resource),
+                ));
             }
             Location::Disk(p) => format!("Folder on disk\n{}", p.display()),
             Location::Archive(rpf, _) => {
@@ -618,15 +811,17 @@ fn show_folder_info(ui: &AppWindow) {
                 )
             }
         };
-        let shown = if l.vpath.is_empty() { "(game folder)".to_owned() } else { l.vpath.clone() };
         let origin = match l.origin {
             Origin::Mods => "\nFrom the mods folder (replaces the game's version)",
             Origin::Merged => "\nGame folder merged with its mods counterpart",
             Origin::Base => "",
         };
-        Some(format!("{shown}\n{place}{origin}"))
+        Some((name, l.vpath.clone(), format!("{place}{origin}"), folder_icon))
     });
-    ui.set_info_text(text.unwrap_or_default().into());
+    let (title, path, details, icon) =
+        info.unwrap_or_else(|| (String::new(), String::new(), String::new(), ("folder", slint::Color::default())));
+    ui.set_location_title(title.clone().into());
+    set_info(ui, &title, &path, &details, icon);
     ui.set_preview_text(SharedString::new());
     ui.set_has_image(false);
     ui.set_model_mode(false);
@@ -714,18 +909,16 @@ fn select_row(ui: &AppWindow, row: usize) {
     }
     ui.set_entry_selected(item.entry.is_some());
 
-    let mut info =
-        format!("{}\n{}\n{} · {}", item.name, vpath, badges::type_name(&item.name, item.kind), human_size(item.size));
+    let mut info = format!("{} · {}", badges::type_name(&item.name, item.kind), human_size(item.size));
     if !item.info.is_empty() {
         info.push_str(&format!(" · {}", item.info));
     }
-    ui.set_info_text(info.clone().into());
+    set_info(ui, &item.name, &vpath, &info, badges::icon(&item.name, item.kind));
     ui.set_preview_text(SharedString::new());
     ui.set_has_image(false);
     ui.set_model_mode(false);
     with_app(|a| a.model = None);
-    if item.kind == ItemKind::Resource && openrage_app::models::is_model(&item.name) && item.mark != Some(Mark::Removed)
-    {
+    if is_model_item(&item) {
         start_model_preview(ui, vpath.clone(), info, generation);
         return;
     }
@@ -749,7 +942,7 @@ fn select_row(ui: &AppWindow, row: usize) {
                 return;
             }
             if !extra.is_empty() {
-                ui.set_info_text(format!("{info}\n{extra}").into());
+                ui.set_info_details(format!("{info}\n{extra}").into());
             }
             ui.set_preview_text(body.into());
             match image {
@@ -1574,7 +1767,7 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: String, generation: 
                     if m.loaded.drawables.len() > 1 {
                         text.push_str("\nThe preview shows the first drawable of the dictionary.");
                     }
-                    ui.set_info_text(text.into());
+                    ui.set_info_details(text.into());
                     with_app(|a| {
                         a.model = Some(Arc::new(m));
                         a.model_view = openrage_app::render::View::default();
@@ -1582,7 +1775,7 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: String, generation: 
                     ui.set_model_mode(true);
                     render_model(&ui);
                 }
-                Err(e) => ui.set_info_text(format!("{info}\nCannot read the model: {e:#}").into()),
+                Err(e) => ui.set_info_details(format!("{info}\nCannot read the model: {e:#}").into()),
             }
         });
     });
@@ -1592,8 +1785,12 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: String, generation: 
 fn render_model(ui: &AppWindow) {
     let Some((model, view)) = with_app(|a| a.model.clone().map(|m| (m, a.model_view))) else { return };
     let Some((_, d)) = model.loaded.drawables.first() else { return };
-    let w = (ui.get_preview_area_width() - 16.0).max(64.0) as usize;
-    let h = (ui.get_preview_area_height() - 16.0).max(64.0) as usize;
+    let (aw, ah) = if ui.get_viewer_open() {
+        (ui.get_viewer_area_width() - 32.0, ui.get_viewer_area_height() - 32.0)
+    } else {
+        (ui.get_preview_area_width() - 16.0, ui.get_preview_area_height() - 16.0)
+    };
+    let (w, h) = (aw.max(64.0) as usize, ah.max(64.0) as usize);
     let rgba = openrage_app::render::render(d, &model.materials, view, w, h);
     let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w as u32, h as u32);
     ui.set_preview_image(slint::Image::from_rgba8(buffer));

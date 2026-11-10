@@ -11,6 +11,8 @@ pub struct Config {
     pub game_dir: Option<PathBuf>,
     /// Key blob used during setup, remembered so keys can be re-derived after game updates.
     pub magic_path: Option<PathBuf>,
+    /// GUI color scheme: `system`, `light` or `dark`.
+    pub theme: Option<String>,
 }
 
 fn dir() -> Option<PathBuf> {
@@ -27,10 +29,11 @@ impl Config {
             .unwrap_or_default();
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
-            let v = PathBuf::from(v.trim());
+            let v = v.trim();
             match k.trim() {
-                "game_dir" => cfg.game_dir = Some(v),
-                "magic_path" => cfg.magic_path = Some(v),
+                "game_dir" => cfg.game_dir = Some(PathBuf::from(v)),
+                "magic_path" => cfg.magic_path = Some(PathBuf::from(v)),
+                "theme" => cfg.theme = Some(v.to_owned()),
                 _ => {}
             }
         }
@@ -46,6 +49,9 @@ impl Config {
         }
         if let Some(p) = &self.magic_path {
             text.push_str(&format!("magic_path={}\n", p.display()));
+        }
+        if let Some(t) = &self.theme {
+            text.push_str(&format!("theme={t}\n"));
         }
         let path = dir.join("settings.conf");
         fs::write(&path, text).with_context(|| format!("writing {}", path.display()))

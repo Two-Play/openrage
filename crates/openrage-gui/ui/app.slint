@@ -1,7 +1,9 @@
 // OpenRAGE main window.
 // All user-visible strings go through @tr() so the UI can be translated.
+// Spacing, sizes and colors come from the Theme tokens (theme.slint).
 
 import { Button, LineEdit, ComboBox, ScrollView, ListView, Palette, Spinner } from "std-widgets.slint";
+import { Theme, Icons } from "theme.slint";
 
 export struct TreeRow {
     name: string,
@@ -9,42 +11,83 @@ export struct TreeRow {
     depth: int,
     expandable: bool,
     expanded: bool,
-    badge: string,
+    icon: string,
     tint: color,
 }
 
 export struct FileRow {
-    mark-color: color,
+    // Mod status: 0 none, 1 added/new, 2 changed, 3 contains mods, 4 removed.
+    mark: int,
     dim: bool,
     name: string,
-    badge: string,
+    icon: string,
     tint: color,
     kind: string,
     size: string,
     info: string,
+    // Double-click navigates into it (folder, archive, texture dictionary, search hit).
+    can-open: bool,
+    // Has a 3D or image view (model, texture).
+    can-view: bool,
+    is-model: bool,
 }
 
-component Badge inherits Rectangle {
-    in property <string> text;
+component FormatIcon inherits Image {
+    in property <string> name;
     in property <color> tint;
-    width: 34px;
-    height: 16px;
-    border-radius: 3px;
-    background: tint;
-    Text {
-        text: root.text;
-        color: white;
-        font-size: 9px;
-        font-weight: 700;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    width: Theme.icon-size;
+    height: Theme.icon-size;
+    source: Icons.get(root.name);
+    colorize: root.tint;
+    image-rendering: smooth;
+}
+
+// Flat icon button for the toolbar.
+component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> active;
+    callback clicked();
+    width: 30px;
+    height: 30px;
+    border-radius: Theme.radius;
+    background: root.active ? Theme.accent-subtle : (ta.has-hover && root.enabled ? Theme.hover : transparent);
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { root.clicked(); }
+    Image {
+        width: 18px;
+        height: 18px;
+        source: root.icon;
+        colorize: root.enabled ? Theme.text : Theme.text-faint;
+        image-rendering: smooth;
     }
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+    Tooltip {
+        text: @markdown("\{root.label}");
+    }
+}
+
+component VSeparator inherits Rectangle {
+    width: 1px;
+    height: 20px;
+    background: Theme.border;
 }
 
 component Splitter inherits Rectangle {
     callback dragged(length);
     width: 5px;
-    background: ta.has-hover || ta.pressed ? Palette.accent-background : transparent;
+    background: ta.has-hover || ta.pressed ? Theme.accent : transparent;
+    Rectangle {
+        x: (parent.width - 1px) / 2;
+        width: 1px;
+        background: Theme.border;
+    }
     ta := TouchArea {
         mouse-cursor: col-resize;
         moved => {
@@ -60,21 +103,24 @@ component TreeItem inherits Rectangle {
     in property <bool> selected;
     callback toggle();
     callback activate();
-    height: 22px;
-    background: selected ? Palette.selection-background : area.has-hover ? Palette.alternate-background : transparent;
+    height: Theme.row-height;
+    border-radius: Theme.radius-s;
+    background: selected ? Theme.selection : area.has-hover ? Theme.hover : transparent;
+    accessible-role: list-item;
+    accessible-label: item.name;
     area := TouchArea {
         clicked => { root.activate(); }
         double-clicked => { root.toggle(); }
     }
     HorizontalLayout {
-        padding-left: 4px + item.depth * 14px;
-        padding-right: 4px;
-        spacing: 4px;
+        padding-left: Theme.space-xs + item.depth * 14px;
+        padding-right: Theme.space-s;
+        spacing: Theme.space-xs;
         Rectangle {
-            width: 14px;
+            width: 16px;
             Text {
                 text: item.expandable ? (item.expanded ? "▾" : "▸") : "";
-                color: selected ? Palette.selection-foreground : Palette.foreground;
+                color: selected ? Theme.selection-text : Theme.text-muted;
                 vertical-alignment: center;
                 horizontal-alignment: center;
             }
@@ -82,88 +128,149 @@ component TreeItem inherits Rectangle {
                 clicked => { root.toggle(); }
             }
         }
-        Badge {
+        FormatIcon {
             y: (parent.height - self.height) / 2;
-            text: item.badge;
+            name: item.icon;
             tint: item.tint;
         }
         Text {
             text: item.name;
             vertical-alignment: center;
             overflow: elide;
-            color: selected ? Palette.selection-foreground : Palette.foreground;
+            color: selected ? Theme.selection-text : Theme.text;
         }
     }
 }
 
 component FileItem inherits Rectangle {
-    opacity: item.dim ? 0.5 : 1.0;
     in property <FileRow> item;
     // Search results show a stretching location column instead of the fixed type column.
     in property <bool> wide-kind;
     in property <bool> selected;
+    in property <bool> focused;
     in property <bool> odd;
+    // Context of the current folder, for the context menu.
+    in property <bool> archive-mode;
+    in property <bool> texture-mode;
+    in property <bool> history-mode;
     callback select();
     callback open();
-    height: 22px;
-    background: selected ? Palette.selection-background : area.has-hover ? Palette.alternate-background : odd ? Palette.alternate-background.with-alpha(0.35) : transparent;
-    area := TouchArea {
-        clicked => { root.select(); }
-        double-clicked => { root.open(); }
-    }
-    // Mod status stripe (added/new green, changed orange, removed red).
-    Rectangle {
-        x: 0;
-        width: 3px;
-        background: item.mark-color;
-    }
-    HorizontalLayout {
-        padding-left: 6px;
-        padding-right: 6px;
-        spacing: 8px;
-        Badge {
-            y: (parent.height - self.height) / 2;
-            text: item.badge;
-            tint: item.tint;
-        }
-        Text {
-            text: item.name;
-            vertical-alignment: center;
-            overflow: elide;
-            horizontal-stretch: 1;
-            min-width: 80px;
-            preferred-width: 100px;
-            max-width: 100000px;
-            color: selected ? Palette.selection-foreground : Palette.foreground;
-        }
-        Rectangle {
-            // Fixed 90px type column, or a stretching location column for search results.
-            horizontal-stretch: root.wide-kind ? 2 : 0;
-            min-width: root.wide-kind ? 60px : 90px;
-            preferred-width: 90px;
-            max-width: root.wide-kind ? 100000px : 90px;
-            Text {
-                width: 100%;
-                text: item.kind;
-                horizontal-alignment: left;
-                vertical-alignment: center;
-                overflow: elide;
-                color: selected ? Palette.selection-foreground : root.wide-kind ? Palette.foreground.with-alpha(0.75) : Palette.foreground;
+    callback action(string);
+    height: Theme.row-height;
+    opacity: item.dim ? 0.55 : 1.0;
+    property <color> fg: selected && focused ? Theme.selection-text : Theme.text;
+    background: selected ? (focused ? Theme.selection : Theme.accent-subtle) : area.has-hover ? Theme.hover : odd ? Theme.stripe : transparent;
+    accessible-role: list-item;
+    accessible-label: item.name + ", " + item.kind;
+    accessible-item-selected: root.selected;
+
+    ContextMenuArea {
+        Menu {
+            if item.can-open: MenuItem {
+                title: @tr("Open");
+                activated => { root.action("open"); }
+            }
+            if item.can-view: MenuItem {
+                title: @tr("Open in viewer");
+                activated => { root.action("view"); }
+            }
+            if !root.history-mode: MenuItem {
+                title: @tr("Extract…");
+                activated => { root.action("extract"); }
+            }
+            if item.is-model: MenuItem {
+                title: @tr("Export glTF…");
+                activated => { root.action("gltf"); }
+            }
+            if root.texture-mode: MenuItem {
+                title: @tr("Save PNG…");
+                activated => { root.action("png"); }
+            }
+            if root.archive-mode || root.texture-mode: MenuSeparator { }
+            if root.archive-mode || root.texture-mode: MenuItem {
+                title: @tr("Replace…");
+                activated => { root.action("replace"); }
+            }
+            if root.archive-mode: MenuItem {
+                title: @tr("Rename…");
+                activated => { root.action("rename"); }
+            }
+            if root.archive-mode || root.texture-mode: MenuItem {
+                title: root.texture-mode ? @tr("Remove") : @tr("Delete");
+                activated => { root.action("delete"); }
+            }
+            if root.history-mode: MenuItem {
+                title: @tr("Uninstall package");
+                activated => { root.action("uninstall"); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: @tr("Copy name");
+                activated => { root.action("copy-name"); }
+            }
+            MenuItem {
+                title: @tr("Copy path");
+                activated => { root.action("copy-path"); }
             }
         }
-        Text {
-            width: 80px;
-            text: item.size;
-            vertical-alignment: center;
-            horizontal-alignment: right;
-            color: selected ? Palette.selection-foreground : Palette.foreground;
+
+        area := TouchArea {
+            clicked => { root.select(); }
+            double-clicked => { root.open(); }
         }
-        Text {
-            width: 90px;
-            text: item.info;
-            vertical-alignment: center;
-            overflow: elide;
-            color: selected ? Palette.selection-foreground : Palette.foreground.with-alpha(0.7);
+        // Mod status stripe (added/new green, changed orange, has mods blue, removed red).
+        Rectangle {
+            x: 0;
+            width: 3px;
+            background: Theme.mark-color(item.mark);
+        }
+        HorizontalLayout {
+            padding-left: Theme.space-s;
+            padding-right: Theme.space-s;
+            spacing: Theme.space-s;
+            FormatIcon {
+                y: (parent.height - self.height) / 2;
+                name: item.icon;
+                tint: item.tint;
+            }
+            Text {
+                text: item.name;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+                min-width: 80px;
+                preferred-width: 100px;
+                max-width: 100000px;
+                color: root.fg;
+            }
+            Rectangle {
+                // Fixed type column, or a stretching location column for search results.
+                horizontal-stretch: root.wide-kind ? 2 : 0;
+                min-width: root.wide-kind ? 60px : 100px;
+                preferred-width: 100px;
+                max-width: root.wide-kind ? 100000px : 100px;
+                Text {
+                    width: 100%;
+                    text: item.kind;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    color: selected && focused ? Theme.selection-text : Theme.text-muted;
+                }
+            }
+            Text {
+                width: 72px;
+                text: item.size;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                color: root.fg;
+            }
+            Text {
+                width: 96px;
+                text: item.info;
+                vertical-alignment: center;
+                overflow: elide;
+                color: selected && focused ? Theme.selection-text : Theme.text-muted;
+            }
         }
     }
 }
@@ -174,17 +281,139 @@ component HeaderCell inherits Rectangle {
     in property <bool> descending;
     in property <TextHorizontalAlignment> align: left;
     callback clicked();
-    TouchArea {
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.clicked(); }
+    ta := TouchArea {
         clicked => { root.clicked(); }
     }
     Text {
         width: 100%;
         text: root.label + (root.active ? (root.descending ? " ▾" : " ▴") : "");
+        font-size: Theme.font-small;
         font-weight: 600;
         vertical-alignment: center;
         horizontal-alignment: root.align;
-        color: Palette.foreground;
+        color: ta.has-hover || root.active ? Theme.text : Theme.text-muted;
     }
+}
+
+// Tinted bar above the file list explaining the current context and its actions.
+component ContextBar inherits Rectangle {
+    in property <string> title;
+    in property <string> description;
+    background: Theme.accent-subtle;
+    border-radius: Theme.radius;
+    HorizontalLayout {
+        padding: Theme.space-s;
+        padding-left: Theme.space-m;
+        spacing: Theme.space-s;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.title;
+                font-weight: 600;
+                overflow: elide;
+                color: Theme.text;
+            }
+            if root.description != "": Text {
+                text: root.description;
+                font-size: Theme.font-small;
+                overflow: elide;
+                color: Theme.text-muted;
+            }
+        }
+        @children
+    }
+}
+
+// Drag to orbit, wheel to zoom.
+component ModelControls inherits TouchArea {
+    callback orbit(length, length);
+    callback zoom(float);
+    property <length> last-x;
+    property <length> last-y;
+    mouse-cursor: self.pressed ? MouseCursor.grabbing : MouseCursor.grab;
+    pointer-event(e) => {
+        if (e.kind == PointerEventKind.down) {
+            self.last-x = self.mouse-x;
+            self.last-y = self.mouse-y;
+        }
+    }
+    moved => {
+        if (self.pressed) {
+            root.orbit(self.mouse-x - self.last-x, self.mouse-y - self.last-y);
+            self.last-x = self.mouse-x;
+            self.last-y = self.mouse-y;
+        }
+    }
+    scroll-event(e) => {
+        root.zoom(e.delta-y / 1px);
+        return EventResult.accept;
+    }
+}
+
+// Modal dialog: dims the window, closes with Escape (when closable).
+component Dialog inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <length> panel-width: 520px;
+    in property <length> panel-height: 400px;
+    in property <bool> closable: true;
+    callback close();
+    background: Theme.scrim;
+    TouchArea { }
+    scope := FocusScope {
+        KeyBinding {
+            keys: @keys(Escape);
+            enabled: root.closable;
+            activated => { root.close(); }
+        }
+        Rectangle {
+            width: min(root.panel-width, root.width - 48px);
+            height: min(root.panel-height, root.height - 48px);
+            border-radius: 10px;
+            background: Theme.background;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #00000050;
+            accessible-role: groupbox;
+            accessible-label: root.title;
+            VerticalLayout {
+                padding: Theme.space-xl;
+                spacing: Theme.space-m;
+                HorizontalLayout {
+                    spacing: Theme.space-s;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: Theme.space-xs;
+                        Text {
+                            text: root.title;
+                            font-size: Theme.font-heading;
+                            font-weight: 700;
+                            overflow: elide;
+                            color: Theme.text;
+                        }
+                        if root.subtitle != "": Text {
+                            text: root.subtitle;
+                            overflow: elide;
+                            color: Theme.text-muted;
+                        }
+                    }
+                    if root.closable: IconButton {
+                        icon: @image-url("icons/close.svg");
+                        label: @tr("Close");
+                        clicked => { root.close(); }
+                    }
+                }
+                @children
+            }
+        }
+    }
+    init => { scope.focus(); }
 }
 
 export component AppWindow inherits Window {
@@ -192,19 +421,23 @@ export component AppWindow inherits Window {
     icon: @image-url("icon.png");
     preferred-width: 1440px;
     preferred-height: 900px;
-    min-width: 800px;
-    min-height: 480px;
-    background: Palette.background;
+    min-width: 900px;
+    min-height: 520px;
+    background: Theme.background;
+    default-font-size: Theme.font-body;
 
     in property <string> window-title: "OpenRAGE";
     // Resolved at startup; Slint does not map the generic "monospace" family everywhere.
     in property <string> mono-font: "monospace";
+    // 0 = follow the system, 1 = light, 2 = dark.
+    in-out property <int> theme-mode;
 
     // Navigation
     in-out property <string> address;
     in property <bool> can-back;
     in property <bool> can-forward;
     in property <bool> can-up;
+    in property <string> location-title;
 
     // Tree
     in property <[TreeRow]> tree;
@@ -228,8 +461,12 @@ export component AppWindow inherits Window {
     in-out property <int> language-index;
     in property <string> index-status;
 
-    // Preview
-    in property <string> info-text;
+    // Info + preview
+    in property <string> info-title;
+    in property <string> info-path;
+    in property <string> info-details;
+    in property <string> info-icon: "folder";
+    in property <color> info-tint: #b8902a;
     in property <string> preview-text;
     in property <image> preview-image;
     in property <bool> has-image;
@@ -237,6 +474,10 @@ export component AppWindow inherits Window {
     in property <bool> model-mode;
     out property <length> preview-area-width;
     out property <length> preview-area-height;
+    // Large viewer for models and images (double-click).
+    in-out property <bool> viewer-open;
+    out property <length> viewer-area-width;
+    out property <length> viewer-area-height;
     in property <bool> texture-mode;
     // Editing archives (written into the mods folder)
     in property <bool> archive-mode;
@@ -261,6 +502,7 @@ export component AppWindow inherits Window {
     in-out property <string> prompt-value;
     in property <bool> texture-selected;
     in property <bool> preview-loading;
+    in-out property <bool> shortcuts-visible;
 
     // Status / background task
     in property <string> status;
@@ -284,6 +526,7 @@ export component AppWindow inherits Window {
     callback tree-activate(int);
     callback file-select(int);
     callback file-open(int);
+    callback row-action(int, string);
     callback sort-by(int);
     callback filter-edited(string);
     callback search(string);
@@ -296,6 +539,7 @@ export component AppWindow inherits Window {
     callback model-zoom(float);
     callback model-resized();
     callback export-gltf();
+    callback open-viewer();
     callback archive-import();
     callback archive-replace();
     callback archive-rename();
@@ -317,90 +561,339 @@ export component AppWindow inherits Window {
     callback setup-browse-magic();
     callback setup-pick-detected(string);
     callback setup-run();
+    callback theme-changed(int);
+    callback quit();
 
     preview-area-width: preview-area.width;
     preview-area-height: preview-area.height;
     changed preview-area-width => { root.model-resized(); }
     changed preview-area-height => { root.model-resized(); }
-    property <length> tree-width: 240px;
-    property <length> preview-width: 480px;
+    changed viewer-area-width => { root.model-resized(); }
+    changed viewer-area-height => { root.model-resized(); }
+    changed viewer-open => { root.model-resized(); }
+    changed theme-mode => { root.apply-theme(); }
+    init => { root.apply-theme(); }
+
+    property <length> tree-width: 260px;
+    property <length> preview-width: 460px;
+    property <bool> has-selection: root.file-selected >= 0;
+    property <bool> can-view: root.model-mode || root.has-image;
+
+    function apply-theme() {
+        Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+
+    function set-theme(mode: int) {
+        root.theme-mode = mode;
+        root.theme-changed(mode);
+    }
+
+    function select-row(i: int) {
+        root.file-select(i);
+        // Keep the selected row in view.
+        if (i * Theme.row-height < -list.content-y) {
+            list.content-y = -i * Theme.row-height;
+        } else if ((i + 1) * Theme.row-height > list.visible-height - list.content-y) {
+            list.content-y = list.visible-height - (i + 1) * Theme.row-height;
+        }
+    }
+
+    function move-selection(delta: int) {
+        if (root.files.length > 0) {
+            root.select-row(root.file-selected < 0 ? 0 : max(0, min(root.files.length - 1, root.file-selected + delta)));
+        }
+    }
+
+    function delete-selected() {
+        if (root.busy) {
+            return;
+        }
+        if (root.archive-mode && root.entry-selected) {
+            root.archive-delete();
+        } else if (root.texture-mode && root.texture-selected) {
+            root.texture-remove();
+        }
+    }
+
+    function replace-selected() {
+        if (root.archive-mode && root.entry-selected) {
+            root.archive-replace();
+        } else if (root.texture-mode && root.texture-selected) {
+            root.texture-replace();
+        }
+    }
+
+    MenuBar {
+        Menu {
+            title: @tr("File");
+            MenuItem {
+                title: @tr("Install package (.oiv)…");
+                shortcut: @keys(Control + O);
+                enabled: !root.busy;
+                activated => { root.install-oiv(); }
+            }
+            MenuItem {
+                title: @tr("Extract…");
+                shortcut: @keys(Control + E);
+                enabled: root.can-extract && !root.busy;
+                activated => { root.extract-selected(); }
+            }
+            MenuItem {
+                title: @tr("Export glTF…");
+                enabled: root.model-mode && !root.busy;
+                activated => { root.export-gltf(); }
+            }
+            MenuItem {
+                title: @tr("Save PNG…");
+                enabled: root.texture-mode && !root.busy;
+                activated => { root.save-png(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: @tr("Game setup…");
+                activated => { root.open-setup(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: @tr("Quit");
+                shortcut: @keys(Control + Q);
+                activated => { root.quit(); }
+            }
+        }
+        Menu {
+            title: @tr("Edit");
+            MenuItem {
+                title: root.can-undo ? @tr("Undo: {}", root.undo-label) : @tr("Undo");
+                shortcut: @keys(Control + Z);
+                enabled: root.can-undo && !root.busy;
+                activated => { root.undo(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: root.texture-mode ? @tr("Add texture…") : @tr("Import files…");
+                enabled: (root.archive-mode || root.texture-mode) && !root.busy;
+                activated => {
+                    if (root.texture-mode) {
+                        root.texture-add();
+                    } else {
+                        root.archive-import();
+                    }
+                }
+            }
+            MenuItem {
+                title: @tr("Replace…");
+                enabled: ((root.archive-mode && root.entry-selected) || (root.texture-mode && root.texture-selected)) && !root.busy;
+                activated => { root.replace-selected(); }
+            }
+            MenuItem {
+                title: @tr("Rename…");
+                shortcut: @keys(F2);
+                enabled: root.archive-mode && root.entry-selected && !root.busy;
+                activated => { root.archive-rename(); }
+            }
+            MenuItem {
+                title: @tr("New folder…");
+                shortcut: @keys(Control + Shift + N);
+                enabled: root.archive-mode && !root.busy;
+                activated => { root.archive-new-folder(); }
+            }
+            MenuItem {
+                title: root.texture-mode ? @tr("Remove texture") : @tr("Delete");
+                enabled: ((root.archive-mode && root.entry-selected) || (root.texture-mode && root.texture-selected)) && !root.busy;
+                activated => { root.delete-selected(); }
+            }
+        }
+        Menu {
+            title: @tr("View");
+            MenuItem {
+                title: @tr("Open in viewer");
+                shortcut: @keys(Control + Return);
+                enabled: root.can-view;
+                activated => { root.open-viewer(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: root.mods-overlay ? @tr("✓ Show mods overlay") : @tr("Show mods overlay");
+                enabled: root.mods-available;
+                activated => {
+                    root.mods-overlay = !root.mods-overlay;
+                    root.overlay-toggled(root.mods-overlay);
+                }
+            }
+            MenuItem {
+                title: @tr("All mod changes");
+                enabled: root.mods-available;
+                activated => { root.show-changes(); }
+            }
+            MenuItem {
+                title: @tr("History");
+                shortcut: @keys(Control + H);
+                activated => { root.show-history(); }
+            }
+            MenuSeparator { }
+            Menu {
+                title: @tr("Theme");
+                MenuItem {
+                    title: (root.theme-mode == 0 ? "✓ " : "") + @tr("System");
+                    activated => { root.set-theme(0); }
+                }
+                MenuItem {
+                    title: (root.theme-mode == 1 ? "✓ " : "") + @tr("Light");
+                    activated => { root.set-theme(1); }
+                }
+                MenuItem {
+                    title: (root.theme-mode == 2 ? "✓ " : "") + @tr("Dark");
+                    activated => { root.set-theme(2); }
+                }
+            }
+        }
+        Menu {
+            title: @tr("Go");
+            MenuItem {
+                title: @tr("Back");
+                shortcut: @keys(Alt + LeftArrow);
+                enabled: root.can-back;
+                activated => { root.go-back(); }
+            }
+            MenuItem {
+                title: @tr("Forward");
+                shortcut: @keys(Alt + RightArrow);
+                enabled: root.can-forward;
+                activated => { root.go-forward(); }
+            }
+            MenuItem {
+                title: @tr("Up");
+                shortcut: @keys(Alt + UpArrow);
+                enabled: root.can-up;
+                activated => { root.go-up(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: @tr("Edit address");
+                shortcut: @keys(Control + L);
+                activated => { address-edit.focus(); }
+            }
+            MenuItem {
+                title: @tr("Search");
+                shortcut: @keys(Control + F);
+                activated => { search-edit.focus(); }
+            }
+            MenuItem {
+                title: @tr("Filter list");
+                shortcut: @keys(Control + Shift + F);
+                activated => { filter-edit.focus(); }
+            }
+        }
+        Menu {
+            title: @tr("Help");
+            MenuItem {
+                title: @tr("Keyboard shortcuts");
+                shortcut: @keys(F1);
+                activated => { root.shortcuts-visible = true; }
+            }
+        }
+    }
 
     VerticalLayout {
-        // Toolbar
-        HorizontalLayout {
-            padding: 6px;
-            spacing: 6px;
-            Button {
-                text: "◀";
-                enabled: root.can-back;
-                clicked => { root.go-back(); }
-            }
-            Button {
-                text: "▶";
-                enabled: root.can-forward;
-                clicked => { root.go-forward(); }
-            }
-            Button {
-                text: "▲";
-                enabled: root.can-up;
-                clicked => { root.go-up(); }
-            }
-            address-edit := LineEdit {
-                horizontal-stretch: 1;
-                text <=> root.address;
-                placeholder-text: @tr("Path, e.g. x64e.rpf/levels/gta5/vehicles.rpf");
-                accepted(text) => { root.navigate(text); }
-            }
-            LineEdit {
-                width: 260px;
-                placeholder-text: @tr("Search names, hashes, text…");
-                accepted(text) => { root.search(text); }
-            }
-            LineEdit {
-                width: 160px;
-                text <=> root.filter;
-                placeholder-text: @tr("Filter list");
-                edited(text) => { root.filter-edited(text); }
-            }
-            if root.mods-available: Button {
-                text: @tr("Mods");
-                checkable: true;
-                checked <=> root.mods-overlay;
-                clicked => { root.overlay-toggled(self.checked); }
-            }
-            if root.mods-available: Button {
-                text: @tr("Changes");
-                clicked => { root.show-changes(); }
-            }
-            Button {
-                text: @tr("Install .oiv…");
-                enabled: !root.busy;
-                clicked => { root.install-oiv(); }
-            }
-            Button {
-                text: @tr("History");
-                clicked => { root.show-history(); }
-            }
-            if root.can-undo: Button {
-                text: @tr("Undo");
-                enabled: !root.busy;
-                clicked => { root.undo(); }
-            }
-            Button {
-                text: @tr("Extract…");
-                enabled: root.can-extract && !root.busy;
-                clicked => { root.extract-selected(); }
-            }
-
-            Button {
-                text: @tr("Setup");
-                clicked => { root.open-setup(); }
+        // Toolbar: navigation · location · search · views · actions
+        Rectangle {
+            background: Theme.surface;
+            HorizontalLayout {
+                padding: Theme.space-s;
+                padding-left: Theme.space-m;
+                padding-right: Theme.space-m;
+                spacing: Theme.space-s;
+                HorizontalLayout {
+                    spacing: 2px;
+                    IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: @image-url("icons/back.svg");
+                        label: @tr("Back (Alt+Left)");
+                        enabled: root.can-back;
+                        clicked => { root.go-back(); }
+                    }
+                    IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: @image-url("icons/forward.svg");
+                        label: @tr("Forward (Alt+Right)");
+                        enabled: root.can-forward;
+                        clicked => { root.go-forward(); }
+                    }
+                    IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: @image-url("icons/up.svg");
+                        label: @tr("Up (Alt+Up)");
+                        enabled: root.can-up;
+                        clicked => { root.go-up(); }
+                    }
+                }
+                address-edit := LineEdit {
+                    horizontal-stretch: 1;
+                    text <=> root.address;
+                    placeholder-text: @tr("Path, e.g. x64e.rpf/levels/gta5/vehicles.rpf");
+                    accessible-label: @tr("Address");
+                    accepted(text) => { root.navigate(text); }
+                }
+                search-edit := LineEdit {
+                    width: 280px;
+                    placeholder-text: @tr("Search names, hashes, text… (Ctrl+F)");
+                    accessible-label: @tr("Search");
+                    accepted(text) => { root.search(text); }
+                }
+                VSeparator {
+                    y: (parent.height - self.height) / 2;
+                }
+                if root.mods-available: Button {
+                    text: @tr("Mods");
+                    checkable: true;
+                    checked <=> root.mods-overlay;
+                    clicked => { root.overlay-toggled(self.checked); }
+                    Tooltip {
+                        text: @markdown("\{@tr("Show the game as the mods folder changes it")}");
+                    }
+                }
+                if root.mods-available: Button {
+                    text: @tr("Changes");
+                    clicked => { root.show-changes(); }
+                    Tooltip {
+                        text: @markdown("\{@tr("Every difference of all mods at once")}");
+                    }
+                }
+                Button {
+                    text: @tr("History");
+                    clicked => { root.show-history(); }
+                }
+                VSeparator {
+                    y: (parent.height - self.height) / 2;
+                }
+                Button {
+                    text: @tr("Extract…");
+                    enabled: root.can-extract && !root.busy;
+                    clicked => { root.extract-selected(); }
+                }
+                Button {
+                    text: @tr("Install .oiv…");
+                    enabled: !root.busy;
+                    clicked => { root.install-oiv(); }
+                }
+                IconButton {
+                    y: (parent.height - self.height) / 2;
+                    icon: Theme.dark ? @image-url("icons/sun.svg") : @image-url("icons/moon.svg");
+                    label: Theme.dark ? @tr("Switch to light mode") : @tr("Switch to dark mode");
+                    clicked => { root.set-theme(Theme.dark ? 1 : 2); }
+                }
+                IconButton {
+                    y: (parent.height - self.height) / 2;
+                    icon: @image-url("icons/settings.svg");
+                    label: @tr("Game setup");
+                    clicked => { root.open-setup(); }
+                }
             }
         }
 
         Rectangle {
             height: 1px;
-            background: Palette.border;
+            background: Theme.border;
         }
 
         HorizontalLayout {
@@ -409,33 +902,64 @@ export component AppWindow inherits Window {
             // Folder tree
             Rectangle {
                 width: root.tree-width;
-                ListView {
-                    for row[i] in root.tree: TreeItem {
-                        item: row;
-                        selected: i == root.tree-selected;
-                        toggle => { root.tree-toggle(i); }
-                        activate => { root.tree-activate(i); }
+                background: Theme.surface;
+                VerticalLayout {
+                    padding: Theme.space-xs;
+                    ListView {
+                        for row[i] in root.tree: TreeItem {
+                            item: row;
+                            selected: i == root.tree-selected;
+                            toggle => { root.tree-toggle(i); }
+                            activate => { root.tree-activate(i); }
+                        }
                     }
                 }
             }
 
             Splitter {
-                dragged(d) => { root.tree-width = max(160px, min(root.width / 2, root.tree-width + d)); }
+                dragged(d) => { root.tree-width = max(180px, min(root.width / 2, root.tree-width + d)); }
             }
 
             // File list
             VerticalLayout {
                 horizontal-stretch: 1;
-                if root.history-mode: HorizontalLayout {
-                    padding: 6px;
-                    spacing: 6px;
-                    Text {
+                padding: Theme.space-s;
+                padding-top: Theme.space-m;
+                spacing: Theme.space-s;
+
+                // Location header: where am I, how many items, filter
+                HorizontalLayout {
+                    spacing: Theme.space-m;
+                    padding-left: Theme.space-xs;
+                    VerticalLayout {
                         horizontal-stretch: 1;
-                        text: @tr("Changes made to the mods folder, newest first. Everything can be undone.");
-                        vertical-alignment: center;
-                        overflow: elide;
-                        color: Palette.foreground.with-alpha(0.8);
+                        alignment: center;
+                        Text {
+                            text: root.location-title;
+                            font-size: Theme.font-title;
+                            font-weight: 600;
+                            overflow: elide;
+                            color: Theme.text;
+                            accessible-role: text;
+                        }
+                        Text {
+                            text: root.filter == "" ? @tr("{} items", root.total-count) : @tr("{} of {} items", root.files.length, root.total-count);
+                            font-size: Theme.font-small;
+                            color: Theme.text-muted;
+                        }
                     }
+                    filter-edit := LineEdit {
+                        width: 200px;
+                        text <=> root.filter;
+                        placeholder-text: @tr("Filter this list");
+                        accessible-label: @tr("Filter this list");
+                        edited(text) => { root.filter-edited(text); }
+                    }
+                }
+
+                if root.history-mode: ContextBar {
+                    title: @tr("History");
+                    description: @tr("Changes made to the mods folder, newest first. Everything can be undone.");
                     Button {
                         text: @tr("Undo newest");
                         enabled: root.can-undo && !root.busy;
@@ -443,24 +967,24 @@ export component AppWindow inherits Window {
                     }
                     Button {
                         text: root.history-group == "" ? @tr("Uninstall package") : @tr("Uninstall “{}”", root.history-group);
+                        primary: root.history-group != "";
                         enabled: root.history-group != "" && !root.busy;
                         clicked => { root.uninstall-group(); }
                     }
                 }
-                if root.archive-mode: HorizontalLayout {
-                    padding: 6px;
-                    spacing: 6px;
-                    Text {
-                        horizontal-stretch: 1;
-                        text: @tr("Changes go to the mods folder, like OpenIV — drop files here to import.");
-                        vertical-alignment: center;
-                        overflow: elide;
-                        color: Palette.foreground.with-alpha(0.8);
-                    }
+                if root.archive-mode: ContextBar {
+                    title: @tr("Archive");
+                    description: @tr("Changes go to the mods folder and can be undone.");
                     Button {
                         text: @tr("Import…");
+                        primary: true;
                         enabled: !root.busy;
                         clicked => { root.archive-import(); }
+                    }
+                    Button {
+                        text: @tr("New folder…");
+                        enabled: !root.busy;
+                        clicked => { root.archive-new-folder(); }
                     }
                     Button {
                         text: @tr("Replace…");
@@ -472,26 +996,25 @@ export component AppWindow inherits Window {
                         enabled: root.entry-selected && !root.busy;
                         clicked => { root.archive-rename(); }
                     }
-                    Button {
-                        text: @tr("New folder…");
-                        enabled: !root.busy;
-                        clicked => { root.archive-new-folder(); }
+                    VSeparator {
+                        y: (parent.height - self.height) / 2;
                     }
                     Button {
                         text: @tr("Delete");
+                        icon: @image-url("icons/trash.svg");
+                        colorize-icon: false;
                         enabled: root.entry-selected && !root.busy;
                         clicked => { root.archive-delete(); }
                     }
                 }
-                if root.texture-mode: HorizontalLayout {
-                    padding: 6px;
-                    spacing: 6px;
-                    Text {
-                        horizontal-stretch: 1;
-                        text: @tr("Texture dictionary — changes are written to the mods folder, like OpenIV.");
-                        vertical-alignment: center;
-                        overflow: elide;
-                        color: Palette.foreground.with-alpha(0.8);
+                if root.texture-mode: ContextBar {
+                    title: @tr("Texture dictionary");
+                    description: @tr("Changes are written to the mods folder, like OpenIV.");
+                    Button {
+                        text: @tr("Add…");
+                        primary: true;
+                        enabled: !root.busy;
+                        clicked => { root.texture-add(); }
                     }
                     Button {
                         text: @tr("Replace…");
@@ -499,140 +1022,269 @@ export component AppWindow inherits Window {
                         clicked => { root.texture-replace(); }
                     }
                     Button {
-                        text: @tr("Add…");
-                        enabled: !root.busy;
-                        clicked => { root.texture-add(); }
-                    }
-                    Button {
-                        text: @tr("Remove");
-                        enabled: root.texture-selected && !root.busy;
-                        clicked => { root.texture-remove(); }
-                    }
-                    Button {
                         text: @tr("Save PNG…");
                         enabled: !root.busy;
                         clicked => { root.save-png(); }
                     }
-                }
-                if root.search-mode: HorizontalLayout {
-                    padding: 6px;
-                    spacing: 8px;
-                    Text {
-                        horizontal-stretch: 1;
-                        text: root.search-summary;
-                        wrap: word-wrap;
-                        vertical-alignment: center;
-                        color: Palette.foreground;
+                    VSeparator {
+                        y: (parent.height - self.height) / 2;
                     }
+                    Button {
+                        text: @tr("Remove");
+                        icon: @image-url("icons/trash.svg");
+                        colorize-icon: false;
+                        enabled: root.texture-selected && !root.busy;
+                        clicked => { root.texture-remove(); }
+                    }
+                }
+                if root.search-mode: ContextBar {
+                    title: @tr("Search results");
+                    description: root.search-summary;
                     if root.show-language: ComboBox {
-                        width: 170px;
+                        width: 180px;
                         model: root.languages;
                         current-index <=> root.language-index;
                         selected => { root.language-picked(self.current-index); }
                     }
                 }
-                HorizontalLayout {
-                    height: 24px;
-                    padding-left: 6px + 34px + 8px;
-                    padding-right: 6px;
-                    spacing: 8px;
-                    HeaderCell {
-                        horizontal-stretch: 1;
-                        min-width: 80px;
-                        preferred-width: 100px;
-                        label: @tr("Name");
-                        active: root.sort-column == 0;
-                        descending: root.sort-descending;
-                        clicked => { root.sort-by(0); }
-                    }
-                    HeaderCell {
-                        horizontal-stretch: root.search-mode ? 2 : 0;
-                        min-width: root.search-mode ? 60px : 90px;
-                        preferred-width: 90px;
-                        max-width: root.search-mode ? 100000px : 90px;
-                        label: root.search-mode ? @tr("Location") : @tr("Type");
-                        active: !root.search-mode && root.sort-column == 1;
-                        descending: root.sort-descending;
-                        clicked => { root.sort-by(1); }
-                    }
-                    HeaderCell {
-                        width: 80px;
-                        align: right;
-                        label: @tr("Size");
-                        active: root.sort-column == 2;
-                        descending: root.sort-descending;
-                        clicked => { root.sort-by(2); }
-                    }
-                    HeaderCell {
-                        width: 90px;
-                        label: @tr("Info");
-                        active: root.sort-column == 3;
-                        descending: root.sort-descending;
-                        clicked => { root.sort-by(3); }
-                    }
-                }
-                Rectangle {
-                    height: 1px;
-                    background: Palette.border;
-                }
+
+                // Column headers + list
                 Rectangle {
                     vertical-stretch: 1;
-                    border-width: drop.has-drag ? 2px : 0px;
-                    border-color: Palette.accent-background;
-                    drop := DropArea {
-                        enabled: root.archive-mode && !root.busy;
-                        can-drop(event) => { return DragAction.copy; }
-                        dropped(event) => {
-                            root.files-dropped(event.data);
-                            return DragAction.copy;
+                    border-radius: Theme.radius;
+                    border-width: drop.has-drag ? 2px : 1px;
+                    border-color: drop.has-drag || list-scope.has-focus ? Theme.accent : Theme.border;
+                    clip: true;
+                    VerticalLayout {
+                        Rectangle {
+                            height: 28px;
+                            background: Theme.surface;
+                            HorizontalLayout {
+                                padding-left: Theme.space-s + Theme.icon-size + Theme.space-s;
+                                padding-right: Theme.space-s;
+                                spacing: Theme.space-s;
+                                HeaderCell {
+                                    horizontal-stretch: 1;
+                                    min-width: 80px;
+                                    preferred-width: 100px;
+                                    label: @tr("Name");
+                                    active: root.sort-column == 0;
+                                    descending: root.sort-descending;
+                                    clicked => { root.sort-by(0); }
+                                }
+                                HeaderCell {
+                                    horizontal-stretch: root.search-mode ? 2 : 0;
+                                    min-width: root.search-mode ? 60px : 100px;
+                                    preferred-width: 100px;
+                                    max-width: root.search-mode ? 100000px : 100px;
+                                    label: root.search-mode ? @tr("Location") : @tr("Type");
+                                    active: !root.search-mode && root.sort-column == 1;
+                                    descending: root.sort-descending;
+                                    clicked => { root.sort-by(1); }
+                                }
+                                HeaderCell {
+                                    width: 72px;
+                                    align: right;
+                                    label: @tr("Size");
+                                    active: root.sort-column == 2;
+                                    descending: root.sort-descending;
+                                    clicked => { root.sort-by(2); }
+                                }
+                                HeaderCell {
+                                    width: 96px;
+                                    label: @tr("Info");
+                                    active: root.sort-column == 3;
+                                    descending: root.sort-descending;
+                                    clicked => { root.sort-by(3); }
+                                }
+                            }
+                        }
+                        Rectangle {
+                            height: 1px;
+                            background: Theme.border;
+                        }
+                        list-scope := FocusScope {
+                            vertical-stretch: 1;
+                            accessible-role: AccessibleRole.list;
+                            accessible-label: @tr("Files");
+                            KeyBinding {
+                                keys: @keys(DownArrow);
+                                activated => { root.move-selection(1); }
+                            }
+                            KeyBinding {
+                                keys: @keys(UpArrow);
+                                activated => { root.move-selection(-1); }
+                            }
+                            KeyBinding {
+                                keys: @keys(PageDown);
+                                activated => { root.move-selection(max(1, floor(list.visible-height / Theme.row-height) - 1)); }
+                            }
+                            KeyBinding {
+                                keys: @keys(PageUp);
+                                activated => { root.move-selection(-max(1, floor(list.visible-height / Theme.row-height) - 1)); }
+                            }
+                            KeyBinding {
+                                keys: @keys(Home);
+                                activated => { root.move-selection(-root.files.length); }
+                            }
+                            KeyBinding {
+                                keys: @keys(End);
+                                activated => { root.move-selection(root.files.length); }
+                            }
+                            KeyBinding {
+                                keys: @keys(Return);
+                                activated => {
+                                    if (root.file-selected >= 0) {
+                                        root.file-open(root.file-selected);
+                                    }
+                                }
+                            }
+                            KeyBinding {
+                                keys: @keys(Backspace);
+                                enabled: root.can-up;
+                                activated => { root.go-up(); }
+                            }
+                            KeyBinding {
+                                keys: @keys(Delete);
+                                activated => { root.delete-selected(); }
+                            }
+                            Rectangle {
+                                drop := DropArea {
+                                    enabled: root.archive-mode && !root.busy;
+                                    can-drop(event) => { return DragAction.copy; }
+                                    dropped(event) => {
+                                        root.files-dropped(event.data);
+                                        return DragAction.copy;
+                                    }
+                                }
+                                list := ListView {
+                                    for row[i] in root.files: FileItem {
+                                        item: row;
+                                        wide-kind: root.search-mode;
+                                        odd: Math.mod(i, 2) == 1;
+                                        selected: i == root.file-selected;
+                                        focused: list-scope.has-focus;
+                                        archive-mode: root.archive-mode;
+                                        texture-mode: root.texture-mode;
+                                        history-mode: root.history-mode;
+                                        select => {
+                                            list-scope.focus();
+                                            root.file-select(i);
+                                        }
+                                        open => { root.file-open(i); }
+                                        action(a) => {
+                                            list-scope.focus();
+                                            root.row-action(i, a);
+                                        }
+                                    }
+                                }
+                                // Empty states
+                                if root.files.length == 0 && !root.busy: VerticalLayout {
+                                    alignment: center;
+                                    spacing: Theme.space-xs;
+                                    padding: Theme.space-xl;
+                                    Text {
+                                        horizontal-alignment: center;
+                                        font-size: Theme.font-title;
+                                        font-weight: 600;
+                                        color: Theme.text-muted;
+                                        text: root.filter != "" ? @tr("Nothing matches “{}”", root.filter)
+                                            : root.search-mode ? @tr("No results")
+                                            : root.history-mode ? @tr("No changes yet")
+                                            : @tr("This folder is empty");
+                                    }
+                                    Text {
+                                        horizontal-alignment: center;
+                                        wrap: word-wrap;
+                                        color: Theme.text-faint;
+                                        text: root.filter != "" ? @tr("Clear the filter to see all items.")
+                                            : root.search-mode ? @tr("Try another term, a hash such as 0xB779A091, or search all languages.")
+                                            : root.history-mode ? @tr("Changes you make to archives and installed packages appear here and can be undone.")
+                                            : root.archive-mode ? @tr("Import files or drop them here.") : "";
+                                    }
+                                }
+                            }
                         }
                     }
-                    ListView {
-                    for row[i] in root.files: FileItem {
-                        item: row;
-                        wide-kind: root.search-mode;
-                        odd: Math.mod(i, 2) == 1;
-                        selected: i == root.file-selected;
-                        select => { root.file-select(i); }
-                        open => { root.file-open(i); }
-                    }
-                }
                 }
             }
 
             Splitter {
-                dragged(d) => { root.preview-width = max(240px, min(root.width / 2, root.preview-width - d)); }
+                dragged(d) => { root.preview-width = max(280px, min(root.width / 2, root.preview-width - d)); }
             }
 
             // Info + preview
             VerticalLayout {
                 width: root.preview-width;
-                padding: 6px;
-                spacing: 6px;
-                Text {
-                    text: root.info-text;
-                    wrap: word-wrap;
-                    color: Palette.foreground;
-                }
-                if root.model-mode: HorizontalLayout {
-                    spacing: 6px;
-                    Text {
-                        horizontal-stretch: 1;
-                        text: @tr("Drag to rotate, scroll to zoom");
-                        vertical-alignment: center;
-                        color: Palette.foreground.with-alpha(0.7);
+                padding: Theme.space-l;
+                padding-top: Theme.space-m;
+                spacing: Theme.space-m;
+
+                // Header: what is selected
+                VerticalLayout {
+                    spacing: Theme.space-xs;
+                    HorizontalLayout {
+                        spacing: Theme.space-s;
+                        FormatIcon {
+                            y: (parent.height - self.height) / 2;
+                            width: 20px;
+                            height: 20px;
+                            name: root.info-icon;
+                            tint: root.info-tint;
+                        }
+                        Text {
+                            text: root.info-title;
+                            font-size: Theme.font-title;
+                            font-weight: 600;
+                            overflow: elide;
+                            color: Theme.text;
+                        }
                     }
+                    if root.info-path != "": Text {
+                        text: root.info-path;
+                        font-family: root.mono-font;
+                        font-size: Theme.font-small;
+                        wrap: char-wrap;
+                        color: Theme.text-muted;
+                    }
+                }
+                if root.info-details != "": Text {
+                    text: root.info-details;
+                    wrap: word-wrap;
+                    color: Theme.text;
+                }
+
+                // Actions for the selection
+                if root.can-view: HorizontalLayout {
+                    spacing: Theme.space-s;
                     Button {
+                        text: @tr("Open viewer");
+                        icon: @image-url("icons/expand.svg");
+                        colorize-icon: true;
+                        clicked => { root.open-viewer(); }
+                    }
+                    if root.model-mode: Button {
                         text: @tr("Export glTF…");
                         enabled: !root.busy;
                         clicked => { root.export-gltf(); }
                     }
+                    if root.texture-mode: Button {
+                        text: @tr("Save PNG…");
+                        enabled: !root.busy;
+                        clicked => { root.save-png(); }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
                 }
+
                 preview-area := Rectangle {
                     vertical-stretch: 1;
+                    border-radius: Theme.radius;
                     border-width: 1px;
-                    border-color: Palette.border;
-                    background: Palette.alternate-background;
+                    border-color: Theme.border;
+                    background: Theme.surface-raised;
+                    clip: true;
                     if root.has-image: Image {
                         x: 8px;
                         y: 8px;
@@ -641,30 +1293,22 @@ export component AppWindow inherits Window {
                         source: root.preview-image;
                         image-fit: contain;
                         image-rendering: smooth;
+                        accessible-role: image;
+                        accessible-label: @tr("Preview of {}", root.info-title);
                     }
-                    if root.model-mode: TouchArea {
-                        property <length> last-x;
-                        property <length> last-y;
-                        mouse-cursor: self.pressed ? MouseCursor.grabbing : MouseCursor.grab;
-                        pointer-event(e) => {
-                            if (e.kind == PointerEventKind.down) {
-                                self.last-x = self.mouse-x;
-                                self.last-y = self.mouse-y;
-                            }
-                        }
-                        moved => {
-                            if (self.pressed) {
-                                root.model-orbit(self.mouse-x - self.last-x, self.mouse-y - self.last-y);
-                                self.last-x = self.mouse-x;
-                                self.last-y = self.mouse-y;
-                            }
-                        }
-                        scroll-event(e) => {
-                            root.model-zoom(e.delta-y / 1px);
-                            return EventResult.accept;
-                        }
+                    if root.model-mode: ModelControls {
+                        orbit(dx, dy) => { root.model-orbit(dx, dy); }
+                        zoom(d) => { root.model-zoom(d); }
+                        double-clicked => { root.open-viewer(); }
                     }
-                    if !root.has-image: ScrollView {
+                    if root.model-mode: Text {
+                        x: Theme.space-s;
+                        y: parent.height - self.height - Theme.space-s;
+                        text: @tr("Drag to rotate · scroll to zoom");
+                        font-size: Theme.font-small;
+                        color: Theme.text-faint;
+                    }
+                    if !root.has-image && root.preview-text != "": ScrollView {
                         content-width: max(self.visible-width, preview.preferred-width + 16px);
                         content-height: max(self.visible-height, preview.preferred-height + 16px);
                         preview := Text {
@@ -674,8 +1318,15 @@ export component AppWindow inherits Window {
                             font-family: root.mono-font;
                             font-size: 12px;
                             wrap: no-wrap;
-                            color: Palette.foreground;
+                            color: Theme.text;
                         }
+                    }
+                    if !root.has-image && root.preview-text == "" && !root.preview-loading: Text {
+                        width: parent.width - 2 * Theme.space-xl;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                        color: Theme.text-faint;
+                        text: root.has-selection ? @tr("No preview for this file type") : @tr("Select a file to preview it");
                     }
                     if root.preview-loading: Spinner {
                         width: 32px;
@@ -688,273 +1339,385 @@ export component AppWindow inherits Window {
 
         Rectangle {
             height: 1px;
-            background: Palette.border;
+            background: Theme.border;
         }
 
         // Status bar
-        HorizontalLayout {
-            padding: 4px;
-            padding-left: 8px;
-            spacing: 8px;
-            height: 28px;
-            Text {
-                text: root.filter == "" ? @tr("{} items", root.total-count) : @tr("{} of {} items", root.files.length, root.total-count);
-                vertical-alignment: center;
-                color: Palette.foreground;
-            }
-            Text {
-                horizontal-stretch: 1;
-                text: root.status;
-                vertical-alignment: center;
-                overflow: elide;
-                color: Palette.foreground.with-alpha(0.8);
-            }
-            Text {
-                text: root.index-status;
-                vertical-alignment: center;
-                color: Palette.foreground.with-alpha(0.7);
-            }
-            if root.busy: Spinner {
-                width: 18px;
-                indeterminate: true;
-            }
-            if root.busy: Button {
-                text: @tr("Cancel");
-                clicked => { root.cancel-task(); }
+        Rectangle {
+            background: Theme.surface;
+            HorizontalLayout {
+                padding-left: Theme.space-m;
+                padding-right: Theme.space-m;
+                spacing: Theme.space-m;
+                height: 30px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.status;
+                    font-size: Theme.font-small;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    color: Theme.text-muted;
+                    accessible-role: text;
+                }
+                Text {
+                    text: root.index-status;
+                    font-size: Theme.font-small;
+                    vertical-alignment: center;
+                    color: Theme.text-faint;
+                }
+                if root.busy: Spinner {
+                    width: 16px;
+                    indeterminate: true;
+                }
+                if root.busy: Button {
+                    text: @tr("Cancel");
+                    clicked => { root.cancel-task(); }
+                }
             }
         }
     }
 
-    // OpenIV package preview
-    if root.oiv-visible: Rectangle {
-        background: #00000080;
+    // Large viewer for the selected model or image
+    if root.viewer-open: Rectangle {
+        background: Theme.background;
         TouchArea { }
-        Rectangle {
-            width: min(760px, root.width - 40px);
-            height: min(620px, root.height - 40px);
-            border-radius: 8px;
-            background: Palette.background;
-            border-width: 1px;
-            border-color: Palette.border;
+        scope := FocusScope {
+            KeyBinding {
+                keys: @keys(Escape);
+                activated => { root.viewer-open = false; }
+            }
             VerticalLayout {
-                padding: 16px;
-                spacing: 8px;
-                Text {
-                    text: root.oiv-title;
-                    font-size: 18px;
-                    font-weight: 700;
-                    overflow: elide;
-                    color: Palette.foreground;
-                }
-                Text {
-                    text: root.oiv-subtitle;
-                    color: Palette.foreground.with-alpha(0.75);
-                }
-                Text {
-                    text: root.oiv-description;
-                    wrap: word-wrap;
-                    max-height: 80px;
-                    overflow: elide;
-                    color: Palette.foreground;
-                }
-                Text {
-                    text: @tr("Changes (written to the mods folder; can be uninstalled from History):");
-                    font-weight: 600;
-                    color: Palette.foreground;
-                }
                 Rectangle {
-                    vertical-stretch: 1;
-                    background: Palette.alternate-background;
-                    border-radius: 4px;
-                    ScrollView {
-                        content-width: max(self.visible-width, changes.preferred-width + 16px);
-                        content-height: max(self.visible-height, changes.preferred-height + 16px);
-                        changes := Text {
-                            x: 8px;
-                            y: 8px;
-                            text: root.oiv-changes;
-                            font-family: root.mono-font;
-                            font-size: 12px;
-                            color: Palette.foreground;
+                    background: Theme.surface;
+                    HorizontalLayout {
+                        padding: Theme.space-s;
+                        padding-left: Theme.space-l;
+                        spacing: Theme.space-s;
+                        FormatIcon {
+                            y: (parent.height - self.height) / 2;
+                            width: 20px;
+                            height: 20px;
+                            name: root.info-icon;
+                            tint: root.info-tint;
+                        }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            Text {
+                                text: root.info-title;
+                                font-size: Theme.font-title;
+                                font-weight: 600;
+                                overflow: elide;
+                                color: Theme.text;
+                            }
+                            Text {
+                                text: root.model-mode ? @tr("Drag to rotate · scroll to zoom · Esc to close") : @tr("Esc to close");
+                                font-size: Theme.font-small;
+                                color: Theme.text-muted;
+                            }
+                        }
+                        if root.model-mode: Button {
+                            text: @tr("Export glTF…");
+                            enabled: !root.busy;
+                            clicked => { root.export-gltf(); }
+                        }
+                        if root.texture-mode: Button {
+                            text: @tr("Save PNG…");
+                            enabled: !root.busy;
+                            clicked => { root.save-png(); }
+                        }
+                        IconButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/close.svg");
+                            label: @tr("Close viewer (Esc)");
+                            clicked => { root.viewer-open = false; }
                         }
                     }
                 }
-                if root.oiv-problems != "": Text {
+                Rectangle {
+                    height: 1px;
+                    background: Theme.border;
+                }
+                viewer-area := Rectangle {
+                    vertical-stretch: 1;
+                    background: Theme.surface-raised;
+                    init => {
+                        root.viewer-area-width = self.width;
+                        root.viewer-area-height = self.height;
+                    }
+                    changed width => { root.viewer-area-width = self.width; }
+                    changed height => { root.viewer-area-height = self.height; }
+                    if root.has-image: Image {
+                        x: Theme.space-l;
+                        y: Theme.space-l;
+                        width: parent.width - 2 * Theme.space-l;
+                        height: parent.height - 2 * Theme.space-l;
+                        source: root.preview-image;
+                        image-fit: contain;
+                        image-rendering: root.model-mode ? smooth : pixelated;
+                    }
+                    if root.model-mode: ModelControls {
+                        orbit(dx, dy) => { root.model-orbit(dx, dy); }
+                        zoom(d) => { root.model-zoom(d); }
+                    }
+                }
+            }
+        }
+        init => { scope.focus(); }
+    }
+
+    // OpenIV package preview
+    if root.oiv-visible: Dialog {
+        title: root.oiv-title;
+        subtitle: root.oiv-subtitle;
+        panel-width: 760px;
+        panel-height: 640px;
+        closable: !root.oiv-running;
+        close => { root.oiv-visible = false; }
+        if root.oiv-description != "": Text {
+            text: root.oiv-description;
+            wrap: word-wrap;
+            max-height: 80px;
+            overflow: elide;
+            color: Theme.text;
+        }
+        Text {
+            text: @tr("Changes — written to the mods folder, can be uninstalled from History");
+            font-weight: 600;
+            color: Theme.text;
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.surface-raised;
+            border-radius: Theme.radius;
+            ScrollView {
+                content-width: max(self.visible-width, changes.preferred-width + 16px);
+                content-height: max(self.visible-height, changes.preferred-height + 16px);
+                changes := Text {
+                    x: 8px;
+                    y: 8px;
+                    text: root.oiv-changes;
+                    font-family: root.mono-font;
+                    font-size: 12px;
+                    color: Theme.text;
+                }
+            }
+        }
+        if root.oiv-problems != "": Rectangle {
+            border-radius: Theme.radius;
+            background: (root.oiv-can-install ? Theme.warning : Theme.danger).with-alpha(0.12);
+            HorizontalLayout {
+                padding: Theme.space-s;
+                Text {
                     text: root.oiv-problems;
                     wrap: word-wrap;
-                    color: root.oiv-can-install ? #d6a12a : #e5484d;
+                    color: root.oiv-can-install ? Theme.warning : Theme.danger;
                 }
-                HorizontalLayout {
-                    alignment: end;
-                    spacing: 6px;
-                    if root.oiv-running: Spinner {
-                        width: 24px;
-                        indeterminate: true;
-                    }
-                    Button {
-                        text: @tr("Cancel");
-                        enabled: !root.oiv-running;
-                        clicked => { root.oiv-visible = false; }
-                    }
-                    Button {
-                        text: @tr("Install");
-                        primary: true;
-                        enabled: root.oiv-can-install && !root.oiv-running;
-                        clicked => { root.oiv-confirm(); }
-                    }
-                }
+            }
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: Theme.space-s;
+            if root.oiv-running: Spinner {
+                width: 24px;
+                indeterminate: true;
+            }
+            Button {
+                text: @tr("Cancel");
+                enabled: !root.oiv-running;
+                clicked => { root.oiv-visible = false; }
+            }
+            Button {
+                text: @tr("Install");
+                primary: true;
+                enabled: root.oiv-can-install && !root.oiv-running;
+                clicked => { root.oiv-confirm(); }
             }
         }
     }
 
     // Text prompt (rename, new folder)
-    if root.prompt-visible: Rectangle {
-        background: #00000080;
-        TouchArea { }
-        Rectangle {
-            width: min(460px, root.width - 40px);
-            height: 150px;
-            border-radius: 8px;
-            background: Palette.background;
-            border-width: 1px;
-            border-color: Palette.border;
-            VerticalLayout {
-                padding: 16px;
-                spacing: 10px;
-                Text {
-                    text: root.prompt-title;
-                    font-weight: 700;
-                    color: Palette.foreground;
-                }
-                prompt-edit := LineEdit {
-                    text <=> root.prompt-value;
-                    accepted(text) => { root.prompt-accepted(text); }
-                }
-                HorizontalLayout {
-                    alignment: end;
-                    spacing: 6px;
-                    Button {
-                        text: @tr("Cancel");
-                        clicked => { root.prompt-visible = false; }
-                    }
-                    Button {
-                        text: @tr("OK");
-                        primary: true;
-                        enabled: root.prompt-value != "";
-                        clicked => { root.prompt-accepted(root.prompt-value); }
-                    }
-                }
+    if root.prompt-visible: Dialog {
+        title: root.prompt-title;
+        panel-width: 460px;
+        panel-height: 190px;
+        close => { root.prompt-visible = false; }
+        prompt-edit := LineEdit {
+            text <=> root.prompt-value;
+            accessible-label: root.prompt-title;
+            accepted(text) => { root.prompt-accepted(text); }
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: Theme.space-s;
+            Button {
+                text: @tr("Cancel");
+                clicked => { root.prompt-visible = false; }
+            }
+            Button {
+                text: @tr("OK");
+                primary: true;
+                enabled: root.prompt-value != "";
+                clicked => { root.prompt-accepted(root.prompt-value); }
             }
         }
         init => { prompt-edit.focus(); }
     }
 
-    // First-run / key setup overlay
-    if root.setup-visible: Rectangle {
-        background: #000000a0;
-        TouchArea { }
+    // Keyboard shortcuts
+    if root.shortcuts-visible: Dialog {
+        title: @tr("Keyboard shortcuts");
+        panel-width: 520px;
+        panel-height: 500px;
+        close => { root.shortcuts-visible = false; }
+        GridLayout {
+            spacing-horizontal: Theme.space-xl;
+            spacing-vertical: Theme.space-s;
+            Row {
+                Text { text: "↑ ↓ · PgUp PgDn · Home End"; color: Theme.text-muted; }
+                Text { text: @tr("Move the selection in the list"); color: Theme.text; }
+            }
+            Row {
+                Text { text: "Enter"; color: Theme.text-muted; }
+                Text { text: @tr("Open folder, archive or texture dictionary"); color: Theme.text; }
+            }
+            Row {
+                Text { text: "Ctrl+Enter"; color: Theme.text-muted; }
+                Text { text: @tr("Open the model or image in the viewer"); color: Theme.text; }
+            }
+            Row {
+                Text { text: "Backspace · Alt+Up"; color: Theme.text-muted; }
+                Text { text: @tr("Go up one level"); color: Theme.text; }
+            }
+            Row {
+                Text { text: "Alt+Left · Alt+Right"; color: Theme.text-muted; }
+                Text { text: @tr("Back · forward"); color: Theme.text; }
+            }
+            Row {
+                Text { text: "Ctrl+L · Ctrl+F · Ctrl+Shift+F"; color: Theme.text-muted; }
+                Text { text: @tr("Address · search · filter"); color: Theme.text; }
+            }
+            Row {
+                Text { text: "F2 · Delete"; color: Theme.text-muted; }
+                Text { text: @tr("Rename · delete (inside archives)"); color: Theme.text; }
+            }
+            Row {
+                Text { text: "Ctrl+Z"; color: Theme.text-muted; }
+                Text { text: @tr("Undo the newest change"); color: Theme.text; }
+            }
+            Row {
+                Text { text: "Ctrl+E · Ctrl+O"; color: Theme.text-muted; }
+                Text { text: @tr("Extract · install .oiv package"); color: Theme.text; }
+            }
+            Row {
+                Text { text: @tr("Right-click"); color: Theme.text-muted; }
+                Text { text: @tr("Actions for a file"); color: Theme.text; }
+            }
+        }
         Rectangle {
-            width: min(640px, root.width - 40px);
-            height: min(460px, root.height - 40px);
-            border-radius: 8px;
-            background: Palette.background;
-            border-width: 1px;
-            border-color: Palette.border;
-            VerticalLayout {
-                padding: 16px;
-                spacing: 10px;
-                Text {
-                    text: @tr("Set up OpenRAGE");
-                    font-size: 18px;
-                    font-weight: 700;
-                    color: Palette.foreground;
+            vertical-stretch: 1;
+        }
+    }
+
+    // First-run / key setup
+    if root.setup-visible: Dialog {
+        title: @tr("Set up OpenRAGE");
+        panel-width: 660px;
+        panel-height: 520px;
+        closable: root.setup-can-cancel && !root.setup-running;
+        close => { root.setup-visible = false; }
+        Text {
+            text: @tr("OpenRAGE reads the archive keys from your own copy of GTA V. No keys or game files are included with OpenRAGE.");
+            wrap: word-wrap;
+            color: Theme.text-muted;
+        }
+        if root.setup-detected.length > 0: HorizontalLayout {
+            spacing: Theme.space-s;
+            Text {
+                text: @tr("Detected:");
+                vertical-alignment: center;
+                color: Theme.text;
+            }
+            ComboBox {
+                horizontal-stretch: 1;
+                model: root.setup-detected;
+                selected(value) => { root.setup-pick-detected(value); }
+            }
+        }
+        VerticalLayout {
+            spacing: Theme.space-xs;
+            Text {
+                text: @tr("Game directory");
+                font-weight: 600;
+                color: Theme.text;
+            }
+            HorizontalLayout {
+                spacing: Theme.space-s;
+                LineEdit {
+                    horizontal-stretch: 1;
+                    text <=> root.setup-game-dir;
+                    accessible-label: @tr("Game directory");
+                    placeholder-text: @tr("Folder containing GTA5_Enhanced.exe or GTA5.exe");
                 }
-                Text {
-                    text: @tr("OpenRAGE reads the archive keys from your own copy of GTA V. No keys or game files are included with OpenRAGE.");
-                    wrap: word-wrap;
-                    color: Palette.foreground;
+                Button {
+                    text: @tr("Browse…");
+                    clicked => { root.setup-browse-game(); }
                 }
-                if root.setup-detected.length > 0: HorizontalLayout {
-                    spacing: 6px;
-                    Text {
-                        text: @tr("Detected:");
-                        vertical-alignment: center;
-                        color: Palette.foreground;
-                    }
-                    ComboBox {
-                        horizontal-stretch: 1;
-                        model: root.setup-detected;
-                        selected(value) => { root.setup-pick-detected(value); }
-                    }
+            }
+        }
+        VerticalLayout {
+            spacing: Theme.space-xs;
+            Text {
+                text: @tr("Key blob (only needed for GTA V Enhanced)");
+                font-weight: 600;
+                color: Theme.text;
+            }
+            HorizontalLayout {
+                spacing: Theme.space-s;
+                LineEdit {
+                    horizontal-stretch: 1;
+                    text <=> root.setup-magic-path;
+                    accessible-label: @tr("Key blob");
+                    placeholder-text: @tr("Path to magic.dat");
                 }
-                Text {
-                    text: @tr("Game directory");
-                    font-weight: 600;
-                    color: Palette.foreground;
+                Button {
+                    text: @tr("Browse…");
+                    clicked => { root.setup-browse-magic(); }
                 }
-                HorizontalLayout {
-                    spacing: 6px;
-                    LineEdit {
-                        horizontal-stretch: 1;
-                        text <=> root.setup-game-dir;
-                        placeholder-text: @tr("Folder containing GTA5_Enhanced.exe or GTA5.exe");
-                    }
-                    Button {
-                        text: @tr("Browse…");
-                        clicked => { root.setup-browse-game(); }
-                    }
-                }
-                Text {
-                    text: @tr("Key blob (only needed for GTA V Enhanced)");
-                    font-weight: 600;
-                    color: Palette.foreground;
-                }
-                HorizontalLayout {
-                    spacing: 6px;
-                    LineEdit {
-                        horizontal-stretch: 1;
-                        text <=> root.setup-magic-path;
-                        placeholder-text: @tr("Path to magic.dat");
-                    }
-                    Button {
-                        text: @tr("Browse…");
-                        clicked => { root.setup-browse-magic(); }
-                    }
-                }
-                Rectangle {
-                    vertical-stretch: 1;
-                    background: Palette.alternate-background;
-                    border-radius: 4px;
-                    Text {
-                        x: 8px;
-                        y: 8px;
-                        width: parent.width - 16px;
-                        text: root.setup-log;
-                        wrap: word-wrap;
-                        font-family: root.mono-font;
-                        font-size: 12px;
-                        color: Palette.foreground;
-                    }
-                }
-                HorizontalLayout {
-                    spacing: 6px;
-                    alignment: end;
-                    if root.setup-running: Spinner {
-                        width: 24px;
-                        indeterminate: true;
-                    }
-                    if root.setup-can-cancel: Button {
-                        text: @tr("Close");
-                        enabled: !root.setup-running;
-                        clicked => { root.setup-visible = false; }
-                    }
-                    Button {
-                        text: @tr("Derive keys");
-                        primary: true;
-                        enabled: !root.setup-running && root.setup-game-dir != "";
-                        clicked => { root.setup-run(); }
-                    }
-                }
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.surface-raised;
+            border-radius: Theme.radius;
+            Text {
+                x: 8px;
+                y: 8px;
+                width: parent.width - 16px;
+                text: root.setup-log;
+                wrap: word-wrap;
+                font-family: root.mono-font;
+                font-size: 12px;
+                color: Theme.text;
+            }
+        }
+        HorizontalLayout {
+            spacing: Theme.space-s;
+            alignment: end;
+            if root.setup-running: Spinner {
+                width: 24px;
+                indeterminate: true;
+            }
+            if root.setup-can-cancel: Button {
+                text: @tr("Close");
+                enabled: !root.setup-running;
+                clicked => { root.setup-visible = false; }
+            }
+            Button {
+                text: @tr("Derive keys");
+                primary: true;
+                enabled: !root.setup-running && root.setup-game-dir != "";
+                clicked => { root.setup-run(); }
             }
         }
     }

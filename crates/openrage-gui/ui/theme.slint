@@ -1,0 +1,83 @@
+// Design tokens: spacing, sizes and semantic colors for light and dark mode.
+// Base colors come from the widget style's Palette, which follows the
+// color scheme chosen in View → Theme (or the system setting).
+
+import { Palette } from "std-widgets.slint";
+
+export global Theme {
+    out property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+
+    // Spacing scale
+    out property <length> space-xs: 4px;
+    out property <length> space-s: 8px;
+    out property <length> space-m: 12px;
+    out property <length> space-l: 16px;
+    out property <length> space-xl: 24px;
+
+    out property <length> radius: 6px;
+    out property <length> radius-s: 4px;
+    out property <length> row-height: 26px;
+    out property <length> icon-size: 16px;
+
+    // Type scale
+    out property <length> font-small: 11px;
+    out property <length> font-body: 13px;
+    out property <length> font-title: 16px;
+    out property <length> font-heading: 20px;
+
+    // Surfaces
+    out property <color> background: Palette.background;
+    out property <color> surface: dark ? #ffffff08 : #00000005;
+    out property <color> surface-raised: Palette.alternate-background;
+    out property <color> hover: dark ? #ffffff10 : #0000000b;
+    out property <color> stripe: dark ? #ffffff06 : #00000006;
+    out property <color> border: Palette.border;
+    out property <color> scrim: dark ? #000000a0 : #00000066;
+
+    // Text
+    out property <color> text: Palette.foreground;
+    out property <color> text-muted: Palette.foreground.with-alpha(0.68);
+    out property <color> text-faint: Palette.foreground.with-alpha(0.5);
+
+    // Accent and states (contrast ≥ 4.5:1 on the respective background)
+    out property <color> accent: Palette.accent-background;
+    out property <color> accent-subtle: Palette.accent-background.with-alpha(dark ? 0.16 : 0.10);
+    out property <color> selection: Palette.selection-background;
+    out property <color> selection-text: Palette.selection-foreground;
+    out property <color> success: dark ? #4cc38a : #1a7f4f;
+    out property <color> warning: dark ? #e5b454 : #8a5a00;
+    out property <color> danger: dark ? #f2777b : #c0282d;
+    out property <color> info: dark ? #74a8ff : #2160d8;
+
+    // Mod status (stripe in the file list)
+    pure public function mark-color(mark: int) -> color {
+        if (mark == 1) { return root.success; }
+        if (mark == 2) { return root.warning; }
+        if (mark == 3) { return root.info; }
+        if (mark == 4) { return root.danger; }
+        return transparent;
+    }
+}
+
+// Icons for file formats and toolbar glyphs (white strokes, tinted with `colorize`).
+export global Icons {
+    pure public function get(name: string) -> image {
+        if (name == "folder") { return @image-url("icons/folder.svg"); }
+        if (name == "archive") { return @image-url("icons/archive.svg"); }
+        if (name == "texture") { return @image-url("icons/texture.svg"); }
+        if (name == "model") { return @image-url("icons/model.svg"); }
+        if (name == "map") { return @image-url("icons/map.svg"); }
+        if (name == "data") { return @image-url("icons/data.svg"); }
+        if (name == "text") { return @image-url("icons/text.svg"); }
+        if (name == "audio") { return @image-url("icons/audio.svg"); }
+        if (name == "script") { return @image-url("icons/script.svg"); }
+        if (name == "collision") { return @image-url("icons/collision.svg"); }
+        if (name == "path") { return @image-url("icons/path.svg"); }
+        if (name == "anim") { return @image-url("icons/anim.svg"); }
+        if (name == "lang") { return @image-url("icons/lang.svg"); }
+        if (name == "particles") { return @image-url("icons/particles.svg"); }
+        if (name == "package") { return @image-url("icons/package.svg"); }
+        if (name == "search") { return @image-url("icons/search.svg"); }
+        return @image-url("icons/file.svg");
+    }
+}
