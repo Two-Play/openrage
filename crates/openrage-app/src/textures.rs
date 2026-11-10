@@ -9,8 +9,7 @@ use rage_formats::ytd_write::{self, Edit, EditResult};
 use rage_rpf::EntryKind;
 use rage_rpf::vfs::Node;
 
-use crate::install::write_entry_into_mods;
-use crate::repack;
+use crate::install::{Op, apply_at};
 
 /// Applies texture edits to the `.ytd` at `vpath` (as the game sees it, i.e.
 /// including mods) and writes the result into the mods folder.
@@ -29,8 +28,14 @@ pub fn edit_textures(
     let dict = rage_formats::ytd::parse(&res).context("reading the texture dictionary")?;
     let result = ytd_write::apply(&res, system_flags, graphics_flags, &dict, edits)?;
     drop(rpf);
-    let written = write_entry_into_mods(game_dir, keys, vpath, repack::Edit::Set(result.file.clone()))?;
-    Ok((result, written))
+    let name = vpath.rsplit('/').next().unwrap_or(vpath);
+    let what = match edits {
+        [ytd_write::Edit::Set(t)] => format!("Replaced texture {} in {name}", t.name),
+        [ytd_write::Edit::Remove(n)] => format!("Removed texture {n} from {name}"),
+        _ => format!("Changed {} textures in {name}", edits.len()),
+    };
+    let applied = apply_at(game_dir, keys, vpath, Op::Set(result.file.clone()), &what)?;
+    Ok((result, applied.path))
 }
 
 /// Reads a DDS file as a texture to put into a dictionary under `name`.

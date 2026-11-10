@@ -86,6 +86,9 @@ fn scan_disk(game_dir: &Path) -> (Vec<Record>, Vec<DiskArchive>) {
         for entry in rd.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
             let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".openrage" {
+                continue; // OpenRAGE's journal inside the mods folder
+            }
             let rel = if rel_dir.is_empty() { name.clone() } else { format!("{rel_dir}/{name}") };
             let is_rpf = !meta.is_dir() && name.to_ascii_lowercase().ends_with(".rpf");
             let kind = if meta.is_dir() {

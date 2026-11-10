@@ -9,13 +9,14 @@ mod preview;
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use openrage_app::config::Config;
 use openrage_app::extract::{extract_entry, human_size};
+use openrage_app::install::{self, Op};
 use openrage_app::setup::{self, KeyBlobRequired, KeySource};
 use openrage_app::{detect, game_language_from_locale, index_path, load_keys};
 use rage_crypto::GtaVKeys;
@@ -53,6 +54,8 @@ struct App {
     /// Show the game as it sees itself with the OpenIV `mods` folder applied.
     overlay: bool,
     diff_generation: Arc<AtomicU64>,
+    /// What the open text prompt is for.
+    prompt: Option<Prompt>,
     index_running: bool,
 }
 
@@ -90,6 +93,7 @@ fn main() -> anyhow::Result<()> {
             search_generation: Arc::new(AtomicU64::new(0)),
             overlay: false,
             diff_generation: Arc::new(AtomicU64::new(0)),
+            prompt: None,
             index_running: false,
         })
     });
@@ -242,6 +246,41 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_save_png(move || with_ui(&w, |ui| export_textures(ui, true)));
     let w = ui.as_weak();
+    ui.on_archive_import(move || with_ui(&w, |ui| archive_import(ui, None)));
+    let w = ui.as_weak();
+    ui.on_files_dropped(move |data| {
+        let paths: Vec<PathBuf> = data.file_paths().map(|it| it.map(Path::to_path_buf).collect()).unwrap_or_default();
+        with_ui(&w, |ui| {
+            if paths.is_empty() {
+                ui.set_status("Only files can be dropped here.".into());
+            } else {
+                archive_import(ui, Some(paths));
+            }
+        })
+    });
+    let w = ui.as_weak();
+    ui.on_archive_replace(move || with_ui(&w, archive_replace));
+    let w = ui.as_weak();
+    ui.on_archive_delete(move || with_ui(&w, archive_delete));
+    let w = ui.as_weak();
+    ui.on_archive_rename(move || {
+        with_ui(&w, |ui| {
+            let Some((vpath, name)) = selected_entry() else { return };
+            open_prompt(ui, Prompt::Rename { vpath }, "Rename to", &name);
+        })
+    });
+    let w = ui.as_weak();
+    ui.on_archive_new_folder(move || {
+        with_ui(&w, |ui| {
+            let Some(dir) = with_app(|a| a.listing.as_ref().map(|l| l.vpath.clone())) else { return };
+            open_prompt(ui, Prompt::NewFolder { dir }, "New folder name", "new_folder");
+        })
+    });
+    let w = ui.as_weak();
+    ui.on_prompt_accepted(move |text| with_ui(&w, |ui| prompt_accepted(ui, text.trim())));
+    let w = ui.as_weak();
+    ui.on_undo(move || with_ui(&w, start_undo));
+    let w = ui.as_weak();
     ui.on_texture_replace(move || with_ui(&w, |ui| edit_texture(ui, TextureAction::Replace)));
     let w = ui.as_weak();
     ui.on_texture_add(move || with_ui(&w, |ui| edit_texture(ui, TextureAction::Add)));
@@ -312,6 +351,7 @@ fn start_browsing(ui: &AppWindow) {
     });
     ui.set_window_title(title.into());
     start_index_update(ui);
+    refresh_undo(ui);
     navigate(ui, "", true);
     // Optional start path, e.g. `openrage-gui x64e.rpf/levels/gta5/vehicles.rpf/adder.yft`.
     if let Some(path) = std::env::args().nth(1) {
@@ -444,6 +484,9 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
     let texture_mode = with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { .. })));
     ui.set_texture_mode(texture_mode);
     ui.set_texture_selected(texture_mode && selected_row.is_some());
+    let archive_mode = with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Archive(..))));
+    ui.set_archive_mode(archive_mode);
+    ui.set_entry_selected(archive_mode && selected_row.is_some());
     if let (Some(row), Some(_)) = (selected_row, select) {
         select_row(ui, row);
     }
@@ -596,6 +639,7 @@ fn select_row(ui: &AppWindow, row: usize) {
     ui.set_file_selected(row as i32);
     ui.set_can_extract(true);
     ui.set_texture_selected(item.kind == ItemKind::Texture);
+    ui.set_entry_selected(item.entry.is_some());
 
     let mut info =
         format!("{}\n{}\n{} · {}", item.name, vpath, badges::type_name(&item.name, item.kind), human_size(item.size));
@@ -992,7 +1036,13 @@ fn start_folder_diff(ui: &AppWindow) {
                         for r in &d.removed {
                             l.items.push(Item {
                                 name: r.name.clone(),
-                                kind: if r.is_dir { ItemKind::Dir } else { ItemKind::File },
+                                kind: if r.is_archive {
+                                    ItemKind::Archive
+                                } else if r.is_dir {
+                                    ItemKind::Dir
+                                } else {
+                                    ItemKind::File
+                                },
                                 size: r.size,
                                 info: String::new(),
                                 entry: None,
@@ -1159,6 +1209,240 @@ fn export_textures(ui: &AppWindow, png: bool) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Editing archives (always in the mods folder)
+
+#[derive(Debug, Clone)]
+enum Prompt {
+    Rename { vpath: String },
+    NewFolder { dir: String },
+}
+
+/// Virtual path and name of the selected entry in an archive listing.
+fn selected_entry() -> Option<(String, String)> {
+    with_app(|a| {
+        let l = a.listing.as_ref()?;
+        if !matches!(l.location, Location::Archive(..)) {
+            return None;
+        }
+        let item = &l.items[a.selected?];
+        item.entry?;
+        Some((browser::join(&l.vpath, &item.name), item.name.clone()))
+    })
+}
+
+fn open_prompt(ui: &AppWindow, prompt: Prompt, title: &str, value: &str) {
+    with_app(|a| a.prompt = Some(prompt));
+    ui.set_prompt_title(title.into());
+    ui.set_prompt_value(value.into());
+    ui.set_prompt_visible(true);
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['/', '\\', ':']) && name != "." && name != ".."
+}
+
+fn prompt_accepted(ui: &AppWindow, text: &str) {
+    if !valid_name(text) {
+        ui.set_status(format!("\"{text}\" is not a valid name.").into());
+        return;
+    }
+    ui.set_prompt_visible(false);
+    match with_app(|a| a.prompt.take()) {
+        Some(Prompt::Rename { vpath }) => {
+            let to = browser::join(&browser::parent(&vpath).unwrap_or_default(), text);
+            let what = format!("Renamed {} to {text}", vpath.rsplit('/').next().unwrap_or(&vpath));
+            run_archive_ops(ui, vec![(vpath, OpTarget::Rename(to))], what, Some(text.to_owned()));
+        }
+        Some(Prompt::NewFolder { dir }) => {
+            let path = browser::join(&dir, text);
+            run_archive_ops(
+                ui,
+                vec![(path, OpTarget::Op(Op::CreateDir))],
+                format!("Created folder {text}"),
+                Some(text.to_owned()),
+            );
+        }
+        None => {}
+    }
+}
+
+/// An operation on a virtual path; renames carry the full new virtual path.
+enum OpTarget {
+    Op(Op),
+    Rename(String),
+}
+
+/// Applies operations (grouped per top-level archive) in the background, then refreshes the view.
+fn run_archive_ops(ui: &AppWindow, ops: Vec<(String, OpTarget)>, description: String, select: Option<String>) {
+    let Some((game_dir, keys, current)) =
+        with_app(|a| Some((a.game_dir.clone()?, a.keys.clone(), a.listing.as_ref()?.vpath.clone())))
+    else {
+        return;
+    };
+    set_busy(ui, true, "Writing into the mods folder…".into());
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = (|| -> anyhow::Result<install::Applied> {
+            let mut grouped: Vec<(String, Vec<(String, Op)>)> = Vec::new();
+            for (vpath, op) in ops {
+                let t = install::split(&game_dir, &vpath)
+                    .ok_or_else(|| anyhow::anyhow!("{vpath} is not inside an archive"))?;
+                let op = match op {
+                    OpTarget::Op(op) => op,
+                    OpTarget::Rename(to) => {
+                        let to =
+                            install::split(&game_dir, &to).ok_or_else(|| anyhow::anyhow!("invalid target {to}"))?;
+                        Op::Rename(to.inner)
+                    }
+                };
+                match grouped.iter_mut().find(|(a, _)| a.eq_ignore_ascii_case(&t.archive)) {
+                    Some((_, list)) => list.push((t.inner, op)),
+                    None => grouped.push((t.archive, vec![(t.inner, op)])),
+                }
+            }
+            let mut last = None;
+            for (archive, list) in grouped {
+                last = Some(install::apply(&game_dir, keys.clone(), &archive, &list, &description)?);
+            }
+            last.ok_or_else(|| anyhow::anyhow!("nothing to do"))
+        })();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            set_busy(&ui, false, String::new());
+            match result {
+                Ok(applied) => {
+                    with_app(|a| a.overlay = true);
+                    ui.set_mods_available(true);
+                    ui.set_mods_overlay(true);
+                    rebuild_tree(&ui);
+                    let target = match &select {
+                        Some(name) => browser::join(&current, name),
+                        None => current.clone(),
+                    };
+                    navigate(&ui, &target, false);
+                    if select.is_some() && with_app(|a| a.selected.is_none()) {
+                        navigate(&ui, &current, false);
+                    }
+                    refresh_undo(&ui);
+                    let mut msg = format!("{description} — {:.2}s", started.elapsed().as_secs_f32());
+                    if applied.created {
+                        msg.push_str(" (archive copied into the mods folder first)");
+                    }
+                    ui.set_status(msg.into());
+                }
+                Err(e) => ui.set_status(format!("{description} failed: {e:#}").into()),
+            }
+        });
+    });
+}
+
+fn archive_import(ui: &AppWindow, dropped: Option<Vec<PathBuf>>) {
+    let Some(dir) = with_app(|a| {
+        let l = a.listing.as_ref()?;
+        matches!(l.location, Location::Archive(..)).then(|| l.vpath.clone())
+    }) else {
+        ui.set_status("Open a folder inside an archive to import files.".into());
+        return;
+    };
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let files = match dropped {
+            Some(f) => f,
+            None => match rfd::FileDialog::new().set_title("Import files into the archive").pick_files() {
+                Some(f) => f,
+                None => return,
+            },
+        };
+        let mut ops = Vec::new();
+        let mut problems = Vec::new();
+        for f in files.iter().filter(|f| f.is_file()) {
+            let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match std::fs::read(f) {
+                Ok(data) => ops.push((browser::join(&dir, &name), OpTarget::Op(Op::Set(data)))),
+                Err(e) => problems.push(format!("{name}: {e}")),
+            }
+        }
+        let description = match ops.len() {
+            1 => format!("Imported {}", ops[0].0.rsplit('/').next().unwrap_or_default()),
+            n => format!("Imported {n} files"),
+        };
+        let select = (ops.len() == 1).then(|| ops[0].0.rsplit('/').next().unwrap_or_default().to_owned());
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if let Some(p) = problems.first() {
+                ui.set_status(format!("Could not read {p}").into());
+            }
+            if !ops.is_empty() {
+                run_archive_ops(&ui, ops, description, select);
+            }
+        });
+    });
+}
+
+fn archive_replace(ui: &AppWindow) {
+    let Some((vpath, name)) = selected_entry() else { return };
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let Some(file) = rfd::FileDialog::new().set_title(format!("Replace {name}")).pick_file() else { return };
+        let result = std::fs::read(&file);
+        let _ = weak.upgrade_in_event_loop(move |ui| match result {
+            Ok(data) => {
+                run_archive_ops(&ui, vec![(vpath, OpTarget::Op(Op::Set(data)))], format!("Replaced {name}"), Some(name))
+            }
+            Err(e) => ui.set_status(format!("Could not read {}: {e}", file.display()).into()),
+        });
+    });
+}
+
+fn archive_delete(ui: &AppWindow) {
+    let Some((vpath, name)) = selected_entry() else { return };
+    run_archive_ops(ui, vec![(vpath, OpTarget::Op(Op::Remove))], format!("Deleted {name}"), None);
+}
+
+/// Shows or hides the Undo button with the newest journal entry.
+fn refresh_undo(ui: &AppWindow) {
+    let newest = with_app(|a| a.game_dir.clone())
+        .and_then(|d| rage_mods::mods_dir(&d))
+        .and_then(|m| openrage_app::journal::Journal::new(&m).entries().ok())
+        .and_then(|e| e.into_iter().next());
+    ui.set_can_undo(newest.is_some());
+    ui.set_undo_label(newest.map(|e| e.description).unwrap_or_default().into());
+}
+
+fn start_undo(ui: &AppWindow) {
+    let Some((game_dir, current)) =
+        with_app(|a| Some((a.game_dir.clone()?, a.listing.as_ref().map(|l| l.vpath.clone()).unwrap_or_default())))
+    else {
+        return;
+    };
+    set_busy(ui, true, "Undoing…".into());
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let result = install::undo_last(&game_dir);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            set_busy(&ui, false, String::new());
+            let msg = match result {
+                Ok(Some(e)) => format!("Undone: {}", e.description),
+                Ok(None) => "Nothing to undo.".into(),
+                Err(e) => format!("Undo failed: {e:#}"),
+            };
+            rebuild_tree(&ui);
+            // The current folder may no longer exist after undoing.
+            let mut target = current.clone();
+            loop {
+                navigate(&ui, &target, false);
+                let ok = with_app(|a| a.listing.as_ref().is_some_and(|l| l.vpath.eq_ignore_ascii_case(&target)));
+                match browser::parent(&target) {
+                    Some(p) if !ok => target = p,
+                    _ => break,
+                }
+            }
+            refresh_undo(&ui);
+            ui.set_status(msg.into());
+        });
+    });
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextureAction {
     Replace,
@@ -1233,6 +1517,7 @@ fn edit_texture(ui: &AppWindow, action: TextureAction) {
                 ui.set_mods_overlay(true);
                 rebuild_tree(&ui);
                 navigate(&ui, &ytd, false);
+                refresh_undo(&ui);
             }
             ui.set_status(msg.into());
         });

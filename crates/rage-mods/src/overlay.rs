@@ -11,6 +11,9 @@ use rage_rpf::vfs::{self, Node};
 /// Name of OpenIV's mods folder inside the game directory.
 pub const MODS_FOLDER: &str = "mods";
 
+/// OpenRAGE's own data inside the mods folder (journal, temporary files); never part of a mod.
+pub const OPENRAGE_FOLDER: &str = ".openrage";
+
 /// The `mods` folder of a game installation, if present.
 pub fn mods_dir(game_dir: &Path) -> Option<PathBuf> {
     vfs::match_case_insensitive(game_dir, MODS_FOLDER).filter(|p| p.is_dir())
@@ -46,7 +49,9 @@ pub fn scan(game_dir: &Path) -> Vec<ModFile> {
             let name = entry.file_name().to_string_lossy().into_owned();
             let rel = if rel_dir.is_empty() { name.clone() } else { format!("{rel_dir}/{name}") };
             if meta.is_dir() {
-                stack.push((entry.path(), rel));
+                if !name.eq_ignore_ascii_case(OPENRAGE_FOLDER) {
+                    stack.push((entry.path(), rel));
+                }
                 continue;
             }
             let replaces = vfs::find_case_insensitive(game_dir, &rel).is_some_and(|p| p.is_file());

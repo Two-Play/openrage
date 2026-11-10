@@ -5,6 +5,7 @@ pub mod config;
 pub mod detect;
 pub mod extract;
 pub mod install;
+pub mod journal;
 pub mod repack;
 pub mod setup;
 pub mod textures;

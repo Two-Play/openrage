@@ -223,10 +223,17 @@ pub fn list(
 
 /// Adds the `mods` counterpart of a disk folder to its listing and marks items.
 fn merge_mods(game_dir: &Path, listing: &mut Listing) {
+    merge_mods_inner(game_dir, listing);
+    // OpenRAGE's journal folder inside `mods` is not part of the game.
+    listing.items.retain(|i| !i.name.eq_ignore_ascii_case(rage_mods::overlay::OPENRAGE_FOLDER));
+}
+
+fn merge_mods_inner(game_dir: &Path, listing: &mut Listing) {
     let Some(mods) = rage_mods::mods_dir(game_dir) else { return };
     if listing.vpath.is_empty() {
         listing.items.retain(|i| !i.name.eq_ignore_ascii_case(rage_mods::overlay::MODS_FOLDER));
     }
+
     if listing.origin == Origin::Mods {
         listing.items.iter_mut().for_each(|i| i.mark = Some(Mark::New));
         return;

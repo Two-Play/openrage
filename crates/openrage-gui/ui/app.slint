@@ -234,6 +234,15 @@ export component AppWindow inherits Window {
     in property <image> preview-image;
     in property <bool> has-image;
     in property <bool> texture-mode;
+    // Editing archives (written into the mods folder)
+    in property <bool> archive-mode;
+    in property <bool> entry-selected;
+    in property <bool> can-undo;
+    in property <string> undo-label;
+    // Text prompt (rename, new folder)
+    in-out property <bool> prompt-visible;
+    in property <string> prompt-title;
+    in-out property <string> prompt-value;
     in property <bool> texture-selected;
     in property <bool> preview-loading;
 
@@ -267,6 +276,14 @@ export component AppWindow inherits Window {
     callback language-picked(int);
     callback extract-selected();
     callback save-png();
+    callback archive-import();
+    callback archive-replace();
+    callback archive-rename();
+    callback archive-new-folder();
+    callback archive-delete();
+    callback files-dropped(data-transfer);
+    callback undo();
+    callback prompt-accepted(string);
     callback texture-replace();
     callback texture-add();
     callback texture-remove();
@@ -327,6 +344,11 @@ export component AppWindow inherits Window {
                 text: @tr("Changes");
                 clicked => { root.show-changes(); }
             }
+            if root.can-undo: Button {
+                text: @tr("Undo");
+                enabled: !root.busy;
+                clicked => { root.undo(); }
+            }
             Button {
                 text: @tr("Extract…");
                 enabled: root.can-extract && !root.busy;
@@ -367,6 +389,42 @@ export component AppWindow inherits Window {
             // File list
             VerticalLayout {
                 horizontal-stretch: 1;
+                if root.archive-mode: HorizontalLayout {
+                    padding: 6px;
+                    spacing: 6px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: @tr("Changes go to the mods folder, like OpenIV — drop files here to import.");
+                        vertical-alignment: center;
+                        overflow: elide;
+                        color: Palette.foreground.with-alpha(0.8);
+                    }
+                    Button {
+                        text: @tr("Import…");
+                        enabled: !root.busy;
+                        clicked => { root.archive-import(); }
+                    }
+                    Button {
+                        text: @tr("Replace…");
+                        enabled: root.entry-selected && !root.busy;
+                        clicked => { root.archive-replace(); }
+                    }
+                    Button {
+                        text: @tr("Rename…");
+                        enabled: root.entry-selected && !root.busy;
+                        clicked => { root.archive-rename(); }
+                    }
+                    Button {
+                        text: @tr("New folder…");
+                        enabled: !root.busy;
+                        clicked => { root.archive-new-folder(); }
+                    }
+                    Button {
+                        text: @tr("Delete");
+                        enabled: root.entry-selected && !root.busy;
+                        clicked => { root.archive-delete(); }
+                    }
+                }
                 if root.texture-mode: HorizontalLayout {
                     padding: 6px;
                     spacing: 6px;
@@ -459,7 +517,19 @@ export component AppWindow inherits Window {
                     height: 1px;
                     background: Palette.border;
                 }
-                ListView {
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-width: drop.has-drag ? 2px : 0px;
+                    border-color: Palette.accent-background;
+                    drop := DropArea {
+                        enabled: root.archive-mode && !root.busy;
+                        can-drop(event) => { return DragAction.copy; }
+                        dropped(event) => {
+                            root.files-dropped(event.data);
+                            return DragAction.copy;
+                        }
+                    }
+                    ListView {
                     for row[i] in root.files: FileItem {
                         item: row;
                         wide-kind: root.search-mode;
@@ -468,6 +538,7 @@ export component AppWindow inherits Window {
                         select => { root.file-select(i); }
                         open => { root.file-open(i); }
                     }
+                }
                 }
             }
 
@@ -558,6 +629,48 @@ export component AppWindow inherits Window {
                 clicked => { root.cancel-task(); }
             }
         }
+    }
+
+    // Text prompt (rename, new folder)
+    if root.prompt-visible: Rectangle {
+        background: #00000080;
+        TouchArea { }
+        Rectangle {
+            width: min(460px, root.width - 40px);
+            height: 150px;
+            border-radius: 8px;
+            background: Palette.background;
+            border-width: 1px;
+            border-color: Palette.border;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+                Text {
+                    text: root.prompt-title;
+                    font-weight: 700;
+                    color: Palette.foreground;
+                }
+                prompt-edit := LineEdit {
+                    text <=> root.prompt-value;
+                    accepted(text) => { root.prompt-accepted(text); }
+                }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 6px;
+                    Button {
+                        text: @tr("Cancel");
+                        clicked => { root.prompt-visible = false; }
+                    }
+                    Button {
+                        text: @tr("OK");
+                        primary: true;
+                        enabled: root.prompt-value != "";
+                        clicked => { root.prompt-accepted(root.prompt-value); }
+                    }
+                }
+            }
+        }
+        init => { prompt-edit.focus(); }
     }
 
     // First-run / key setup overlay
