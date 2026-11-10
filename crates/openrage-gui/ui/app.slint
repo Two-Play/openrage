@@ -233,6 +233,10 @@ export component AppWindow inherits Window {
     in property <string> preview-text;
     in property <image> preview-image;
     in property <bool> has-image;
+    // Model preview: drag to orbit, wheel to zoom.
+    in property <bool> model-mode;
+    out property <length> preview-area-width;
+    out property <length> preview-area-height;
     in property <bool> texture-mode;
     // Editing archives (written into the mods folder)
     in property <bool> archive-mode;
@@ -288,6 +292,10 @@ export component AppWindow inherits Window {
     callback language-picked(int);
     callback extract-selected();
     callback save-png();
+    callback model-orbit(length, length);
+    callback model-zoom(float);
+    callback model-resized();
+    callback export-gltf();
     callback archive-import();
     callback archive-replace();
     callback archive-rename();
@@ -310,6 +318,10 @@ export component AppWindow inherits Window {
     callback setup-pick-detected(string);
     callback setup-run();
 
+    preview-area-width: preview-area.width;
+    preview-area-height: preview-area.height;
+    changed preview-area-width => { root.model-resized(); }
+    changed preview-area-height => { root.model-resized(); }
     property <length> tree-width: 240px;
     property <length> preview-width: 480px;
 
@@ -602,7 +614,21 @@ export component AppWindow inherits Window {
                     wrap: word-wrap;
                     color: Palette.foreground;
                 }
-                Rectangle {
+                if root.model-mode: HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: @tr("Drag to rotate, scroll to zoom");
+                        vertical-alignment: center;
+                        color: Palette.foreground.with-alpha(0.7);
+                    }
+                    Button {
+                        text: @tr("Export glTF…");
+                        enabled: !root.busy;
+                        clicked => { root.export-gltf(); }
+                    }
+                }
+                preview-area := Rectangle {
                     vertical-stretch: 1;
                     border-width: 1px;
                     border-color: Palette.border;
@@ -615,6 +641,28 @@ export component AppWindow inherits Window {
                         source: root.preview-image;
                         image-fit: contain;
                         image-rendering: smooth;
+                    }
+                    if root.model-mode: TouchArea {
+                        property <length> last-x;
+                        property <length> last-y;
+                        mouse-cursor: self.pressed ? MouseCursor.grabbing : MouseCursor.grab;
+                        pointer-event(e) => {
+                            if (e.kind == PointerEventKind.down) {
+                                self.last-x = self.mouse-x;
+                                self.last-y = self.mouse-y;
+                            }
+                        }
+                        moved => {
+                            if (self.pressed) {
+                                root.model-orbit(self.mouse-x - self.last-x, self.mouse-y - self.last-y);
+                                self.last-x = self.mouse-x;
+                                self.last-y = self.mouse-y;
+                            }
+                        }
+                        scroll-event(e) => {
+                            root.model-zoom(e.delta-y / 1px);
+                            return EventResult.accept;
+                        }
                     }
                     if !root.has-image: ScrollView {
                         content-width: max(self.visible-width, preview.preferred-width + 16px);

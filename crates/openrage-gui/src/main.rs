@@ -32,6 +32,13 @@ slint::include_modules!();
 
 /// UI-thread state. Lives in a thread-local so that closures posted back from
 /// worker threads (which must be `Send`) can reach it.
+/// A loaded model ready to be rendered.
+struct ModelPreview {
+    loaded: openrage_app::models::LoadedModel,
+    materials: openrage_app::render::Materials,
+    name: String,
+}
+
 struct App {
     cfg: Config,
     game_dir: Option<PathBuf>,
@@ -58,6 +65,9 @@ struct App {
     prompt: Option<Prompt>,
     /// Package shown in the install dialog.
     package: Option<Arc<openrage_app::oiv::Package>>,
+    /// Model shown in the preview, with its camera.
+    model: Option<Arc<ModelPreview>>,
+    model_view: openrage_app::render::View,
     index_running: bool,
 }
 
@@ -97,6 +107,8 @@ fn main() -> anyhow::Result<()> {
             diff_generation: Arc::new(AtomicU64::new(0)),
             prompt: None,
             package: None,
+            model: None,
+            model_view: openrage_app::render::View::default(),
             index_running: false,
         })
     });
@@ -249,6 +261,27 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_show_changes(move || with_ui(&w, |ui| navigate(ui, browser::CHANGES_PATH, true)));
     let w = ui.as_weak();
     ui.on_extract_selected(move || with_ui(&w, start_extract));
+    let w = ui.as_weak();
+    ui.on_model_orbit(move |dx, dy| {
+        with_ui(&w, |ui| {
+            with_app(|a| {
+                a.model_view.yaw -= dx * 0.01;
+                a.model_view.pitch = (a.model_view.pitch + dy * 0.01).clamp(-1.5, 1.5);
+            });
+            render_model(ui);
+        })
+    });
+    let w = ui.as_weak();
+    ui.on_model_zoom(move |delta| {
+        with_ui(&w, |ui| {
+            with_app(|a| a.model_view.zoom = (a.model_view.zoom * 1.1f32.powf(delta / 120.0)).clamp(0.2, 20.0));
+            render_model(ui);
+        })
+    });
+    let w = ui.as_weak();
+    ui.on_model_resized(move || with_ui(&w, render_model));
+    let w = ui.as_weak();
+    ui.on_export_gltf(move || with_ui(&w, export_gltf));
     let w = ui.as_weak();
     ui.on_save_png(move || with_ui(&w, |ui| export_textures(ui, true)));
     let w = ui.as_weak();
@@ -596,6 +629,7 @@ fn show_folder_info(ui: &AppWindow) {
     ui.set_info_text(text.unwrap_or_default().into());
     ui.set_preview_text(SharedString::new());
     ui.set_has_image(false);
+    ui.set_model_mode(false);
     ui.set_preview_loading(false);
 }
 
@@ -688,6 +722,13 @@ fn select_row(ui: &AppWindow, row: usize) {
     ui.set_info_text(info.clone().into());
     ui.set_preview_text(SharedString::new());
     ui.set_has_image(false);
+    ui.set_model_mode(false);
+    with_app(|a| a.model = None);
+    if item.kind == ItemKind::Resource && openrage_app::models::is_model(&item.name) && item.mark != Some(Mark::Removed)
+    {
+        start_model_preview(ui, vpath.clone(), info, generation);
+        return;
+    }
     let Some(source) = source else {
         ui.set_preview_loading(false);
         return;
@@ -1482,6 +1523,103 @@ fn start_undo(ui: &AppWindow) {
             refresh_undo(&ui);
             ui.set_status(msg.into());
         });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Model preview
+
+fn start_model_preview(ui: &AppWindow, vpath: String, info: String, generation: u64) {
+    let Some((game_dir, keys, counter)) =
+        with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone(), Arc::clone(&a.preview_generation))))
+    else {
+        return;
+    };
+    ui.set_preview_loading(true);
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let result = openrage_app::models::load(&game_dir, keys, &vpath).map(|loaded| {
+            let materials = match loaded.drawables.first() {
+                Some((_, d)) => openrage_app::render::Materials::new(d, &|t| loaded.texture(d, t)),
+                None => openrage_app::render::Materials::new(&Default::default(), &|_| None),
+            };
+            let name = loaded.drawables.first().map(|(n, _)| n.clone()).unwrap_or_default();
+            ModelPreview { loaded, materials, name }
+        });
+        if counter.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if counter.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            ui.set_preview_loading(false);
+            match result {
+                Ok(m) => {
+                    let mut text = info.clone();
+                    for (name, d) in &m.loaded.drawables {
+                        let textured = d
+                            .shaders
+                            .iter()
+                            .filter(|s| s.base_texture().is_some_and(|t| m.loaded.texture(d, t).is_some()))
+                            .count();
+                        text.push_str(&format!(
+                            "\n{name}: {} meshes · {} vertices · {} triangles · {textured}/{} shaders textured",
+                            d.meshes.len(),
+                            d.vertex_count(),
+                            d.triangle_count(),
+                            d.shaders.len()
+                        ));
+                    }
+                    if m.loaded.drawables.len() > 1 {
+                        text.push_str("\nThe preview shows the first drawable of the dictionary.");
+                    }
+                    ui.set_info_text(text.into());
+                    with_app(|a| {
+                        a.model = Some(Arc::new(m));
+                        a.model_view = openrage_app::render::View::default();
+                    });
+                    ui.set_model_mode(true);
+                    render_model(&ui);
+                }
+                Err(e) => ui.set_info_text(format!("{info}\nCannot read the model: {e:#}").into()),
+            }
+        });
+    });
+}
+
+/// Renders the current model at the size of the preview area.
+fn render_model(ui: &AppWindow) {
+    let Some((model, view)) = with_app(|a| a.model.clone().map(|m| (m, a.model_view))) else { return };
+    let Some((_, d)) = model.loaded.drawables.first() else { return };
+    let w = (ui.get_preview_area_width() - 16.0).max(64.0) as usize;
+    let h = (ui.get_preview_area_height() - 16.0).max(64.0) as usize;
+    let rgba = openrage_app::render::render(d, &model.materials, view, w, h);
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w as u32, h as u32);
+    ui.set_preview_image(slint::Image::from_rgba8(buffer));
+    ui.set_has_image(true);
+}
+
+fn export_gltf(ui: &AppWindow) {
+    let Some(model) = with_app(|a| a.model.clone()) else { return };
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export glTF")
+            .set_file_name(format!("{}.glb", model.name))
+            .add_filter("glTF binary", &["glb"])
+            .save_file()
+        else {
+            return;
+        };
+        let result = openrage_app::models::to_glb(&model.loaded, 0)
+            .ok_or_else(|| "the model has no drawable".to_owned())
+            .and_then(|glb| std::fs::write(&path, glb).map_err(|e| e.to_string()));
+        let msg = match result {
+            Ok(()) => format!("Exported {}", path.display()),
+            Err(e) => format!("Export failed: {e}"),
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
     });
 }
 

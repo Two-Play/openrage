@@ -5,6 +5,8 @@
 //! * [`dds`], [`png`]: export, compatible with OpenIV/CodeWalker output
 
 pub mod dds;
+pub mod drawable;
+pub mod gltf;
 pub mod texture;
 pub mod ytd;
 pub mod ytd_write;

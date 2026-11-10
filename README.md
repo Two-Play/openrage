@@ -8,11 +8,11 @@ An open-source explorer and modding toolkit for games built on Rockstar's RAGE e
 
 | Game | Archives | Formats |
 |---|---|---|
-| GTA V (Legacy & Enhanced) | ✅ RPF7 read, incl. nested archives; edit in place in the mods folder, with undo | ✅ textures (YTD): view, DDS/PNG export, replace/add/remove · resources as RSC7 files |
+| GTA V (Legacy & Enhanced) | ✅ RPF7 read, incl. nested archives; edit in place in the mods folder, with undo | ✅ textures (YTD): view, DDS/PNG export, replace/add/remove · models (YDR/YFT/YDD): 3D preview, glTF export · resources as RSC7 files |
 | GTA IV | planned (RPF3) | – |
 | Red Dead Redemption 2 | planned (RPF8) | – |
 
-Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF) → **6** GTA IV → **7** RDR2.
+Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF) (done) → **6** GTA IV → **7** RDR2.
 
 ## Build
 
@@ -61,6 +61,12 @@ Texture dictionaries (`.ytd`) open like folders: double-click one (or type its p
 **Replace…**, **Add…** and **Remove** change the dictionary the OpenIV way: the archive is copied to the `mods` folder (or the copy already there is used) and rewritten there — your game files are never touched. Replacing a texture with a DDS of the same format, size and mip count only overwrites its pixels; anything else rebuilds the dictionary from its original structures with a fresh page layout. Archives are streamed while they are rewritten, so even multi-gigabyte archives need little memory.
 
 Both layouts are supported: GTA V Legacy (resource version 13, Direct3D 9 formats) and GTA V Enhanced (version 5, DXGI formats such as BC7). All 341,000+ textures of GTA V Enhanced decode.
+
+### Models
+
+Selecting a model (`.ydr` drawable, `.yft` fragment such as a vehicle, `.ydd` drawable dictionary) shows it in 3D: drag to rotate, scroll to zoom. Textures are taken from the model itself, the `.ytd` next to it (`adder.ytd`, `adder+hi.ytd`) and, for vehicles, `vehshare.ytd`. **Export glTF…** writes a binary glTF 2.0 file (`.glb`) with the textures embedded, which Blender and other tools open directly. Coordinates are converted from the game's Z-up to glTF's Y-up.
+
+All 168,000+ models of GTA V Enhanced load, as do the Legacy formats. Not shown yet: wheels and other child drawables of fragments, and skeletons.
 
 ### Editing archives
 
@@ -113,6 +119,10 @@ openrage oiv list / oiv uninstall "Name 1.0"   # installed packages, uninstall
 openrage history                               # changes made to the mods folder
 openrage undo                                  # revert the newest change
 openrage verify --textures [--rebuild]         # decode (and rebuild) every texture dictionary
+openrage model …/vehicles.rpf/adder.yft                       # meshes, shaders, textures
+openrage model …/adder.yft --export adder.glb                  # glTF with embedded textures
+openrage model …/adder.yft --render adder.png [--yaw 1.2]      # software-rendered image
+openrage verify --models                       # parse every model of the game
 openrage mods                                  # files in the OpenIV mods folder
 openrage mods --changes [--deep]               # every added/removed/modified entry
 ```
