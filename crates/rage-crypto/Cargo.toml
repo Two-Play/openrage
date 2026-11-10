@@ -1,0 +1,15 @@
+[package]
+name = "rage-crypto"
+description = "GTA V archive cryptography (AES, NG) and user-side key extraction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rage-core.workspace = true
+aes.workspace = true
+dirs.workspace = true
+flate2.workspace = true
+rayon.workspace = true
+sha1.workspace = true
+thiserror.workspace = true

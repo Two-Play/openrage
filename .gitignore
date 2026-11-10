@@ -1,0 +1,8 @@
+/target
+
+# Never commit game data or key material.
+*.rpf
+*.keys
+magic.dat
+gtav_*.dat
+*.exe

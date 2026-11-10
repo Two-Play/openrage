@@ -1,0 +1,17 @@
+[package]
+name = "rage-index"
+description = "Search index over RAGE game archives: names, hashes and full text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rage-core.workspace = true
+rage-crypto.workspace = true
+rage-rpf.workspace = true
+rayon.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+flate2.workspace = true

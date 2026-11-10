@@ -1,0 +1,19 @@
+[package]
+name = "openrage-cli"
+description = "OpenRAGE command-line tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openrage"
+path = "src/main.rs"
+
+[dependencies]
+rage-crypto.workspace = true
+openrage-app = { path = "../openrage-app" }
+rage-rpf.workspace = true
+rage-index.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+rayon.workspace = true

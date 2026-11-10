@@ -1,0 +1,23 @@
+[package]
+name = "openrage-gui"
+description = "OpenRAGE graphical explorer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openrage-gui"
+path = "src/main.rs"
+
+[dependencies]
+openrage-app = { path = "../openrage-app" }
+rage-core.workspace = true
+rage-crypto.workspace = true
+rage-rpf.workspace = true
+rage-index.workspace = true
+anyhow.workspace = true
+rfd = "0.15"
+slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "renderer-software", "accessibility"] }
+
+[build-dependencies]
+slint-build = "1.18"

@@ -1,0 +1,12 @@
+[package]
+name = "rage-rpf"
+description = "Reader for RAGE RPF archives (RPF7 / GTA V)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rage-core.workspace = true
+rage-crypto.workspace = true
+flate2.workspace = true
+thiserror.workspace = true
