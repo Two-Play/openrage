@@ -38,7 +38,10 @@ pub fn page_size_from_flags(flags: u32) -> usize {
     (0x200usize << (flags & 0xF)) * pages as usize
 }
 
+pub mod builder;
+
 /// An inflated resource, split into its memory segments.
+#[derive(Clone)]
 pub struct Resource {
     pub version: u32,
     pub system: Vec<u8>,
@@ -96,6 +99,20 @@ impl Resource {
         segment
             .get(start..start.checked_add(len).ok_or(ResourceError::OutOfBounds { ptr, len })?)
             .ok_or(ResourceError::OutOfBounds { ptr, len })
+    }
+
+    /// Mutable bytes at a virtual address (for in-place edits).
+    pub fn bytes_mut(&mut self, ptr: u64, len: usize) -> Result<&mut [u8], ResourceError> {
+        let (segment, offset) = if ptr >= GRAPHICS_BASE {
+            (&mut self.graphics, ptr - GRAPHICS_BASE)
+        } else if ptr >= SYSTEM_BASE {
+            (&mut self.system, ptr - SYSTEM_BASE)
+        } else {
+            return Err(ResourceError::BadPointer(ptr));
+        };
+        let start = offset as usize;
+        let end = start.checked_add(len).ok_or(ResourceError::OutOfBounds { ptr, len })?;
+        segment.get_mut(start..end).ok_or(ResourceError::OutOfBounds { ptr, len })
     }
 
     pub fn u8(&self, ptr: u64) -> Result<u8, ResourceError> {

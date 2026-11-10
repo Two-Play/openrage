@@ -7,6 +7,7 @@
 pub mod dds;
 pub mod texture;
 pub mod ytd;
+pub mod ytd_write;
 
 /// Encodes RGBA8 pixels as a PNG file.
 pub fn png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, ::png::EncodingError> {

@@ -1,9 +1,12 @@
-//! Rewriting an archive with edits, OpenIV style (experimental; basis of stage 4).
+//! Rewriting an archive with edits, OpenIV style.
 //!
-//! Unchanged entries are copied byte for byte; nested archives are rebuilt
-//! only if an edit reaches inside them.
+//! Unchanged entries are copied byte for byte while writing (streamed, one
+//! entry at a time); nested archives are rebuilt (in memory) only if an edit
+//! reaches inside them.
 
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use rage_rpf::vfs;
@@ -16,9 +19,7 @@ pub enum Edit {
     Remove,
 }
 
-/// Rebuilds `rpf` with `edits` applied; paths are relative to the archive and
-/// may reach into nested archives (`levels/gta5/vehicles.rpf/adder.ytd`).
-pub fn repack(rpf: &Rpf7, edits: &BTreeMap<String, Edit>) -> Result<Vec<u8>> {
+fn writer_for(rpf: &Arc<Rpf7>, edits: &BTreeMap<String, Edit>) -> Result<ArchiveWriter> {
     // Edits that reach into a nested archive are grouped by that archive.
     let mut nested: BTreeMap<String, BTreeMap<String, Edit>> = BTreeMap::new();
     let mut local: BTreeMap<String, Edit> = BTreeMap::new();
@@ -29,15 +30,15 @@ pub fn repack(rpf: &Rpf7, edits: &BTreeMap<String, Edit>) -> Result<Vec<u8>> {
         for (i, seg) in segs.iter().enumerate().take(segs.len().saturating_sub(1)) {
             let Some(child) = rpf.find_child(dir, seg) else { break };
             if rpf.entry(child).is_archive() {
-                split = Some(i + 1);
+                split = Some((i + 1, child));
                 break;
             }
             dir = child;
         }
         match split {
-            Some(n) => {
+            Some((n, child)) => {
                 nested
-                    .entry(rpf.path_of(resolve_id(rpf, &segs[..n].join("/"))?))
+                    .entry(rpf.path_of(child).to_ascii_lowercase())
                     .or_default()
                     .insert(segs[n..].join("/"), edit.clone());
             }
@@ -58,15 +59,17 @@ pub fn repack(rpf: &Rpf7, edits: &BTreeMap<String, Edit>) -> Result<Vec<u8>> {
             if failure.is_some() || a.entry(id).is_dir() {
                 return;
             }
-            let result = match nested.get(path) {
-                Some(inner) => a.open_child(id).map_err(anyhow::Error::from).and_then(|child| {
-                    let bytes = repack(&child, inner)?;
-                    w.add_file(path, bytes).map_err(anyhow::Error::from)
-                }),
-                None => a.read_raw_entry(id).map(|raw| w.add_raw(path, raw)).map_err(anyhow::Error::from),
-            };
-            if let Err(e) = result {
-                failure = Some(e.context(format!("copying {path}")));
+            match nested.get(&path.to_ascii_lowercase()) {
+                Some(inner) => {
+                    let result = a.open_child(id).map_err(anyhow::Error::from).and_then(|child| {
+                        let bytes = repack(&Arc::new(child), inner)?;
+                        w.add_file(path, bytes).map_err(anyhow::Error::from)
+                    });
+                    if let Err(e) = result {
+                        failure = Some(e.context(format!("rebuilding {path}")));
+                    }
+                }
+                None => w.add_copy(path, Arc::clone(rpf), id),
             }
         },
         &mut |_| {},
@@ -85,11 +88,16 @@ pub fn repack(rpf: &Rpf7, edits: &BTreeMap<String, Edit>) -> Result<Vec<u8>> {
             Edit::Set(data) => w.add_file(path, data.clone())?,
         }
     }
-    Ok(w.build()?)
+    Ok(w)
 }
 
-fn resolve_id(rpf: &Rpf7, path: &str) -> Result<rage_rpf::EntryId> {
-    path.split('/')
-        .try_fold(Rpf7::ROOT, |dir, seg| rpf.find_child(dir, seg))
-        .with_context(|| format!("{path} not found"))
+/// Rebuilds `rpf` with `edits` applied, in memory. Paths are relative to the
+/// archive and may reach into nested archives (`levels/gta5/vehicles.rpf/adder.ytd`).
+pub fn repack(rpf: &Arc<Rpf7>, edits: &BTreeMap<String, Edit>) -> Result<Vec<u8>> {
+    Ok(writer_for(rpf, edits)?.build()?)
+}
+
+/// Like [`repack`], but streams the result to `out`. Returns the bytes written.
+pub fn repack_into<W: Write>(rpf: &Arc<Rpf7>, edits: &BTreeMap<String, Edit>, out: &mut W) -> Result<u64> {
+    writer_for(rpf, edits)?.write_to(out).context("writing archive")
 }

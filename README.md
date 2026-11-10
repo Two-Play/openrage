@@ -8,11 +8,11 @@ An open-source explorer and modding toolkit for games built on Rockstar's RAGE e
 
 | Game | Archives | Formats |
 |---|---|---|
-| GTA V (Legacy & Enhanced) | ✅ RPF7 read, incl. nested archives; OpenIV-style writer (experimental) | ✅ textures (YTD): view, DDS/PNG export · resources as RSC7 files |
+| GTA V (Legacy & Enhanced) | ✅ RPF7 read, incl. nested archives; OpenIV-style writer (experimental) | ✅ textures (YTD): view, DDS/PNG export, replace/add/remove · resources as RSC7 files |
 | GTA IV | planned (RPF3) | – |
 | Red Dead Redemption 2 | planned (RPF8) | – |
 
-Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (view + export done; import next) → **4** writing/replacing archive contents → **5** models (YDR/YFT → glTF) → **6** GTA IV → **7** RDR2.
+Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** writing/replacing archive contents → **5** models (YDR/YFT → glTF) → **6** GTA IV → **7** RDR2.
 
 ## Build
 
@@ -58,6 +58,8 @@ Typing `?query` into the address bar searches as well; Back returns to the resul
 
 Texture dictionaries (`.ytd`) open like folders: double-click one (or type its path) to list its textures with size, format and mip levels. Selecting a texture shows it in the preview; selecting a `.ytd` previews its first texture. **Extract…** writes DDS files exactly like OpenIV/CodeWalker (classic DXT/ATI FourCC headers, DX10 headers for BC7 and other modern formats); **Save PNG…** writes images. With nothing selected, the whole dictionary is exported into a folder named after it.
 
+**Replace…**, **Add…** and **Remove** change the dictionary the OpenIV way: the archive is copied to the `mods` folder (or the copy already there is used) and rewritten there — your game files are never touched. Replacing a texture with a DDS of the same format, size and mip count only overwrites its pixels; anything else rebuilds the dictionary from its original structures with a fresh page layout. Archives are streamed while they are rewritten, so even multi-gigabyte archives need little memory.
+
 Both layouts are supported: GTA V Legacy (resource version 13, Direct3D 9 formats) and GTA V Enhanced (version 5, DXGI formats such as BC7). All 341,000+ textures of GTA V Enhanced decode.
 
 ### Mods folder (OpenIV compatible)
@@ -88,7 +90,8 @@ openrage search 0xB779A091                     # hash lookup
 openrage search Pegassi --lang american        # game text in another language (or `all`)
 openrage textures x64e.rpf/levels/gta5/vehicles.rpf/adder.ytd                 # list textures
 openrage textures …/adder.ytd --export out/ [--png]                            # DDS (default) or PNG
-openrage verify --textures                     # decode every texture of the game
+openrage textures …/blips.ytd --set radar_darts=new.dds --remove radar_taco_van   # written into mods/
+openrage verify --textures [--rebuild]         # decode (and rebuild) every texture dictionary
 openrage mods                                  # files in the OpenIV mods folder
 openrage mods --changes [--deep]               # every added/removed/modified entry
 ```
