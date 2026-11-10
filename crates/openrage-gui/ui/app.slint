@@ -231,6 +231,9 @@ export component AppWindow inherits Window {
     // Preview
     in property <string> info-text;
     in property <string> preview-text;
+    in property <image> preview-image;
+    in property <bool> has-image;
+    in property <bool> can-png;
     in property <bool> preview-loading;
 
     // Status / background task
@@ -262,6 +265,7 @@ export component AppWindow inherits Window {
     callback show-changes();
     callback language-picked(int);
     callback extract-selected();
+    callback save-png();
     callback cancel-task();
     callback open-setup();
     callback setup-browse-game();
@@ -323,6 +327,11 @@ export component AppWindow inherits Window {
                 text: @tr("Extract…");
                 enabled: root.can-extract && !root.busy;
                 clicked => { root.extract-selected(); }
+            }
+            if root.can-png: Button {
+                text: @tr("Save PNG…");
+                enabled: !root.busy;
+                clicked => { root.save-png(); }
             }
             Button {
                 text: @tr("Setup");
@@ -450,7 +459,16 @@ export component AppWindow inherits Window {
                     border-width: 1px;
                     border-color: Palette.border;
                     background: Palette.alternate-background;
-                    ScrollView {
+                    if root.has-image: Image {
+                        x: 8px;
+                        y: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height - 16px;
+                        source: root.preview-image;
+                        image-fit: contain;
+                        image-rendering: smooth;
+                    }
+                    if !root.has-image: ScrollView {
                         content-width: max(self.visible-width, preview.preferred-width + 16px);
                         content-height: max(self.visible-height, preview.preferred-height + 16px);
                         preview := Text {

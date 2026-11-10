@@ -14,6 +14,8 @@ pub enum RpfError {
     OutOfBounds { archive: String, entry: String },
     #[error("{archive}/{entry}: decompression failed: {source}")]
     Inflate { archive: String, entry: String, source: std::io::Error },
+    #[error("{path}: invalid resource: {reason}")]
+    BadResource { path: String, reason: String },
     #[error("{0} is not a directory")]
     NotADirectory(String),
     #[error("{0} is not a nested archive")]

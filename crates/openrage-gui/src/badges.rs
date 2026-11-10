@@ -17,6 +17,7 @@ pub fn badge(name: &str, kind: ItemKind) -> (String, Color) {
     match kind {
         ItemKind::Dir => return ("DIR".into(), rgb(0xB8902A)),
         ItemKind::Archive => return ("RPF".into(), rgb(0xD9822B)),
+        ItemKind::Texture => return ("TEX".into(), rgb(0x8E5BD6)),
         _ => {}
     }
     let ext = extension(name);
@@ -40,6 +41,7 @@ pub fn type_name(name: &str, kind: ItemKind) -> String {
     let known = match ext.as_str() {
         _ if kind == ItemKind::Dir => "Folder",
         _ if kind == ItemKind::Archive => "Archive",
+        _ if kind == ItemKind::Texture => "Texture",
         "ytd" => "Texture dict",
         "ydr" => "Drawable",
         "ydd" => "Drawable dict",

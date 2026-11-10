@@ -8,11 +8,11 @@ An open-source explorer and modding toolkit for games built on Rockstar's RAGE e
 
 | Game | Archives | Formats |
 |---|---|---|
-| GTA V (Legacy & Enhanced) | ✅ RPF7 read, incl. nested archives | resources are extracted as RSC7 files |
+| GTA V (Legacy & Enhanced) | ✅ RPF7 read, incl. nested archives; OpenIV-style writer (experimental) | ✅ textures (YTD): view, DDS/PNG export · resources as RSC7 files |
 | GTA IV | planned (RPF3) | – |
 | Red Dead Redemption 2 | planned (RPF8) | – |
 
-Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) → **4** writing/replacing archive contents → **5** models (YDR/YFT → glTF) → **6** GTA IV → **7** RDR2.
+Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (view + export done; import next) → **4** writing/replacing archive contents → **5** models (YDR/YFT → glTF) → **6** GTA IV → **7** RDR2.
 
 ## Build
 
@@ -54,6 +54,12 @@ OpenRAGE keeps a search index of the whole game (built once in about 30 seconds,
 
 Typing `?query` into the address bar searches as well; Back returns to the results.
 
+### Textures
+
+Texture dictionaries (`.ytd`) open like folders: double-click one (or type its path) to list its textures with size, format and mip levels. Selecting a texture shows it in the preview; selecting a `.ytd` previews its first texture. **Extract…** writes DDS files exactly like OpenIV/CodeWalker (classic DXT/ATI FourCC headers, DX10 headers for BC7 and other modern formats); **Save PNG…** writes images. With nothing selected, the whole dictionary is exported into a folder named after it.
+
+Both layouts are supported: GTA V Legacy (resource version 13, Direct3D 9 formats) and GTA V Enhanced (version 5, DXGI formats such as BC7). All 341,000+ textures of GTA V Enhanced decode.
+
 ### Mods folder (OpenIV compatible)
 
 OpenRAGE understands the `mods` folder used by OpenIV.asi, where a file at `mods/<path>` replaces `<path>` in the game. It never changes that layout — it only shows what it means:
@@ -80,6 +86,9 @@ openrage index                                 # build / update the search index
 openrage search weapon_pistol                  # names + full text, shows matching lines
 openrage search 0xB779A091                     # hash lookup
 openrage search Pegassi --lang american        # game text in another language (or `all`)
+openrage textures x64e.rpf/levels/gta5/vehicles.rpf/adder.ytd                 # list textures
+openrage textures …/adder.ytd --export out/ [--png]                            # DDS (default) or PNG
+openrage verify --textures                     # decode every texture of the game
 openrage mods                                  # files in the OpenIV mods folder
 openrage mods --changes [--deep]               # every added/removed/modified entry
 ```
@@ -92,6 +101,8 @@ openrage mods --changes [--deep]               # every added/removed/modified en
 | `rage-crypto` | AES / NG ciphers, key discovery in the user's executable, key cache |
 | `rage-rpf` | RPF7 reader and OpenIV-style writer, virtual file system over nested archives |
 | `rage-index` | SQLite search index: names, hash dictionary, FTS5 full text, incremental updates |
+| `rage-resource` | RSC7 resources: page layout, virtual pointers into system/graphics memory |
+| `rage-formats` | game formats: texture dictionaries (YTD), BC1–BC7 decoding, DDS and PNG export |
 | `rage-mods` | OpenIV `mods` folder: overlay resolution, folder comparison, change lists |
 | `openrage-app` | settings, key setup, game detection and extraction shared by CLI and GUI |
 | `openrage-cli` | the `openrage` command-line tool |

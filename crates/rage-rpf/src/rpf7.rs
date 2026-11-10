@@ -16,6 +16,7 @@ use std::sync::Arc;
 use flate2::read::DeflateDecoder;
 use rage_core::io::{read_exact_at, u24_le, u32_le};
 use rage_crypto::GtaVKeys;
+use rage_resource::{Resource, page_size_from_flags};
 
 use crate::RpfError;
 
@@ -115,7 +116,7 @@ impl Entry {
     pub fn resource_page_sizes(&self) -> Option<(u64, u64)> {
         match self.kind {
             EntryKind::Resource { system_flags, graphics_flags, .. } => {
-                Some((page_size_from_flags(system_flags), page_size_from_flags(graphics_flags)))
+                Some((page_size_from_flags(system_flags) as u64, page_size_from_flags(graphics_flags) as u64))
             }
             _ => None,
         }
@@ -129,21 +130,6 @@ impl Entry {
             EntryKind::Resource { .. } => "resource",
         }
     }
-}
-
-/// Total size described by an RSC7 page flag word: a base page size
-/// (`0x200 << shift`) times a weighted count of pages in nine size buckets.
-fn page_size_from_flags(flags: u32) -> u64 {
-    let pages = ((flags >> 27) & 0x1)
-        + (((flags >> 26) & 0x1) << 1)
-        + (((flags >> 25) & 0x1) << 2)
-        + (((flags >> 24) & 0x1) << 3)
-        + (((flags >> 17) & 0x7F) << 4)
-        + (((flags >> 11) & 0x3F) << 5)
-        + (((flags >> 7) & 0xF) << 6)
-        + (((flags >> 5) & 0x3) << 7)
-        + (((flags >> 4) & 0x1) << 8);
-    (0x200u64 << (flags & 0xF)) * pages as u64
 }
 
 /// An opened RPF7 archive (top-level or nested).
@@ -451,6 +437,20 @@ impl Rpf7 {
             source,
         })?;
         Ok(out)
+    }
+
+    /// Reads a resource entry as a [`Resource`] (inflated and split into memory segments).
+    pub fn read_resource(&self, id: EntryId) -> Result<Resource, RpfError> {
+        let entry = &self.entries[id];
+        let EntryKind::Resource { system_flags, graphics_flags, .. } = entry.kind else {
+            return Err(RpfError::NotFound(format!("{} is not a resource", self.path_of(id))));
+        };
+        let pages = self.read_resource_pages(id)?;
+        let version = entry.resource_version().unwrap_or_default();
+        Resource::from_pages(version, system_flags, graphics_flags, pages).map_err(|e| RpfError::BadResource {
+            path: format!("{}/{}", self.display_path, self.path_of(id)),
+            reason: e.to_string(),
+        })
     }
 
     /// Opens a nested `.rpf` entry as an archive (no copy; reads go to the same file).

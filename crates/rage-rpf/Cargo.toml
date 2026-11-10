@@ -8,5 +8,6 @@ license.workspace = true
 [dependencies]
 rage-core.workspace = true
 rage-crypto.workspace = true
+rage-resource.workspace = true
 flate2.workspace = true
 thiserror.workspace = true

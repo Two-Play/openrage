@@ -15,6 +15,8 @@ pub enum ItemKind {
     Archive,
     File,
     Resource,
+    /// A texture inside an opened texture dictionary.
+    Texture,
 }
 
 impl ItemKind {
@@ -80,6 +82,15 @@ pub enum Location {
     Changes {
         summary: String,
     },
+    /// An opened texture dictionary (`.ytd`); items are its textures in order.
+    Textures {
+        dict: Arc<rage_formats::ytd::TextureDictionary>,
+    },
+}
+
+/// Whether a file name is a texture dictionary that can be opened like a folder.
+pub fn is_texture_dict(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".ytd")
 }
 
 /// The virtual path of the mod change list.
@@ -171,12 +182,29 @@ pub fn list(
     overlay: bool,
 ) -> Result<(Listing, Option<String>), RpfError> {
     let vpath = normalize(vpath);
-    let (node, origin) = if overlay {
-        rage_mods::resolve(game_dir, &vpath, keys.clone())?
-    } else {
-        (vfs::resolve(game_dir, &vpath, keys.clone())?, Origin::Base)
+    let resolve = |p: &str| -> Result<(Node, Origin), RpfError> {
+        if overlay {
+            rage_mods::resolve(game_dir, p, keys.clone())
+        } else {
+            Ok((vfs::resolve(game_dir, p, keys.clone())?, Origin::Base))
+        }
+    };
+    let (node, origin) = match resolve(&vpath) {
+        Ok(found) => found,
+        // `…/name.ytd/texture`: open the dictionary and select the texture.
+        Err(RpfError::NotFound(_)) if parent(&vpath).is_some_and(|p| is_texture_dict(&p)) => {
+            let dict_path = parent(&vpath).unwrap_or_default();
+            let (listing, _) = list(game_dir, &dict_path, keys, overlay)?;
+            return Ok((listing, Some(last_segment(&vpath))));
+        }
+        Err(e) => return Err(e),
     };
     match node {
+        Node::ArchiveFile(rpf, id)
+            if is_texture_dict(&rpf.entry(id).name) && rpf.entry(id).resource_version().is_some() =>
+        {
+            Ok((list_textures(vpath, rpf, id, origin)?, None))
+        }
         Node::Dir(dir) => {
             let mut listing = list_disk(vpath, dir, origin)?;
             if overlay {
@@ -215,6 +243,26 @@ fn merge_mods(game_dir: &Path, listing: &mut Listing) {
             None => listing.items.push(Item { mark: Some(Mark::New), ..m }),
         }
     }
+}
+
+fn list_textures(vpath: String, rpf: Arc<Rpf7>, id: EntryId, origin: Origin) -> Result<Listing, RpfError> {
+    let res = rpf.read_resource(id)?;
+    let dict = rage_formats::ytd::parse(&res)
+        .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
+    let items = dict
+        .textures
+        .iter()
+        .map(|t| Item {
+            name: t.name.clone(),
+            kind: ItemKind::Texture,
+            size: t.data.len() as u64,
+            info: format!("{}×{} {}", t.width, t.height, t.format.name()),
+            entry: None,
+            vpath: None,
+            mark: None,
+        })
+        .collect();
+    Ok(Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict) }, items })
 }
 
 fn list_disk(vpath: String, dir: PathBuf, origin: Origin) -> Result<Listing, RpfError> {
