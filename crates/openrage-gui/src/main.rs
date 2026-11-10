@@ -5,6 +5,7 @@
 mod badges;
 mod browser;
 mod preview;
+mod viewer;
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -68,6 +69,8 @@ struct App {
     /// Model shown in the preview, with its camera.
     model: Option<Arc<ModelPreview>>,
     model_view: openrage_app::render::View,
+    /// Open a viewer window as soon as the current preview has loaded.
+    pending_viewer: bool,
     index_running: bool,
 }
 
@@ -109,11 +112,13 @@ fn main() -> anyhow::Result<()> {
             package: None,
             model: None,
             model_view: openrage_app::render::View::default(),
+            pending_viewer: false,
             index_running: false,
         })
     });
 
     ui.set_mono_font(mono_font().into());
+    ui.set_theme_mode(with_app(|a| theme_mode(a.cfg.theme.as_deref())));
     let languages: Vec<SharedString> =
         std::iter::once("All languages".into()).chain(LANGUAGES.iter().map(|l| capitalize(l).into())).collect();
     ui.set_languages(ModelRc::new(VecModel::from(languages)));
@@ -128,8 +133,51 @@ fn main() -> anyhow::Result<()> {
     } else {
         show_setup(&ui, false);
     }
+    #[cfg(debug_assertions)]
+    debug_snapshot(&ui);
     ui.run()?;
     Ok(())
+}
+
+/// Development aid (debug builds only): `OPENRAGE_SNAPSHOT=out.png` saves an
+/// image of this window after a few seconds and quits; `OPENRAGE_THEME`
+/// (`light`/`dark`), `OPENRAGE_VIEWER`, `OPENRAGE_EDIT` and `OPENRAGE_UNLOCK`
+/// set up the state to capture.
+#[cfg(debug_assertions)]
+fn debug_snapshot(ui: &AppWindow) {
+    if let Ok(theme) = std::env::var("OPENRAGE_THEME") {
+        ui.set_theme_mode(theme_mode(Some(&theme)));
+    }
+    let Ok(path) = std::env::var("OPENRAGE_SNAPSHOT") else { return };
+    let weak = ui.as_weak();
+    slint::Timer::single_shot(Duration::from_secs(5), move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if std::env::var("OPENRAGE_VIEWER").is_ok() {
+            open_viewer(&ui);
+        }
+        if std::env::var("OPENRAGE_EDIT").is_ok() {
+            ui.set_edit_mode(true);
+        }
+        if std::env::var("OPENRAGE_UNLOCK").is_ok() {
+            ui.set_unlock_visible(true);
+        }
+        let weak = ui.as_weak();
+        slint::Timer::single_shot(Duration::from_secs(2), move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let snap = match viewer::newest() {
+                Some(v) => v.window().take_snapshot(),
+                None => ui.window().take_snapshot(),
+            };
+            match snap {
+                Ok(img) => {
+                    let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
+                        .map(|png| std::fs::write(&path, png));
+                }
+                Err(e) => eprintln!("snapshot failed: {e}"),
+            }
+            let _ = slint::quit_event_loop();
+        });
+    });
 }
 
 fn wire_callbacks(ui: &AppWindow) {
@@ -172,6 +220,26 @@ fn wire_callbacks(ui: &AppWindow) {
         })
     });
     let w = ui.as_weak();
+    ui.on_tree_action(move |i, action| {
+        with_ui(&w, |ui| {
+            let Some(vpath) = with_app(|a| a.tree.nodes.get(i as usize).map(|n| n.vpath.clone())) else { return };
+            match action.as_str() {
+                "extract" => {
+                    navigate(ui, &vpath, true);
+                    start_extract(ui);
+                }
+                "copy-path" => {
+                    let msg = match copy_to_clipboard(&vpath) {
+                        Ok(()) => format!("Copied {vpath}"),
+                        Err(e) => format!("Cannot copy to the clipboard: {e}"),
+                    };
+                    ui.set_status(msg.into());
+                }
+                _ => {}
+            }
+        })
+    });
+    let w = ui.as_weak();
     ui.on_tree_activate(move |i| {
         with_ui(&w, |ui| {
             if let Some(p) = with_app(|a| a.tree.nodes.get(i as usize).map(|n| n.vpath.clone())) {
@@ -184,6 +252,18 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_file_open(move |i| {
         with_ui(&w, |ui| {
+            let viewable = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(i as usize)?];
+                Some(is_viewable(item) && !is_openable(item))
+            });
+            if viewable == Some(true) {
+                if ui.get_file_selected() != i {
+                    select_row(ui, i as usize);
+                }
+                open_viewer(ui);
+                return;
+            }
             let target = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
@@ -283,6 +363,20 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_export_gltf(move || with_ui(&w, export_gltf));
     let w = ui.as_weak();
+    ui.on_open_viewer(move || with_ui(&w, open_viewer));
+    let w = ui.as_weak();
+    ui.on_row_action(move |i, action| with_ui(&w, |ui| row_action(ui, i as usize, &action)));
+    ui.on_theme_changed(|mode| {
+        with_app(|a| {
+            a.cfg.theme = Some(theme_name(mode).to_owned());
+            let _ = a.cfg.save();
+        });
+        viewer::set_theme(mode);
+    });
+    ui.on_quit(|| {
+        let _ = slint::quit_event_loop();
+    });
+    let w = ui.as_weak();
     ui.on_save_png(move || with_ui(&w, |ui| export_textures(ui, true)));
     let w = ui.as_weak();
     ui.on_archive_import(move || with_ui(&w, |ui| archive_import(ui, None)));
@@ -350,6 +444,82 @@ fn wire_callbacks(ui: &AppWindow) {
     });
     let w = ui.as_weak();
     ui.on_setup_run(move || with_ui(&w, run_setup));
+}
+
+fn theme_name(mode: i32) -> &'static str {
+    match mode {
+        1 => "light",
+        2 => "dark",
+        _ => "system",
+    }
+}
+
+fn theme_mode(name: Option<&str>) -> i32 {
+    match name {
+        Some("light") => 1,
+        Some("dark") => 2,
+        _ => 0,
+    }
+}
+
+/// Context-menu action on a file row.
+fn row_action(ui: &AppWindow, row: usize, action: &str) {
+    if ui.get_file_selected() != row as i32 {
+        select_row(ui, row);
+    }
+    match action {
+        "open" => ui.invoke_file_open(row as i32),
+        "view" => open_viewer(ui),
+        "extract" => ui.invoke_extract_selected(),
+        "gltf" => {
+            if with_app(|a| a.model.is_some()) {
+                ui.invoke_export_gltf();
+            } else {
+                ui.set_status("The model is still loading.".into());
+            }
+        }
+        "png" => ui.invoke_save_png(),
+        "replace" if ui.get_texture_mode() => ui.invoke_texture_replace(),
+        "replace" => ui.invoke_archive_replace(),
+        "rename" => ui.invoke_archive_rename(),
+        "delete" if ui.get_texture_mode() => ui.invoke_texture_remove(),
+        "delete" => ui.invoke_archive_delete(),
+        "uninstall" => ui.invoke_uninstall_group(),
+        "copy-name" | "copy-path" => {
+            let text = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(row)?];
+                Some(if action == "copy-name" {
+                    item.name.clone()
+                } else {
+                    item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name))
+                })
+            });
+            if let Some(text) = text {
+                let msg = match copy_to_clipboard(&text) {
+                    Ok(()) => format!("Copied {text}"),
+                    Err(e) => format!("Cannot copy to the clipboard: {e}"),
+                };
+                ui.set_status(msg.into());
+            }
+        }
+        _ => {}
+    }
+}
+
+thread_local! {
+    // Kept alive: on X11 the clipboard content disappears with its owner.
+    static CLIPBOARD: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), arboard::Error> {
+    CLIPBOARD.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.is_none() {
+            *c = Some(arboard::Clipboard::new()?);
+        }
+        c.as_mut().map_or(Ok(()), |c| c.set_text(text))
+    })
 }
 
 fn capitalize(s: &str) -> String {
@@ -449,9 +619,10 @@ fn navigate(ui: &AppWindow, path: &str, record: bool) {
             });
             ui.set_filter(SharedString::new());
             ui.set_search_mode(false);
-            ui.set_address(vpath.clone().into());
+            set_location(ui, &vpath);
             let tree_idx = with_app(|a| a.tree.reveal(&vpath, &dir, keys, overlay));
             refresh_tree(ui, tree_idx);
+            ui.set_location_title(with_app(|a| a.listing.as_ref().map(location_title)).unwrap_or_default().into());
             refresh_files(ui, select.as_deref());
             if select.is_none() {
                 show_folder_info(ui);
@@ -479,14 +650,14 @@ fn refresh_tree(ui: &AppWindow, selected: Option<usize>) {
             .nodes
             .iter()
             .map(|n| {
-                let (badge, tint) = badges::badge(&n.name, n.kind);
+                let (icon, tint) = badges::icon(&n.name, n.kind);
                 TreeRow {
                     name: n.name.clone().into(),
                     path: n.vpath.clone().into(),
                     depth: n.depth as i32,
                     expandable: n.expandable,
                     expanded: n.expanded,
-                    badge: badge.into(),
+                    icon: icon.into(),
                     tint,
                 }
             })
@@ -546,6 +717,7 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
         ui.set_history_group(SharedString::new());
     }
     let archive_mode = with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Archive(..))));
+    ui.set_in_mods(with_app(|a| a.listing.as_ref().is_some_and(|l| l.origin != Origin::Base)));
     ui.set_archive_mode(archive_mode);
     ui.set_entry_selected(archive_mode && selected_row.is_some());
     if let (Some(row), Some(_)) = (selected_row, select) {
@@ -553,30 +725,50 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
     }
 }
 
-fn mark_color(mark: Option<Mark>) -> slint::Color {
-    let rgb = |v: u32| slint::Color::from_rgb_u8((v >> 16) as u8, (v >> 8) as u8, v as u8);
+/// Mod status as the UI's mark index (see `Theme.mark-color`).
+fn mark_index(mark: Option<Mark>) -> i32 {
     match mark {
-        None => slint::Color::from_argb_u8(0, 0, 0, 0),
-        Some(Mark::Added | Mark::New) => rgb(0x22A06B),
-        Some(Mark::Changed | Mark::Replaced) => rgb(0xE8A317),
-        Some(Mark::ContainsMods) => rgb(0x4F8DE8),
-        Some(Mark::Removed) => rgb(0xDC2626),
+        None => 0,
+        Some(Mark::Added | Mark::New) => 1,
+        Some(Mark::Changed | Mark::Replaced) => 2,
+        Some(Mark::ContainsMods) => 3,
+        Some(Mark::Removed) => 4,
     }
 }
 
+fn is_model_item(item: &Item) -> bool {
+    item.kind == ItemKind::Resource && openrage_app::models::is_model(&item.name) && item.mark != Some(Mark::Removed)
+}
+
+/// Items with a large view: models, textures and images.
+fn is_viewable(item: &Item) -> bool {
+    let lower = item.name.to_ascii_lowercase();
+    is_model_item(item) || item.kind == ItemKind::Texture || [".ytd", ".dds", ".png"].iter().any(|e| lower.ends_with(e))
+}
+
+/// Double-click navigates into it (or, for search hits and changes, to it).
+fn is_openable(item: &Item) -> bool {
+    item.vpath.is_some()
+        || item.kind.is_container()
+        || (item.kind == ItemKind::Resource && browser::is_texture_dict(&item.name))
+}
+
 fn file_row(item: &Item) -> FileRow {
-    let (badge, tint) = badges::badge(&item.name, item.kind);
+    let (icon, tint) = badges::icon(&item.name, item.kind);
     let info = match (item.mark, item.info.is_empty()) {
         (Some(m), true) => m.label().to_owned(),
         (Some(m), false) if item.vpath.is_none() => format!("{} · {}", m.label(), item.info),
         _ => item.info.clone(),
     };
     FileRow {
-        mark_color: mark_color(item.mark),
+        mark: mark_index(item.mark),
         dim: item.mark == Some(Mark::Removed),
         name: item.name.clone().into(),
-        badge: badge.into(),
+        icon: icon.into(),
         tint,
+        can_open: is_openable(item),
+        can_view: is_viewable(item),
+        is_model: is_model_item(item),
         kind: match &item.vpath {
             Some(_) if item.detail.is_some() => item.detail.clone().unwrap_or_default().into(),
             Some(vpath) => browser::short_location(&browser::parent(vpath).unwrap_or_default(), 40).into(),
@@ -591,42 +783,151 @@ fn file_row(item: &Item) -> FileRow {
     }
 }
 
+/// Shows `vpath` in the address bar, as text and as clickable breadcrumbs.
+fn set_location(ui: &AppWindow, vpath: &str) {
+    ui.set_address(vpath.into());
+    ui.set_address_editing(false);
+    ui.set_crumbs(ModelRc::new(VecModel::from(crumbs(vpath))));
+}
+
+fn crumbs(vpath: &str) -> Vec<Crumb> {
+    let crumb = |label: &str, path: &str| Crumb { label: label.into(), path: path.into() };
+    let mut out = vec![crumb("Game", "")];
+    if let Some(q) = browser::search_query(vpath) {
+        out.push(crumb(&format!("Search: {q}"), vpath));
+        return out;
+    }
+    match vpath.trim() {
+        browser::CHANGES_PATH => out.push(crumb("Mod changes", vpath)),
+        browser::HISTORY_PATH => out.push(crumb("History", vpath)),
+        _ => {
+            let mut acc = String::new();
+            for part in vpath.split('/').filter(|p| !p.is_empty()) {
+                if !acc.is_empty() {
+                    acc.push('/');
+                }
+                acc.push_str(part);
+                out.push(crumb(part, &acc));
+            }
+        }
+    }
+    // Deep paths: keep the root and the last levels; "…" goes to the hidden parent.
+    const KEEP: usize = 5;
+    if out.len() > KEEP + 2 {
+        let hidden = out[out.len() - KEEP - 1].path.clone();
+        let tail = out.split_off(out.len() - KEEP);
+        out.truncate(1);
+        out.push(crumb("…", &hidden));
+        out.extend(tail);
+    }
+    out
+}
+
+/// Heading of the file list: the folder's name, or what the list shows.
+fn location_title(l: &Listing) -> String {
+    match &l.location {
+        Location::Search { query, .. } => format!("Search: {query}"),
+        Location::Changes { .. } => "Mod changes".into(),
+        Location::History => "History".into(),
+        _ => l.vpath.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("Game folder").to_owned(),
+    }
+}
+
+/// Fills the info panel header and metadata table.
+fn set_info(ui: &AppWindow, title: &str, path: &str, meta: &Meta, icon: (&str, slint::Color)) {
+    ui.set_info_title(title.into());
+    ui.set_info_path(path.into());
+    set_meta(ui, meta);
+    ui.set_info_icon(icon.0.into());
+    ui.set_info_tint(icon.1);
+}
+
+fn set_meta(ui: &AppWindow, meta: &Meta) {
+    let rows: Vec<InfoRow> = meta.iter().map(|(k, v)| InfoRow { key: k.into(), value: v.into() }).collect();
+    ui.set_info_rows(ModelRc::new(VecModel::from(rows)));
+}
+
+/// `13379` → `13,379`.
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn show_folder_info(ui: &AppWindow) {
-    let text = with_app(|a| {
+    let info = with_app(|a| {
         let l = a.listing.as_ref()?;
+        let name = location_title(l);
+        let folder_icon = if l.vpath.to_ascii_lowercase().ends_with(".rpf") {
+            badges::icon(&name, ItemKind::Archive)
+        } else {
+            badges::icon(&name, ItemKind::Dir)
+        };
         let place = match &l.location {
-            Location::Search { summary, .. } | Location::Changes { summary } => return Some(summary.clone()),
+            Location::Search { query, summary } => {
+                return Some((
+                    format!("Search: {query}"),
+                    String::new(),
+                    vec![note(summary)],
+                    ("search", badges::NEUTRAL),
+                ));
+            }
+            Location::Changes { summary } => {
+                return Some((
+                    "Mod changes".into(),
+                    String::new(),
+                    vec![note(summary)],
+                    badges::icon("", ItemKind::Dir),
+                ));
+            }
             Location::History => {
-                return Some(
-                    "Every change OpenRAGE made to the mods folder. Select a package entry to uninstall the whole package."
-                        .into(),
-                );
+                return Some((
+                    "History".into(),
+                    String::new(),
+                    vec![note(
+                        "Every change OpenRAGE made to the mods folder. Select a package entry to uninstall the whole package.",
+                    )],
+                    ("history", badges::NEUTRAL),
+                ));
             }
             Location::Textures { dict, .. } => {
-                format!(
-                    "Texture dictionary · {} textures\nExtract… exports DDS files like OpenIV; Save PNG… exports images.",
-                    dict.textures.len()
-                )
+                return Some((
+                    name.clone(),
+                    l.vpath.clone(),
+                    vec![
+                        kv("Type", "Texture dictionary"),
+                        kv("Textures", dict.textures.len()),
+                        note("Extract… exports DDS files like OpenIV; Save PNG… exports images."),
+                    ],
+                    badges::icon(&name, ItemKind::Resource),
+                ));
             }
-            Location::Disk(p) => format!("Folder on disk\n{}", p.display()),
-            Location::Archive(rpf, _) => {
-                format!(
-                    "Inside archive {}\nEncryption: {:?}, {} entries",
-                    rpf.name(),
-                    rpf.encryption(),
-                    rpf.entries().len()
-                )
-            }
+            Location::Disk(p) => vec![kv("Type", "Folder"), kv("On disk", p.display())],
+            Location::Archive(rpf, _) => vec![
+                kv("Type", "Inside an archive"),
+                kv("Archive", rpf.name()),
+                kv("Encryption", format!("{:?}", rpf.encryption())),
+                kv("Entries", grouped(rpf.entries().len())),
+            ],
         };
-        let shown = if l.vpath.is_empty() { "(game folder)".to_owned() } else { l.vpath.clone() };
-        let origin = match l.origin {
-            Origin::Mods => "\nFrom the mods folder (replaces the game's version)",
-            Origin::Merged => "\nGame folder merged with its mods counterpart",
-            Origin::Base => "",
-        };
-        Some(format!("{shown}\n{place}{origin}"))
+        let mut meta = place;
+        match l.origin {
+            Origin::Mods => meta.push(kv("Source", "mods folder (replaces the game's version)")),
+            Origin::Merged => meta.push(kv("Source", "game folder merged with its mods counterpart")),
+            Origin::Base => {}
+        }
+        Some((name, l.vpath.clone(), meta, folder_icon))
     });
-    ui.set_info_text(text.unwrap_or_default().into());
+    let (title, path, meta, icon) =
+        info.unwrap_or_else(|| (String::new(), String::new(), Meta::new(), ("folder", slint::Color::default())));
+    ui.set_location_title(title.clone().into());
+    set_info(ui, &title, &path, &meta, icon);
     ui.set_preview_text(SharedString::new());
     ui.set_has_image(false);
     ui.set_model_mode(false);
@@ -707,6 +1008,7 @@ fn select_row(ui: &AppWindow, row: usize) {
         return;
     };
     ui.set_file_selected(row as i32);
+    with_app(|a| a.pending_viewer = false);
     ui.set_can_extract(true);
     ui.set_texture_selected(item.kind == ItemKind::Texture);
     if with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::History))) {
@@ -714,18 +1016,18 @@ fn select_row(ui: &AppWindow, row: usize) {
     }
     ui.set_entry_selected(item.entry.is_some());
 
-    let mut info =
-        format!("{}\n{}\n{} · {}", item.name, vpath, badges::type_name(&item.name, item.kind), human_size(item.size));
+    let mut info = vec![kv("Type", badges::type_name(&item.name, item.kind)), kv("Size", human_size(item.size))];
     if !item.info.is_empty() {
-        info.push_str(&format!(" · {}", item.info));
+        // Resources show their version ("v171"); other items a short note.
+        let is_version = item.info.strip_prefix('v').is_some_and(|v| v.chars().all(|c| c.is_ascii_digit()));
+        info.push(kv(if is_version { "Version" } else { "Details" }, &item.info));
     }
-    ui.set_info_text(info.clone().into());
+    set_info(ui, &item.name, &vpath, &info, badges::icon(&item.name, item.kind));
     ui.set_preview_text(SharedString::new());
     ui.set_has_image(false);
     ui.set_model_mode(false);
     with_app(|a| a.model = None);
-    if item.kind == ItemKind::Resource && openrage_app::models::is_model(&item.name) && item.mark != Some(Mark::Removed)
-    {
+    if is_model_item(&item) {
         start_model_preview(ui, vpath.clone(), info, generation);
         return;
     }
@@ -749,13 +1051,16 @@ fn select_row(ui: &AppWindow, row: usize) {
                 return;
             }
             if !extra.is_empty() {
-                ui.set_info_text(format!("{info}\n{extra}").into());
+                set_meta(&ui, &info.iter().cloned().chain(extra).collect());
             }
             ui.set_preview_text(body.into());
             match image {
                 Some(buffer) => {
                     ui.set_preview_image(slint::Image::from_rgba8(buffer));
                     ui.set_has_image(true);
+                    if with_app(|a| std::mem::take(&mut a.pending_viewer)) {
+                        open_viewer(&ui);
+                    }
                 }
                 None => ui.set_has_image(false),
             }
@@ -767,16 +1072,25 @@ fn select_row(ui: &AppWindow, row: usize) {
 /// Decoded RGBA image: (width, height, pixels).
 type Rgba = (u32, u32, Vec<u8>);
 
-fn texture_info(t: &rage_formats::texture::Texture) -> String {
-    format!(
-        "{}×{} · {} · {} mip levels · {} · {}",
-        t.width,
-        t.height,
-        t.format.name(),
-        t.levels,
-        t.usage_name(),
-        human_size(t.data.len() as u64)
-    )
+/// Metadata shown as a key/value table; an empty key is a note spanning the row.
+type Meta = Vec<(String, String)>;
+
+fn kv(key: &str, value: impl ToString) -> (String, String) {
+    (key.to_owned(), value.to_string())
+}
+
+fn note(text: impl ToString) -> (String, String) {
+    (String::new(), text.to_string())
+}
+
+fn texture_info(t: &rage_formats::texture::Texture) -> Meta {
+    vec![
+        kv("Dimensions", format!("{} × {}", t.width, t.height)),
+        kv("Format", t.format.name()),
+        kv("Mip levels", t.levels),
+        kv("Usage", t.usage_name()),
+        kv("Data", human_size(t.data.len() as u64)),
+    ]
 }
 
 fn texture_image(t: &rage_formats::texture::Texture) -> Option<Rgba> {
@@ -784,16 +1098,18 @@ fn texture_image(t: &rage_formats::texture::Texture) -> Option<Rgba> {
 }
 
 /// Preview with an optional image: textures and texture dictionaries show a picture.
-fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (String, String, Option<Rgba>) {
+fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, String, Option<Rgba>) {
     match source {
         PreviewSource::Texture(dict, idx) => match dict.textures.get(idx) {
             Some(t) => {
                 let image = texture_image(t);
-                let note =
-                    if image.is_none() { "\nNo preview decoder for this format (DDS export works)." } else { "" };
-                (format!("{}{note}", texture_info(t)), String::new(), image)
+                let mut meta = texture_info(t);
+                if image.is_none() {
+                    meta.push(note("No preview decoder for this format (DDS export works)."));
+                }
+                (meta, String::new(), image)
             }
-            None => (String::new(), String::new(), None),
+            None => (Meta::new(), String::new(), None),
         },
         PreviewSource::Entry(rpf, id) if browser::is_texture_dict(&rpf.entry(id).name) => {
             match rpf
@@ -804,25 +1120,25 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (String, 
                 Ok(dict) => {
                     let names: Vec<&str> = dict.textures.iter().take(8).map(|t| t.name.as_str()).collect();
                     let more = if dict.textures.len() > 8 { ", …" } else { "" };
-                    let info = format!(
-                        "Texture dictionary · {} textures (double-click to open)\n{}{more}",
-                        dict.textures.len(),
-                        names.join(", ")
-                    );
-                    (info, String::new(), dict.textures.first().and_then(texture_image))
+                    let meta = vec![
+                        kv("Textures", dict.textures.len()),
+                        kv("Contains", format!("{}{more}", names.join(", "))),
+                        note("Double-click to open the dictionary."),
+                    ];
+                    (meta, String::new(), dict.textures.first().and_then(texture_image))
                 }
-                Err(e) => (format!("Error: {e}"), String::new(), None),
+                Err(e) => (vec![kv("Error", e)], String::new(), None),
             }
         }
         other => {
-            let (extra, body) = load_preview_text(other, keys);
-            (extra, body, None)
+            let (meta, body) = load_preview_text(other, keys);
+            (meta, body, None)
         }
     }
 }
 
-/// Returns (additional info lines, preview body).
-fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (String, String) {
+/// Returns (metadata, preview body).
+fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, String) {
     match source {
         PreviewSource::Virtual { game_dir, vpath, query, overlay } => match if overlay {
             rage_mods::resolve(&game_dir, &vpath, keys.clone()).map(|(n, _)| n)
@@ -830,7 +1146,7 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Str
             vfs::resolve(&game_dir, &vpath, keys.clone())
         } {
             Ok(Node::ArchiveFile(rpf, id)) => {
-                let (mut extra, body) = load_preview_text(PreviewSource::Entry(Arc::clone(&rpf), id), keys);
+                let (mut meta, body) = load_preview_text(PreviewSource::Entry(Arc::clone(&rpf), id), keys);
                 if let Some(q) = query {
                     let name = rpf.entry(id).name.clone();
                     let line = rpf
@@ -839,75 +1155,76 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Str
                         .and_then(|d| rage_index::content_for(&name, &d))
                         .and_then(|(text, _)| rage_index::snippet(&text, &q));
                     if let Some(line) = line {
-                        extra = format!("Match: {line}\n{extra}");
+                        meta.insert(0, kv("Match", line));
                     }
                 }
-                (extra, body)
+                (meta, body)
             }
             Ok(Node::ArchiveDir(rpf, id)) if id == Rpf7::ROOT => (archive_info(&rpf), String::new()),
-            Ok(Node::ArchiveDir(..)) | Ok(Node::Dir(_)) => (String::new(), String::new()),
+            Ok(Node::ArchiveDir(..)) | Ok(Node::Dir(_)) => (Meta::new(), String::new()),
             Ok(Node::PlainFile(p)) => load_preview_text(PreviewSource::DiskFile(p), keys),
-            Err(e) => (format!("Error: {e}"), String::new()),
+            Err(e) => (vec![kv("Error", e)], String::new()),
         },
-        PreviewSource::Texture(..) => (String::new(), String::new()),
+        PreviewSource::Texture(..) => (Meta::new(), String::new()),
         PreviewSource::DiskFile(path) => {
             let mut data = Vec::new();
             match File::open(&path).and_then(|f| f.take(1 << 20).read_to_end(&mut data)) {
-                Ok(_) => (String::new(), preview::render(&data)),
-                Err(e) => (format!("Error: {e}"), String::new()),
+                Ok(_) => (Meta::new(), preview::render(&data)),
+                Err(e) => (vec![kv("Error", e)], String::new()),
             }
         }
         PreviewSource::DiskArchive(path) => match Rpf7::open(&path, keys) {
             Ok(rpf) => (archive_info(&rpf), String::new()),
-            Err(e) => (format!("Error: {e}"), String::new()),
+            Err(e) => (vec![kv("Error", e)], String::new()),
         },
         PreviewSource::Entry(rpf, id) => {
             let entry = rpf.entry(id).clone();
             if entry.is_archive() {
                 return match rpf.open_child(id) {
                     Ok(child) => (archive_info(&child), String::new()),
-                    Err(e) => (format!("Error: {e}"), String::new()),
+                    Err(e) => (vec![kv("Error", e)], String::new()),
                 };
             }
             match entry.kind {
                 EntryKind::Resource { size, .. } => {
                     let (sys, gfx) = entry.resource_page_sizes().unwrap_or_default();
-                    let info = format!(
-                        "Resource version {} · stored {} · system pages {} · graphics pages {}",
-                        entry.resource_version().unwrap_or_default(),
-                        human_size(size as u64),
-                        human_size(sys),
-                        human_size(gfx)
-                    );
+                    let mut meta = vec![
+                        kv("Resource version", entry.resource_version().unwrap_or_default()),
+                        kv("Stored", human_size(size as u64)),
+                        kv("System pages", human_size(sys)),
+                        kv("Graphics pages", human_size(gfx)),
+                    ];
                     match rpf.read_resource_pages(id) {
-                        Ok(pages) => (info, preview::hex_dump(&pages)),
-                        Err(e) => (format!("{info}\nError: {e}"), String::new()),
+                        Ok(pages) => (meta, preview::hex_dump(&pages)),
+                        Err(e) => {
+                            meta.push(kv("Error", e));
+                            (meta, String::new())
+                        }
                     }
                 }
                 EntryKind::Binary { stored_size, size, encrypted, .. } => {
-                    let mut info = Vec::new();
+                    let mut meta = Meta::new();
                     if stored_size > 0 {
-                        info.push(format!(
-                            "compressed {} → {}",
-                            human_size(stored_size as u64),
-                            human_size(size as u64)
+                        meta.push(kv(
+                            "Compressed",
+                            format!("{} → {}", human_size(stored_size as u64), human_size(size as u64)),
                         ));
                     }
                     if encrypted {
-                        info.push("encrypted".into());
+                        meta.push(kv("Encrypted", "yes"));
                     }
                     match rpf.read(id) {
-                        Ok(data) => (info.join(" · "), preview::render(&data)),
-                        Err(e) => (format!("Error: {e}"), String::new()),
+                        Ok(data) => (meta, preview::render(&data)),
+                        Err(e) => (vec![kv("Error", e)], String::new()),
                     }
                 }
-                EntryKind::Directory { .. } => (String::new(), String::new()),
+                EntryKind::Directory { .. } => (Meta::new(), String::new()),
             }
         }
     }
 }
 
-fn archive_info(rpf: &Rpf7) -> String {
+fn archive_info(rpf: &Rpf7) -> Meta {
     let (mut dirs, mut files, mut resources, mut archives) = (0, 0, 0, 0);
     for e in rpf.entries() {
         match e.kind_label() {
@@ -917,10 +1234,14 @@ fn archive_info(rpf: &Rpf7) -> String {
             _ => files += 1,
         }
     }
-    format!(
-        "RPF7 · encryption {:?}\n{dirs} folders, {files} files, {resources} resources, {archives} nested archives",
-        rpf.encryption()
-    )
+    vec![
+        kv("Format", "RPF7"),
+        kv("Encryption", format!("{:?}", rpf.encryption())),
+        kv("Folders", dirs),
+        kv("Files", files),
+        kv("Resources", resources),
+        kv("Nested archives", archives),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,7 +1373,7 @@ fn show_search_results(ui: &AppWindow, query: String, results: rage_index::Searc
         a.filter.clear();
     });
     ui.set_filter(SharedString::new());
-    ui.set_address(vpath.into());
+    set_location(ui, &vpath);
     ui.set_search_mode(true);
     ui.set_show_language(true);
     ui.set_search_summary(summary.into());
@@ -1222,7 +1543,7 @@ fn show_changes(ui: &AppWindow, changes: Vec<rage_mods::Change>, ms: u128, recor
         a.filter.clear();
     });
     ui.set_filter(SharedString::new());
-    ui.set_address(vpath.into());
+    set_location(ui, &vpath);
     ui.set_search_mode(true);
     ui.set_show_language(false);
     ui.set_search_summary(summary.into());
@@ -1529,7 +1850,7 @@ fn start_undo(ui: &AppWindow) {
 // ---------------------------------------------------------------------------
 // Model preview
 
-fn start_model_preview(ui: &AppWindow, vpath: String, info: String, generation: u64) {
+fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u64) {
     let Some((game_dir, keys, counter)) =
         with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone(), Arc::clone(&a.preview_generation))))
     else {
@@ -1556,53 +1877,99 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: String, generation: 
             ui.set_preview_loading(false);
             match result {
                 Ok(m) => {
-                    let mut text = info.clone();
+                    let mut meta = info.clone();
+                    let single = m.loaded.drawables.len() == 1;
                     for (name, d) in &m.loaded.drawables {
                         let textured = d
                             .shaders
                             .iter()
                             .filter(|s| s.base_texture().is_some_and(|t| m.loaded.texture(d, t).is_some()))
                             .count();
-                        text.push_str(&format!(
-                            "\n{name}: {} meshes · {} vertices · {} triangles · {textured}/{} shaders textured",
-                            d.meshes.len(),
-                            d.vertex_count(),
-                            d.triangle_count(),
-                            d.shaders.len()
-                        ));
+                        if single {
+                            meta.push(kv("Meshes", d.meshes.len()));
+                            meta.push(kv("Vertices", grouped(d.vertex_count())));
+                            meta.push(kv("Triangles", grouped(d.triangle_count())));
+                            meta.push(kv("Textured", format!("{textured} of {} shaders", d.shaders.len())));
+                        } else {
+                            meta.push(kv(
+                                name,
+                                format!(
+                                    "{} meshes · {} triangles · {textured}/{} textured",
+                                    d.meshes.len(),
+                                    grouped(d.triangle_count()),
+                                    d.shaders.len()
+                                ),
+                            ));
+                        }
                     }
-                    if m.loaded.drawables.len() > 1 {
-                        text.push_str("\nThe preview shows the first drawable of the dictionary.");
+                    if !single {
+                        meta.push(note("The preview shows the first drawable of the dictionary."));
                     }
-                    ui.set_info_text(text.into());
+                    set_meta(&ui, &meta);
                     with_app(|a| {
                         a.model = Some(Arc::new(m));
                         a.model_view = openrage_app::render::View::default();
                     });
                     ui.set_model_mode(true);
                     render_model(&ui);
+                    if with_app(|a| std::mem::take(&mut a.pending_viewer)) {
+                        open_viewer(&ui);
+                    }
                 }
-                Err(e) => ui.set_info_text(format!("{info}\nCannot read the model: {e:#}").into()),
+                Err(e) => {
+                    let mut meta = info.clone();
+                    meta.push(kv("Error", format!("Cannot read the model: {e:#}")));
+                    set_meta(&ui, &meta);
+                }
             }
         });
     });
 }
 
+/// Renders a model into an image of `w × h` pixels.
+fn render_image(model: &ModelPreview, view: openrage_app::render::View, w: usize, h: usize) -> Option<slint::Image> {
+    let (_, d) = model.loaded.drawables.first()?;
+    let rgba = openrage_app::render::render(d, &model.materials, view, w, h);
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w as u32, h as u32);
+    Some(slint::Image::from_rgba8(buffer))
+}
+
 /// Renders the current model at the size of the preview area.
 fn render_model(ui: &AppWindow) {
     let Some((model, view)) = with_app(|a| a.model.clone().map(|m| (m, a.model_view))) else { return };
-    let Some((_, d)) = model.loaded.drawables.first() else { return };
     let w = (ui.get_preview_area_width() - 16.0).max(64.0) as usize;
     let h = (ui.get_preview_area_height() - 16.0).max(64.0) as usize;
-    let rgba = openrage_app::render::render(d, &model.materials, view, w, h);
-    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w as u32, h as u32);
-    ui.set_preview_image(slint::Image::from_rgba8(buffer));
-    ui.set_has_image(true);
+    if let Some(img) = render_image(&model, view, w, h) {
+        ui.set_preview_image(img);
+        ui.set_has_image(true);
+    }
+}
+
+/// Opens the selected model or image in its own window (once it has loaded).
+fn open_viewer(ui: &AppWindow) {
+    if ui.get_model_mode() {
+        if let Some(m) = with_app(|a| a.model.clone()) {
+            viewer::open(ui, viewer::Content::Model(m));
+            return;
+        }
+    } else if ui.get_has_image() {
+        viewer::open(ui, viewer::Content::Image(ui.get_preview_image()));
+        return;
+    }
+    if ui.get_preview_loading() {
+        with_app(|a| a.pending_viewer = true);
+        ui.set_status("The viewer opens when the preview has loaded…".into());
+    }
 }
 
 fn export_gltf(ui: &AppWindow) {
-    let Some(model) = with_app(|a| a.model.clone()) else { return };
-    let weak = ui.as_weak();
+    if let Some(model) = with_app(|a| a.model.clone()) {
+        save_glb(model, ui.as_weak());
+    }
+}
+
+/// Asks for a file name and writes the model as `.glb`; reports in the main window.
+fn save_glb(model: Arc<ModelPreview>, main: Weak<AppWindow>) {
     std::thread::spawn(move || {
         let Some(path) = rfd::FileDialog::new()
             .set_title("Export glTF")
@@ -1619,7 +1986,33 @@ fn export_gltf(ui: &AppWindow) {
             Ok(()) => format!("Exported {}", path.display()),
             Err(e) => format!("Export failed: {e}"),
         };
-        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+        let _ = main.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+    });
+}
+
+/// Asks for a file name and saves an image shown in a viewer as PNG.
+fn save_png_image(img: &slint::Image, name: String, main: Weak<AppWindow>) {
+    let Some(pixels) = img.to_rgba8() else { return };
+    let (w, h) = (pixels.width(), pixels.height());
+    let rgba = pixels.as_bytes().to_vec();
+    std::thread::spawn(move || {
+        let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_owned();
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save PNG")
+            .set_file_name(format!("{stem}.png"))
+            .add_filter("PNG image", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+        let result = rage_formats::png(w, h, &rgba)
+            .map_err(|e| e.to_string())
+            .and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string()));
+        let msg = match result {
+            Ok(()) => format!("Saved {}", path.display()),
+            Err(e) => format!("Saving failed: {e}"),
+        };
+        let _ = main.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
     });
 }
 
@@ -1662,7 +2055,7 @@ fn show_history(ui: &AppWindow, record: bool) {
         a.filter.clear();
     });
     ui.set_filter(SharedString::new());
-    ui.set_address(vpath.into());
+    set_location(ui, &vpath);
     ui.set_search_mode(true);
     ui.set_show_language(false);
     ui.set_search_summary(summary.into());

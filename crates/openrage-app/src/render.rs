@@ -88,18 +88,12 @@ fn norm(a: V3) -> V3 {
     [a[0] / l, a[1] / l, a[2] / l]
 }
 
-/// Renders the drawable into an RGBA image of `width × height`.
+/// Renders the drawable into an RGBA image of `width × height` with a
+/// transparent background.
 pub fn render(d: &Drawable, materials: &Materials, view: View, width: usize, height: usize) -> Vec<u8> {
     let (w, h) = (width.max(1), height.max(1));
+    // Transparent background: the UI (or the PNG viewer) shows through.
     let mut color = vec![0u8; w * h * 4];
-    // Background: subtle vertical gradient.
-    for y in 0..h {
-        let t = y as f32 / h as f32;
-        let c = [(46.0 - 18.0 * t) as u8, (50.0 - 18.0 * t) as u8, (58.0 - 18.0 * t) as u8, 255];
-        for x in 0..w {
-            color[(y * w + x) * 4..][..4].copy_from_slice(&c);
-        }
-    }
     let mut depth = vec![f32::INFINITY; w * h];
 
     // Bounds from the vertices (more reliable than stored bounds).
