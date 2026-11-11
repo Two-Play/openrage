@@ -14,9 +14,11 @@
 //! the user provides. Without keys, the header is still readable and
 //! plaintext archives open fully.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rage_core::hash::joaat;
 
@@ -212,6 +214,35 @@ impl Entry {
     }
 }
 
+/// The decryption keys of RDR2 PC archives, taken from the user's own game.
+pub struct Rdr2Keys {
+    pub context: rage_tfit2::Context,
+    pub iv: [u8; 16],
+    /// By key id (0–162, 0xC0, 0xC5, 0xC6).
+    pub keys: HashMap<u8, rage_tfit2::Key>,
+}
+
+impl std::fmt::Debug for Rdr2Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Rdr2Keys({} keys)", self.keys.len())
+    }
+}
+
+/// Whether decrypted table bytes look like a real entry table: hashes in
+/// ascending order, data inside the file, known compression, valid key ids.
+/// Used to recognise the right key without any reference data.
+pub fn plausible_table(table: &[u8], archive_size: u64) -> bool {
+    let entries: Vec<Entry> = table.as_chunks::<ENTRY_LEN>().0.iter().map(|c| Entry::parse(c)).collect();
+    !entries.is_empty()
+        && entries.windows(2).all(|w| w[0].hash <= w[1].hash)
+        && entries.iter().all(|e| {
+            e.offset + e.size_on_disk <= archive_size
+                && !matches!(e.compression, Compression::Unknown(_))
+                && (e.key_id <= 162 || matches!(e.key_id, 0xC0 | 0xC5 | 0xC6 | 0xFF))
+                && (e.ext_id == 0xFF || EXTENSIONS.iter().any(|(id, _)| *id == e.ext_id))
+        })
+}
+
 /// An opened RPF8 archive.
 #[derive(Debug)]
 pub struct Rpf8 {
@@ -220,6 +251,7 @@ pub struct Rpf8 {
     size: u64,
     /// `None` while the entry table is encrypted and no keys are available.
     entries: Option<Vec<Entry>>,
+    keys: Option<Arc<Rdr2Keys>>,
 }
 
 impl Rpf8 {
@@ -230,6 +262,11 @@ impl Rpf8 {
 
     /// Opens an archive. Encrypted entry tables are left unread.
     pub fn open(path: &Path) -> Result<Rpf8, RpfError> {
+        Self::open_with_keys(path, None)
+    }
+
+    /// Opens an archive, decrypting its entry table when the keys have the one it needs.
+    pub fn open_with_keys(path: &Path, keys: Option<Arc<Rdr2Keys>>) -> Result<Rpf8, RpfError> {
         let name = path.display().to_string();
         let mut f = File::open(path)?;
         let size = f.metadata()?.len();
@@ -242,12 +279,27 @@ impl Rpf8 {
         if table_end > size || u64::from(header.names_length) > size {
             return Err(RpfError::CorruptToc { archive: name, reason: "entry table larger than the file".into() });
         }
-        let entries = if header.is_encrypted() {
+        let table_key = match &keys {
+            Some(k) if header.is_encrypted() => {
+                k.keys.get(&(header.decryption_tag as u8)).filter(|_| header.decryption_tag < 0x100)
+            }
+            _ => None,
+        };
+        let entries = if header.is_encrypted() && table_key.is_none() {
             None
         } else {
             f.seek(SeekFrom::Start(HEADER_LEN + SIGNATURE_LEN))?;
             let mut table = vec![0u8; header.entry_count as usize * ENTRY_LEN];
             f.read_exact(&mut table)?;
+            if let (Some(key), Some(k)) = (table_key, &keys) {
+                rage_tfit2::Cbc::new(&k.context, key, k.iv).decrypt(&mut table);
+                if !plausible_table(&table, size) {
+                    return Err(RpfError::CorruptToc {
+                        archive: name,
+                        reason: "the table does not decrypt with the loaded keys".into(),
+                    });
+                }
+            }
             let mut entries: Vec<Entry> = table.as_chunks::<ENTRY_LEN>().0.iter().map(|c| Entry::parse(c)).collect();
             for e in &entries {
                 if e.offset + e.size_on_disk > size {
@@ -262,7 +314,7 @@ impl Rpf8 {
             }
             Some(entries)
         };
-        Ok(Rpf8 { path: path.to_path_buf(), header, size, entries })
+        Ok(Rpf8 { path: path.to_path_buf(), header, size, entries, keys })
     }
 
     pub fn header(&self) -> Header {
@@ -282,19 +334,38 @@ impl Rpf8 {
         self.entries.as_deref()
     }
 
-    /// Reads an entry's data (only unencrypted, uncompressed or deflated binary files for now).
+    /// Reads an entry's data: decrypted, and decompressed when stored or
+    /// deflated (Oodle is not supported yet). Resources come without their
+    /// 16-byte on-disk prefix.
     pub fn read(&self, entry: &Entry) -> Result<Vec<u8>, RpfError> {
         let archive = self.path.display().to_string();
         let name = entry.display_name(self.header.platform);
-        if entry.is_encrypted() {
-            return Err(RpfError::KeysRequired(format!("{archive}/{name}")));
-        }
+        let key = if entry.is_encrypted() {
+            let k = self.keys.as_ref().ok_or_else(|| RpfError::KeysRequired(format!("{archive}/{name}")))?;
+            Some((
+                k,
+                k.keys
+                    .get(&entry.key_id)
+                    .ok_or_else(|| RpfError::KeysRequired(format!("{archive}/{name} (key {})", entry.key_id)))?,
+            ))
+        } else {
+            None
+        };
         let mut f = File::open(&self.path)?;
         f.seek(SeekFrom::Start(entry.offset))?;
         let mut data = vec![0u8; entry.size_on_disk as usize];
         f.read_exact(&mut data)?;
+        // Unverified on real data: Swage places the signature at the end.
         if entry.signed && data.len() >= SIGNATURE_LEN as usize {
             data.truncate(data.len() - SIGNATURE_LEN as usize);
+        }
+        if entry.is_resource && data.len() >= 16 {
+            data.drain(..16);
+        }
+        if let Some((k, key)) = key {
+            let compressed = entry.compression != Compression::None;
+            let chunk = rage_tfit2::chunk_size(entry.is_resource, compressed, entry.size());
+            rage_tfit2::decrypt_file(&k.context, key, k.iv, entry.encryption_config, chunk, &mut data);
         }
         match entry.compression {
             Compression::None => {
@@ -394,6 +465,17 @@ mod tests {
         assert_eq!(rpf.read(&entries[0]).unwrap(), text);
         assert_eq!(rpf.read(&entries[1]).unwrap(), text);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn recognises_plausible_tables() {
+        let good = [entry_bytes(1, 5, 3, 0x200, 0x40, 2, 7), entry_bytes(9, 0xFF, 0xFF, 0x240, 0x10, 0, 3)].concat();
+        assert!(plausible_table(&good, 0x1000));
+        let unsorted = [entry_bytes(9, 5, 3, 0x200, 0x40, 2, 7), entry_bytes(1, 5, 3, 0x240, 0x10, 0, 3)].concat();
+        assert!(!plausible_table(&unsorted, 0x1000));
+        assert!(!plausible_table(&good, 0x220), "data past the end");
+        let bad_ext = entry_bytes(1, 40, 3, 0x200, 0x40, 2, 7);
+        assert!(!plausible_table(&bad_ext, 0x1000));
     }
 
     #[test]

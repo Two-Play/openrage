@@ -4154,8 +4154,13 @@ dependencies = [
  "rage-core",
  "rage-crypto",
  "rage-resource",
+ "rage-tfit2",
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "rage-tfit2"
+version = "0.1.0"
 
 [[package]]
 name = "rand"

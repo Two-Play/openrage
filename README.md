@@ -419,6 +419,6 @@ The UI language is English; the GUI is built with Slint's translation support so
 
 ## License
 
-GPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for third-party attributions.
+GPL-3.0-only, except `crates/rage-tfit2` (the RDR2 archive cipher, ported from an AGPL-3.0 project), which is AGPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for third-party attributions.
 
 Grand Theft Auto, Red Dead Redemption, RAGE and Rockstar Games are trademarks of Take-Two Interactive Software, Inc. The screenshots show OpenRAGE displaying files from the author's own copy of the game.

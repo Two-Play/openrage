@@ -1,0 +1,9 @@
+[package]
+name = "rage-tfit2"
+description = "TFIT2-CBC cipher and strided file encryption of RDR2 PC archives (RPF8)"
+version.workspace = true
+edition.workspace = true
+# Ported from RDR2-RPF-Tool (AGPL-3.0); combined with the GPL-3.0 rest of OpenRAGE under GPL-3.0 section 13.
+license = "AGPL-3.0-only"
+
+[dependencies]

@@ -12,6 +12,7 @@ authors = ["OpenRAGE contributors"]
 [workspace.dependencies]
 rage-core = { path = "crates/rage-core" }
 rage-crypto = { path = "crates/rage-crypto" }
+rage-tfit2 = { path = "crates/rage-tfit2" }
 rage-rpf = { path = "crates/rage-rpf" }
 rage-index = { path = "crates/rage-index" }
 rage-mods = { path = "crates/rage-mods" }
