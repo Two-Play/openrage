@@ -47,6 +47,10 @@ pub struct Mesh {
     pub indices: Vec<u32>,
     /// Index into [`Drawable::shaders`].
     pub shader: u16,
+    /// Skinning: up to four bones per vertex (skeleton bone indices) and
+    /// their weights; empty for meshes that are not skinned.
+    pub bone_indices: Vec<[u16; 4]>,
+    pub bone_weights: Vec<[f32; 4]>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -195,6 +199,8 @@ enum Encoding {
     Half4,
     Unorm8x4,
     Snorm8x4,
+    /// Four unsigned bytes as integers (bone indices).
+    Uint8x4,
     /// 10:10:10:2, signed normalized (Enhanced normals).
     R10G10B10A2,
 }
@@ -209,6 +215,7 @@ impl Encoding {
             Encoding::Half2 => [h(0), h(2), 0.0, 0.0],
             Encoding::Half4 => [h(0), h(2), h(4), h(6)],
             Encoding::Unorm8x4 => [d[0], d[1], d[2], d[3]].map(|v| v as f32 / 255.0),
+            Encoding::Uint8x4 => [d[0], d[1], d[2], d[3]].map(|v| v as f32),
             Encoding::Snorm8x4 => [d[0], d[1], d[2], d[3]].map(|v| (v as i8 as f32 / 127.0).max(-1.0)),
             Encoding::R10G10B10A2 => {
                 let v = u32::from_le_bytes(d[0..4].try_into().unwrap());
@@ -227,7 +234,7 @@ impl Encoding {
             Encoding::Float2 | Encoding::Half4 => 8,
             Encoding::Float3 => 12,
             Encoding::Float4 => 16,
-            Encoding::Half2 | Encoding::Unorm8x4 | Encoding::Snorm8x4 | Encoding::R10G10B10A2 => 4,
+            Encoding::Half2 | Encoding::Unorm8x4 | Encoding::Snorm8x4 | Encoding::Uint8x4 | Encoding::R10G10B10A2 => 4,
         }
     }
 }
@@ -240,6 +247,8 @@ struct VertexLayout {
     normal: Option<(usize, Encoding)>,
     uv: Option<(usize, Encoding)>,
     color: Option<(usize, Encoding)>,
+    weights: Option<(usize, Encoding)>,
+    indices: Option<(usize, Encoding)>,
 }
 
 fn legacy_encoding(t: u64) -> Option<(usize, Option<Encoding>)> {
@@ -252,7 +261,7 @@ fn legacy_encoding(t: u64) -> Option<(usize, Option<Encoding>)> {
         5 => (8, Some(Encoding::Float2)),
         6 => (12, Some(Encoding::Float3)),
         7 => (16, Some(Encoding::Float4)),
-        8 => (4, None), // ubyte4 (blend indices)
+        8 => (4, Some(Encoding::Uint8x4)), // ubyte4 (blend indices)
         9 => (4, Some(Encoding::Unorm8x4)),
         10 => (4, Some(Encoding::Snorm8x4)),
         _ => return None,
@@ -274,6 +283,8 @@ fn legacy_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayou
             let slot = Some((offset, enc));
             match k {
                 0 => layout.position = slot,
+                1 => layout.weights = slot,
+                2 => layout.indices = slot,
                 3 => layout.normal = slot,
                 4 => layout.color = slot,
                 6 => layout.uv = slot,
@@ -296,10 +307,12 @@ fn gen9_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayout,
         16 => Some(Encoding::Float2), // R32G32_TYPELESS
         24 => Some(Encoding::R10G10B10A2),
         28 => Some(Encoding::Unorm8x4),
+        30 => Some(Encoding::Uint8x4),
         34 => Some(Encoding::Half2),
         _ => None,
     };
-    for (slot, target) in [(0usize, 0u8), (4, 1), (24, 2), (28, 3)] {
+    // Slots: 0 position, 4 normal, 16 blend weights, 20 blend indices, 24 colour, 28 uv0.
+    for (slot, target) in [(0usize, 0u8), (4, 1), (24, 2), (28, 3), (16, 4), (20, 5)] {
         let t = types[slot];
         if t == 0 {
             continue;
@@ -311,7 +324,9 @@ fn gen9_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayout,
             0 => layout.position = v,
             1 => layout.normal = v,
             2 => layout.color = v,
-            _ => layout.uv = v,
+            3 => layout.uv = v,
+            4 => layout.weights = v,
+            _ => layout.indices = v,
         }
     }
     Ok(layout)
@@ -354,6 +369,21 @@ fn read_geometry(res: &Resource, g: u64, enhanced: bool) -> Result<Mesh, Resourc
         }
         if let Some(c) = attr(layout.color, i) {
             mesh.colors.push(c);
+        }
+        if let (Some(w), Some(b)) = (attr(layout.weights, i), attr(layout.indices, i)) {
+            mesh.bone_weights.push(w);
+            mesh.bone_indices.push(b.map(|v| v as u16));
+        }
+    }
+    // Blend indices point into the geometry's bone table (skeleton indices).
+    if !mesh.bone_indices.is_empty() {
+        let table = res.u64(g + 0x68)?;
+        let count = res.u16(g + 0x72)? as u64;
+        if table != 0 && count > 0 && count <= 1024 {
+            let ids: Vec<u16> = (0..count).map(|i| res.u16(table + i * 2)).collect::<Result<_, _>>()?;
+            for b in &mut mesh.bone_indices {
+                *b = b.map(|i| ids.get(i as usize).copied().unwrap_or(0));
+            }
         }
     }
 

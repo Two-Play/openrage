@@ -156,7 +156,7 @@ pub fn render(
 ) -> Vec<u8> {
     // Bounds from the vertices (more reliable than stored bounds).
     match bounds(model, &look.parts) {
-        Some((lo, hi)) => render_camera(model, look, materials, &orbit_camera(lo, hi, view), width, height),
+        Some((lo, hi)) => render_camera(model, look, materials, &orbit_camera(lo, hi, view), None, width, height),
         None => vec![0u8; width.max(1) * height.max(1) * 4],
     }
 }
@@ -171,12 +171,14 @@ pub fn fly_camera(eye: [f32; 3], yaw: f32, pitch: f32, radius: f32) -> Camera {
     Camera { eye, forward, right, up, distance: radius.max(0.01), radius: radius.max(0.01), fov: 60f32.to_radians() }
 }
 
-/// Renders from any camera (see [`orbit_camera`], [`fly_camera`]).
+/// Renders from any camera (see [`orbit_camera`], [`fly_camera`]); `skin`
+/// poses skinned meshes (skinning matrices per skeleton bone).
 pub fn render_camera(
     model: &LoadedModel,
     look: &Look,
     materials: &Materials,
     camera: &Camera,
+    skin: Option<&[math::Mat4]>,
     width: usize,
     height: usize,
 ) -> Vec<u8> {
@@ -202,10 +204,33 @@ pub fn render_camera(
             let img = materials.image(part.drawable, mesh.shader);
             let has_uv = mesh.uvs.len() == mesh.positions.len();
             let has_n = mesh.normals.len() == mesh.positions.len();
-            let positions: Vec<[f32; 3]> =
-                mesh.positions.iter().map(|p| math::transform_point(&part.transform, *p)).collect();
-            let normals: Vec<[f32; 3]> =
-                mesh.normals.iter().map(|n| math::transform_dir(&part.transform, *n)).collect();
+            let skinned = skin.filter(|_| mesh.bone_weights.len() == mesh.positions.len());
+            let positions: Vec<[f32; 3]> = mesh
+                .positions
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let p = match skinned {
+                        Some(s) => crate::anim::skin_point(s, mesh.bone_indices[i], mesh.bone_weights[i], *p, false),
+                        None => *p,
+                    };
+                    math::transform_point(&part.transform, p)
+                })
+                .collect();
+            let normals: Vec<[f32; 3]> = mesh
+                .normals
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let n = match skinned {
+                        Some(s) if i < mesh.bone_weights.len() => {
+                            crate::anim::skin_point(s, mesh.bone_indices[i], mesh.bone_weights[i], *n, true)
+                        }
+                        _ => *n,
+                    };
+                    math::transform_dir(&part.transform, n)
+                })
+                .collect();
             let pts: Vec<(f32, f32, f32)> = positions.iter().map(|p| project(*p)).collect();
             for tri in mesh.indices.as_chunks::<3>().0 {
                 let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];

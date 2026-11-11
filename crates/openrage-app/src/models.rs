@@ -38,6 +38,9 @@ pub struct LoadedModel {
     pub external: Vec<(String, TextureDictionary)>,
     /// Materials: shaders with the same name across all drawables.
     pub materials: Vec<MaterialSlot>,
+    /// The skeleton skinned meshes are bound to (for peds: from the `.yft`
+    /// next to the `.ydd`).
+    pub skeleton: Option<drawable::Skeleton>,
     /// Material index per drawable and shader.
     shader_material: Vec<Vec<usize>>,
 }
@@ -326,7 +329,13 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
             external.push((c, dict));
         }
     }
-    let mut model = LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new() };
+    // Peds keep their skeleton in a fragment next to the drawable dictionary.
+    let skeleton = drawables.iter().find_map(|(_, d)| d.skeleton.clone()).or_else(|| {
+        let tid = rpf.find_child(dir, &format!("{stem}.yft"))?;
+        drawable::parse_fragment(&rpf.read_resource(tid).ok()?).ok()?.drawable.skeleton
+    });
+    let mut model =
+        LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
     model.collect_materials();
     Ok(model)
 }

@@ -102,6 +102,17 @@ enum Command {
         /// Camera angle around the model for --render, in degrees.
         #[arg(long, default_value_t = -130.0, allow_hyphen_values = true)]
         yaw: f32,
+        /// Pose the model with a clip for --render: `<path of .ycd>:<clip name>[@seconds]`.
+        #[arg(long)]
+        anim: Option<String>,
+    },
+    /// List the clips of a clip dictionary (.ycd).
+    Clips {
+        /// Virtual path of the .ycd file.
+        path: String,
+        /// Print the values of every track of this clip at a few frames.
+        #[arg(long)]
+        clip: Option<String>,
     },
     /// List the sounds of an audio container (.awc) and optionally export them as WAV.
     Audio {
@@ -256,9 +267,10 @@ fn run() -> Result<()> {
         }
         Command::Textures { path, export, png, .. } => cmd_textures(&game_dir, &path, export.as_deref(), png, keys),
         Command::Index => cmd_index(&game_dir, keys),
-        Command::Model { path, export, render, yaw } => {
-            cmd_model(&game_dir, &path, export.as_deref(), render.as_deref(), yaw, keys)
+        Command::Model { path, export, render, yaw, anim } => {
+            cmd_model(&game_dir, &path, export.as_deref(), render.as_deref(), yaw, anim.as_deref(), keys)
         }
+        Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
         Command::Audio { path, export } => cmd_audio(&game_dir, &path, export.as_deref(), keys),
         Command::Put { file, target } => cmd_put(&game_dir, &file, &target, keys),
         Command::Rm { path } => cmd_edit(&game_dir, &path, Op::Remove, &format!("Removed {path}"), keys),
@@ -828,9 +840,13 @@ fn cmd_model(
     export: Option<&Path>,
     render: Option<&Path>,
     yaw: f32,
+    anim: Option<&str>,
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
-    let model = openrage_app::models::load(game_dir, keys, path)?;
+    let model = openrage_app::models::load(game_dir, keys.clone(), path)?;
+    if let Some(s) = &model.skeleton {
+        outln!("skeleton: {} bones", s.bones.len());
+    }
     for (name, d) in &model.drawables {
         outln!(
             "{name}: {} meshes, {} vertices, {} triangles, {} shaders",
@@ -883,10 +899,90 @@ fn cmd_model(
         let materials = render::Materials::new(&model);
         let view = render::View { yaw: yaw.to_radians(), ..Default::default() };
         let started = Instant::now();
-        let rgba = render::render(&model, &model.default_look(), &materials, view, 960, 600);
+        let look = model.default_look();
+        let skin = match anim {
+            Some(spec) => {
+                let (ycd, rest) = spec.rsplit_once(':').context("--anim wants <ycd>:<clip>[@seconds]")?;
+                let (clip, secs) = match rest.split_once('@') {
+                    Some((c, t)) => (c, t.parse::<f32>().context("bad time")?),
+                    None => (rest, 0.0),
+                };
+                let (node, _) = rage_mods::resolve(game_dir, ycd, keys)?;
+                let vfs::Node::ArchiveFile(rpf, id) = node else { bail!("{ycd} is not a file") };
+                let dict = rage_formats::clip::parse_ycd(&rpf.read_resource(id)?)?;
+                let c = dict.clips.iter().find(|c| c.name.eq_ignore_ascii_case(clip)).context("no such clip")?;
+                let part = c.parts.first().context("clip without animation")?;
+                let a = &dict.animations[part.animation];
+                let skel = model.skeleton.as_ref().context("the model has no skeleton")?;
+                let binding = openrage_app::anim::Binding::new(skel, a);
+                outln!("animating {} of {} bones", binding.animated_bones(), skel.bones.len());
+                Some(binding.skin(skel, a, a.frame_at(part.start + secs * part.rate)))
+            }
+            None => None,
+        };
+        let (lo, hi) = render::bounds(&model, &look.parts).context("nothing to render")?;
+        let camera = render::orbit_camera(lo, hi, view);
+        let rgba = render::render_camera(&model, &look, &materials, &camera, skin.as_deref(), 960, 600);
         let ms = started.elapsed().as_millis();
         fs::write(out, rage_formats::png(960, 600, &rgba)?)?;
         outln!("Rendered {} in {ms} ms", out.display());
+    }
+    Ok(())
+}
+
+fn cmd_clips(game_dir: &Path, path: &str, clip: Option<&str>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
+    let vfs::Node::ArchiveFile(rpf, id) = node else { bail!("{path} is not a file inside an archive") };
+    let dict = rage_formats::clip::parse_ycd(&rpf.read_resource(id)?)?;
+    outln!("{} clips, {} animations", dict.clips.len(), dict.animations.len());
+    for c in &dict.clips {
+        let parts: Vec<String> = c
+            .parts
+            .iter()
+            .map(|p| {
+                let a = &dict.animations[p.animation];
+                format!("anim {} ({} frames, {} tracks)", p.animation, a.frames, a.tracks.len())
+            })
+            .collect();
+        outln!("  {:<40} {:>6.2}s  {}", c.name, c.duration(), parts.join(", "));
+    }
+    if let Some(name) = clip {
+        let c = dict.clips.iter().find(|c| c.name.eq_ignore_ascii_case(name)).context("no such clip")?;
+        let a = &dict.animations[c.parts.first().context("clip without animation")?.animation];
+        let mut worst_norm = 0f32;
+        let mut worst_jump = 0f32;
+        for (t, tr) in a.tracks.iter().enumerate() {
+            let vals: Vec<[f32; 4]> = (0..a.frames).filter_map(|f| a.value(t, f as f32)).collect();
+            if tr.format == 1 {
+                for v in &vals {
+                    let n = (v.iter().map(|x| x * x).sum::<f32>()).sqrt();
+                    worst_norm = worst_norm.max((n - 1.0).abs());
+                }
+            }
+            for w in vals.windows(2) {
+                let d = (0..3).map(|i| (w[1][i] - w[0][i]).abs()).fold(0.0, f32::max);
+                worst_jump = worst_jump.max(d);
+            }
+            if t < 12 {
+                let first = vals.first().copied().unwrap_or_default();
+                let mid = vals.get(vals.len() / 2).copied().unwrap_or_default();
+                outln!(
+                    "  bone {:04x} track {} fmt {}: f0 [{:.3} {:.3} {:.3} {:.3}]  mid [{:.3} {:.3} {:.3} {:.3}]",
+                    tr.bone,
+                    tr.track,
+                    tr.format,
+                    first[0],
+                    first[1],
+                    first[2],
+                    first[3],
+                    mid[0],
+                    mid[1],
+                    mid[2],
+                    mid[3]
+                );
+            }
+        }
+        outln!("worst |q|-1: {worst_norm:.4}, largest frame-to-frame change: {worst_jump:.4}");
     }
     Ok(())
 }
