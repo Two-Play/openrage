@@ -65,6 +65,34 @@ pub fn transform_dir(m: &Mat4, v: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+/// Inverse of an affine transform (rotation/scale + translation).
+pub fn inverse_affine(m: &Mat4) -> Mat4 {
+    let (a, b, c) = (m[0], m[4], m[8]);
+    let (d, e, f) = (m[1], m[5], m[9]);
+    let (g, h, i) = (m[2], m[6], m[10]);
+    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if det.abs() < 1e-12 {
+        return IDENTITY;
+    }
+    let inv = 1.0 / det;
+    // Inverse of the 3x3 part (row-major r[row][col]).
+    let r = [
+        [(e * i - f * h) * inv, (c * h - b * i) * inv, (b * f - c * e) * inv],
+        [(f * g - d * i) * inv, (a * i - c * g) * inv, (c * d - a * f) * inv],
+        [(d * h - e * g) * inv, (b * g - a * h) * inv, (a * e - b * d) * inv],
+    ];
+    let t = [m[12], m[13], m[14]];
+    let nt = [
+        -(r[0][0] * t[0] + r[0][1] * t[1] + r[0][2] * t[2]),
+        -(r[1][0] * t[0] + r[1][1] * t[1] + r[1][2] * t[2]),
+        -(r[2][0] * t[0] + r[2][1] * t[1] + r[2][2] * t[2]),
+    ];
+    [
+        r[0][0], r[1][0], r[2][0], 0.0, r[0][1], r[1][1], r[2][1], 0.0, r[0][2], r[1][2], r[2][2], 0.0, nt[0], nt[1],
+        nt[2], 1.0,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,6 +104,10 @@ mod tests {
         let m = from_trs([1.0, 2.0, 3.0], [0.0, 0.0, quarter, quarter], [1.0; 3]);
         let p = transform_point(&m, [1.0, 0.0, 0.0]);
         assert!((p[0] - 1.0).abs() < 1e-5 && (p[1] - 3.0).abs() < 1e-5 && (p[2] - 3.0).abs() < 1e-5, "{p:?}");
+        let back = mul(&inverse_affine(&m), &m);
+        for (x, y) in back.iter().zip(IDENTITY) {
+            assert!((x - y).abs() < 1e-5, "{back:?}");
+        }
         let r = mul(&rotation_z(std::f32::consts::PI), &IDENTITY);
         let q = transform_point(&r, [1.0, 0.0, 0.0]);
         assert!((q[0] + 1.0).abs() < 1e-5 && q[1].abs() < 1e-5);

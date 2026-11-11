@@ -12,7 +12,38 @@ use std::time::{Duration, Instant};
 use openrage_app::render::{self, Camera, View};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 
-use crate::{AppWindow, MaterialRow, ModelPreview, PartRow, ViewerWindow};
+use crate::{AppWindow, ClipRow, MaterialRow, ModelPreview, PartRow, ViewerWindow};
+use openrage_app::anim::Binding;
+use rage_formats::clip::ClipDictionary;
+use rage_formats::math::Mat4;
+
+/// An animation playing in a viewer.
+pub struct AnimState {
+    dict: Arc<ClipDictionary>,
+    clip: Option<usize>,
+    binding: Option<Binding>,
+    /// Seconds into the clip.
+    time: f32,
+    playing: bool,
+    speed: f32,
+    last: Instant,
+}
+
+impl AnimState {
+    fn clip_duration(&self) -> f32 {
+        self.clip.and_then(|c| self.dict.clips.get(c)).map_or(0.0, |c| c.duration())
+    }
+
+    /// Skinning matrices for the current time.
+    pub fn skin(&self, m: &ModelPreview) -> Option<Vec<Mat4>> {
+        let clip = self.dict.clips.get(self.clip?)?;
+        let part = clip.parts.first()?;
+        let anim = self.dict.animations.get(part.animation)?;
+        let skeleton = m.loaded.skeleton.as_ref()?;
+        let at = part.start + self.time * part.rate;
+        Some(self.binding.as_ref()?.skin(skeleton, anim, anim.frame_at(at)))
+    }
+}
 
 pub enum Content {
     Model(Arc<ModelPreview>),
@@ -36,6 +67,10 @@ enum PartEntry {
 
 struct State {
     content: Content,
+    anim: Option<AnimState>,
+    /// Clip dictionaries found by the animation search.
+    results: Vec<String>,
+    anim_timer: slint::Timer,
     /// Rows of the parts list.
     entries: Vec<(String, i32, PartEntry)>,
     view: View,
@@ -83,14 +118,35 @@ thread_local! {
 /// Opens a viewer window for `content`, labelled with the main window's
 /// current selection (title, path, details).
 pub fn open(ui: &AppWindow, content: Content) {
+    let labels = Labels {
+        heading: ui.get_info_title().into(),
+        path: ui.get_info_path().into(),
+        icon: ui.get_info_icon().into(),
+        tint: ui.get_info_tint(),
+        rows: ui.get_info_rows(),
+    };
+    open_with(ui, content, labels, None);
+}
+
+/// What a viewer window shows about its model.
+pub struct Labels {
+    pub heading: String,
+    pub path: String,
+    pub icon: String,
+    pub tint: slint::Color,
+    pub rows: ModelRc<crate::InfoRow>,
+}
+
+/// Opens a viewer; with `animation` (path of a `.ycd`) its first clip plays.
+pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Option<String>) {
     let Ok(win) = ViewerWindow::new() else { return };
     win.set_theme_mode(ui.get_theme_mode());
     win.set_mono_font(ui.get_mono_font());
-    win.set_heading(ui.get_info_title());
-    win.set_path(ui.get_info_path());
-    win.set_icon_name(ui.get_info_icon());
-    win.set_tint(ui.get_info_tint());
-    win.set_rows(ui.get_info_rows());
+    win.set_heading(labels.heading.into());
+    win.set_path(labels.path.into());
+    win.set_icon_name(labels.icon.into());
+    win.set_tint(labels.tint);
+    win.set_rows(labels.rows);
     win.set_model_mode(matches!(content, Content::Model(_)));
     if let Content::Image(img) = &content {
         win.set_image(img.clone());
@@ -106,8 +162,13 @@ pub fn open(ui: &AppWindow, content: Content) {
     if let Content::Model(m) = &content {
         refresh_lists(&win, m, &entries);
     }
+    let has_skeleton = matches!(&content, Content::Model(m) if m.loaded.skeleton.is_some());
+    win.set_has_skeleton(has_skeleton);
     let state = Rc::new(RefCell::new(State {
         content,
+        anim: None,
+        results: Vec::new(),
+        anim_timer: slint::Timer::default(),
         entries,
         view: View::default(),
         fly: None,
@@ -153,6 +214,18 @@ pub fn open(ui: &AppWindow, content: Content) {
     });
     let (w, s) = (win.as_weak(), Rc::clone(&state));
     win.on_toggle_fly(move || toggle_fly(&w, &s));
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    win.on_look_along(move |axis| {
+        {
+            let mut st = s.borrow_mut();
+            st.fly = None;
+            st.view = crate::axis_view(axis, st.view);
+        }
+        if let Some(win) = w.upgrade() {
+            win.set_fly_mode(false);
+        }
+        render(&w, &s);
+    });
     let (w, s) = (win.as_weak(), Rc::clone(&state));
     win.on_key_down(move |text, shift| {
         let key = text.to_lowercase();
@@ -270,6 +343,110 @@ pub fn open(ui: &AppWindow, content: Content) {
             crate::save_png_image(img, win.get_heading().to_string(), main.clone());
         }
     });
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    win.on_anim_search(move |text| anim_search(&w, &s, &text));
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    win.on_anim_open(move |i| {
+        let Some(win) = w.upgrade() else { return };
+        if i < 0 {
+            s.borrow_mut().anim = None;
+            win.set_anim_dictionary("".into());
+            win.set_anim_clip(-1);
+            render(&w, &s);
+            return;
+        }
+        let Some(vpath) = s.borrow().results.get(i as usize).cloned() else { return };
+        win.set_anim_status(format!("Loading {vpath} …").into());
+        match crate::load_clip_dictionary(&vpath) {
+            Ok(dict) => {
+                let rows: Vec<ClipRow> = dict
+                    .clips
+                    .iter()
+                    .map(|c| ClipRow { name: c.name.clone().into(), info: format!("{:.1} s", c.duration()).into() })
+                    .collect();
+                let name = vpath.rsplit('/').next().unwrap_or(&vpath).to_owned();
+                win.set_anim_clips(ModelRc::new(VecModel::from(rows)));
+                win.set_anim_dictionary(name.into());
+                win.set_anim_clip(-1);
+                win.set_anim_status(format!("{} clips · {}", dict.clips.len(), vpath).into());
+                s.borrow_mut().anim = Some(AnimState {
+                    dict: Arc::new(dict),
+                    clip: None,
+                    binding: None,
+                    time: 0.0,
+                    playing: false,
+                    speed: 1.0,
+                    last: Instant::now(),
+                });
+            }
+            Err(e) => win.set_anim_status(format!("Cannot read {vpath}: {e:#}").into()),
+        }
+    });
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    win.on_anim_select(move |i| {
+        {
+            let mut st = s.borrow_mut();
+            let skeleton = st.model().and_then(|m| m.loaded.skeleton.clone());
+            let Some(a) = st.anim.as_mut() else { return };
+            let Some(clip) = a.dict.clips.get(i as usize) else { return };
+            let binding = skeleton
+                .as_ref()
+                .zip(clip.parts.first())
+                .map(|(sk, p)| Binding::new(sk, &a.dict.animations[p.animation]));
+            let moved = binding.as_ref().map_or(0, Binding::animated_bones);
+            a.binding = binding;
+            a.clip = Some(i as usize);
+            a.time = 0.0;
+            a.playing = true;
+            a.last = Instant::now();
+            if let Some(win) = w.upgrade() {
+                win.set_anim_clip(i);
+                if moved == 0 {
+                    win.set_anim_status("This clip animates none of the model's bones (different skeleton).".into());
+                } else {
+                    win.set_anim_status(format!("{moved} bones animated").into());
+                }
+            }
+        }
+        start_anim_timer(&w, &s);
+    });
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    win.on_anim_toggle(move || {
+        let playing = {
+            let mut st = s.borrow_mut();
+            let Some(a) = st.anim.as_mut() else { return };
+            if a.clip.is_none() {
+                return;
+            }
+            if !a.playing && a.time >= a.clip_duration() {
+                a.time = 0.0;
+            }
+            a.playing = !a.playing;
+            a.last = Instant::now();
+            a.playing
+        };
+        if playing {
+            start_anim_timer(&w, &s);
+        } else {
+            s.borrow().anim_timer.stop();
+            update_anim_ui(&w, &s);
+        }
+    });
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    win.on_anim_seek(move |v| {
+        if let Some(a) = s.borrow_mut().anim.as_mut() {
+            a.time = v.clamp(0.0, 1.0) * a.clip_duration();
+        }
+        update_anim_ui(&w, &s);
+        render(&w, &s);
+    });
+    let s = Rc::clone(&state);
+    win.on_anim_speed(move |i| {
+        if let Some(a) = s.borrow_mut().anim.as_mut() {
+            a.speed = [0.25, 0.5, 1.0, 2.0].get(i as usize).copied().unwrap_or(1.0);
+        }
+    });
+
     let w = win.as_weak();
     win.on_close_viewer(move || {
         if let Some(win) = w.upgrade() {
@@ -282,6 +459,18 @@ pub fn open(ui: &AppWindow, content: Content) {
         slint::CloseRequestResponse::HideWindow
     });
 
+    if let Some(ycd) = animation.filter(|_| has_skeleton) {
+        let rows = vec![ClipRow { name: ycd.rsplit('/').next().unwrap_or(&ycd).into(), info: ycd.clone().into() }];
+        win.set_anim_results(ModelRc::new(VecModel::from(rows)));
+        state.borrow_mut().results = vec![ycd];
+        win.invoke_anim_open(0);
+        win.invoke_anim_select(0);
+        win.set_panel_tab(3);
+    } else if has_skeleton {
+        // Suggest the generic movement clips for peds.
+        let female = win.get_heading().contains("_f_");
+        anim_search(&win.as_weak(), &state, if female { "move_f@generic" } else { "move_m@generic" });
+    }
     if win.show().is_ok() {
         render(&win.as_weak(), &state);
         OPEN.with(|o| o.borrow_mut().push((id, win)));
@@ -301,10 +490,71 @@ fn render(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>) {
     if let Content::Model(m) = &st.content {
         let width = (win.get_area_width() - 32.0).max(64.0) as usize;
         let height = (win.get_area_height() - 32.0).max(64.0) as usize;
-        if let Some(img) = crate::render_image(m, |lo, hi| st.camera(lo, hi), width, height) {
+        let skin = st.anim.as_ref().and_then(|a| a.skin(m));
+        if let Some((img, gizmo)) = crate::render_image(m, |lo, hi| st.camera(lo, hi), skin.as_deref(), width, height) {
             win.set_image(img);
+            win.set_gizmo(gizmo);
         }
     }
+}
+
+fn anim_search(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>, text: &str) {
+    let Some(win) = w.upgrade() else { return };
+    let found = crate::find_files(text, ".ycd", 200);
+    let rows: Vec<ClipRow> = found
+        .iter()
+        .map(|v| {
+            let (dir, name) = v.rsplit_once('/').unwrap_or(("", v));
+            ClipRow { name: name.into(), info: dir.into() }
+        })
+        .collect();
+    win.set_anim_status(if found.is_empty() {
+        format!("No clip dictionaries match \"{text}\" (the search index may still be building).").into()
+    } else {
+        "".into()
+    });
+    win.set_anim_results(ModelRc::new(VecModel::from(rows)));
+    win.set_anim_dictionary("".into());
+    state.borrow_mut().results = found;
+}
+
+fn start_anim_timer(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>) {
+    let (w2, s2) = (w.clone(), Rc::clone(state));
+    state.borrow().anim_timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || {
+        let done = {
+            let mut st = s2.borrow_mut();
+            let looping = w2.upgrade().is_some_and(|win| win.get_anim_loop());
+            let Some(a) = st.anim.as_mut() else { return };
+            let dt = a.last.elapsed().as_secs_f32().min(0.1);
+            a.last = Instant::now();
+            let total = a.clip_duration();
+            a.time += dt * a.speed;
+            if a.time >= total {
+                if looping && total > 0.0 {
+                    a.time %= total;
+                } else {
+                    a.time = total;
+                    a.playing = false;
+                }
+            }
+            !a.playing
+        };
+        update_anim_ui(&w2, &s2);
+        render(&w2, &s2);
+        if done {
+            s2.borrow().anim_timer.stop();
+        }
+    });
+    update_anim_ui(w, state);
+}
+
+fn update_anim_ui(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>) {
+    let (Some(win), st) = (w.upgrade(), state.borrow()) else { return };
+    let Some(a) = &st.anim else { return };
+    let total = a.clip_duration().max(0.001);
+    win.set_anim_position(a.time / total);
+    win.set_anim_playing(a.playing);
+    win.set_anim_time(format!("{:.2} / {:.2} s", a.time, total).into());
 }
 
 /// Switches between orbiting and flying, starting where the camera is.

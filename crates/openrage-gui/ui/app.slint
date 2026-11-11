@@ -2,7 +2,7 @@
 // All user-visible strings go through @tr() so the UI can be translated.
 // Spacing, sizes and colors come from the Theme tokens (theme.slint).
 
-import { Button, CheckBox, LineEdit, ComboBox, ScrollView, ListView, Palette, Spinner, TabWidget, TextEdit } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ComboBox, ScrollView, ListView, Palette, Slider, Spinner, TabWidget, TextEdit } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 
 export struct TreeRow {
@@ -38,6 +38,27 @@ export struct MaterialRow {
     textured: bool,
 }
 
+export struct HistoryRow {
+    when: string,
+    description: string,
+    place: string,
+    group: string,
+}
+
+// One axis of the orientation compass: screen direction (-1..1) and
+// whether it points away from the viewer.
+export struct GizmoAxis {
+    dx: float,
+    dy: float,
+    away: bool,
+}
+
+export struct ClipRow {
+    name: string,
+    // Length, e.g. "2.1 s".
+    info: string,
+}
+
 export struct Crumb {
     label: string,
     path: string,
@@ -62,14 +83,38 @@ export struct FileRow {
     can-edit-text: bool,
 }
 
-component FormatIcon inherits Image {
+component FormatIcon inherits Rectangle {
     in property <string> name;
     in property <color> tint;
+    // A file that holds other files (opens like a folder): marked with a badge.
+    in property <bool> container;
     width: Theme.icon-size;
     height: Theme.icon-size;
-    source: Icons.get(root.name);
-    colorize: root.tint;
-    image-rendering: smooth;
+    Image {
+        width: 100%;
+        height: 100%;
+        source: Icons.get(root.name);
+        colorize: root.tint;
+        image-rendering: smooth;
+    }
+    if root.container: Rectangle {
+        x: parent.width - self.width + 3px;
+        y: parent.height - self.height + 3px;
+        width: 10px;
+        height: 10px;
+        border-radius: 3px;
+        background: root.tint;
+        border-width: 1.5px;
+        border-color: Theme.background;
+        // Three stacked lines: "contains items".
+        for i in 3: Rectangle {
+            x: 2.5px;
+            y: 2.5px + i * 2px;
+            width: 5px;
+            height: 1px;
+            background: Theme.background;
+        }
+    }
 }
 
 // Flat icon button for the toolbar.
@@ -315,6 +360,10 @@ component FileItem inherits Rectangle {
                 y: (parent.height - self.height) / 2;
                 name: item.icon;
                 tint: item.tint;
+                container: item.can-open && item.icon != "folder" && item.icon != "archive";
+                Tooltip {
+                    text: @markdown("\{item.can-open && item.icon != "folder" && item.icon != "archive" ? @tr("Contains files — double-click to open") : item.kind}");
+                }
             }
             HorizontalLayout {
                 horizontal-stretch: 1;
@@ -328,17 +377,6 @@ component FileItem inherits Rectangle {
                     vertical-alignment: center;
                     overflow: elide;
                     color: root.fg;
-                }
-                // Files that open like folders (texture dictionaries, audio containers).
-                if item.can-open && item.icon != "folder" && item.icon != "archive": Text {
-                    text: "›";
-                    vertical-alignment: center;
-                    font-weight: 700;
-                    color: selected && focused ? Theme.selection-text : Theme.accent;
-                    accessible-role: none;
-                    Tooltip {
-                        text: @markdown("\{@tr("Double-click to open its contents")}");
-                    }
                 }
             }
             Rectangle {
@@ -424,6 +462,48 @@ component ContextBar inherits Rectangle {
             }
         }
         @children
+    }
+}
+
+// Orientation compass: the game's X (red), Y (green) and Z (blue, up) axes
+// as seen by the camera. Clicking a letter looks along that axis.
+component AxisGizmo inherits Rectangle {
+    in property <[GizmoAxis]> axes;
+    callback pick(int);
+    width: 76px;
+    height: 76px;
+    border-radius: 38px;
+    background: Theme.background.with-alpha(0.55);
+    property <[color]> colors: [#e5484d, #30a46c, #3e7bf6];
+    property <[string]> names: ["X", "Y", "Z"];
+    for a[i] in root.axes: Path {
+        width: root.width;
+        height: root.height;
+        viewbox-x: -1;
+        viewbox-y: -1;
+        viewbox-width: 2;
+        viewbox-height: 2;
+        stroke: root.colors[i].with-alpha(a.away ? 0.45 : 1.0);
+        stroke-width: a.away ? 1.5px : 2.5px;
+        commands: "M 0 0 L " + (a.dx * 0.62) + " " + (a.dy * 0.62);
+    }
+    for a[i] in root.axes: Rectangle {
+        x: root.width / 2 + a.dx * 0.62 * root.width / 2 - self.width / 2;
+        y: root.height / 2 + a.dy * 0.62 * root.height / 2 - self.height / 2;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: root.colors[i].with-alpha(a.away ? 0.5 : 1.0);
+        Text {
+            text: root.names[i];
+            font-size: 10px;
+            font-weight: 700;
+            color: white;
+        }
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.pick(i); }
+        }
     }
 }
 
@@ -688,6 +768,12 @@ export component AppWindow inherits Window {
     in property <bool> has-image;
     // Model preview: drag to orbit, wheel to zoom.
     in property <bool> model-mode;
+    in property <[GizmoAxis]> gizmo;
+    // Models suggested for the selected clip dictionary.
+    in property <[ClipRow]> suggestions;
+    in property <string> suggest-title;
+    // Icon of the rows: "model" for suggested models, "audio" for a container's sounds.
+    in property <string> suggest-icon: "model";
     // Sound preview: waveform in the preview area, player controls above it.
     in property <bool> audio-mode;
     // The preview image is a texture or picture (not a waveform), so it can open in the viewer.
@@ -731,6 +817,8 @@ export component AppWindow inherits Window {
     in property <bool> texture-selected;
     in property <bool> preview-loading;
     in-out property <bool> shortcuts-visible;
+    // History opens in its own window (else in the file list).
+    in-out property <bool> history-in-window: true;
 
     // Status / background task
     in property <string> status;
@@ -766,6 +854,8 @@ export component AppWindow inherits Window {
     callback save-png();
     callback model-orbit(length, length);
     callback model-zoom(float);
+    callback model-axis(int);
+    callback suggestion-open(int);
     callback model-resized();
     callback export-gltf();
     callback audio-toggle();
@@ -798,6 +888,7 @@ export component AppWindow inherits Window {
     callback setup-run();
     callback theme-changed(int);
     callback edit-mode-changed(bool);
+    callback history-window-changed(bool);
     callback quit();
 
     preview-area-width: preview-area.width;
@@ -988,6 +1079,13 @@ export component AppWindow inherits Window {
                 title: @tr("All mod changes");
                 enabled: root.mods-available;
                 activated => { root.show-changes(); }
+            }
+            MenuItem {
+                title: (root.history-in-window ? "✓ " : "") + @tr("History in its own window");
+                activated => {
+                    root.history-in-window = !root.history-in-window;
+                    root.history-window-changed(root.history-in-window);
+                }
             }
             MenuItem {
                 title: @tr("History");
@@ -1743,90 +1841,127 @@ export component AppWindow inherits Window {
                 }
 
                 if root.audio-mode: Rectangle {
+                    height: 50px;
                     border-radius: Theme.radius;
                     background: Theme.surface;
                     border-width: 1px;
                     border-color: Theme.border;
+                    // Every control sits centred in a cell spanning the row's height.
                     HorizontalLayout {
-                        padding: Theme.space-xs;
                         padding-left: Theme.space-s;
+                        padding-right: Theme.space-s;
                         spacing: 2px;
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/prev.svg");
-                            label: @tr("Previous sound");
-                            enabled: root.audio-has-prev;
-                            clicked => { root.audio-step(-1); }
-                        }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/back5.svg");
-                            label: @tr("Back 5 seconds");
-                            clicked => { root.audio-skip(-5); }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/prev.svg");
+                                label: @tr("Previous sound");
+                                enabled: root.audio-has-prev;
+                                clicked => { root.audio-step(-1); }
+                            }
                         }
                         Rectangle {
-                            y: (parent.height - self.height) / 2;
-                            width: 38px;
-                            height: 38px;
-                            border-radius: 19px;
-                            background: play-ta.has-hover ? Theme.accent.darker(0.1) : Theme.accent;
-                            accessible-role: button;
-                            accessible-label: root.audio-playing ? @tr("Pause") : @tr("Play");
-                            accessible-action-default => { root.audio-toggle(); }
-                            Image {
-                                width: 18px;
-                                height: 18px;
-                                source: root.audio-playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
-                                colorize: Palette.accent-foreground;
-                            }
-                            play-ta := TouchArea {
-                                clicked => { root.audio-toggle(); }
-                            }
-                            Tooltip {
-                                text: @markdown("\{@tr("Play / pause (Space)")}");
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/back5.svg");
+                                label: @tr("Back 5 seconds");
+                                clicked => { root.audio-skip(-5); }
                             }
                         }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/fwd5.svg");
-                            label: @tr("Forward 5 seconds");
-                            clicked => { root.audio-skip(5); }
+                        Rectangle {
+                            width: 44px;
+                            Rectangle {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                width: 38px;
+                                height: 38px;
+                                border-radius: 19px;
+                                background: play-ta.has-hover ? Theme.accent.darker(0.1) : Theme.accent;
+                                accessible-role: button;
+                                accessible-label: root.audio-playing ? @tr("Pause") : @tr("Play");
+                                accessible-action-default => { root.audio-toggle(); }
+                                Image {
+                                    width: 16px;
+                                    height: 16px;
+                                    // The play triangle's visual centre is left of its box.
+                                    x: (parent.width - self.width) / 2 + (root.audio-playing ? 0px : 1.5px);
+                                    y: (parent.height - self.height) / 2;
+                                    source: root.audio-playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
+                                    colorize: Palette.accent-foreground;
+                                }
+                                play-ta := TouchArea {
+                                    clicked => { root.audio-toggle(); }
+                                }
+                                Tooltip {
+                                    text: @markdown("\{@tr("Play / pause (Space)")}");
+                                }
+                            }
                         }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/next.svg");
-                            label: @tr("Next sound");
-                            enabled: root.audio-has-next;
-                            clicked => { root.audio-step(1); }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/fwd5.svg");
+                                label: @tr("Forward 5 seconds");
+                                clicked => { root.audio-skip(5); }
+                            }
                         }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/stop.svg");
-                            label: @tr("Stop");
-                            clicked => { root.audio-stop(); }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/next.svg");
+                                label: @tr("Next sound");
+                                enabled: root.audio-has-next;
+                                clicked => { root.audio-step(1); }
+                            }
+                        }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/stop.svg");
+                                label: @tr("Stop");
+                                clicked => { root.audio-stop(); }
+                            }
                         }
                         Text {
                             horizontal-stretch: 1;
                             horizontal-alignment: center;
-                            text: root.audio-time;
                             vertical-alignment: center;
+                            text: root.audio-time;
                             font-family: root.mono-font;
                             font-size: Theme.font-small;
                             color: Theme.text-muted;
                         }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/repeat.svg");
-                            label: root.audio-play-all ? @tr("Playing all sounds in a row (click to stop after this one)") : @tr("Play all sounds in a row");
-                            active: root.audio-play-all;
-                            clicked => { root.audio-play-all = !root.audio-play-all; }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/repeat.svg");
+                                label: root.audio-play-all ? @tr("Playing all sounds in a row (click to stop after this one)") : @tr("Play all sounds in a row");
+                                active: root.audio-play-all;
+                                clicked => { root.audio-play-all = !root.audio-play-all; }
+                            }
                         }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/extract.svg");
-                            label: @tr("Save WAV…");
-                            enabled: !root.busy;
-                            clicked => { root.audio-save-wav(); }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/extract.svg");
+                                label: @tr("Save WAV…");
+                                enabled: !root.busy;
+                                clicked => { root.audio-save-wav(); }
+                            }
                         }
                     }
                 }
@@ -1869,6 +2004,12 @@ export component AppWindow inherits Window {
                         zoom(d) => { root.model-zoom(d); }
                         double-clicked => { root.open-viewer(); }
                     }
+                    if root.model-mode: AxisGizmo {
+                        x: parent.width - self.width - Theme.space-s;
+                        y: parent.height - self.height - Theme.space-s;
+                        axes: root.gizmo;
+                        pick(i) => { root.model-axis(i); }
+                    }
                     if root.model-mode: Text {
                         x: Theme.space-s;
                         y: parent.height - self.height - Theme.space-s;
@@ -1889,7 +2030,59 @@ export component AppWindow inherits Window {
                             color: Theme.text;
                         }
                     }
-                    if !root.has-image && root.preview-text == "" && !root.preview-loading: Text {
+                    if root.suggestions.length > 0: VerticalLayout {
+                        padding: Theme.space-m;
+                        spacing: Theme.space-s;
+                        Text {
+                            text: root.suggest-title;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                            color: Theme.text;
+                        }
+                        ListView {
+                            vertical-stretch: 1;
+                            for m[i] in root.suggestions: Rectangle {
+                                height: 42px;
+                                border-radius: Theme.radius-s;
+                                background: sug-ta.has-hover ? Theme.hover : transparent;
+                                sug-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.suggestion-open(i); }
+                                }
+                                HorizontalLayout {
+                                    padding-left: Theme.space-s;
+                                    padding-right: Theme.space-s;
+                                    spacing: Theme.space-s;
+                                    FormatIcon {
+                                        y: (parent.height - self.height) / 2;
+                                        name: root.suggest-icon;
+                                        tint: root.suggest-icon == "audio" ? #db4f8a : #3b82f6;
+                                    }
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        alignment: center;
+                                        Text {
+                                            text: m.name;
+                                            overflow: elide;
+                                            color: Theme.text;
+                                        }
+                                        Text {
+                                            text: m.info;
+                                            font-size: Theme.font-small;
+                                            overflow: elide;
+                                            color: Theme.text-faint;
+                                        }
+                                    }
+                                    Text {
+                                        text: "▶";
+                                        vertical-alignment: center;
+                                        color: Theme.accent;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !root.has-image && root.preview-text == "" && !root.preview-loading && root.suggestions.length == 0: Text {
                         width: parent.width - 2 * Theme.space-xl;
                         horizontal-alignment: center;
                         wrap: word-wrap;
@@ -2253,6 +2446,7 @@ export component ViewerWindow inherits Window {
     in property <color> tint;
     in property <image> image;
     in property <bool> model-mode;
+    in property <[GizmoAxis]> gizmo;
     in property <[InfoRow]> rows;
     in property <string> mono-font: "monospace";
     in-out property <bool> show-info: true;
@@ -2260,6 +2454,19 @@ export component ViewerWindow inherits Window {
     in property <bool> fly-mode;
     in property <[PartRow]> parts;
     in property <[MaterialRow]> materials;
+    // Animation: whether the model can be animated, dictionaries found by the
+    // search, the opened dictionary's clips and the player state.
+    in property <bool> has-skeleton;
+    in property <[ClipRow]> anim-results;
+    in property <string> anim-dictionary;
+    in property <[ClipRow]> anim-clips;
+    in property <int> anim-clip: -1;
+    in property <bool> anim-playing;
+    in property <float> anim-position;
+    in property <string> anim-time;
+    in property <string> anim-status;
+    in-out property <int> anim-speed-index: 2;
+    in-out property <bool> anim-loop: true;
     in-out property <int> panel-tab;
     property <int> editing-material: -1;
     out property <length> area-width: area.width;
@@ -2269,6 +2476,7 @@ export component ViewerWindow inherits Window {
     callback zoom(float);
     callback resized();
     callback reset-view();
+    callback look-along(int);
     callback export-gltf();
     callback save-png();
     callback close-viewer();
@@ -2282,6 +2490,12 @@ export component ViewerWindow inherits Window {
     callback material-color(int, color);
     callback material-hex(int, string);
     callback material-reset(int);
+    callback anim-search(string);
+    callback anim-open(int);
+    callback anim-select(int);
+    callback anim-toggle();
+    callback anim-seek(float);
+    callback anim-speed(int);
 
     changed area-width => { root.resized(); }
     changed area-height => { root.resized(); }
@@ -2408,6 +2622,15 @@ export component ViewerWindow inherits Window {
                         zoom(d) => { root.zoom(d); }
                         double-clicked => { root.reset-view(); }
                         pressed-down => { scope.focus(); }
+                    }
+                    if root.model-mode: AxisGizmo {
+                        x: parent.width - self.width - Theme.space-m;
+                        y: parent.height - self.height - Theme.space-m;
+                        width: 96px;
+                        height: 96px;
+                        border-radius: 48px;
+                        axes: root.gizmo;
+                        pick(i) => { root.look-along(i); }
                     }
                     Text {
                         x: Theme.space-m;
@@ -2562,6 +2785,156 @@ export component ViewerWindow inherits Window {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                        Tab {
+                            title: @tr("Animation");
+                            VerticalLayout {
+                                padding: Theme.space-m;
+                                spacing: Theme.space-s;
+                                if !root.has-skeleton: Text {
+                                    text: @tr("This model has no skeleton to animate. Peds (.ydd with a .yft next to it) and other skinned models can be animated.");
+                                    wrap: word-wrap;
+                                    color: Theme.text-muted;
+                                }
+                                if root.has-skeleton: LineEdit {
+                                    placeholder-text: @tr("Find clip dictionaries, e.g. move_m@generic");
+                                    accepted(text) => { root.anim-search(text); }
+                                }
+                                if root.has-skeleton && root.anim-dictionary == "": ListView {
+                                    vertical-stretch: 1;
+                                    for r[i] in root.anim-results: Rectangle {
+                                        height: 40px;
+                                        border-radius: Theme.radius-s;
+                                        background: res-ta.has-hover ? Theme.hover : transparent;
+                                        res-ta := TouchArea {
+                                            clicked => { root.anim-open(i); }
+                                        }
+                                        VerticalLayout {
+                                            padding-left: Theme.space-s;
+                                            alignment: center;
+                                            Text {
+                                                text: r.name;
+                                                overflow: elide;
+                                                color: Theme.text;
+                                            }
+                                            Text {
+                                                text: r.info;
+                                                font-size: Theme.font-small;
+                                                overflow: elide;
+                                                color: Theme.text-faint;
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.anim-dictionary != "": HorizontalLayout {
+                                    spacing: Theme.space-s;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: root.anim-dictionary;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        color: Theme.text;
+                                    }
+                                    Button {
+                                        text: @tr("Other…");
+                                        clicked => { root.anim-open(-1); }
+                                    }
+                                }
+                                if root.anim-dictionary != "": ListView {
+                                    vertical-stretch: 1;
+                                    for c[i] in root.anim-clips: Rectangle {
+                                        height: 28px;
+                                        border-radius: Theme.radius-s;
+                                        background: i == root.anim-clip ? Theme.accent-subtle : clip-ta.has-hover ? Theme.hover : transparent;
+                                        clip-ta := TouchArea {
+                                            clicked => { root.anim-select(i); }
+                                        }
+                                        HorizontalLayout {
+                                            padding-left: Theme.space-s;
+                                            padding-right: Theme.space-s;
+                                            Text {
+                                                horizontal-stretch: 1;
+                                                text: c.name;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                font-weight: i == root.anim-clip ? 600 : 400;
+                                                color: Theme.text;
+                                            }
+                                            Text {
+                                                text: c.info;
+                                                vertical-alignment: center;
+                                                font-size: Theme.font-small;
+                                                color: Theme.text-faint;
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.anim-clip >= 0: Rectangle {
+                                    border-radius: Theme.radius;
+                                    background: Theme.background;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    VerticalLayout {
+                                        padding: Theme.space-s;
+                                        spacing: Theme.space-xs;
+                                        HorizontalLayout {
+                                            spacing: Theme.space-s;
+                                            Rectangle {
+                                                width: 34px;
+                                                height: 34px;
+                                                y: (parent.height - self.height) / 2;
+                                                border-radius: 17px;
+                                                background: Theme.accent;
+                                                Image {
+                                                    width: 16px;
+                                                    height: 16px;
+                                                    x: (parent.width - self.width) / 2 + (root.anim-playing ? 0px : 1.5px);
+                                                    y: (parent.height - self.height) / 2;
+                                                    source: root.anim-playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
+                                                    colorize: Palette.accent-foreground;
+                                                }
+                                                TouchArea {
+                                                    clicked => { root.anim-toggle(); }
+                                                }
+                                            }
+                                            Slider {
+                                                horizontal-stretch: 1;
+                                                minimum: 0;
+                                                maximum: 1;
+                                                value: root.anim-position;
+                                                changed(v) => { root.anim-seek(v); }
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: Theme.space-s;
+                                            Text {
+                                                horizontal-stretch: 1;
+                                                text: root.anim-time;
+                                                vertical-alignment: center;
+                                                font-size: Theme.font-small;
+                                                color: Theme.text-muted;
+                                            }
+                                            ComboBox {
+                                                width: 90px;
+                                                model: ["0.25×", "0.5×", "1×", "2×"];
+                                                current-index <=> root.anim-speed-index;
+                                                selected => { root.anim-speed(self.current-index); }
+                                            }
+                                            CheckBox {
+                                                text: @tr("Loop");
+                                                checked <=> root.anim-loop;
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.anim-status != "": Text {
+                                    text: root.anim-status;
+                                    wrap: word-wrap;
+                                    font-size: Theme.font-small;
+                                    color: Theme.text-muted;
                                 }
                             }
                         }
@@ -2854,5 +3227,199 @@ export component EditorWindow inherits Window {
     init => {
         root.apply-theme();
         editor.focus();
+    }
+}
+
+// The change journal in its own window.
+export component HistoryWindow inherits Window {
+    title: @tr("History — OpenRAGE");
+    icon: @image-url("icon.png");
+    preferred-width: 820px;
+    preferred-height: 560px;
+    min-width: 520px;
+    min-height: 300px;
+    background: Theme.background;
+    default-font-size: Theme.font-body;
+
+    in-out property <int> theme-mode;
+    in property <[HistoryRow]> rows;
+    in-out property <int> selected: -1;
+    in property <bool> busy;
+    in property <bool> edit-mode;
+    in property <string> status;
+
+    callback undo();
+    callback uninstall(string);
+    callback show-in-main();
+    callback set-edit-mode(bool);
+    in-out property <bool> unlock-visible;
+
+    changed theme-mode => { root.apply-theme(); }
+    init => { root.apply-theme(); }
+
+    function apply-theme() {
+        Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+
+    property <string> group: root.selected >= 0 && root.selected < root.rows.length ? root.rows[root.selected].group : "";
+
+    VerticalLayout {
+        Rectangle {
+            background: Theme.surface;
+            HorizontalLayout {
+                padding: Theme.space-m;
+                padding-left: Theme.space-l;
+                spacing: Theme.space-s;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    Text {
+                        text: @tr("History");
+                        font-size: Theme.font-title;
+                        font-weight: 600;
+                        color: Theme.text;
+                    }
+                    Text {
+                        text: @tr("Every change OpenRAGE made to the mods folder, newest first. Everything can be undone.");
+                        font-size: Theme.font-small;
+                        overflow: elide;
+                        color: Theme.text-muted;
+                    }
+                }
+                Button {
+                    text: @tr("Show in main window");
+                    clicked => { root.show-in-main(); }
+                }
+            }
+        }
+        if !root.edit-mode: Rectangle {
+            background: Theme.accent-subtle;
+            HorizontalLayout {
+                padding: Theme.space-s;
+                padding-left: Theme.space-l;
+                spacing: Theme.space-s;
+                Text {
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    text: @tr("Read-only. Unlock editing in the main window to undo or uninstall.");
+                    color: Theme.text;
+                }
+                Button {
+                    text: @tr("Unlock editing…");
+                    icon: @image-url("icons/unlock.svg");
+                    colorize-icon: true;
+                    clicked => { root.unlock-visible = true; }
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            ListView {
+                for r[i] in root.rows: Rectangle {
+                    height: 44px;
+                    background: i == root.selected ? Theme.accent-subtle : ta.has-hover ? Theme.hover : Math.mod(i, 2) == 1 ? Theme.stripe : transparent;
+                    ta := TouchArea {
+                        clicked => { root.selected = i; }
+                    }
+                    HorizontalLayout {
+                        padding-left: Theme.space-l;
+                        padding-right: Theme.space-l;
+                        spacing: Theme.space-m;
+                        Text {
+                            width: 110px;
+                            text: r.when;
+                            vertical-alignment: center;
+                            font-size: Theme.font-small;
+                            color: Theme.text-muted;
+                        }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            Text {
+                                text: r.description;
+                                overflow: elide;
+                                font-weight: i == 0 ? 600 : 400;
+                                color: Theme.text;
+                            }
+                            Text {
+                                text: r.place;
+                                font-size: Theme.font-small;
+                                overflow: elide;
+                                color: Theme.text-faint;
+                            }
+                        }
+                        if r.group != "": Rectangle {
+                            y: (parent.height - self.height) / 2;
+                            height: 22px;
+                            border-radius: 11px;
+                            background: Theme.accent-subtle;
+                            HorizontalLayout {
+                                padding-left: Theme.space-s;
+                                padding-right: Theme.space-s;
+                                Text {
+                                    text: r.group;
+                                    vertical-alignment: center;
+                                    font-size: Theme.font-small;
+                                    color: Theme.text;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if root.rows.length == 0: Text {
+                text: @tr("No changes yet.");
+                color: Theme.text-faint;
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+        Rectangle {
+            background: Theme.surface;
+            HorizontalLayout {
+                padding: Theme.space-s;
+                padding-left: Theme.space-l;
+                spacing: Theme.space-s;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.status;
+                    vertical-alignment: center;
+                    font-size: Theme.font-small;
+                    overflow: elide;
+                    color: Theme.text-muted;
+                }
+                Button {
+                    text: root.group == "" ? @tr("Uninstall package") : @tr("Uninstall “{}”", root.group);
+                    icon: @image-url("icons/remove.svg");
+                    colorize-icon: true;
+                    enabled: root.group != "" && root.edit-mode && !root.busy;
+                    clicked => { root.uninstall(root.group); }
+                }
+                Button {
+                    text: @tr("Undo newest");
+                    icon: @image-url("icons/undo.svg");
+                    colorize-icon: true;
+                    primary: true;
+                    enabled: root.rows.length > 0 && root.edit-mode && !root.busy;
+                    clicked => { root.undo(); }
+                }
+            }
+        }
+    }
+
+    if root.unlock-visible: UnlockDialog {
+        width: root.width;
+        height: root.height;
+        confirm => {
+            root.unlock-visible = false;
+            root.set-edit-mode(true);
+        }
+        cancel => { root.unlock-visible = false; }
     }
 }

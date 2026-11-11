@@ -5,6 +5,7 @@
 //! * [`dds`], [`png`]: export, compatible with OpenIV/CodeWalker output
 
 pub mod awc;
+pub mod clip;
 pub mod dds;
 pub mod drawable;
 pub mod gltf;

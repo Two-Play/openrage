@@ -26,6 +26,8 @@ pub struct Part {
     /// Model-space placement.
     pub transform: Mat4,
     pub visible: bool,
+    /// Skeleton bone the part is attached to (it follows the bone when animated).
+    pub bone: Option<usize>,
 }
 
 pub struct LoadedModel {
@@ -38,6 +40,9 @@ pub struct LoadedModel {
     pub external: Vec<(String, TextureDictionary)>,
     /// Materials: shaders with the same name across all drawables.
     pub materials: Vec<MaterialSlot>,
+    /// The skeleton skinned meshes are bound to (for peds: from the `.yft`
+    /// next to the `.ydd`).
+    pub skeleton: Option<drawable::Skeleton>,
     /// Material index per drawable and shader.
     shader_material: Vec<Vec<usize>>,
 }
@@ -176,14 +181,20 @@ fn ped_component_names() -> &'static HashMap<u32, String> {
     })
 }
 
+fn is_ped_dictionary(names: &[String]) -> bool {
+    names.iter().filter(|n| ped_component_names().values().any(|v| v == *n)).count() >= 2
+}
+
+/// How many drawables of a (non-ped) dictionary are shown at first.
+const SHOWN_AT_FIRST: usize = 64;
+
 /// Which drawables of a dictionary to show at first. Peds: the first variant of
-/// every component (head, upper body, legs, …) — a whole person; otherwise
-/// the first drawable.
+/// every component (head, upper body, legs, …) — a whole person; other
+/// dictionaries: all of them (laid out side by side), up to a limit.
 fn default_visibility(names: &[String]) -> Vec<bool> {
     let component = |n: &str| n.split('_').next().map(str::to_owned);
-    let is_ped = names.iter().filter(|n| ped_component_names().values().any(|v| v == *n)).count() >= 2;
-    if !is_ped {
-        return (0..names.len()).map(|i| i == 0).collect();
+    if !is_ped_dictionary(names) {
+        return (0..names.len()).map(|i| i < SHOWN_AT_FIRST).collect();
     }
     let mut best: HashMap<String, &str> = HashMap::new();
     for n in names {
@@ -211,6 +222,7 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
         drawable: 0,
         transform: math::IDENTITY,
         visible: true,
+        bone: None,
     }];
     let mut wheels: Vec<(String, usize)> = Vec::new();
     for child in children {
@@ -224,7 +236,7 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
             wheels.push((bone_name.clone(), index));
         }
         let group = if bone_name.starts_with("wheel_") { "Wheels" } else { "Parts" };
-        parts.push(Part { name: bone_name, group: group.into(), drawable: index, transform, visible: true });
+        parts.push(Part { name: bone_name, group: group.into(), drawable: index, transform, visible: true, bone });
     }
     // Copy wheels to the wheel bones that have no drawable of their own.
     if !wheels.is_empty() {
@@ -254,6 +266,7 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
                 drawable: src,
                 transform,
                 visible: true,
+                bone: Some(b),
             });
         }
     }
@@ -287,6 +300,9 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
             })
             .collect();
         let names: Vec<String> = drawables.iter().map(|(n, _)| n.clone()).collect();
+        // Peds are assembled in place; other dictionaries are laid out in a grid.
+        let layout =
+            if is_ped_dictionary(&names) { vec![math::IDENTITY; drawables.len()] } else { grid_layout(&drawables) };
         let parts = default_visibility(&names)
             .into_iter()
             .enumerate()
@@ -294,16 +310,23 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
                 name: names[i].clone(),
                 group: ped_group(&names[i]),
                 drawable: i,
-                transform: math::IDENTITY,
+                transform: layout[i],
                 visible,
+                bone: None,
             })
             .collect();
         (drawables, parts)
     } else if lower.ends_with(".yft") {
         fragment_parts(drawable::parse_fragment(&res)?, &stem)
     } else if lower.ends_with(".ydr") {
-        let part =
-            Part { name: stem.clone(), group: String::new(), drawable: 0, transform: math::IDENTITY, visible: true };
+        let part = Part {
+            name: stem.clone(),
+            group: String::new(),
+            drawable: 0,
+            transform: math::IDENTITY,
+            visible: true,
+            bone: None,
+        };
         (vec![(stem.clone(), drawable::parse_ydr(&res)?)], vec![part])
     } else {
         bail!("{name} is not a model (.ydr, .yft, .ydd)");
@@ -326,9 +349,49 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
             external.push((c, dict));
         }
     }
-    let mut model = LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new() };
+    // Peds keep their skeleton in a fragment next to the drawable dictionary.
+    let skeleton = drawables.iter().find_map(|(_, d)| d.skeleton.clone()).or_else(|| {
+        let tid = rpf.find_child(dir, &format!("{stem}.yft"))?;
+        drawable::parse_fragment(&rpf.read_resource(tid).ok()?).ok()?.drawable.skeleton
+    });
+    let mut model =
+        LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
     model.collect_materials();
     Ok(model)
+}
+
+/// Places drawables side by side in rows (centred on their bounds), so a
+/// dictionary of unrelated objects shows all of them.
+fn grid_layout(drawables: &[(String, Drawable)]) -> Vec<Mat4> {
+    let bounds: Vec<([f32; 3], [f32; 3])> = drawables
+        .iter()
+        .map(|(_, d)| {
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in d.meshes.iter().flat_map(|m| &m.positions) {
+                for i in 0..3 {
+                    lo[i] = lo[i].min(p[i]);
+                    hi[i] = hi[i].max(p[i]);
+                }
+            }
+            if lo[0] > hi[0] { ([0.0; 3], [0.0; 3]) } else { (lo, hi) }
+        })
+        .collect();
+    let cell = bounds.iter().map(|(lo, hi)| (hi[0] - lo[0]).max(hi[1] - lo[1])).fold(0.0f32, f32::max) * 1.2 + 0.1;
+    let shown = drawables.len().min(SHOWN_AT_FIRST);
+    let columns = (shown as f32).sqrt().ceil().max(1.0) as usize;
+    bounds
+        .iter()
+        .enumerate()
+        .map(|(i, (lo, hi))| {
+            let (col, row) = ((i % SHOWN_AT_FIRST) % columns, (i % SHOWN_AT_FIRST) / columns);
+            let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, lo[2]];
+            let mut m = math::IDENTITY;
+            m[12] = col as f32 * cell - centre[0];
+            m[13] = -(row as f32) * cell - centre[1];
+            m[14] = -centre[2];
+            m
+        })
+        .collect()
 }
 
 /// Group of a ped component (`uppr_001_u` → "Upper body"); other drawables none.

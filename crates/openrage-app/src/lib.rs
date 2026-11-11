@@ -1,6 +1,7 @@
 //! Application logic shared by the OpenRAGE CLI and GUI:
 //! settings, key setup and game detection.
 
+pub mod anim;
 pub mod audio;
 pub mod config;
 pub mod detect;

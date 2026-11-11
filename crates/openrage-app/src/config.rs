@@ -13,6 +13,8 @@ pub struct Config {
     pub magic_path: Option<PathBuf>,
     /// GUI color scheme: `system`, `light` or `dark`.
     pub theme: Option<String>,
+    /// Show the change history in its own window (default) instead of the file list.
+    pub history_window: Option<bool>,
 }
 
 fn dir() -> Option<PathBuf> {
@@ -34,6 +36,7 @@ impl Config {
                 "game_dir" => cfg.game_dir = Some(PathBuf::from(v)),
                 "magic_path" => cfg.magic_path = Some(PathBuf::from(v)),
                 "theme" => cfg.theme = Some(v.to_owned()),
+                "history_window" => cfg.history_window = Some(v == "true"),
                 _ => {}
             }
         }
@@ -52,6 +55,9 @@ impl Config {
         }
         if let Some(t) = &self.theme {
             text.push_str(&format!("theme={t}\n"));
+        }
+        if let Some(h) = self.history_window {
+            text.push_str(&format!("history_window={h}\n"));
         }
         let path = dir.join("settings.conf");
         fs::write(&path, text).with_context(|| format!("writing {}", path.display()))

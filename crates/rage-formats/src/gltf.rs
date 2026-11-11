@@ -283,6 +283,7 @@ mod tests {
                 colors: Vec::new(),
                 indices: vec![0, 1, 2],
                 shader: 0,
+                ..Default::default()
             }],
             shaders: vec![Shader { name_hash: 1, textures: vec!["body".into()] }],
             ..Default::default()
