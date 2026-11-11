@@ -106,6 +106,9 @@ enum Command {
         /// Write the XML to this file instead of printing it.
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Print the readable structure (as in the GUI) instead of the XML.
+        #[arg(long, conflicts_with = "out")]
+        tree: bool,
     },
     /// Show a text table (.gxt2 as OpenIV .oxt text, .nametable one name per line).
     Text {
@@ -301,7 +304,7 @@ fn run() -> Result<()> {
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
         Command::Text { path, out } => cmd_text(&game_dir, &path, out.as_deref(), keys),
-        Command::Xml { path, out } => cmd_xml(&game_dir, &path, out.as_deref(), keys),
+        Command::Xml { path, out, tree } => cmd_xml(&game_dir, &path, out.as_deref(), tree, keys),
         Command::Audio { path, export } => cmd_audio(&game_dir, &path, export.as_deref(), keys),
         Command::Put { file, target } => cmd_put(&game_dir, &file, &target, keys),
         Command::Rm { path } => cmd_edit(&game_dir, &path, Op::Remove, &format!("Removed {path}"), keys),
@@ -1067,7 +1070,7 @@ fn cmd_audio(game_dir: &Path, path: &str, export: Option<&Path>, keys: Option<Ar
     Ok(())
 }
 
-fn cmd_xml(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+fn cmd_xml(game_dir: &Path, path: &str, out: Option<&Path>, tree: bool, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     // Names of models, textures, … from the search index, so hashes read as names.
     if let Ok(names) = open_index(game_dir).and_then(|i| Ok(i.known_names()?)) {
         rage_formats::names::register(names);
@@ -1075,6 +1078,27 @@ fn cmd_xml(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<Gta
     let xml = openrage_app::metadata::load(game_dir, keys, path)?;
     for e in xml.errors.iter().take(20) {
         eprintln!("warning: {e}");
+    }
+    if tree {
+        fn print(n: &openrage_app::xmltree::Node, depth: usize) {
+            outln!("{}{}", "  ".repeat(depth), n.label);
+            for (k, v) in &n.fields {
+                outln!("{}  · {k}: {v}", "  ".repeat(depth));
+            }
+            for c in &n.children {
+                print(c, depth + 1);
+            }
+        }
+        let started = Instant::now();
+        let root = openrage_app::xmltree::parse(&xml.text)?;
+        print(&root, 0);
+        eprintln!(
+            "{} structures, {} of XML, tree built in {} ms",
+            root.count(),
+            human(xml.text.len() as u64),
+            started.elapsed().as_millis()
+        );
+        return Ok(());
     }
     match out {
         Some(file) => {

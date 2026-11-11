@@ -49,6 +49,11 @@ export global Theme {
     out property <color> danger: dark ? #f2777b : #c0282d;
     out property <color> info: dark ? #74a8ff : #2160d8;
 
+    // XML syntax colors.
+    out property <color> syntax-tag: dark ? #6cb6ff : #0550ae;
+    out property <color> syntax-attribute: dark ? #d2a8ff : #8250df;
+    out property <color> syntax-value: dark ? #96d0a0 : #116329;
+
     // Mod status (stripe in the file list)
     pure public function mark-color(mark: int) -> color {
         if (mark == 1) { return root.success; }
