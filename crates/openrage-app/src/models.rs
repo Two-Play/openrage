@@ -95,7 +95,14 @@ impl LoadedModel {
             materials: self
                 .materials
                 .iter()
-                .map(|m| MaterialLook { visible: true, tint: if m.textured { [1.0; 4] } else { PLAIN } })
+                .map(|m| MaterialLook {
+                    visible: true,
+                    tint: if m.textured {
+                        [1.0; 4]
+                    } else {
+                        rage_formats::shaders::color(m.name_hash).unwrap_or(PLAIN)
+                    },
+                })
                 .collect(),
         }
     }
@@ -275,19 +282,89 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
 
 pub fn is_model(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n.ends_with(".ydr") || n.ends_with(".yft") || n.ends_with(".ydd") || n.ends_with(".ypt")
+    n.ends_with(".ydr") || n.ends_with(".yft") || n.ends_with(".ydd") || n.ends_with(".ypt") || n.ends_with(".ybn")
+}
+
+/// Colour of a collision material, by what it is made of.
+fn material_color(name: &str, index: u8) -> [f32; 4] {
+    let n = name.to_ascii_uppercase();
+    let rgb = |r: u8, g: u8, b: u8| [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0];
+    let has = |words: &[&str]| words.iter().any(|w| n.contains(w));
+    if has(&["GRASS", "LEAVES", "BUSH", "TREE", "HEDGE", "MOSS", "FOLIAGE"]) {
+        rgb(110, 170, 80)
+    } else if has(&["WATER", "PUDDLE"]) {
+        rgb(80, 150, 220)
+    } else if has(&["WOOD", "BARK", "TWIGS", "PLYWOOD"]) {
+        rgb(170, 120, 75)
+    } else if has(&["METAL", "STEEL", "ALUMIN", "IRON", "CHAIN", "RAIL", "CAR_"]) {
+        rgb(120, 140, 170)
+    } else if has(&["GLASS", "PERSPEX", "PLEXI"]) {
+        rgb(150, 210, 230)
+    } else if has(&["SAND", "DIRT", "MUD", "SOIL", "GRAVEL", "CLAY", "STONE", "ROCK"]) {
+        rgb(190, 160, 110)
+    } else if has(&["CONCRETE", "TARMAC", "ASPHALT", "BRICK", "TILE", "PAVING", "CEMENT", "MARBLE", "PLASTER"]) {
+        rgb(175, 175, 180)
+    } else if has(&["CARPET", "CLOTH", "FABRIC", "LEATHER", "RUBBER", "FOAM", "PLASTIC"]) {
+        rgb(200, 130, 160)
+    } else {
+        // Anything else: a stable, soft colour per material.
+        let h = (index as f32 * 0.618_034) % 1.0;
+        let (r, g, b) = hue(h);
+        [0.45 + 0.4 * r, 0.45 + 0.4 * g, 0.45 + 0.4 * b, 1.0]
+    }
+}
+
+fn hue(h: f32) -> (f32, f32, f32) {
+    let x = |o: f32| ((h * 6.0 + o) % 6.0 - 3.0).abs() - 1.0;
+    (x(0.0).clamp(0.0, 1.0), x(4.0).clamp(0.0, 1.0), x(2.0).clamp(0.0, 1.0))
+}
+
+/// Names of the collision materials, read once from the game's `materials.dat`.
+fn collision_material_names(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        for path in ["update/update.rpf/common/data/materials/materials.dat", "common.rpf/data/materials/materials.dat"]
+        {
+            if let Ok((Node::ArchiveFile(rpf, id), _)) = rage_mods::resolve(game_dir, path, keys.clone())
+                && let Ok(data) = rpf.read(id)
+            {
+                let names = rage_formats::ybn::material_names(&String::from_utf8_lossy(&data));
+                if !names.is_empty() {
+                    return names;
+                }
+            }
+        }
+        Vec::new()
+    })
 }
 
 /// Loads a model as the game sees it (mods included).
 pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result<LoadedModel> {
-    let (node, _) = rage_mods::resolve(game_dir, vpath, keys)?;
+    let (node, _) = rage_mods::resolve(game_dir, vpath, keys.clone())?;
     let Node::ArchiveFile(rpf, id) = node else { bail!("{vpath} is not a file inside an archive") };
     let name = rpf.entry(id).name.clone();
     let res = rpf.read_resource(id)?;
     let lower = name.to_ascii_lowercase();
     let stem = name.split('.').next().unwrap_or(&name).to_owned();
     let mut external = Vec::new();
-    let (drawables, parts) = if lower.ends_with(".ypt") {
+    let (drawables, parts) = if lower.ends_with(".ybn") {
+        let (collision, stats) = rage_formats::ybn::parse(&res)?;
+        let names = collision_material_names(game_dir, keys.clone());
+        for &m in &stats.materials {
+            let label = names.get(m as usize).cloned().unwrap_or_else(|| format!("Material {m}"));
+            let color = material_color(&label, m);
+            rage_formats::shaders::register(rage_formats::ybn::MATERIAL_BASE + m as u32, label, color);
+        }
+        let part = Part {
+            name: stem.clone(),
+            group: String::new(),
+            drawable: 0,
+            transform: math::IDENTITY,
+            visible: true,
+            bone: None,
+        };
+        (vec![(stem.clone(), collision)], vec![part])
+    } else if lower.ends_with(".ypt") {
         // Particle models (debris, sparks, …) side by side, textured from the
         // dictionary inside the file.
         let ptfx = rage_formats::ypt::parse(&res)?;
@@ -364,7 +441,7 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
         };
         (vec![(stem.clone(), drawable::parse_ydr(&res)?)], vec![part])
     } else {
-        bail!("{name} is not a model (.ydr, .yft, .ydd, .ypt)");
+        bail!("{name} is not a model (.ydr, .yft, .ydd, .ypt, .ybn)");
     };
 
     // Textures usually live next to the model: adder.yft → adder.ytd (+ vehshare.ytd for vehicles).

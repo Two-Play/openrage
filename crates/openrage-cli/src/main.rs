@@ -98,6 +98,9 @@ enum Command {
         /// Instead of archives, parse every particle dictionary (.ypt): effects, textures and models.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text"])]
         particles: bool,
+        /// Instead of archives, read every collision file (.ybn) and build its meshes.
+        #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles"])]
+        collisions: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
         #[arg(long, requires = "textures")]
         rebuild: bool,
@@ -297,6 +300,7 @@ fn run() -> Result<()> {
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
+        Command::Verify { path, collisions: true, .. } => cmd_verify_collisions(&game_dir, &path, keys),
         Command::Verify { path, particles: true, .. } => cmd_verify_particles(&game_dir, &path, keys),
         Command::Verify { path, text: true, .. } => cmd_verify_text(&game_dir, &path, keys),
         Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
@@ -1152,6 +1156,67 @@ fn cmd_particles(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Re
     Ok(())
 }
 
+fn cmd_verify_collisions(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let starts = archive_roots(game_dir, within, keys)?;
+    let started = Instant::now();
+    type Counts = (usize, usize, usize, usize);
+    let all: Vec<(Counts, Vec<String>)> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let mut c: Counts = (0, 0, 0, 0);
+            let (mut errors, mut nested) = (Vec::new(), Vec::new());
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    if !a.entry(id).name.to_ascii_lowercase().ends_with(".ybn") {
+                        return;
+                    }
+                    c.0 += 1;
+                    match a
+                        .read_resource(id)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|r| Ok(rage_formats::ybn::parse(&r)?))
+                    {
+                        Ok((_, s)) => {
+                            c.1 += s.bounds;
+                            c.2 += s.triangles;
+                            c.3 += s.primitives;
+                        }
+                        Err(e) => errors.push(format!("{p}: {e:#}")),
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (c, errors)
+        })
+        .collect();
+    let mut t: Counts = (0, 0, 0, 0);
+    for (c, _) in &all {
+        t = (t.0 + c.0, t.1 + c.1, t.2 + c.2, t.3 + c.3);
+    }
+    let errors: Vec<&String> = all.iter().flat_map(|x| &x.1).collect();
+    for e in errors.iter().take(30) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} collision files, {} bounds, {} triangles, {} primitives; {} errors ({:.1}s)",
+        t.0,
+        t.1,
+        t.2,
+        t.3,
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() {
+        bail!("{} errors", errors.len());
+    }
+    Ok(())
+}
+
 fn cmd_verify_particles(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
@@ -1552,7 +1617,8 @@ fn cmd_verify_models(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>)
                 true,
                 &mut |a, id, p| {
                     let n = a.entry(id).name.to_ascii_lowercase();
-                    if !openrage_app::models::is_model(&n) || a.entry(id).resource_version().is_none() {
+                    let drawable_file = n.ends_with(".ydr") || n.ends_with(".yft") || n.ends_with(".ydd");
+                    if !drawable_file || a.entry(id).resource_version().is_none() {
                         return;
                     }
                     models += 1;
