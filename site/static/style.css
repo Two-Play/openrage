@@ -251,7 +251,7 @@ section.alt { background: var(--bg-alt); border-block: 1px solid var(--border); 
 
 .features {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
   gap: 1rem;
   list-style: none;
   padding: 0;

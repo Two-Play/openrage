@@ -16,10 +16,7 @@ It contains **no game files and no encryption keys**: keys are taken from your o
 
 # Section titles and intros
 features_title = "Highlights"
-features_intro = """
-Browse and search every archive, preview textures, models, sounds and animations, read metadata as XML,
-edit game text and install `.oiv` packages — compatible with OpenIV's `mods` folder, with undo.
-"""
+features_intro = "What OpenRAGE can open, show and change today."
 screenshots_title = "Screenshots"
 screenshots_intro = "The screenshots show OpenRAGE displaying files from the author's own copy of the game."
 games_title = "Supported games"
@@ -27,16 +24,13 @@ games_intro = "GTA V comes first; Red Dead Redemption 2 archives and textures wo
 details_summary = "Checked against the whole game"
 download_intro = "Unpack the archive and run `openrage-gui` (or `openrage` for the command line). On first start the GUI detects your game and sets up the keys."
 why_title = "Why OpenRAGE"
-why_intro = """
-OpenIV has been the standard tool for RAGE games for years, and OpenRAGE keeps what it got right:
-the same `mods` folder, the same `.oiv` packages, the same export formats. This is what it adds.
-"""
+why_intro = "OpenRAGE keeps what OpenIV got right — the `mods` folder, `.oiv` packages, the export formats — and adds this."
 compare_title = "OpenRAGE and OpenIV side by side"
 compare_note = """
-OpenIV is a mature tool with wider game support and model import. You can use both:
-they share the same `mods` folder. Compared with OpenIV's public releases;
-if something is out of date, please [open an issue](https://github.com/Two-Play/openrage/issues).
+OpenIV supports more games and can import models; both tools share the same `mods` folder, so you can use them side by side.
+Out of date? [Open an issue](https://github.com/Two-Play/openrage/issues).
 """
+
 
 [extra.hero]
 light = "explorer-light.png"
@@ -50,62 +44,47 @@ alt = "OpenRAGE explorer showing the vehicles archive of GTA V with a 3D preview
 [[extra.features]]
 icon = "🗂️"
 title = "Explorer"
-text = "Archives — even nested ones — behave like folders. Breadcrumbs, format icons, context menus, keyboard navigation, light and dark mode."
+text = "Archives, even nested ones, open like folders."
 
 [[extra.features]]
 icon = "🔎"
-title = "Search everything"
-text = "Names, hashes (`0xB779A091` → `adder`) and full text of the whole game in milliseconds, from an index that updates itself."
+title = "Search"
+text = "Names, hashes and full text of the whole game in milliseconds."
 
 [[extra.features]]
 icon = "🖼️"
 title = "Textures"
-text = "All formats of GTA V Legacy and Enhanced (incl. BC7); DDS/PNG export identical to OpenIV; replace, add and remove."
+text = "Every GTA V format incl. BC7: view, export, replace, add, remove."
 
 [[extra.features]]
 icon = "🚗"
-title = "Models"
-text = "Complete vehicles and peds in a GPU viewer: orbit or fly, show/hide parts, paint materials, export glTF for Blender."
+title = "Models and animations"
+text = "Complete vehicles and peds on the GPU, animated, with glTF export."
 
 [[extra.features]]
 icon = "🔊"
 title = "Audio"
-text = "Plays every sound and radio track of the game, with waveform, seeking and WAV export."
-
-[[extra.features]]
-icon = "🏃"
-title = "Animations"
-text = "Clip dictionaries play on skinned models; fitting models are suggested from the bones a clip moves."
+text = "Every sound and radio track, with waveform and WAV export."
 
 [[extra.features]]
 icon = "📄"
-title = "Metadata"
-text = "`.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.cut` and `.pso` as XML (RSC meta, PSO and RBF), compatible with CodeWalker."
+title = "Metadata and game text"
+text = "Maps and archetypes as XML; `.gxt2` text editable without loss."
 
 [[extra.features]]
 icon = "🎬"
 title = "Cutscenes"
-text = "Play a whole cutscene: every actor animated in one scene, through the cutscene camera or a free camera."
+text = "Whole cutscenes in one scene, seen through the cutscene camera."
 
 [[extra.features]]
 icon = "🧱"
-title = "Collisions, paths, nav meshes"
-text = "`.ybn`, `.ynd`, `.ynv`, `.yvr` and `.ywr` in 3D, coloured by material or kind."
+title = "Collisions and paths"
+text = "Collisions, road networks and nav meshes in 3D."
 
 [[extra.features]]
 icon = "📜"
 title = "Scripts and particles"
-text = "Disassembles compiled scripts (`.ysc`); lists effects, textures and models of particle dictionaries (`.ypt`)."
-
-[[extra.features]]
-icon = "🌐"
-title = "Game text"
-text = "Edit `.gxt2` text tables in OpenIV's `.oxt` form and save them back losslessly."
-
-[[extra.features]]
-icon = "🧩"
-title = "Mods, safely"
-text = "Changes go to OpenIV's `mods` folder, never into your game files; every change and every `.oiv` package can be undone."
+text = "Disassembled scripts; particle effects with their textures and models."
 
 # --------------------------------------------------------------- Screenshots
 # `dark` (optional) is shown instead of `image` in dark mode.
@@ -179,42 +158,32 @@ formats_status = "none"
 [[extra.reasons]]
 icon = "🔓"
 title = "Open source"
-text = "GPL-3.0. Read the code, check what it does with your files, fix it or fork it. The tool cannot vanish with a single team."
+text = "GPL-3.0: read, check and improve the code."
 
 [[extra.reasons]]
 icon = "🐧"
-title = "Native on Linux and Windows"
-text = "One code base, native builds for both. Works with Steam and Proton installs; no Wine needed for the tool itself."
+title = "Linux and Windows"
+text = "Native on both, Steam and Proton installs included."
+
+[[extra.reasons]]
+icon = "🛠️"
+title = "Actively developed"
+text = "Supports GTA V Enhanced. OpenIV's last release, 4.1, is from January 2022."
 
 [[extra.reasons]]
 icon = "↩️"
 title = "Undo everything"
-text = "Every change is journaled and can be undone step by step, back to the original files. Installed `.oiv` packages can be uninstalled."
-
-[[extra.reasons]]
-icon = "👀"
-title = "See before you install"
-text = "An `.oiv` package shows exactly which files and lines it would change before anything is written."
-
-[[extra.reasons]]
-icon = "🔎"
-title = "Search the whole game"
-text = "Names, hashes (`0xB779A091` → `adder`) and full text of every archive, in milliseconds."
-
-[[extra.reasons]]
-icon = "🎬"
-title = "More than a file browser"
-text = "Play whole cutscenes in one scene, view collisions, road networks and nav meshes in 3D, disassemble scripts, export models as glTF for Blender."
+text = "Preview what an `.oiv` changes, undo any edit, uninstall packages."
 
 [[extra.reasons]]
 icon = "✅"
 title = "Tested on the whole game"
-text = "Every format is checked against every file of the game: hundreds of thousands of textures, models, sounds and clips."
+text = "Every format is checked against every file of the game."
 
 [[extra.reasons]]
 icon = "🔁"
 title = "No lock-in"
-text = "Same `mods` layout, `.oiv` format and DDS/WAV output as OpenIV. Switch back and forth whenever you like."
+text = "Same `mods` folder, `.oiv` format and export output as OpenIV."
 
 # Comparison table. `edge` marks the cell that is ahead: openrage, openiv or empty.
 
@@ -232,13 +201,25 @@ edge = "openrage"
 [[extra.compare]]
 feature = "Operating systems"
 openiv = "Windows"
-openrage = "Linux and Windows, native"
+openrage = "Linux and Windows"
 edge = "openrage"
 
 [[extra.compare]]
-feature = "Games"
-openiv = "GTA IV, EFLC, GTA V, Max Payne 3"
-openrage = "GTA V; RDR2 archives and textures; GTA IV planned"
+feature = "Last release"
+openiv = "4.1, January 2022"
+openrage = "Actively developed"
+edge = "openrage"
+
+[[extra.compare]]
+feature = "GTA V Enhanced"
+openiv = "Released after OpenIV's last update"
+openrage = "Supported"
+edge = "openrage"
+
+[[extra.compare]]
+feature = "Other games"
+openiv = "GTA IV, EFLC, Max Payne 3"
+openrage = "RDR2 archives and textures; GTA IV planned"
 edge = "openiv"
 
 [[extra.compare]]
@@ -249,44 +230,43 @@ openrage = "Yes, same layout"
 [[extra.compare]]
 feature = "`.oiv` packages"
 openiv = "Install"
-openrage = "Install with a preview of every change, uninstall"
+openrage = "Install, preview, uninstall"
 edge = "openrage"
 
 [[extra.compare]]
 feature = "Undo"
 openiv = "No"
-openrage = "Every change, step by step"
+openrage = "Every change"
 edge = "openrage"
 
 [[extra.compare]]
 feature = "Search"
 openiv = "File names"
-openrage = "Names, hashes and full text of the whole game"
+openrage = "Names, hashes, full text"
 edge = "openrage"
 
 [[extra.compare]]
 feature = "Model export"
 openiv = "openFormats"
-openrage = "glTF (Blender and most 3D tools)"
+openrage = "glTF (Blender)"
 
 [[extra.compare]]
 feature = "Model import"
-openiv = "Yes, from openFormats"
+openiv = "Yes"
 openrage = "Not yet"
 edge = "openiv"
 
 [[extra.compare]]
 feature = "Cutscenes"
-openiv = "As files"
-openrage = "Play the whole scene with every actor and the cutscene camera"
+openiv = "Files only"
+openrage = "Play the whole scene"
 edge = "openrage"
 
 [[extra.compare]]
 feature = "Command line"
 openiv = "No"
-openrage = "Yes, for scripts and automation"
+openrage = "Yes"
 edge = "openrage"
-
 +++
 
 <!-- This text is shown under "Checked against the whole game" in the Supported games section. -->
