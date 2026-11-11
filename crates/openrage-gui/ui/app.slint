@@ -516,6 +516,120 @@ component Dialog inherits Rectangle {
     init => { scope.focus(); }
 }
 
+// Asks before unlocking edit mode (used by the main window and editor windows).
+component UnlockDialog {
+    callback confirm();
+    callback cancel();
+    Dialog {
+        width: root.width;
+        height: root.height;
+        title: @tr("Unlock editing?");
+        panel-width: 540px;
+        panel-height: 360px;
+        close => { root.cancel(); }
+        Text {
+            wrap: word-wrap;
+            color: Theme.text;
+            text: @tr("Edit mode lets OpenRAGE change archives, textures and text files, and install packages.");
+        }
+        Rectangle {
+            border-radius: Theme.radius;
+            background: Theme.warning.with-alpha(0.14);
+            border-width: 1px;
+            border-color: Theme.warning.with-alpha(0.5);
+            HorizontalLayout {
+                padding: Theme.space-m;
+                spacing: Theme.space-m;
+                Image {
+                    y: Theme.space-xs;
+                    width: 22px;
+                    height: 22px;
+                    source: @image-url("icons/warning.svg");
+                    colorize: Theme.warning;
+                }
+                VerticalLayout {
+                    spacing: Theme.space-xs;
+                    Text {
+                        text: @tr("Do not play online with modified files.");
+                        font-weight: 700;
+                        wrap: word-wrap;
+                        color: Theme.warning;
+                    }
+                    Text {
+                        text: @tr("Rockstar can ban accounts that join GTA Online with changed game files. Use mods only in story mode.");
+                        wrap: word-wrap;
+                        color: Theme.text;
+                    }
+                }
+            }
+        }
+        VerticalLayout {
+            spacing: Theme.space-xs;
+            Text {
+                wrap: word-wrap;
+                color: Theme.text-muted;
+                text: @tr("• Game files are never changed: an archive is copied to the mods folder before its first change.");
+            }
+            Text {
+                wrap: word-wrap;
+                color: Theme.text-muted;
+                text: @tr("• Every change is recorded in History and can be undone.");
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: Theme.space-s;
+            Button {
+                text: @tr("Cancel");
+                clicked => { root.cancel(); }
+            }
+            Button {
+                text: @tr("Unlock editing");
+                icon: @image-url("icons/unlock.svg");
+                colorize-icon: true;
+                primary: true;
+                clicked => { root.confirm(); }
+            }
+        }
+    }
+}
+
+// Shown while edit mode is on, with a way to lock again.
+component EditModeStrip inherits Rectangle {
+    callback lock();
+    background: Theme.warning.with-alpha(0.16);
+    HorizontalLayout {
+        padding-top: Theme.space-xs;
+        padding-bottom: Theme.space-xs;
+        padding-left: Theme.space-l;
+        padding-right: Theme.space-m;
+        spacing: Theme.space-s;
+        Image {
+            y: (parent.height - self.height) / 2;
+            width: 18px;
+            height: 18px;
+            source: @image-url("icons/warning.svg");
+            colorize: Theme.warning;
+        }
+        Text {
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+            overflow: elide;
+            color: Theme.text;
+            text: @tr("Edit mode is on — changes are written to the mods folder. Lock it when you are done.");
+        }
+        Button {
+            text: @tr("Lock editing");
+            icon: @image-url("icons/lock.svg");
+            colorize-icon: true;
+            clicked => { root.lock(); }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: root.window-title;
     icon: @image-url("icon.png");
@@ -582,6 +696,9 @@ export component AppWindow inherits Window {
     in property <float> audio-position;
     in property <string> audio-time;
     in property <bool> audio-mode-folder;
+    in property <bool> audio-has-prev;
+    in property <bool> audio-has-next;
+    in-out property <bool> audio-play-all;
     out property <length> preview-area-width;
     out property <length> preview-area-height;
     in property <bool> texture-mode;
@@ -654,6 +771,8 @@ export component AppWindow inherits Window {
     callback audio-toggle();
     callback audio-stop();
     callback audio-seek(float);
+    callback audio-step(int);
+    callback audio-skip(float);
     callback audio-save-wav();
     callback open-viewer();
     callback archive-import();
@@ -712,7 +831,7 @@ export component AppWindow inherits Window {
         root.theme-changed(mode);
     }
 
-    function select-row(i: int) {
+    public function select-row(i: int) {
         root.file-select(i);
         // Keep the selected row in view.
         if (i * Theme.row-height < -list.content-y) {
@@ -1144,6 +1263,10 @@ export component AppWindow inherits Window {
         Rectangle {
             height: 1px;
             background: Theme.border;
+        }
+
+        if root.edit-mode: EditModeStrip {
+            lock => { root.edit-mode = false; }
         }
 
         HorizontalLayout {
@@ -1619,31 +1742,92 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if root.audio-mode: HorizontalLayout {
-                    spacing: Theme.space-s;
-                    Button {
-                        text: root.audio-playing ? @tr("Pause") : @tr("Play");
-                        primary: true;
-                        clicked => { root.audio-toggle(); }
-                    }
-                    Button {
-                        text: @tr("Stop");
-                        clicked => { root.audio-stop(); }
-                    }
-                    Text {
-                        horizontal-stretch: 1;
-                        text: root.audio-time;
-                        vertical-alignment: center;
-                        font-family: root.mono-font;
-                        font-size: Theme.font-small;
-                        color: Theme.text-muted;
-                    }
-                    Button {
-                        text: @tr("Save WAV…");
-                        icon: @image-url("icons/extract.svg");
-                        colorize-icon: true;
-                        enabled: !root.busy;
-                        clicked => { root.audio-save-wav(); }
+                if root.audio-mode: Rectangle {
+                    border-radius: Theme.radius;
+                    background: Theme.surface;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    HorizontalLayout {
+                        padding: Theme.space-xs;
+                        padding-left: Theme.space-s;
+                        spacing: 2px;
+                        IconButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/prev.svg");
+                            label: @tr("Previous sound");
+                            enabled: root.audio-has-prev;
+                            clicked => { root.audio-step(-1); }
+                        }
+                        IconButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/back5.svg");
+                            label: @tr("Back 5 seconds");
+                            clicked => { root.audio-skip(-5); }
+                        }
+                        Rectangle {
+                            y: (parent.height - self.height) / 2;
+                            width: 38px;
+                            height: 38px;
+                            border-radius: 19px;
+                            background: play-ta.has-hover ? Theme.accent.darker(0.1) : Theme.accent;
+                            accessible-role: button;
+                            accessible-label: root.audio-playing ? @tr("Pause") : @tr("Play");
+                            accessible-action-default => { root.audio-toggle(); }
+                            Image {
+                                width: 18px;
+                                height: 18px;
+                                source: root.audio-playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
+                                colorize: Palette.accent-foreground;
+                            }
+                            play-ta := TouchArea {
+                                clicked => { root.audio-toggle(); }
+                            }
+                            Tooltip {
+                                text: @markdown("\{@tr("Play / pause (Space)")}");
+                            }
+                        }
+                        IconButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/fwd5.svg");
+                            label: @tr("Forward 5 seconds");
+                            clicked => { root.audio-skip(5); }
+                        }
+                        IconButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/next.svg");
+                            label: @tr("Next sound");
+                            enabled: root.audio-has-next;
+                            clicked => { root.audio-step(1); }
+                        }
+                        IconButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/stop.svg");
+                            label: @tr("Stop");
+                            clicked => { root.audio-stop(); }
+                        }
+                        Text {
+                            horizontal-stretch: 1;
+                            horizontal-alignment: center;
+                            text: root.audio-time;
+                            vertical-alignment: center;
+                            font-family: root.mono-font;
+                            font-size: Theme.font-small;
+                            color: Theme.text-muted;
+                        }
+                        IconButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/repeat.svg");
+                            label: root.audio-play-all ? @tr("Playing all sounds in a row (click to stop after this one)") : @tr("Play all sounds in a row");
+                            active: root.audio-play-all;
+                            clicked => { root.audio-play-all = !root.audio-play-all; }
+                        }
+                        IconButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/extract.svg");
+                            label: @tr("Save WAV…");
+                            enabled: !root.busy;
+                            clicked => { root.audio-save-wav(); }
+                        }
                     }
                 }
                 preview-area := Rectangle {
@@ -1937,55 +2121,14 @@ export component AppWindow inherits Window {
     }
 
     // Edit mode warning
-    if root.unlock-visible: Dialog {
-        title: @tr("Unlock editing?");
-        panel-width: 520px;
-        panel-height: 300px;
-        close => { root.unlock-visible = false; }
-        Text {
-            wrap: word-wrap;
-            color: Theme.text;
-            text: @tr("Edit mode lets OpenRAGE change archives, textures and install packages.");
+    if root.unlock-visible: UnlockDialog {
+        width: root.width;
+        height: root.height;
+        confirm => {
+            root.edit-mode = true;
+            root.unlock-visible = false;
         }
-        VerticalLayout {
-            spacing: Theme.space-xs;
-            Text {
-                wrap: word-wrap;
-                color: Theme.text-muted;
-                text: @tr("• Game files are never changed: an archive is copied to the mods folder before its first change.");
-            }
-            Text {
-                wrap: word-wrap;
-                color: Theme.text-muted;
-                text: @tr("• Every change is recorded in History and can be undone.");
-            }
-            Text {
-                wrap: word-wrap;
-                color: Theme.text-muted;
-                text: @tr("• Online play with modified files can get your account banned.");
-            }
-        }
-        Rectangle {
-            vertical-stretch: 1;
-        }
-        HorizontalLayout {
-            alignment: end;
-            spacing: Theme.space-s;
-            Button {
-                text: @tr("Cancel");
-                clicked => { root.unlock-visible = false; }
-            }
-            Button {
-                text: @tr("Unlock editing");
-                icon: @image-url("icons/unlock.svg");
-                colorize-icon: true;
-                primary: true;
-                clicked => {
-                    root.edit-mode = true;
-                    root.unlock-visible = false;
-                }
-            }
-        }
+        cancel => { root.unlock-visible = false; }
     }
 
     // First-run / key setup
@@ -2515,11 +2658,16 @@ export component EditorWindow inherits Window {
     in property <string> status;
     in-out property <bool> confirm-close;
     in-out property <bool> wrap: false;
+    in property <bool> has-tabs;
+    in-out property <bool> tabs-shown;
 
     callback save();
-    callback unlock();
+    // Unlocking or locking edit mode (applies to the main window and all editors).
+    callback set-edit-mode(bool);
+    in-out property <bool> unlock-visible;
     callback discard-and-close();
     callback reload();
+    callback toggle-tabs();
 
     changed theme-mode => { root.apply-theme(); }
 
@@ -2570,6 +2718,10 @@ export component EditorWindow inherits Window {
                             color: Theme.text-muted;
                         }
                     }
+                    if root.has-tabs: Button {
+                        text: root.tabs-shown ? @tr("Hide tabs") : @tr("Show tabs");
+                        clicked => { root.toggle-tabs(); }
+                    }
                     Button {
                         text: root.wrap ? @tr("No wrap") : @tr("Wrap lines");
                         clicked => { root.wrap = !root.wrap; }
@@ -2588,6 +2740,9 @@ export component EditorWindow inherits Window {
                         clicked => { root.save(); }
                     }
                 }
+            }
+            if root.editable && root.locked-reason == "": EditModeStrip {
+                lock => { root.set-edit-mode(false); }
             }
             // Protection banner
             if !root.editable || root.locked-reason != "": Rectangle {
@@ -2615,7 +2770,7 @@ export component EditorWindow inherits Window {
                         text: @tr("Unlock editing…");
                         icon: @image-url("icons/unlock.svg");
                         colorize-icon: true;
-                        clicked => { root.unlock(); }
+                        clicked => { root.unlock-visible = true; }
                     }
                 }
             }
@@ -2651,6 +2806,16 @@ export component EditorWindow inherits Window {
                 }
             }
         }
+    }
+
+    if root.unlock-visible: UnlockDialog {
+        width: root.width;
+        height: root.height;
+        confirm => {
+            root.unlock-visible = false;
+            root.set-edit-mode(true);
+        }
+        cancel => { root.unlock-visible = false; }
     }
 
     if root.confirm-close: Dialog {

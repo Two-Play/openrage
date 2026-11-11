@@ -473,6 +473,24 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_audio_save_wav(move || with_ui(&w, save_wav));
     let w = ui.as_weak();
+    ui.on_audio_step(move |d| {
+        with_ui(&w, |ui| {
+            step_sound(ui, d, true);
+        })
+    });
+    let w = ui.as_weak();
+    ui.on_audio_skip(move |secs| {
+        with_ui(&w, |ui| {
+            let Some(pcm) = with_app(|a| a.sound.clone()) else { return };
+            let total = pcm.duration_secs().max(0.001);
+            let now = with_app(|a| match &a.output {
+                Some(o) if Arc::ptr_eq(o.pcm(), &pcm) && !o.finished() => o.position().as_secs_f32(),
+                _ => a.sound_start,
+            });
+            seek_sound(ui, ((now + secs) / total).clamp(0.0, 1.0));
+        })
+    });
+    let w = ui.as_weak();
     ui.on_save_png(move || with_ui(&w, |ui| export_textures(ui, true)));
     let w = ui.as_weak();
     ui.on_archive_import(move || with_ui(&w, |ui| archive_import(ui, None)));
@@ -2382,6 +2400,7 @@ fn start_sound_preview(ui: &AppWindow, awc: Arc<rage_formats::awc::Awc>, index: 
                         a.sound_start = 0.0;
                     });
                     ui.set_audio_mode(true);
+                    update_sound_neighbours(&ui);
                     update_sound_ui(&ui);
                     if with_app(|a| std::mem::take(&mut a.play_when_ready)) {
                         toggle_sound(&ui);
@@ -2394,6 +2413,36 @@ fn start_sound_preview(ui: &AppWindow, awc: Arc<rage_formats::awc::Awc>, index: 
             }
         });
     });
+}
+
+/// Selects the previous/next sound of the opened container (and plays it).
+fn step_sound(ui: &AppWindow, delta: i32, play: bool) -> bool {
+    let target = ui.get_file_selected() + delta;
+    let is_sound = with_app(|a| {
+        let l = a.listing.as_ref()?;
+        let i = *a.visible.get(usize::try_from(target).ok()?)?;
+        Some(l.items[i].kind == ItemKind::Sound)
+    });
+    if is_sound != Some(true) {
+        return false;
+    }
+    with_app(|a| a.play_when_ready = play);
+    ui.invoke_select_row(target);
+    true
+}
+
+/// Whether there are sounds before/after the selected one.
+fn update_sound_neighbours(ui: &AppWindow) {
+    let row = ui.get_file_selected();
+    let is_sound = |r: i32| {
+        with_app(|a| {
+            let l = a.listing.as_ref()?;
+            let i = *a.visible.get(usize::try_from(r).ok()?)?;
+            Some(l.items[i].kind == ItemKind::Sound)
+        }) == Some(true)
+    };
+    ui.set_audio_has_prev(is_sound(row - 1));
+    ui.set_audio_has_next(is_sound(row + 1));
 }
 
 /// Play, pause or resume the selected sound.
@@ -2464,6 +2513,15 @@ fn update_sound_ui(ui: &AppWindow) {
             a.output = None;
             a.audio_timer.stop();
         });
+        // "Play all": continue with the next sound (outside this timer tick).
+        if ui.get_audio_play_all() {
+            let weak = ui.as_weak();
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                if let Some(ui) = weak.upgrade() {
+                    step_sound(&ui, 1, true);
+                }
+            });
+        }
     }
     ui.set_audio_position(pos / total);
     ui.set_audio_playing(playing && !finished);

@@ -9,8 +9,10 @@ use slint::ComponentHandle;
 
 use crate::{AppWindow, EditorWindow};
 
-/// How tabs are shown in the editor.
-pub const TAB_MARK: char = '→';
+/// How tabs are shown in the editor (the text field has no glyph for a
+/// tab): as a visible arrow on request, else as blank space.
+pub const TAB_SHOWN: char = '→';
+pub const TAB_HIDDEN: char = '\u{a0}';
 
 /// A file loaded for editing.
 pub struct Document {
@@ -20,7 +22,8 @@ pub struct Document {
     /// Original line endings and byte order mark, restored when saving.
     pub crlf: bool,
     pub bom: bool,
-    /// Tabs are shown as [`TAB_MARK`] (the text field has no glyph for them).
+    /// Tabs are shown as [`TAB_SHOWN`] or [`TAB_HIDDEN`] (only when the file
+    /// contains neither, so saving restores them exactly).
     pub tab_mark: bool,
     /// Why the file cannot be saved (empty: it can).
     pub locked_reason: String,
@@ -39,9 +42,9 @@ impl Document {
                 let crlf = text.contains("\r\n");
                 let mut text = if crlf { text.replace("\r\n", "\n") } else { text.to_owned() };
                 // Only when it can be undone exactly on saving.
-                let tab_mark = text.contains('\t') && !text.contains(TAB_MARK);
+                let tab_mark = text.contains('\t') && !text.contains(TAB_SHOWN) && !text.contains(TAB_HIDDEN);
                 if tab_mark {
-                    text = text.replace('\t', &TAB_MARK.to_string());
+                    text = text.replace('\t', &TAB_HIDDEN.to_string());
                 }
                 Some(Self { vpath, name, text, crlf, bom, tab_mark, locked_reason: String::new() })
             }
@@ -68,7 +71,7 @@ impl Document {
         if self.bom {
             out.extend_from_slice(b"\xEF\xBB\xBF");
         }
-        let text = if self.tab_mark { text.replace(TAB_MARK, "\t") } else { text.to_owned() };
+        let text = if self.tab_mark { text.replace([TAB_SHOWN, TAB_HIDDEN], "\t") } else { text.to_owned() };
         if self.crlf {
             out.extend_from_slice(text.replace("\r\n", "\n").replace('\n', "\r\n").as_bytes());
         } else {
@@ -101,6 +104,7 @@ pub fn open(ui: &AppWindow, doc: Document) {
     win.set_editable(ui.get_edit_mode());
     win.set_locked_reason(doc.locked_reason.clone().into());
     win.set_status(status_line(&doc).into());
+    win.set_has_tabs(doc.tab_mark);
     let id = NEXT_ID.with(|n| {
         n.set(n.get() + 1);
         n.get()
@@ -132,11 +136,21 @@ pub fn open(ui: &AppWindow, doc: Document) {
         });
     });
     let main = ui.as_weak();
-    win.on_unlock(move || {
+    win.on_set_edit_mode(move |on| {
+        // The main window owns the edit mode; it tells every editor.
         if let Some(ui) = main.upgrade() {
-            ui.set_unlock_visible(true);
-            let _ = ui.show();
+            ui.set_edit_mode(on);
         }
+    });
+    let (w, d) = (win.as_weak(), Rc::clone(&doc));
+    win.on_toggle_tabs(move || {
+        let Some(win) = w.upgrade() else { return };
+        if !d.borrow().tab_mark {
+            return;
+        }
+        let shown = !win.get_tabs_shown();
+        win.set_text(show_tabs(&win.get_text(), shown).into());
+        win.set_tabs_shown(shown);
     });
     let (w, d, main) = (win.as_weak(), Rc::clone(&doc), ui.as_weak());
     win.on_reload(move || {
@@ -144,7 +158,8 @@ pub fn open(ui: &AppWindow, doc: Document) {
         let vpath = d.borrow().vpath.clone();
         match crate::read_file(&ui, &vpath).map(|data| Document::from_bytes(vpath, &data)) {
             Ok(Some(new)) => {
-                win.set_text(new.text.clone().into());
+                win.set_text(show_tabs(&new.text, win.get_tabs_shown()).into());
+                win.set_has_tabs(new.tab_mark);
                 win.set_locked_reason(new.locked_reason.clone().into());
                 win.set_modified(false);
                 win.set_status(status_line(&new).into());
@@ -177,10 +192,19 @@ pub fn open(ui: &AppWindow, doc: Document) {
     }
 }
 
+/// Switches how tabs look in the editor text.
+pub fn show_tabs(text: &str, shown: bool) -> String {
+    if shown {
+        text.replace(TAB_HIDDEN, &TAB_SHOWN.to_string())
+    } else {
+        text.replace(TAB_SHOWN, &TAB_HIDDEN.to_string())
+    }
+}
+
 fn status_line(doc: &Document) -> String {
     let lines = doc.text.lines().count();
     let endings = if doc.crlf { "CRLF" } else { "LF" };
-    let tabs = if doc.tab_mark { " · tabs shown as →" } else { "" };
+    let tabs = if doc.tab_mark { " · contains tabs" } else { "" };
     let encoding = if !doc.locked_reason.is_empty() {
         "other encoding"
     } else if doc.bom {
@@ -221,7 +245,8 @@ mod tests {
         let data = b"\xEF\xBB\xBF<a>\r\n  <b/>\t\r\n</a>\r\n";
         let doc = Document::from_bytes("x/test.xml".into(), data).unwrap();
         assert!(doc.crlf && doc.bom && doc.tab_mark && doc.locked_reason.is_empty());
-        assert_eq!(doc.text, "<a>\n  <b/>→\n</a>\n");
+        assert_eq!(doc.text, "<a>\n  <b/>\u{a0}\n</a>\n");
+        assert_eq!(doc.encode(&show_tabs(&doc.text, true)), data);
         assert_eq!(doc.encode(&doc.text), data);
         assert!(Document::from_bytes("x/bin".into(), &[0, 1, 2, 0xFF, 0]).is_none());
     }
