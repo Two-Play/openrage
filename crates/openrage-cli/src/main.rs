@@ -150,6 +150,18 @@ enum Command {
         #[arg(long)]
         file: Option<PathBuf>,
     },
+    /// Find names for Red Dead Redemption 2's archive entries in the game's own files.
+    ///
+    /// Entries only carry a hash of their name; this searches every file for
+    /// strings that match (once, a few minutes) and caches the hits. A list of
+    /// names (one per line) can be added with --import.
+    Rdr2Names {
+        /// The RDR2 game folder.
+        game: PathBuf,
+        /// Add names from a text file (one path or name per line) instead of searching.
+        #[arg(long)]
+        import: Option<PathBuf>,
+    },
     /// Inspect Red Dead Redemption 2 archives (RPF8): a file or every .rpf in a folder.
     Rpf8 {
         path: PathBuf,
@@ -348,6 +360,9 @@ fn run() -> Result<()> {
     if let Command::Rpf8 { path, list } = &cli.command {
         return cmd_rpf8(path, *list);
     }
+    if let Command::Rdr2Names { game, import } = &cli.command {
+        return cmd_rdr2_names(game, import.as_deref());
+    }
     if let Command::Rdr2Keys { game, dump, file } = &cli.command {
         return cmd_rdr2_keys(game, dump.as_deref(), file.as_deref());
     }
@@ -359,7 +374,9 @@ fn run() -> Result<()> {
     });
 
     match cli.command {
-        Command::Keys { .. } | Command::Rpf8 { .. } | Command::Rdr2Keys { .. } => unreachable!(),
+        Command::Keys { .. } | Command::Rpf8 { .. } | Command::Rdr2Keys { .. } | Command::Rdr2Names { .. } => {
+            unreachable!()
+        }
         Command::Ls { path, recursive } => cmd_ls(&game_dir, &path, recursive, keys),
         Command::Info { path } => cmd_info(&game_dir, &path, keys),
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
@@ -2272,6 +2289,10 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
 fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
     use rage_rpf::rpf8::{Compression, Rpf8};
     let keys = rdr2_keys()?;
+    let names = rdr2_game_folder(path)
+        .and_then(|g| rage_rpf::rpf8_names::NameIndex::default_path(&g))
+        .and_then(|p| rage_rpf::rpf8_names::NameIndex::load(&p).ok().flatten())
+        .map(std::sync::Arc::new);
     fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         for e in std::fs::read_dir(dir)? {
             let p = e?.path();
@@ -2353,7 +2374,10 @@ fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
                     return (name, t);
                 }
                 match Rpf8::open_with_keys(file, keys.clone()) {
-                    Ok(rpf) => {
+                    Ok(mut rpf) => {
+                        if let Some(n) = &names {
+                            rpf.set_names(std::sync::Arc::clone(n));
+                        }
                         t.archives = 1;
                         let h = rpf.header();
                         let table = if h.is_encrypted() {
@@ -2464,5 +2488,51 @@ fn cmd_rdr2_keys(game: &Path, dump: Option<&Path>, file: Option<&Path>) -> Resul
     if !found.missing.is_empty() {
         outln!("Still unknown: key ids {:?} (their files stay closed)", found.missing);
     }
+    Ok(())
+}
+
+/// The RDR2 game folder a path lies in (the folder with RDR2.exe).
+fn rdr2_game_folder(path: &Path) -> Option<PathBuf> {
+    let start = if path.is_dir() { path } else { path.parent()? };
+    start.ancestors().find(|d| d.join("RDR2.exe").is_file()).map(Path::to_path_buf)
+}
+
+fn cmd_rdr2_names(game: &Path, import: Option<&Path>) -> Result<()> {
+    use rage_rpf::rpf8_keys::archives_under;
+    use rage_rpf::rpf8_names::{NameIndex, build, entry_hashes};
+    let started = Instant::now();
+    let keys = rdr2_keys()?.context("no RDR2 keys yet: run `openrage rdr2-keys` first")?;
+    let files = archives_under(game);
+    if files.is_empty() {
+        bail!("no .rpf archives under {}", game.display());
+    }
+    let wanted = entry_hashes(&files, &keys);
+    let path = NameIndex::default_path(game).context("no cache folder")?;
+    let mut index = NameIndex::load(&path)?.unwrap_or_default();
+    match import {
+        Some(list) => {
+            let text = std::fs::read_to_string(list).with_context(|| format!("cannot read {}", list.display()))?;
+            let added = index.add_list(&text, &wanted);
+            outln!("{}: {added} new names", list.display());
+        }
+        None => {
+            let found = build(&files, &keys, &wanted, |done, total| {
+                eprint!("\rsearching the game's files: {done}/{total} archives")
+            });
+            eprintln!();
+            for (h, n) in found.names {
+                index.names.entry(h).or_insert(n);
+            }
+        }
+    }
+    index.save(&path)?;
+    outln!(
+        "{} of {} entry names known ({:.1} %); stored in {} ({:.0} s)",
+        index.names.len(),
+        wanted.len(),
+        index.names.len() as f64 * 100.0 / wanted.len().max(1) as f64,
+        path.display(),
+        started.elapsed().as_secs_f32()
+    );
     Ok(())
 }

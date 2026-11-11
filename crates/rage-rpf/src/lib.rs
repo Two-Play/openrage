@@ -10,6 +10,7 @@ mod rpf7;
 pub mod rpf8;
 pub mod rpf8_exe;
 pub mod rpf8_keys;
+pub mod rpf8_names;
 mod toc;
 pub mod vfs;
 pub mod writer;
