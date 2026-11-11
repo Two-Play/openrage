@@ -9,6 +9,7 @@ mod editor;
 mod gpu;
 mod history;
 mod preview;
+mod scene;
 mod viewer;
 mod xmlview;
 
@@ -262,6 +263,47 @@ fn debug_snapshot_rest(ui: &AppWindow, path: String) {
     }
     if std::env::var("OPENRAGE_UNLOCK").is_ok() {
         ui.set_unlock_visible(true);
+    }
+    // `OPENRAGE_CAST=<row>` with `OPENRAGE_XML=<cut>`: press that actor's Play animation.
+    if let Ok(row) = std::env::var("OPENRAGE_CAST") {
+        if let Some(x) = xmlview::newest() {
+            x.invoke_play_actor(row.parse().unwrap_or(0));
+        }
+        let path = path.clone();
+        slint::Timer::single_shot(Duration::from_secs(20), move || {
+            if let Some(Ok(img)) = viewer::newest().map(|v| v.window().take_snapshot()) {
+                let _ =
+                    rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(&path, png));
+            }
+            let _ = slint::quit_event_loop();
+        });
+        return;
+    }
+    // `OPENRAGE_SCENE=<cut>` (+ `OPENRAGE_SCENE_TIME`, `OPENRAGE_FREE`): the whole cutscene.
+    if let Ok(cut) = std::env::var("OPENRAGE_SCENE") {
+        open_xml_view(ui, cut);
+        if let Some(x) = xmlview::newest() {
+            x.invoke_play_scene();
+        }
+        let waiting = std::rc::Rc::new(slint::Timer::default());
+        let (started, timer) = (Instant::now(), std::rc::Rc::clone(&waiting));
+        waiting.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
+            if !scene::ready() && started.elapsed() < Duration::from_secs(180) {
+                return;
+            }
+            timer.stop();
+            let time = std::env::var("OPENRAGE_SCENE_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0);
+            scene::debug_pose(time, std::env::var("OPENRAGE_FREE").is_ok());
+            let path = path.clone();
+            slint::Timer::single_shot(Duration::from_millis(800), move || {
+                if let Some(Ok(img)) = scene::newest().map(|w| w.window().take_snapshot()) {
+                    let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
+                        .map(|png| std::fs::write(&path, png));
+                }
+                let _ = slint::quit_event_loop();
+            });
+        });
+        return;
     }
     let weak = ui.as_weak();
     slint::Timer::single_shot(Duration::from_secs(2), move || {

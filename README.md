@@ -62,7 +62,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 | ✨ **Particles** | `.ypt` effect dictionaries: effect, emitter and particle rule names, their textures and models. |
 | 🧱 **Collisions** | `.ybn` collision meshes and shapes in 3D, coloured by material (concrete, metal, grass, …). |
 | 🛣️ **Paths** | Road and footpath networks (`.ynd`), nav meshes (`.ynv`), vehicle and waypoint recordings (`.yvr`, `.ywr`) in 3D. |
-| 🎬 **Cutscenes** | The cast of every cutscene; play any actor with its animation over the whole cutscene. |
+| 🎬 **Cutscenes** | Play a whole cutscene: every actor animated in one scene, through the cutscene camera or a free camera. |
 | 📜 **Scripts** | Disassembles compiled game scripts (`.ysc`): functions, jumps, strings and native calls. |
 | 🌐 **Game text** | Edit `.gxt2` text tables in OpenIV's `.oxt` form and save them back losslessly. |
 | 🧩 **Mods, safely** | Changes go to OpenIV's `mods` folder, never into your game files; every change and every `.oiv` package can be undone. |
@@ -132,7 +132,7 @@ Every format is checked against the complete game (GTA V Enhanced):
 - [x] Scripts (`.ysc`) disassembler
 - [x] Cutscenes: cast and actor animations over the whole cutscene
 - [x] Scaleform movies (`.gfx`) and Bink videos (`.bik`): facts and names
-- [ ] Whole cutscenes in one scene (all actors, camera)
+- [x] Whole cutscenes in one scene (all actors, cutscene camera)
 - [ ] GTA IV
 - [ ] Red Dead Redemption 2
 
@@ -273,7 +273,7 @@ Path node files (`.ynd`) show the road and footpath network of their map area: v
 
 ### Cutscenes
 
-A cutscene (`.cut`) opens in the metadata window with a **Cutscene** tab: its length and its cast — people, vehicles, props, the camera, lights and audio. **Play animation** opens an actor's model in the viewer with its animation over the whole cutscene: the cutscene's sections (`name-0.ycd`, `name-1.ycd`, … 4 seconds each) are joined into one clip per actor. Playing all actors together in one scene, with the cutscene camera, will come later.
+A cutscene (`.cut`) opens in the metadata window with a **Cutscene** tab: its length and its cast — people, vehicles, props, the camera, lights and audio. **Play whole cutscene** opens the scene: every person, vehicle and prop with its animation, placed where the cutscene puts it, seen through the cutscene camera (with its field of view) or — drag or scroll — a free camera; play, pause and scrub through it. **Play animation** opens a single actor in the viewer instead. The cutscene's sections (`name-0.ycd`, `name-1.ycd`, … 4 seconds each) are joined into one clip per actor. Not shown yet: the map around the scene, lights, particle effects, and the bodies of online characters (`mp_m_freemode_01`, which are assembled from customisation data); some props stay untextured when their textures live in a separate texture dictionary. The scene needs a GPU.
 
 ### Scripts
 

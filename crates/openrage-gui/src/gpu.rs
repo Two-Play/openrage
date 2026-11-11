@@ -17,6 +17,8 @@ use wgpu::util::DeviceExt;
 const SAMPLES: u32 = 4;
 /// Bones the skinning matrices cover (16 KiB of uniforms, the downlevel limit).
 const MAX_BONES: usize = 256;
+/// Bytes of per-draw data: colour (vec4) and model matrix (mat4).
+const DRAW_DATA: usize = 16 + 64;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -32,8 +34,13 @@ struct Globals {
 // Overlay drawn over the base colour with its alpha, on the second UV set
 // (vehicle liveries and signs); transparent when there is none.
 @group(1) @binding(2) var overlay: texture_2d<f32>;
-// Material colour, multiplied with the texture.
-@group(2) @binding(0) var<uniform> tint: vec4<f32>;
+// Per draw: material colour (multiplied with the texture) and the model's
+// placement in the scene.
+struct DrawData {
+    tint: vec4<f32>,
+    model: mat4x4<f32>,
+};
+@group(2) @binding(0) var<uniform> draw: DrawData;
 // Skinning matrices per skeleton bone (identity when not animated).
 @group(3) @binding(0) var<uniform> skin: array<mat4x4<f32>, 256>;
 
@@ -64,8 +71,8 @@ fn vs_main(v: VsIn) -> VsOut {
         pos = m * pos;
         normal = (m * vec4<f32>(normal, 0.0)).xyz;
     }
-    o.clip = globals.view_proj * pos;
-    o.normal = normal;
+    o.clip = globals.view_proj * draw.model * pos;
+    o.normal = (draw.model * vec4<f32>(normal, 0.0)).xyz;
     o.uv = v.uv;
     o.uv1 = v.uv1;
     return o;
@@ -85,7 +92,7 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
     // Headlight plus a little sky light; double-sided.
     let light = 0.25 + 0.65 * abs(dot(n, globals.forward.xyz)) + 0.1 * max(n.z, 0.0);
     let layer = textureSample(overlay, samp, i.uv1);
-    let colour = mix(base.rgb * tint.rgb, layer.rgb, layer.a);
+    let colour = mix(base.rgb * draw.tint.rgb, layer.rgb, layer.a);
     return vec4<f32>(colour * light, 1.0);
 }
 "#;
@@ -234,16 +241,17 @@ fn init() -> Option<Gpu> {
         label: Some("tint"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::FRAGMENT,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: true,
-                min_binding_size: wgpu::BufferSize::new(16),
+                min_binding_size: wgpu::BufferSize::new(DRAW_DATA as u64),
             },
             count: None,
         }],
     });
-    let tint_stride = (device.limits().min_uniform_buffer_offset_alignment as u64).max(16);
+    let align = (device.limits().min_uniform_buffer_offset_alignment as u64).max(16);
+    let tint_stride = (DRAW_DATA as u64).div_ceil(align) * align;
     let skin_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("skin"),
         entries: &[wgpu::BindGroupLayoutEntry {
@@ -515,6 +523,21 @@ pub fn render(
     w: u32,
     h: u32,
 ) -> Option<slint::Image> {
+    render_scene(&[SceneItem { preview, look, model: math::IDENTITY, skin }], camera, w, h)
+}
+
+/// One model of a scene: what is shown, where it stands and its pose.
+pub struct SceneItem<'a> {
+    pub preview: &'a Arc<crate::ModelPreview>,
+    pub look: &'a Look,
+    /// Placement in the scene.
+    pub model: math::Mat4,
+    pub skin: Option<&'a [math::Mat4]>,
+}
+
+/// Renders several models (each with its own placement and pose) from
+/// `camera`, e.g. all actors of a cutscene.
+pub fn render_scene(items: &[SceneItem], camera: &Camera, w: u32, h: u32) -> Option<slint::Image> {
     STATE.with(|state| {
         let mut st = state.borrow_mut();
         let st = &mut *st;
@@ -526,11 +549,12 @@ pub fn render(
 
         // Upload once per model; forget models that are gone.
         st.models.retain(|m| m.owner.strong_count() > 0);
-        if !st.models.iter().any(|m| std::ptr::eq(m.owner.as_ptr(), Arc::as_ptr(preview))) {
-            let (draws, textures) = upload(gpu, &preview.loaded, &preview.materials);
-            st.models.push(GpuModel { owner: Arc::downgrade(preview), draws, textures });
+        for item in items {
+            if !st.models.iter().any(|m| std::ptr::eq(m.owner.as_ptr(), Arc::as_ptr(item.preview))) {
+                let (draws, textures) = upload(gpu, &item.preview.loaded, &item.preview.materials);
+                st.models.push(GpuModel { owner: Arc::downgrade(item.preview), draws, textures });
+            }
         }
-        let model = st.models.iter().find(|m| std::ptr::eq(m.owner.as_ptr(), Arc::as_ptr(preview)))?;
 
         if st.targets.as_ref().is_none_or(|t| t.size != (w, h)) {
             st.targets = Some(targets(gpu, w, h));
@@ -554,20 +578,27 @@ pub fn render(
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals_buffer.as_entire_binding() }],
         });
 
-        // Shown draws with their colours (hidden parts and materials left out).
-        let shown: Vec<(&Draw, [f32; 4])> = model
-            .draws
-            .iter()
-            .filter(|d| look.parts.get(d.part).copied().unwrap_or(false))
-            .filter_map(|d| Some((d, preview.loaded.tint(look, d.drawable, d.shader)?)))
-            .collect();
+        // Shown draws of every item with their colours (hidden parts and materials left out).
+        let mut shown: Vec<(usize, &GpuModel, &Draw, [f32; 4])> = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let model = st.models.iter().find(|m| std::ptr::eq(m.owner.as_ptr(), Arc::as_ptr(item.preview)))?;
+            for d in &model.draws {
+                if !item.look.parts.get(d.part).copied().unwrap_or(false) {
+                    continue;
+                }
+                if let Some(tint) = item.preview.loaded.tint(item.look, d.drawable, d.shader) {
+                    shown.push((index, model, d, tint));
+                }
+            }
+        }
         let stride = gpu.tint_stride as usize;
         let mut tints = vec![0u8; stride * shown.len().max(1)];
-        for (i, (_, tint)) in shown.iter().enumerate() {
+        for (i, (index, _, _, tint)) in shown.iter().enumerate() {
             tints[i * stride..i * stride + 16].copy_from_slice(bytemuck::cast_slice(tint));
+            tints[i * stride + 16..i * stride + DRAW_DATA].copy_from_slice(bytemuck::cast_slice(&items[*index].model));
         }
         let tint_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tints"),
+            label: Some("draws"),
             contents: &tints,
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -579,27 +610,33 @@ pub fn render(
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &tint_buffer,
                     offset: 0,
-                    size: wgpu::BufferSize::new(16),
+                    size: wgpu::BufferSize::new(DRAW_DATA as u64),
                 }),
             }],
         });
 
-        let mut palette = vec![math::IDENTITY; MAX_BONES];
-        if let Some(skin) = skin {
-            for (slot, m) in palette.iter_mut().zip(skin) {
-                *slot = *m;
-            }
-        }
-        let skin_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("skin"),
-            contents: bytemuck::cast_slice(&palette),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let skin_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &gpu.skin_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: skin_buffer.as_entire_binding() }],
-        });
+        // One bone palette per item.
+        let skin_groups: Vec<wgpu::BindGroup> = items
+            .iter()
+            .map(|item| {
+                let mut palette = vec![math::IDENTITY; MAX_BONES];
+                if let Some(skin) = item.skin {
+                    for (slot, m) in palette.iter_mut().zip(skin) {
+                        *slot = *m;
+                    }
+                }
+                let buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("skin"),
+                    contents: bytemuck::cast_slice(&palette),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &gpu.skin_layout,
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+                })
+            })
+            .collect();
 
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         {
@@ -625,8 +662,8 @@ pub fn render(
             });
             pass.set_pipeline(&gpu.pipeline);
             pass.set_bind_group(0, &globals_group, &[]);
-            pass.set_bind_group(3, &skin_group, &[]);
-            for (i, (d, _)) in shown.iter().enumerate() {
+            for (i, (index, model, d, _)) in shown.iter().enumerate() {
+                pass.set_bind_group(3, &skin_groups[*index], &[]);
                 pass.set_bind_group(1, &model.textures[d.texture], &[]);
                 pass.set_bind_group(2, &tint_group, &[(i * stride) as u32]);
                 pass.set_vertex_buffer(0, d.vertices.slice(..));
