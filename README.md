@@ -277,11 +277,11 @@ A cutscene (`.cut`) opens in the metadata window with a **Cutscene** tab: its le
 
 ### Scripts
 
-Compiled scripts (`.ysc`) show their name, code size, number of functions, natives, statics and their strings in the preview; double-click opens the disassembly: one instruction per line with its address, functions (with their names where the compiler kept them), labels at jump targets, the text next to every `STRING` and the hash of every native call. Both opcode tables of GTA V (older builds, and newer ones with `STATIC_U24` and `IS_BIT_SET`) are recognised automatically by checking that every jump lands on an instruction.
+Compiled scripts (`.ysc`) show their name, code size, number of functions, natives, statics and their strings in the preview; double-click opens the disassembly: one instruction per line with its address, functions (with their names where the compiler kept them), labels at jump targets, the text next to every `STRING` and the hash of every native call. Native names appear once you load a list in the common NativeDB format (`natives.json`) with Help → **Load native names…** or `openrage natives <file>`; OpenRAGE ships none. Both opcode tables of GTA V (older builds, and newer ones with `STATIC_U24` and `IS_BIT_SET`) are recognised automatically by checking that every jump lands on an instruction.
 
 ### Scaleform movies and videos
 
-Scaleform movies (`.gfx`, the game's menus and HUD) show their stage size, frame rate, the symbols they export and the texture images they load; Bink videos (`.bik`) their size, frame rate, length and audio tracks. Neither is played back — Extract… saves the file for tools that can.
+Scaleform movies (`.gfx`, the game's menus and HUD) show their stage size, frame rate, the symbols they export and the texture images they load; **Export as SWF…** turns one into a Flash file for Flash tools such as JPEXS or Ruffle. Bink videos (`.bik`) show their size, frame rate, length and audio tracks, and — when FFmpeg is installed — a frame from the middle; double-click plays the video in your video player (VLC, mpv and other FFmpeg-based players play Bink).
 
 ### Text tables
 
@@ -350,7 +350,8 @@ openrage xml …/ufo.ymap --tree                 # the readable structure, as in
 openrage text …/american_rel.rpf/iap.gxt2 [-o iap.oxt]   # text table → OpenIV .oxt text
 openrage particles …/ptfx.rpf/core.ypt         # effects, emitters, textures and models of a .ypt
 openrage script …/script_rel.rpf/omega2.ysc [-o omega2.txt] [--strings]   # disassemble a script
-openrage media …/scaleform_generic.rpf/hud.gfx # Scaleform movie or Bink video facts
+openrage media …/scaleform_generic.rpf/hud.gfx [--swf hud.swf]   # Scaleform movie or Bink video facts
+openrage natives natives.json                  # native names for script disassembly
 ```
 
 </details>

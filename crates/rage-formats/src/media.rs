@@ -184,6 +184,20 @@ pub fn gfx(data: &[u8]) -> Result<Gfx, MediaError> {
     Ok(out)
 }
 
+/// A Scaleform movie as a Flash file (`.swf`) for Flash tools: Scaleform's
+/// own tags are skipped by them, the rest is SWF. Only the signature differs
+/// (`GFX` → `FWS`, `CFX` → `CWS`).
+pub fn gfx_to_swf(data: &[u8]) -> Result<Vec<u8>, MediaError> {
+    let mut out = data.to_vec();
+    match out.get(..3) {
+        Some(b"GFX") => out[..3].copy_from_slice(b"FWS"),
+        Some(b"CFX") => out[..3].copy_from_slice(b"CWS"),
+        Some(b"FWS" | b"CWS") => {}
+        _ => return Err(MediaError("not a Scaleform movie".into())),
+    }
+    Ok(out)
+}
+
 pub fn is_media(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower.ends_with(".gfx") || lower.ends_with(".bik")
@@ -192,6 +206,13 @@ pub fn is_media(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swf_signature() {
+        assert_eq!(&gfx_to_swf(b"GFX\x08rest").unwrap()[..3], b"FWS");
+        assert_eq!(&gfx_to_swf(b"CFX\x08rest").unwrap()[..3], b"CWS");
+        assert!(gfx_to_swf(b"BIKi").is_err());
+    }
 
     #[test]
     fn bink_header() {

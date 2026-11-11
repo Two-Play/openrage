@@ -22,7 +22,7 @@ pub fn rows(name: &str, data: &[u8]) -> Result<Vec<(String, String)>> {
         let b = media::bink(data)?;
         vec![
             ("Format".into(), format!("Bink video ({})", b.signature)),
-            ("Size".into(), format!("{} × {}", b.width, b.height)),
+            ("Resolution".into(), format!("{} × {}", b.width, b.height)),
             ("Frames".into(), format!("{} at {:.2} fps", b.frames, b.fps)),
             ("Length".into(), format!("{:.1} s", b.duration())),
             ("Audio tracks".into(), b.audio_tracks.to_string()),

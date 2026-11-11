@@ -3612,6 +3612,7 @@ dependencies = [
  "rage-resource",
  "rage-rpf",
  "roxmltree",
+ "serde_json",
  "zip",
 ]
 

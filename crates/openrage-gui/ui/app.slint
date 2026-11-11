@@ -113,6 +113,8 @@ export struct FileRow {
     is-meta: bool,
     // Text table (.gxt2, .nametable) edited as text.
     is-table: bool,
+    // Scaleform movie (.gfx): exportable as .swf.
+    is-gfx: bool,
 }
 
 component FormatIcon inherits Rectangle {
@@ -330,6 +332,11 @@ component FileItem inherits Rectangle {
                 title: @tr("Show as XML");
                 icon: @image-url("icons/menu/text.svg");
                 activated => { root.action("xml-view"); }
+            }
+            if item.is-gfx: MenuItem {
+                title: @tr("Export as SWF…");
+                icon: @image-url("icons/menu/export.svg");
+                activated => { root.action("swf"); }
             }
             if item.is-table: MenuItem {
                 title: @tr("Export as text…");
@@ -955,6 +962,8 @@ export component AppWindow inherits Window {
     callback uninstall-group();
     callback prompt-accepted(string);
     callback texture-replace();
+    // Import a natives.json for script disassembly.
+    callback load-natives();
     callback texture-add();
     callback texture-remove();
     callback cancel-task();
@@ -1256,6 +1265,10 @@ export component AppWindow inherits Window {
                 title: @tr("Keyboard shortcuts");
                 shortcut: @keys(F1);
                 activated => { root.shortcuts-visible = true; }
+            }
+            MenuItem {
+                title: @tr("Load native names…");
+                activated => { root.load-natives(); }
             }
         }
     }

@@ -15,6 +15,7 @@ rage-resource.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 roxmltree.workspace = true
+serde_json.workspace = true
 png = "0.18"
 zip.workspace = true
 
