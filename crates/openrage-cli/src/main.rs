@@ -2290,60 +2290,110 @@ fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
     } else {
         files.push(path.to_path_buf());
     }
-    let (mut ok, mut plain, mut entries_total, mut failed, mut empty) = (0, 0, 0usize, 0, 0);
-    for file in &files {
-        let name =
-            file.strip_prefix(path).ok().filter(|p| !p.as_os_str().is_empty()).unwrap_or(file).display().to_string();
-        if file.metadata().is_ok_and(|m| m.len() == 0) {
-            empty += 1;
-            outln!("{name}: empty file");
-            continue;
-        }
-        match Rpf8::open_with_keys(file, keys.clone()) {
-            Ok(rpf) => {
-                ok += 1;
-                let h = rpf.header();
-                let table = if h.is_encrypted() {
-                    format!("encrypted (key {})", h.decryption_tag)
-                } else {
-                    "plaintext".to_string()
+    /// Counts and report lines for one archive file and everything nested in it.
+    #[derive(Default)]
+    struct Tally {
+        archives: usize,
+        nested: usize,
+        readable: usize,
+        entries: usize,
+        failed: usize,
+        lines: Vec<String>,
+    }
+    fn walk(rpf: &Rpf8, depth: usize, list: bool, t: &mut Tally) {
+        let h = rpf.header();
+        let Some(entries) = rpf.entries() else { return };
+        t.readable += 1;
+        let indent = "  ".repeat(depth + 1);
+        for e in entries {
+            t.entries += 1;
+            let name = e.display_name(h.platform);
+            if list {
+                let comp = match e.compression {
+                    Compression::None => "",
+                    Compression::Deflate => " deflate",
+                    Compression::Oodle => " oodle",
+                    Compression::Unknown(_) => " ?",
                 };
-                outln!(
-                    "{name}: {} entries, table {table}, platform '{}', {} bytes",
-                    h.entry_count,
-                    h.platform,
-                    rpf.size()
-                );
-                if let Some(entries) = rpf.entries() {
-                    plain += 1;
-                    entries_total += entries.len();
-                    for e in entries {
-                        if let Err(err) = rpf.read(e) {
-                            failed += 1;
-                            outln!("  {}: {err}", e.display_name(h.platform));
-                        }
-                        if !list {
-                            continue;
-                        }
-                        let comp = match e.compression {
-                            Compression::None => "",
-                            Compression::Deflate => " deflate",
-                            Compression::Oodle => " oodle",
-                            Compression::Unknown(_) => " ?",
-                        };
-                        let enc = if e.is_encrypted() { " encrypted" } else { "" };
-                        outln!("  {:<60} {:>10}{comp}{enc}", e.display_name(h.platform), e.size());
+                let enc = if e.is_encrypted() { " encrypted" } else { "" };
+                t.lines.push(format!("{indent}{name:<60} {:>10}{comp}{enc}", e.size()));
+            }
+            if e.ext_id == 0 {
+                match rpf.open_child(e) {
+                    Ok(child) => {
+                        t.nested += 1;
+                        walk(&child, depth + 1, list, t);
+                    }
+                    Err(err) => {
+                        t.failed += 1;
+                        t.lines.push(format!("{indent}{name}: {err}"));
                     }
                 }
-            }
-            Err(e) => {
-                failed += 1;
-                outln!("{name}: {e}");
+            } else if let Err(err) = rpf.read(e) {
+                t.failed += 1;
+                t.lines.push(format!("{indent}{name}: {err}"));
             }
         }
     }
+    let tallies: Vec<(String, Tally)> = {
+        use rayon::prelude::*;
+        files
+            .par_iter()
+            .map(|file| {
+                let name = file
+                    .strip_prefix(path)
+                    .ok()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(file)
+                    .display()
+                    .to_string();
+                let mut t = Tally::default();
+                if file.metadata().is_ok_and(|m| m.len() == 0) {
+                    t.lines.push(format!("{name}: empty file"));
+                    return (name, t);
+                }
+                match Rpf8::open_with_keys(file, keys.clone()) {
+                    Ok(rpf) => {
+                        t.archives = 1;
+                        let h = rpf.header();
+                        let table = if h.is_encrypted() {
+                            format!("encrypted (key {})", h.decryption_tag)
+                        } else {
+                            "plaintext".to_string()
+                        };
+                        t.lines.push(format!(
+                            "{name}: {} entries, table {table}, platform '{}', {} bytes",
+                            h.entry_count,
+                            h.platform,
+                            rpf.size()
+                        ));
+                        walk(&rpf, 0, list, &mut t);
+                    }
+                    Err(e) => {
+                        t.failed += 1;
+                        t.lines.push(format!("{name}: {e}"));
+                    }
+                }
+                (name, t)
+            })
+            .collect()
+    };
+    let (mut ok, mut nested, mut plain, mut entries_total, mut failed, mut empty) = (0, 0, 0, 0usize, 0, 0);
+    for (_, t) in &tallies {
+        for l in &t.lines {
+            outln!("{l}");
+        }
+        if t.archives == 0 && t.failed == 0 {
+            empty += 1;
+        }
+        ok += t.archives;
+        nested += t.nested;
+        plain += t.readable;
+        entries_total += t.entries;
+        failed += t.failed;
+    }
     outln!(
-        "\n{ok} archives read, {empty} empty, {failed} failed; {plain} with a readable table ({entries_total} entries).{}",
+        "\n{ok} archives read ({nested} more nested in them), {empty} empty, {failed} failed; {plain} with a readable table ({entries_total} entries).{}",
         if keys.is_some() {
             ""
         } else {

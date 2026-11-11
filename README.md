@@ -143,7 +143,7 @@ Every format is checked against the complete game (GTA V Enhanced):
 
 In both cases the cipher tables and the IV come from your `RDR2.exe`: OpenRAGE finds their 565 pieces by SHA-256 fingerprints (checksums only). All archive keys start with the same 32 bytes; every place in the dump or key file that starts that way is tried on your archives, and the keys that open them are kept. Only the Steam version of 2 April 2024 is known so far; other versions report which pieces are missing.
 
-With the keys, `openrage rpf8 <game folder>` opens all 89 archives and reads all 20,518 files — decrypted, and decompressed with the open-source Oodle decoder [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract). Most files only have a hash so far, not a name; browsing in the GUI and the formats follow.
+With the keys, `openrage rpf8 <game folder>` opens all 89 archives and the 4,874 archives nested in them, and reads all 493,592 files — decrypted, and decompressed with the open-source Oodle decoder [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract). Most files only have a hash so far, not a name; browsing in the GUI and the formats follow.
 
 ## Installation
 

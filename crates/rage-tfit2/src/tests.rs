@@ -67,16 +67,21 @@ fn cbc_matches_the_reference() {
 #[test]
 fn strided_layout() {
     // Config 0: only the last 0x400 bytes.
-    assert_eq!(strided_ranges(0, 0x3000, 0x1000), vec![(0x2C00, 0x3000)]);
+    assert_eq!(strided_ranges(0, 0x3000, 0x1000, 0), vec![(0x2C00, 0x3000)]);
     // Small files: the head covers everything.
-    assert_eq!(strided_ranges(1, 0x300, 0x1000), vec![(0, 0x300)]);
+    assert_eq!(strided_ranges(1, 0x300, 0x1000, 0), vec![(0, 0x300)]);
     // Head 0x1000, blocks of 0x800 every 0x10000, then the tail.
     assert_eq!(
-        strided_ranges(1 | 1 << 2, 0x25000, 0x1000),
+        strided_ranges(1 | 1 << 2, 0x25000, 0x1000, 0),
         vec![(0, 0x1000), (0x10000, 0x10800), (0x20000, 0x20800), (0x24C00, 0x25000)]
     );
     // Without a head, the first block starts at 0.
-    assert_eq!(strided_ranges(1 << 2, 0x12000, 0x1000), vec![(0, 0x800), (0x10000, 0x10800), (0x11C00, 0x12000)]);
+    assert_eq!(strided_ranges(1 << 2, 0x12000, 0x1000, 0), vec![(0, 0x800), (0x10000, 0x10800), (0x11C00, 0x12000)]);
+    // Stride equal to the chunk size with the tail in the second chunk: the
+    // rest is encrypted from that chunk's start, which a resource's 16-byte
+    // header moves 16 bytes earlier (RDR2 level resources, config 0xE9).
+    assert_eq!(strided_ranges(0xE9, 0x801D0, 0x80000, 0), vec![(0, 0x1000), (0x80000, 0x801D0)]);
+    assert_eq!(strided_ranges(0xE9, 0x801D0, 0x80000, 16), vec![(0, 0x1000), (0x7FFF0, 0x801D0)]);
     assert_eq!(chunk_size(true, true, 5), 0x80000);
     assert_eq!(chunk_size(false, false, 5), 0x1000);
 }

@@ -222,8 +222,10 @@ impl<'a> Cbc<'a> {
 }
 
 /// The byte ranges of a file's data that are encrypted, from the entry's
-/// encryption config. `chunk_size` is the size the game reads the file in.
-pub fn strided_ranges(config: u8, file_size: u64, chunk_size: u64) -> Vec<(u64, u64)> {
+/// encryption config. `chunk_size` is the size the game reads the file in;
+/// `prefix` is how many bytes precede the data in the stream the game reads
+/// (16 for a resource's header), which moves the chunk boundaries.
+pub fn strided_ranges(config: u8, file_size: u64, chunk_size: u64, prefix: u64) -> Vec<(u64, u64)> {
     let head_length = if config & 3 != 0 { 0x400u64 << ((config & 3) * 2) } else { 0 };
     let length_config = (config >> 2) & 7;
     let (block_length, block_stride) =
@@ -244,7 +246,10 @@ pub fn strided_ranges(config: u8, file_size: u64, chunk_size: u64) -> Vec<(u64, 
     if head_length < tail_offset {
         if block_length != 0 || block_stride != 0 {
             if block_stride == chunk_size && tail_offset < block_stride && block_stride < file_size {
-                offset = block_stride;
+                // The tail starts in the second chunk: the rest of the file is
+                // read (and encrypted) from that chunk's start on. Found on
+                // RDR2's level resources, whose 16-byte header shifts it.
+                offset = block_stride - prefix;
             } else {
                 let mut block = if offset != 0 { block_stride } else { 0 };
                 while block + block_length <= tail_offset {
@@ -269,9 +274,9 @@ pub fn chunk_size(is_resource: bool, compressed: bool, size: u64) -> u64 {
 }
 
 /// Decrypts a file's data in place: each encrypted range, one CBC chain.
-pub fn decrypt_file(ctx: &Context, key: &Key, iv: [u8; 16], config: u8, chunk_size: u64, data: &mut [u8]) {
+pub fn decrypt_file(ctx: &Context, key: &Key, iv: [u8; 16], config: u8, chunk_size: u64, prefix: u64, data: &mut [u8]) {
     let mut cbc = Cbc::new(ctx, key, iv);
-    for (start, end) in strided_ranges(config, data.len() as u64, chunk_size) {
+    for (start, end) in strided_ranges(config, data.len() as u64, chunk_size, prefix) {
         cbc.decrypt(&mut data[start as usize..end as usize]);
     }
 }
