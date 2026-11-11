@@ -318,7 +318,7 @@ pub fn identify(c: &Candidates, archive_files: &[PathBuf]) -> Result<Found, Iden
                 .filter(|(_, e)| {
                     let start = u64::from(e.is_resource) * 16;
                     let chunk = rage_tfit2::chunk_size(e.is_resource, true, e.size());
-                    rage_tfit2::strided_ranges(e.encryption_config, e.size_on_disk - start, chunk)
+                    rage_tfit2::strided_ranges(e.encryption_config, e.size_on_disk - start, chunk, start)
                         .first()
                         .is_some_and(|r| r.0 == 0)
                 })

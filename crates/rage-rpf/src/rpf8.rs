@@ -247,6 +247,10 @@ pub fn plausible_table(table: &[u8], archive_size: u64) -> bool {
 #[derive(Debug)]
 pub struct Rpf8 {
     path: PathBuf,
+    /// Where the archive starts in the file (non-zero for nested archives).
+    base: u64,
+    /// The archive's name for messages: the file, plus the entries it is nested in.
+    display: String,
     header: Header,
     size: u64,
     /// `None` while the entry table is encrypted and no keys are available.
@@ -267,9 +271,29 @@ impl Rpf8 {
 
     /// Opens an archive, decrypting its entry table when the keys have the one it needs.
     pub fn open_with_keys(path: &Path, keys: Option<Arc<Rdr2Keys>>) -> Result<Rpf8, RpfError> {
-        let name = path.display().to_string();
+        let size = std::fs::metadata(path)?.len();
+        Self::open_range(path, 0, size, path.display().to_string(), keys)
+    }
+
+    /// Opens an archive nested in this one (an entry with the `.rpf` extension,
+    /// stored as is: neither compressed nor encrypted as a whole).
+    pub fn open_child(&self, entry: &Entry) -> Result<Rpf8, RpfError> {
+        let display = format!("{}/{}", self.display, entry.display_name(self.header.platform));
+        if entry.ext_id != 0 || entry.compression != Compression::None || entry.is_encrypted() {
+            return Err(RpfError::NotAnArchive(display));
+        }
+        Self::open_range(&self.path, self.base + entry.offset, entry.size_on_disk, display, self.keys.clone())
+    }
+
+    fn open_range(
+        path: &Path,
+        base: u64,
+        size: u64,
+        name: String,
+        keys: Option<Arc<Rdr2Keys>>,
+    ) -> Result<Rpf8, RpfError> {
         let mut f = File::open(path)?;
-        let size = f.metadata()?.len();
+        f.seek(SeekFrom::Start(base))?;
         let mut head = [0u8; HEADER_LEN as usize];
         f.read_exact(&mut head)?;
         let header = Header::parse(&head).ok_or_else(|| {
@@ -288,7 +312,7 @@ impl Rpf8 {
         let entries = if header.is_encrypted() && table_key.is_none() {
             None
         } else {
-            f.seek(SeekFrom::Start(HEADER_LEN + SIGNATURE_LEN))?;
+            f.seek(SeekFrom::Start(base + HEADER_LEN + SIGNATURE_LEN))?;
             let mut table = vec![0u8; header.entry_count as usize * ENTRY_LEN];
             f.read_exact(&mut table)?;
             if let (Some(key), Some(k)) = (table_key, &keys) {
@@ -307,14 +331,14 @@ impl Rpf8 {
                 }
             }
             if header.names_length > 0 {
-                f.seek(SeekFrom::Start(size - u64::from(header.names_length)))?;
+                f.seek(SeekFrom::Start(base + size - u64::from(header.names_length)))?;
                 let mut names = vec![0u8; header.names_length as usize];
                 f.read_exact(&mut names)?;
                 apply_names(&mut entries, &names, header.platform);
             }
             Some(entries)
         };
-        Ok(Rpf8 { path: path.to_path_buf(), header, size, entries, keys })
+        Ok(Rpf8 { path: path.to_path_buf(), base, display: name, header, size, entries, keys })
     }
 
     pub fn header(&self) -> Header {
@@ -329,6 +353,11 @@ impl Rpf8 {
         &self.path
     }
 
+    /// The archive's name: the file, plus the entries it is nested in.
+    pub fn display_name(&self) -> &str {
+        &self.display
+    }
+
     /// The entries, or `None` while the table is encrypted.
     pub fn entries(&self) -> Option<&[Entry]> {
         self.entries.as_deref()
@@ -338,7 +367,7 @@ impl Rpf8 {
     /// Resources come without their 16-byte on-disk prefix: virtual pages,
     /// then physical pages.
     pub fn read(&self, entry: &Entry) -> Result<Vec<u8>, RpfError> {
-        let archive = self.path.display().to_string();
+        let archive = self.display.clone();
         let name = entry.display_name(self.header.platform);
         let key = if entry.is_encrypted() {
             let k = self.keys.as_ref().ok_or_else(|| RpfError::KeysRequired(format!("{archive}/{name}")))?;
@@ -352,7 +381,7 @@ impl Rpf8 {
             None
         };
         let mut f = File::open(&self.path)?;
-        f.seek(SeekFrom::Start(entry.offset))?;
+        f.seek(SeekFrom::Start(self.base + entry.offset))?;
         let mut data = vec![0u8; entry.size_on_disk as usize];
         f.read_exact(&mut data)?;
         // Unverified on real data: Swage places the signature at the end.
@@ -365,7 +394,8 @@ impl Rpf8 {
         if let Some((k, key)) = key {
             let compressed = entry.compression != Compression::None;
             let chunk = rage_tfit2::chunk_size(entry.is_resource, compressed, entry.size());
-            rage_tfit2::decrypt_file(&k.context, key, k.iv, entry.encryption_config, chunk, &mut data);
+            let prefix = if entry.is_resource { 16 } else { 0 };
+            rage_tfit2::decrypt_file(&k.context, key, k.iv, entry.encryption_config, chunk, prefix, &mut data);
         }
         match entry.compression {
             Compression::None => {
@@ -384,12 +414,16 @@ impl Rpf8 {
             Compression::Oodle => {
                 let expected = entry.size() as usize;
                 let mut out = vec![0u8; expected];
-                let n =
-                    oozextract::Extractor::new().read_from_slice(&data, &mut out).map_err(|e| RpfError::Inflate {
-                        archive: archive.clone(),
-                        entry: name.clone(),
-                        source: std::io::Error::other(e.to_string()),
-                    })?;
+                // oozextract panics on some damaged input instead of failing.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    oozextract::Extractor::new().read_from_slice(&data, &mut out).map_err(|e| e.to_string())
+                }))
+                .unwrap_or_else(|_| Err("damaged Oodle data".to_owned()));
+                let n = result.map_err(|e| RpfError::Inflate {
+                    archive: archive.clone(),
+                    entry: name.clone(),
+                    source: std::io::Error::other(e),
+                })?;
                 if n != expected {
                     return Err(RpfError::Inflate {
                         archive,
