@@ -2,7 +2,8 @@
 
 ## CodeWalker
 
-Format knowledge for RPF7 and the NG cipher, and the SHA-1 fingerprints in
+Format knowledge for RPF7 and the NG cipher, the audio container layout and
+Rockstar's XXTEA variant, and the SHA-1 fingerprints in
 `crates/rage-crypto/src/key_hashes.rs`, are derived from CodeWalker
 (https://github.com/dexyfex/CodeWalker), which is distributed under the MIT license:
 
@@ -36,3 +37,8 @@ user's own game executable. They do not contain or allow reconstruction of any k
 
 Grand Theft Auto, Red Dead Redemption, RAGE and Rockstar Games are trademarks of
 Take-Two Interactive Software, Inc. OpenRAGE is not affiliated with them.
+
+## Symphonia
+
+MPEG audio is decoded with Symphonia (https://github.com/pdeljanov/Symphonia),
+licensed under the Mozilla Public License 2.0; its source is available there.
