@@ -1469,6 +1469,8 @@ fn select_row(ui: &AppWindow, row: usize) {
     ui.set_audio_mode(false);
     with_app(|a| a.sound = None);
     ui.set_suggestions(ModelRc::default());
+    ui.set_suggest_title(SharedString::new());
+    ui.set_suggest_pending(false);
     with_app(|a| {
         a.suggestions.clear();
         a.suggest_ycd.clear();
@@ -2927,6 +2929,7 @@ fn show_clip_dictionary(ui: &AppWindow, vpath: String, mut info: Meta) {
             ui.set_suggest_title("Looking for fitting models…".into());
             ui.set_suggest_icon("model".into());
             ui.set_suggestions(ModelRc::default());
+            ui.set_suggest_pending(true);
             let Some((game_dir, keys)) = with_app(|a| {
                 a.suggestions.clear();
                 a.suggest_ycd = vpath.clone();
@@ -2959,6 +2962,7 @@ fn show_clip_dictionary(ui: &AppWindow, vpath: String, mut info: Meta) {
                         .into(),
                     );
                     ui.set_suggestions(ModelRc::new(VecModel::from(rows)));
+                    ui.set_suggest_pending(false);
                     with_app(|a| {
                         a.suggestions = models;
                         a.suggest_pending = false;
@@ -3381,19 +3385,27 @@ fn update_sound_neighbours(ui: &AppWindow) {
     ui.set_audio_has_next(is_sound(row + 1));
 }
 
+/// How close to the end a position counts as "at the end": playing from
+/// there starts the sound again from the beginning.
+const SOUND_END_MARGIN: f32 = 0.05;
+
 /// Play, pause or resume the selected sound.
 fn toggle_sound(ui: &AppWindow) {
     let Some(pcm) = with_app(|a| a.sound.clone()) else { return };
+    let total = pcm.duration_secs();
     let action = with_app(|a| match &a.output {
         Some(o) if Arc::ptr_eq(o.pcm(), &pcm) && !o.finished() => {
             if o.is_playing() {
                 o.pause();
             } else {
+                if o.position().as_secs_f32() >= total - SOUND_END_MARGIN {
+                    o.seek(Duration::ZERO);
+                }
                 o.resume();
             }
             None
         }
-        _ => Some(a.sound_start),
+        _ => Some(if a.sound_start >= total - SOUND_END_MARGIN { 0.0 } else { a.sound_start }),
     });
     if let Some(start) = action {
         match audio::Output::play(Arc::clone(&pcm), Duration::from_secs_f32(start)) {
@@ -3447,6 +3459,7 @@ fn update_sound_ui(ui: &AppWindow) {
     if finished {
         with_app(|a| {
             a.output = None;
+            a.sound_start = 0.0;
             a.audio_timer.stop();
         });
         // "Play all": continue with the next sound (outside this timer tick).
