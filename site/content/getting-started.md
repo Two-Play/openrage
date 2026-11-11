@@ -70,7 +70,7 @@ The keys are extracted once and cached at `~/.config/openrage/gtav.keys` (Linux)
 
 ## Set up Red Dead Redemption 2
 
-Reading RDR2 archives works on the command line. Unlike GTA V's, most RDR2 archive keys are not stored in the executable on disk;
+RDR2 archives can be browsed in the GUI and on the command line. Unlike GTA V's, most RDR2 archive keys are not stored in the executable on disk;
 they exist only while the game runs. OpenRAGE takes them from your own game and never ships them. There are two ways:
 
 ### From a key file
@@ -91,15 +91,34 @@ The file holds length-prefixed key blocks, such as the `secrets.bin` Swage write
 > [!WARNING]
 > **Delete the dump afterwards.** It is several gigabytes and holds everything the game had in memory, including login data.
 
-The keys are stored in OpenRAGE's config folder (`rdr2.keys`). Then list or read the archives:
+The keys are stored in OpenRAGE's config folder (`rdr2.keys`).
+
+### File names
+
+RDR2 archives store only a hash of each file name. Let OpenRAGE search the game's own files for matching names once
+(about 7 minutes; the result is cached):
+
+```
+openrage rdr2-names "/path/to/Red Dead Redemption 2"
+```
+
+This finds about 44 % of all names, including nearly all models, clip sets and particle files; the rest show as
+`hash/XXXXXXXX.ext`. `--import <list>` adds names from a text file (one per line).
+
+### Browse
+
+In the GUI, choose the RDR2 folder as the game folder: archives open like folders, with file details, a text preview
+and *Extract…* for files and whole folders. **Textures** (`.ytd`) work as in GTA V: preview, viewer and export as DDS
+or PNG. On the command line:
 
 ```
 openrage rpf8 "/path/to/Red Dead Redemption 2"
-openrage rpf8 --list "/path/to/Red Dead Redemption 2/common_0.rpf"
+openrage --game "/path/to/Red Dead Redemption 2" ls levels_1.rpf/levels/rdr3
+openrage textures <path to .ytd> --export out/ --png
 ```
 
 Only the Steam version of 2 April 2024 is known so far; other versions report which pieces are missing.
-Browsing RDR2 in the GUI and its file formats follow.
+The search index and the other format viewers (models, …) are GTA V only for now.
 
 ## Next steps
 
