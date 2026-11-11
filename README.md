@@ -273,7 +273,9 @@ Path node files (`.ynd`) show the road and footpath network of their map area: v
 
 ### Cutscenes
 
-A cutscene (`.cut`) opens in the metadata window with a **Cutscene** tab: its length and its cast — people, vehicles, props, the camera, lights and audio. **Play whole cutscene** opens the scene: every person, vehicle and prop with its animation, placed where the cutscene puts it, seen through the cutscene camera (with its field of view) or — drag or scroll — a free camera; play, pause and scrub through it. **Play animation** opens a single actor in the viewer instead. The cutscene's sections (`name-0.ycd`, `name-1.ycd`, … 4 seconds each) are joined into one clip per actor. Online and story characters whose parts are streamed from a folder (`mp_m_freemode_01`, `cs_lestercrest_2`, …) are assembled from the first variant of each component, and props get their textures through the archetype file the cutscene names. Without a GPU the scene is drawn in software at a lower resolution. Not shown yet: the map around the scene, lights and particle effects.
+A cutscene (`.cut`) opens in the metadata window with a **Cutscene** tab: its length and its cast — people, vehicles, props, the camera, lights and audio. **Play whole cutscene** opens the scene: every person, vehicle and prop with its animation, placed where the cutscene puts it, seen through the cutscene camera (with its field of view) or — drag or scroll — a free camera; play, pause and scrub through it. **Play animation** opens a single actor in the viewer instead. The cutscene's sections (`name-0.ycd`, `name-1.ycd`, … 4 seconds each) are joined into one clip per actor. Online and story characters whose parts are streamed from a folder (`mp_m_freemode_01`, `cs_lestercrest_2`, …) are assembled from the first variant of each component, and props get their textures through the archetype file the cutscene names. The map around the scene is loaded too — buildings, interiors (with their rooms and furnishings from the interior's entity sets) and props within reach, each with its textures — and the cutscene's lights shine on it (their brightness is scaled relative to each other, an approximation of the game's lighting); both can be switched off. Without a GPU the scene is drawn in software at a lower resolution, without lights. Not shown: particle effects (smoke, sparks), which would need the game's particle simulation, and decals (dirt and stains), which need blending.
+
+Finding the surroundings uses a world cache (every map placement file with its extents, every archetype with its texture dictionary and interior contents), built once in about half a minute and stored next to the search index; `openrage world <x> <y> <z>` lists what stands at a place.
 
 ### Scripts
 
@@ -352,6 +354,7 @@ openrage particles …/ptfx.rpf/core.ypt         # effects, emitters, textures a
 openrage script …/script_rel.rpf/omega2.ysc [-o omega2.txt] [--strings]   # disassemble a script
 openrage media …/scaleform_generic.rpf/hud.gfx [--swf hud.swf]   # Scaleform movie or Bink video facts
 openrage natives natives.json                  # native names for script disassembly
+openrage world --radius 40 -- 350 4870 -60     # map objects near a point (builds the world cache)
 ```
 
 </details>

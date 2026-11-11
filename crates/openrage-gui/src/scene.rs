@@ -39,6 +39,14 @@ struct State {
     view: View,
     /// Scene bounds for the free camera.
     bounds: ([f32; 3], [f32; 3]),
+    /// The map around the scene (models with their placements in the scene).
+    surroundings: Vec<(Arc<ModelPreview>, Look, Vec<Mat4>)>,
+    show_surroundings: bool,
+    /// The surroundings are still loading.
+    surroundings_pending: bool,
+    /// The cutscene's lights, ready for the renderer; `show_lights` switches them.
+    lights: Vec<crate::gpu::SceneLight>,
+    show_lights: bool,
     timer: slint::Timer,
 }
 
@@ -81,7 +89,7 @@ pub fn open(ui: &AppWindow, cut_path: String, cut: Cutscene, models: Vec<Option<
                 if let Some(state) =
                     OPEN.with(|o| o.borrow().iter().find(|(i, ..)| *i == id).map(|(_, _, s)| Rc::clone(s)))
                 {
-                    start(&win, &state, dict, &cut, previews);
+                    start(&win, &state, id, dict, &cut, previews);
                 }
             }
             Err(e) => {
@@ -135,6 +143,7 @@ fn load(
 fn start(
     win: &SceneWindow,
     state: &Rc<RefCell<Option<State>>>,
+    id: u64,
     dict: ClipDictionary,
     cut: &Cutscene,
     previews: Vec<Option<ModelPreview>>,
@@ -195,6 +204,8 @@ fn start(
     win.set_status(status.into());
     win.set_loading(false);
     win.set_has_camera(camera_clip.is_some());
+    win.set_has_lights(!cut.lights.is_empty());
+    win.set_lights_on(!cut.lights.is_empty());
     win.set_cut_camera(camera_clip.is_some());
     win.set_duration(duration.max(0.1));
     *state.borrow_mut() = Some(State {
@@ -208,8 +219,14 @@ fn start(
         cut_camera: camera_clip.is_some(),
         view: View { zoom: 2.2, ..View::default() },
         bounds: (lo, hi),
+        surroundings: Vec::new(),
+        show_surroundings: true,
+        surroundings_pending: true,
+        lights: scene_lights(&cut.lights),
+        show_lights: !cut.lights.is_empty(),
         timer: slint::Timer::default(),
     });
+    load_surroundings(win, id, cut, (lo, hi));
     win.set_playing(true);
     let (w, s) = (win.as_weak(), Rc::clone(state));
     if let Some(st) = state.borrow().as_ref() {
@@ -236,6 +253,101 @@ fn hide_oversized_parts(preview: &ModelPreview, look: &mut Look) {
             *v = false;
         }
     }
+}
+
+/// Loads the map objects around the scene in the background (the world
+/// cache is built on first use, which takes a little while).
+fn load_surroundings(win: &SceneWindow, id: u64, cut: &Cutscene, bounds: ([f32; 3], [f32; 3])) {
+    let Some((game_dir, keys)) = crate::with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone()))) else { return };
+    // Scene → world: rotate about Z, then move to the scene's origin.
+    let to_world = math::mul(
+        &math::from_trs(cut.offset, [0.0, 0.0, 0.0, 1.0], [1.0; 3]),
+        &math::rotation_z(cut.rotation.to_radians()),
+    );
+    let to_scene = math::inverse_affine(&to_world);
+    let (lo, hi) = bounds;
+    let centre_local = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+    let centre = math::transform_point(&to_world, centre_local);
+    let half = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt() / 2.0;
+    let radius = (half + 25.0).clamp(30.0, 120.0);
+    win.set_status(format!("{} · loading the surroundings …", win.get_status()).into());
+    let weak = win.as_weak();
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<Vec<(ModelPreview, Vec<Mat4>)>> {
+            let world = openrage_app::world::load(&game_dir, keys.clone())?;
+            let files = openrage_app::world::files(&game_dir)?;
+            let placed = openrage_app::world::objects_near(&world, &game_dir, keys.clone(), centre, radius);
+            let models = openrage_app::world::load_models(&world, &files, &game_dir, keys, &placed);
+            Ok(models
+                .into_iter()
+                .map(|(name, loaded, transforms)| {
+                    let materials = render::Materials::new(&loaded);
+                    let look = std::sync::RwLock::new(loaded.default_look());
+                    let placements = transforms.iter().map(|t| math::mul(&to_scene, t)).collect();
+                    (ModelPreview { loaded, look, materials, name }, placements)
+                })
+                .collect())
+        })();
+        let _ = weak.upgrade_in_event_loop(move |win| {
+            let Some(state) = OPEN.with(|o| o.borrow().iter().find(|(i, ..)| *i == id).map(|(_, _, s)| Rc::clone(s)))
+            else {
+                return;
+            };
+            if let Some(st) = state.borrow_mut().as_mut() {
+                st.surroundings_pending = false;
+            }
+            let status = win.get_status().to_string().replace(" · loading the surroundings …", "");
+            match result {
+                Ok(models) => {
+                    let objects: usize = models.iter().map(|(_, p)| p.len()).sum();
+                    if let Some(st) = state.borrow_mut().as_mut() {
+                        st.surroundings = models
+                            .into_iter()
+                            .map(|(m, p)| {
+                                let mut look = m.loaded.default_look();
+                                // Decals (dirt, stains, signs on floors) need blending the
+                                // scene does not do; drawn opaque they cover the floor.
+                                for (slot, l) in m.loaded.materials.iter().zip(look.materials.iter_mut()) {
+                                    if rage_formats::shaders::name(slot.name_hash).is_some_and(|n| n.contains("decal"))
+                                    {
+                                        l.visible = false;
+                                    }
+                                }
+                                (Arc::new(m), look, p)
+                            })
+                            .collect();
+                    }
+                    win.set_surroundings(1);
+                    win.set_status(format!("{status} · {objects} map objects around it").into());
+                }
+                Err(e) => win.set_status(format!("{status} · no surroundings: {e:#}").into()),
+            }
+            render_frame(&win, &state);
+        });
+    });
+}
+
+/// The cutscene's lights for the renderer. Their intensities use a unit of
+/// the game's renderer; they are scaled relative to the brightest light so
+/// the scene keeps the cutscene's key and fill lights.
+fn scene_lights(lights: &[cutscene::Light]) -> Vec<crate::gpu::SceneLight> {
+    let brightest = lights.iter().map(|l| l.intensity).fold(0.0f32, f32::max).max(1e-6);
+    let mut out: Vec<crate::gpu::SceneLight> = lights
+        .iter()
+        .map(|l| {
+            let strength = 1.6 * (l.intensity / brightest).sqrt();
+            crate::gpu::SceneLight {
+                position: l.position,
+                color: [l.color[0] * strength, l.color[1] * strength, l.color[2] * strength],
+                range: l.range,
+                spot: l.spot.then_some((l.direction, l.cone)),
+            }
+        })
+        .collect();
+    // The strongest ones if there are more than the renderer takes.
+    out.sort_by(|a, b| b.color[0].total_cmp(&a.color[0]));
+    out.truncate(crate::gpu::MAX_LIGHTS);
+    out
 }
 
 fn tick(w: &slint::Weak<SceneWindow>, state: &Rc<RefCell<Option<State>>>) {
@@ -291,7 +403,7 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         });
         poses.push((model, skin));
     }
-    let items: Vec<crate::gpu::SceneItem> = st
+    let mut items: Vec<crate::gpu::SceneItem> = st
         .actors
         .iter()
         .zip(&poses)
@@ -302,10 +414,18 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
             skin: skin.as_deref(),
         })
         .collect();
+    if st.show_surroundings {
+        for (preview, look, placements) in &st.surroundings {
+            for t in placements {
+                items.push(crate::gpu::SceneItem { preview, look, model: *t, skin: None });
+            }
+        }
+    }
     let camera = if st.cut_camera { cut_camera(st) } else { None }
         .unwrap_or_else(|| render::orbit_camera(st.bounds.0, st.bounds.1, st.view));
     let gpu = if std::env::var_os("OPENRAGE_SOFTWARE_RENDERER").is_none() {
-        crate::gpu::render_scene(&items, &camera, width, height)
+        let lights: &[crate::gpu::SceneLight] = if st.show_lights { &st.lights } else { &[] };
+        crate::gpu::render_scene(&items, lights, &camera, width, height)
     } else {
         None
     };
@@ -385,6 +505,26 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         render_frame(&win, &s);
     });
     let (w, s) = (win.as_weak(), Rc::clone(state));
+    win.on_toggle_lights({
+        let (w, s) = (w.clone(), Rc::clone(&s));
+        move || {
+            let Some(win) = w.upgrade() else { return };
+            if let Some(st) = s.borrow_mut().as_mut() {
+                st.show_lights = !st.show_lights && !st.lights.is_empty();
+                win.set_lights_on(st.show_lights);
+            }
+            render_frame(&win, &s);
+        }
+    });
+    win.on_toggle_surroundings(move || {
+        let Some(win) = w.upgrade() else { return };
+        if let Some(st) = s.borrow_mut().as_mut() {
+            st.show_surroundings = !st.show_surroundings;
+            win.set_surroundings(if st.show_surroundings { 1 } else { 2 });
+        }
+        render_frame(&win, &s);
+    });
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_resized(move || {
         if let Some(win) = w.upgrade() {
             render_frame(&win, &s);
@@ -402,7 +542,9 @@ fn forget_closed() {
 /// Whether the newest scene has loaded (for debug snapshots).
 #[cfg(debug_assertions)]
 pub fn ready() -> bool {
-    OPEN.with(|o| o.borrow().last().is_some_and(|(_, _, s)| s.borrow().is_some()))
+    OPEN.with(|o| {
+        o.borrow().last().is_some_and(|(_, _, s)| s.borrow().as_ref().is_some_and(|st| !st.surroundings_pending))
+    })
 }
 
 /// Pauses the newest scene at `time`, through the cutscene or the free camera (debug snapshots).

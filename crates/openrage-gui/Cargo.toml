@@ -29,3 +29,6 @@ slint = { version = "1.18", default-features = false, features = ["std", "compat
 
 [build-dependencies]
 slint-build = "1.18"
+
+[dev-dependencies]
+i-slint-backend-testing = "=1.18.1"

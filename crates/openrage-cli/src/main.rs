@@ -125,6 +125,15 @@ enum Command {
         #[arg(long, conflicts_with = "out")]
         tree: bool,
     },
+    /// List the map objects near a point of the world (builds the world cache on first use).
+    World {
+        x: f32,
+        y: f32,
+        z: f32,
+        /// Radius in metres.
+        #[arg(long, default_value_t = 30.0)]
+        radius: f32,
+    },
     /// Import native names for script disassembly from a NativeDB-style natives.json.
     Natives { file: PathBuf },
     /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
@@ -348,6 +357,26 @@ fn run() -> Result<()> {
             cmd_model(&game_dir, &path, export.as_deref(), render.as_deref(), yaw, anim.as_deref(), keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
+        Command::World { x, y, z, radius } => {
+            let started = Instant::now();
+            let world = openrage_app::world::load(&game_dir, keys.clone())?;
+            outln!(
+                "{} map files, {} archetypes ({:.1}s)",
+                world.maps.len(),
+                world.archetypes.len(),
+                started.elapsed().as_secs_f32()
+            );
+            let near = openrage_app::world::objects_near(&world, &game_dir, keys, [x, y, z], radius);
+            let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            for p in &near {
+                *counts.entry(p.archetype.as_str()).or_default() += 1;
+            }
+            outln!("{} objects within {radius} m ({:.1}s):", near.len(), started.elapsed().as_secs_f32());
+            for (a, n) in counts {
+                outln!("  {n:>4} × {a}");
+            }
+            Ok(())
+        }
         Command::Natives { file } => {
             let n = openrage_app::natives::import(&file)?;
             outln!("Imported {n} native names; script disassemblies now show them.");
