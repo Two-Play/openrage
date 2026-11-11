@@ -38,6 +38,21 @@ export struct MaterialRow {
     textured: bool,
 }
 
+export struct HistoryRow {
+    when: string,
+    description: string,
+    place: string,
+    group: string,
+}
+
+// One axis of the orientation compass: screen direction (-1..1) and
+// whether it points away from the viewer.
+export struct GizmoAxis {
+    dx: float,
+    dy: float,
+    away: bool,
+}
+
 export struct ClipRow {
     name: string,
     // Length, e.g. "2.1 s".
@@ -68,14 +83,38 @@ export struct FileRow {
     can-edit-text: bool,
 }
 
-component FormatIcon inherits Image {
+component FormatIcon inherits Rectangle {
     in property <string> name;
     in property <color> tint;
+    // A file that holds other files (opens like a folder): marked with a badge.
+    in property <bool> container;
     width: Theme.icon-size;
     height: Theme.icon-size;
-    source: Icons.get(root.name);
-    colorize: root.tint;
-    image-rendering: smooth;
+    Image {
+        width: 100%;
+        height: 100%;
+        source: Icons.get(root.name);
+        colorize: root.tint;
+        image-rendering: smooth;
+    }
+    if root.container: Rectangle {
+        x: parent.width - self.width + 3px;
+        y: parent.height - self.height + 3px;
+        width: 10px;
+        height: 10px;
+        border-radius: 3px;
+        background: root.tint;
+        border-width: 1.5px;
+        border-color: Theme.background;
+        // Three stacked lines: "contains items".
+        for i in 3: Rectangle {
+            x: 2.5px;
+            y: 2.5px + i * 2px;
+            width: 5px;
+            height: 1px;
+            background: Theme.background;
+        }
+    }
 }
 
 // Flat icon button for the toolbar.
@@ -321,6 +360,10 @@ component FileItem inherits Rectangle {
                 y: (parent.height - self.height) / 2;
                 name: item.icon;
                 tint: item.tint;
+                container: item.can-open && item.icon != "folder" && item.icon != "archive";
+                Tooltip {
+                    text: @markdown("\{item.can-open && item.icon != "folder" && item.icon != "archive" ? @tr("Contains files — double-click to open") : item.kind}");
+                }
             }
             HorizontalLayout {
                 horizontal-stretch: 1;
@@ -334,17 +377,6 @@ component FileItem inherits Rectangle {
                     vertical-alignment: center;
                     overflow: elide;
                     color: root.fg;
-                }
-                // Files that open like folders (texture dictionaries, audio containers).
-                if item.can-open && item.icon != "folder" && item.icon != "archive": Text {
-                    text: "›";
-                    vertical-alignment: center;
-                    font-weight: 700;
-                    color: selected && focused ? Theme.selection-text : Theme.accent;
-                    accessible-role: none;
-                    Tooltip {
-                        text: @markdown("\{@tr("Double-click to open its contents")}");
-                    }
                 }
             }
             Rectangle {
@@ -430,6 +462,48 @@ component ContextBar inherits Rectangle {
             }
         }
         @children
+    }
+}
+
+// Orientation compass: the game's X (red), Y (green) and Z (blue, up) axes
+// as seen by the camera. Clicking a letter looks along that axis.
+component AxisGizmo inherits Rectangle {
+    in property <[GizmoAxis]> axes;
+    callback pick(int);
+    width: 76px;
+    height: 76px;
+    border-radius: 38px;
+    background: Theme.background.with-alpha(0.55);
+    property <[color]> colors: [#e5484d, #30a46c, #3e7bf6];
+    property <[string]> names: ["X", "Y", "Z"];
+    for a[i] in root.axes: Path {
+        width: root.width;
+        height: root.height;
+        viewbox-x: -1;
+        viewbox-y: -1;
+        viewbox-width: 2;
+        viewbox-height: 2;
+        stroke: root.colors[i].with-alpha(a.away ? 0.45 : 1.0);
+        stroke-width: a.away ? 1.5px : 2.5px;
+        commands: "M 0 0 L " + (a.dx * 0.62) + " " + (a.dy * 0.62);
+    }
+    for a[i] in root.axes: Rectangle {
+        x: root.width / 2 + a.dx * 0.62 * root.width / 2 - self.width / 2;
+        y: root.height / 2 + a.dy * 0.62 * root.height / 2 - self.height / 2;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: root.colors[i].with-alpha(a.away ? 0.5 : 1.0);
+        Text {
+            text: root.names[i];
+            font-size: 10px;
+            font-weight: 700;
+            color: white;
+        }
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.pick(i); }
+        }
     }
 }
 
@@ -694,6 +768,10 @@ export component AppWindow inherits Window {
     in property <bool> has-image;
     // Model preview: drag to orbit, wheel to zoom.
     in property <bool> model-mode;
+    in property <[GizmoAxis]> gizmo;
+    // Models suggested for the selected clip dictionary.
+    in property <[ClipRow]> suggestions;
+    in property <string> suggest-title;
     // Sound preview: waveform in the preview area, player controls above it.
     in property <bool> audio-mode;
     // The preview image is a texture or picture (not a waveform), so it can open in the viewer.
@@ -737,6 +815,8 @@ export component AppWindow inherits Window {
     in property <bool> texture-selected;
     in property <bool> preview-loading;
     in-out property <bool> shortcuts-visible;
+    // History opens in its own window (else in the file list).
+    in-out property <bool> history-in-window: true;
 
     // Status / background task
     in property <string> status;
@@ -772,6 +852,8 @@ export component AppWindow inherits Window {
     callback save-png();
     callback model-orbit(length, length);
     callback model-zoom(float);
+    callback model-axis(int);
+    callback suggestion-open(int);
     callback model-resized();
     callback export-gltf();
     callback audio-toggle();
@@ -804,6 +886,7 @@ export component AppWindow inherits Window {
     callback setup-run();
     callback theme-changed(int);
     callback edit-mode-changed(bool);
+    callback history-window-changed(bool);
     callback quit();
 
     preview-area-width: preview-area.width;
@@ -994,6 +1077,13 @@ export component AppWindow inherits Window {
                 title: @tr("All mod changes");
                 enabled: root.mods-available;
                 activated => { root.show-changes(); }
+            }
+            MenuItem {
+                title: (root.history-in-window ? "✓ " : "") + @tr("History in its own window");
+                activated => {
+                    root.history-in-window = !root.history-in-window;
+                    root.history-window-changed(root.history-in-window);
+                }
             }
             MenuItem {
                 title: @tr("History");
@@ -1782,6 +1872,9 @@ export component AppWindow inherits Window {
                             Image {
                                 width: 18px;
                                 height: 18px;
+                                // Centred; the play triangle needs a nudge to look centred.
+                                x: (parent.width - self.width) / 2 + (root.audio-playing ? 0px : 1.5px);
+                                y: (parent.height - self.height) / 2;
                                 source: root.audio-playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
                                 colorize: Palette.accent-foreground;
                             }
@@ -1875,6 +1968,12 @@ export component AppWindow inherits Window {
                         zoom(d) => { root.model-zoom(d); }
                         double-clicked => { root.open-viewer(); }
                     }
+                    if root.model-mode: AxisGizmo {
+                        x: parent.width - self.width - Theme.space-s;
+                        y: parent.height - self.height - Theme.space-s;
+                        axes: root.gizmo;
+                        pick(i) => { root.model-axis(i); }
+                    }
                     if root.model-mode: Text {
                         x: Theme.space-s;
                         y: parent.height - self.height - Theme.space-s;
@@ -1895,7 +1994,59 @@ export component AppWindow inherits Window {
                             color: Theme.text;
                         }
                     }
-                    if !root.has-image && root.preview-text == "" && !root.preview-loading: Text {
+                    if root.suggestions.length > 0: VerticalLayout {
+                        padding: Theme.space-m;
+                        spacing: Theme.space-s;
+                        Text {
+                            text: root.suggest-title;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                            color: Theme.text;
+                        }
+                        ListView {
+                            vertical-stretch: 1;
+                            for m[i] in root.suggestions: Rectangle {
+                                height: 42px;
+                                border-radius: Theme.radius-s;
+                                background: sug-ta.has-hover ? Theme.hover : transparent;
+                                sug-ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.suggestion-open(i); }
+                                }
+                                HorizontalLayout {
+                                    padding-left: Theme.space-s;
+                                    padding-right: Theme.space-s;
+                                    spacing: Theme.space-s;
+                                    FormatIcon {
+                                        y: (parent.height - self.height) / 2;
+                                        name: "model";
+                                        tint: #3b82f6;
+                                    }
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        alignment: center;
+                                        Text {
+                                            text: m.name;
+                                            overflow: elide;
+                                            color: Theme.text;
+                                        }
+                                        Text {
+                                            text: m.info;
+                                            font-size: Theme.font-small;
+                                            overflow: elide;
+                                            color: Theme.text-faint;
+                                        }
+                                    }
+                                    Text {
+                                        text: "▶";
+                                        vertical-alignment: center;
+                                        color: Theme.accent;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !root.has-image && root.preview-text == "" && !root.preview-loading && root.suggestions.length == 0: Text {
                         width: parent.width - 2 * Theme.space-xl;
                         horizontal-alignment: center;
                         wrap: word-wrap;
@@ -2259,6 +2410,7 @@ export component ViewerWindow inherits Window {
     in property <color> tint;
     in property <image> image;
     in property <bool> model-mode;
+    in property <[GizmoAxis]> gizmo;
     in property <[InfoRow]> rows;
     in property <string> mono-font: "monospace";
     in-out property <bool> show-info: true;
@@ -2288,6 +2440,7 @@ export component ViewerWindow inherits Window {
     callback zoom(float);
     callback resized();
     callback reset-view();
+    callback look-along(int);
     callback export-gltf();
     callback save-png();
     callback close-viewer();
@@ -2433,6 +2586,15 @@ export component ViewerWindow inherits Window {
                         zoom(d) => { root.zoom(d); }
                         double-clicked => { root.reset-view(); }
                         pressed-down => { scope.focus(); }
+                    }
+                    if root.model-mode: AxisGizmo {
+                        x: parent.width - self.width - Theme.space-m;
+                        y: parent.height - self.height - Theme.space-m;
+                        width: 96px;
+                        height: 96px;
+                        border-radius: 48px;
+                        axes: root.gizmo;
+                        pick(i) => { root.look-along(i); }
                     }
                     Text {
                         x: Theme.space-m;
@@ -2692,6 +2854,8 @@ export component ViewerWindow inherits Window {
                                                 Image {
                                                     width: 16px;
                                                     height: 16px;
+                                                    x: (parent.width - self.width) / 2 + (root.anim-playing ? 0px : 1.5px);
+                                                    y: (parent.height - self.height) / 2;
                                                     source: root.anim-playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
                                                     colorize: Palette.accent-foreground;
                                                 }
@@ -3026,5 +3190,199 @@ export component EditorWindow inherits Window {
     init => {
         root.apply-theme();
         editor.focus();
+    }
+}
+
+// The change journal in its own window.
+export component HistoryWindow inherits Window {
+    title: @tr("History — OpenRAGE");
+    icon: @image-url("icon.png");
+    preferred-width: 820px;
+    preferred-height: 560px;
+    min-width: 520px;
+    min-height: 300px;
+    background: Theme.background;
+    default-font-size: Theme.font-body;
+
+    in-out property <int> theme-mode;
+    in property <[HistoryRow]> rows;
+    in-out property <int> selected: -1;
+    in property <bool> busy;
+    in property <bool> edit-mode;
+    in property <string> status;
+
+    callback undo();
+    callback uninstall(string);
+    callback show-in-main();
+    callback set-edit-mode(bool);
+    in-out property <bool> unlock-visible;
+
+    changed theme-mode => { root.apply-theme(); }
+    init => { root.apply-theme(); }
+
+    function apply-theme() {
+        Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+
+    property <string> group: root.selected >= 0 && root.selected < root.rows.length ? root.rows[root.selected].group : "";
+
+    VerticalLayout {
+        Rectangle {
+            background: Theme.surface;
+            HorizontalLayout {
+                padding: Theme.space-m;
+                padding-left: Theme.space-l;
+                spacing: Theme.space-s;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    Text {
+                        text: @tr("History");
+                        font-size: Theme.font-title;
+                        font-weight: 600;
+                        color: Theme.text;
+                    }
+                    Text {
+                        text: @tr("Every change OpenRAGE made to the mods folder, newest first. Everything can be undone.");
+                        font-size: Theme.font-small;
+                        overflow: elide;
+                        color: Theme.text-muted;
+                    }
+                }
+                Button {
+                    text: @tr("Show in main window");
+                    clicked => { root.show-in-main(); }
+                }
+            }
+        }
+        if !root.edit-mode: Rectangle {
+            background: Theme.accent-subtle;
+            HorizontalLayout {
+                padding: Theme.space-s;
+                padding-left: Theme.space-l;
+                spacing: Theme.space-s;
+                Text {
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    text: @tr("Read-only. Unlock editing in the main window to undo or uninstall.");
+                    color: Theme.text;
+                }
+                Button {
+                    text: @tr("Unlock editing…");
+                    icon: @image-url("icons/unlock.svg");
+                    colorize-icon: true;
+                    clicked => { root.unlock-visible = true; }
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            ListView {
+                for r[i] in root.rows: Rectangle {
+                    height: 44px;
+                    background: i == root.selected ? Theme.accent-subtle : ta.has-hover ? Theme.hover : Math.mod(i, 2) == 1 ? Theme.stripe : transparent;
+                    ta := TouchArea {
+                        clicked => { root.selected = i; }
+                    }
+                    HorizontalLayout {
+                        padding-left: Theme.space-l;
+                        padding-right: Theme.space-l;
+                        spacing: Theme.space-m;
+                        Text {
+                            width: 110px;
+                            text: r.when;
+                            vertical-alignment: center;
+                            font-size: Theme.font-small;
+                            color: Theme.text-muted;
+                        }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            Text {
+                                text: r.description;
+                                overflow: elide;
+                                font-weight: i == 0 ? 600 : 400;
+                                color: Theme.text;
+                            }
+                            Text {
+                                text: r.place;
+                                font-size: Theme.font-small;
+                                overflow: elide;
+                                color: Theme.text-faint;
+                            }
+                        }
+                        if r.group != "": Rectangle {
+                            y: (parent.height - self.height) / 2;
+                            height: 22px;
+                            border-radius: 11px;
+                            background: Theme.accent-subtle;
+                            HorizontalLayout {
+                                padding-left: Theme.space-s;
+                                padding-right: Theme.space-s;
+                                Text {
+                                    text: r.group;
+                                    vertical-alignment: center;
+                                    font-size: Theme.font-small;
+                                    color: Theme.text;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if root.rows.length == 0: Text {
+                text: @tr("No changes yet.");
+                color: Theme.text-faint;
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+        Rectangle {
+            background: Theme.surface;
+            HorizontalLayout {
+                padding: Theme.space-s;
+                padding-left: Theme.space-l;
+                spacing: Theme.space-s;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.status;
+                    vertical-alignment: center;
+                    font-size: Theme.font-small;
+                    overflow: elide;
+                    color: Theme.text-muted;
+                }
+                Button {
+                    text: root.group == "" ? @tr("Uninstall package") : @tr("Uninstall “{}”", root.group);
+                    icon: @image-url("icons/remove.svg");
+                    colorize-icon: true;
+                    enabled: root.group != "" && root.edit-mode && !root.busy;
+                    clicked => { root.uninstall(root.group); }
+                }
+                Button {
+                    text: @tr("Undo newest");
+                    icon: @image-url("icons/undo.svg");
+                    colorize-icon: true;
+                    primary: true;
+                    enabled: root.rows.length > 0 && root.edit-mode && !root.busy;
+                    clicked => { root.undo(); }
+                }
+            }
+        }
+    }
+
+    if root.unlock-visible: UnlockDialog {
+        width: root.width;
+        height: root.height;
+        confirm => {
+            root.unlock-visible = false;
+            root.set-edit-mode(true);
+        }
+        cancel => { root.unlock-visible = false; }
     }
 }

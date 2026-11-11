@@ -353,13 +353,23 @@ fn upload(gpu: &Gpu, model: &LoadedModel, materials: &Materials) -> (Vec<Draw>, 
             let has_n = mesh.normals.len() == mesh.positions.len();
             let has_uv = mesh.uvs.len() == mesh.positions.len();
             let skinned = mesh.bone_weights.len() == mesh.positions.len();
+            let bone = part.bone.map(|b| b as u32);
             let vertices: Vec<Vertex> = (0..mesh.positions.len())
                 .map(|i| Vertex {
                     pos: math::transform_point(&part.transform, mesh.positions[i]),
                     normal: if has_n { math::transform_dir(&part.transform, mesh.normals[i]) } else { [0.0; 3] },
                     uv: if has_uv { mesh.uvs[i] } else { [0.0; 2] },
-                    weights: if skinned { mesh.bone_weights[i] } else { [0.0; 4] },
-                    joints: if skinned { mesh.bone_indices[i].map(u32::from) } else { [0; 4] },
+                    // Parts attached to a bone follow it; others use the mesh's weights.
+                    weights: match bone {
+                        Some(_) => [1.0, 0.0, 0.0, 0.0],
+                        None if skinned => mesh.bone_weights[i],
+                        None => [0.0; 4],
+                    },
+                    joints: match bone {
+                        Some(b) => [b, 0, 0, 0],
+                        None if skinned => mesh.bone_indices[i].map(u32::from),
+                        None => [0; 4],
+                    },
                 })
                 .collect();
             let texture = match materials.texture(part.drawable, mesh.shader) {

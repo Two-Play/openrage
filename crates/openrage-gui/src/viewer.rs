@@ -118,14 +118,35 @@ thread_local! {
 /// Opens a viewer window for `content`, labelled with the main window's
 /// current selection (title, path, details).
 pub fn open(ui: &AppWindow, content: Content) {
+    let labels = Labels {
+        heading: ui.get_info_title().into(),
+        path: ui.get_info_path().into(),
+        icon: ui.get_info_icon().into(),
+        tint: ui.get_info_tint(),
+        rows: ui.get_info_rows(),
+    };
+    open_with(ui, content, labels, None);
+}
+
+/// What a viewer window shows about its model.
+pub struct Labels {
+    pub heading: String,
+    pub path: String,
+    pub icon: String,
+    pub tint: slint::Color,
+    pub rows: ModelRc<crate::InfoRow>,
+}
+
+/// Opens a viewer; with `animation` (path of a `.ycd`) its first clip plays.
+pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Option<String>) {
     let Ok(win) = ViewerWindow::new() else { return };
     win.set_theme_mode(ui.get_theme_mode());
     win.set_mono_font(ui.get_mono_font());
-    win.set_heading(ui.get_info_title());
-    win.set_path(ui.get_info_path());
-    win.set_icon_name(ui.get_info_icon());
-    win.set_tint(ui.get_info_tint());
-    win.set_rows(ui.get_info_rows());
+    win.set_heading(labels.heading.into());
+    win.set_path(labels.path.into());
+    win.set_icon_name(labels.icon.into());
+    win.set_tint(labels.tint);
+    win.set_rows(labels.rows);
     win.set_model_mode(matches!(content, Content::Model(_)));
     if let Content::Image(img) = &content {
         win.set_image(img.clone());
@@ -193,6 +214,18 @@ pub fn open(ui: &AppWindow, content: Content) {
     });
     let (w, s) = (win.as_weak(), Rc::clone(&state));
     win.on_toggle_fly(move || toggle_fly(&w, &s));
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    win.on_look_along(move |axis| {
+        {
+            let mut st = s.borrow_mut();
+            st.fly = None;
+            st.view = crate::axis_view(axis, st.view);
+        }
+        if let Some(win) = w.upgrade() {
+            win.set_fly_mode(false);
+        }
+        render(&w, &s);
+    });
     let (w, s) = (win.as_weak(), Rc::clone(&state));
     win.on_key_down(move |text, shift| {
         let key = text.to_lowercase();
@@ -426,7 +459,14 @@ pub fn open(ui: &AppWindow, content: Content) {
         slint::CloseRequestResponse::HideWindow
     });
 
-    if has_skeleton {
+    if let Some(ycd) = animation.filter(|_| has_skeleton) {
+        let rows = vec![ClipRow { name: ycd.rsplit('/').next().unwrap_or(&ycd).into(), info: ycd.clone().into() }];
+        win.set_anim_results(ModelRc::new(VecModel::from(rows)));
+        state.borrow_mut().results = vec![ycd];
+        win.invoke_anim_open(0);
+        win.invoke_anim_select(0);
+        win.set_panel_tab(3);
+    } else if has_skeleton {
         // Suggest the generic movement clips for peds.
         let female = win.get_heading().contains("_f_");
         anim_search(&win.as_weak(), &state, if female { "move_f@generic" } else { "move_m@generic" });
@@ -451,8 +491,9 @@ fn render(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>) {
         let width = (win.get_area_width() - 32.0).max(64.0) as usize;
         let height = (win.get_area_height() - 32.0).max(64.0) as usize;
         let skin = st.anim.as_ref().and_then(|a| a.skin(m));
-        if let Some(img) = crate::render_image(m, |lo, hi| st.camera(lo, hi), skin.as_deref(), width, height) {
+        if let Some((img, gizmo)) = crate::render_image(m, |lo, hi| st.camera(lo, hi), skin.as_deref(), width, height) {
             win.set_image(img);
+            win.set_gizmo(gizmo);
         }
     }
 }

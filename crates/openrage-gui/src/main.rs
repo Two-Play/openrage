@@ -7,6 +7,7 @@ mod badges;
 mod browser;
 mod editor;
 mod gpu;
+mod history;
 mod preview;
 mod viewer;
 
@@ -84,6 +85,9 @@ struct App {
     /// Play the selected sound as soon as it is decoded (double-click).
     play_when_ready: bool,
     audio_timer: slint::Timer,
+    /// Models suggested for the selected clip dictionary, and its path.
+    suggestions: Vec<String>,
+    suggest_ycd: String,
     index_running: bool,
 }
 
@@ -131,12 +135,15 @@ fn main() -> anyhow::Result<()> {
             sound_start: 0.0,
             play_when_ready: false,
             audio_timer: slint::Timer::default(),
+            suggestions: Vec::new(),
+            suggest_ycd: String::new(),
             index_running: false,
         })
     });
 
     ui.set_mono_font(mono_font().into());
     ui.set_theme_mode(with_app(|a| theme_mode(a.cfg.theme.as_deref())));
+    ui.set_history_in_window(with_app(|a| a.cfg.history_window.unwrap_or(true)));
     let languages: Vec<SharedString> =
         std::iter::once("All languages".into()).chain(LANGUAGES.iter().map(|l| capitalize(l).into())).collect();
     ui.set_languages(ModelRc::new(VecModel::from(languages)));
@@ -215,6 +222,12 @@ fn debug_snapshot(ui: &AppWindow) {
                 select_row(&ui, row);
             }
         }
+        if let Ok(i) = std::env::var("OPENRAGE_SUGGEST") {
+            ui.invoke_suggestion_open(i.parse().unwrap_or(0));
+        }
+        if std::env::var("OPENRAGE_HISTORY").is_ok() {
+            history::open(&ui);
+        }
         if let Ok(path) = std::env::var("OPENRAGE_EDITOR") {
             open_editor(&ui, path);
         }
@@ -224,10 +237,11 @@ fn debug_snapshot(ui: &AppWindow) {
         let weak = ui.as_weak();
         slint::Timer::single_shot(Duration::from_secs(2), move || {
             let Some(ui) = weak.upgrade() else { return };
-            let snap = match (viewer::newest(), editor::newest()) {
-                (Some(v), _) => v.window().take_snapshot(),
-                (None, Some(e)) => e.window().take_snapshot(),
-                (None, None) => ui.window().take_snapshot(),
+            let snap = match (viewer::newest(), editor::newest(), history::window()) {
+                (Some(v), ..) => v.window().take_snapshot(),
+                (None, Some(e), _) => e.window().take_snapshot(),
+                (None, None, Some(h)) => h.window().take_snapshot(),
+                (None, None, None) => ui.window().take_snapshot(),
             };
             match snap {
                 Ok(img) => {
@@ -346,6 +360,20 @@ fn wire_callbacks(ui: &AppWindow) {
                 open_editor(ui, vpath);
                 return;
             }
+            let is_ycd = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                Some(listing.items[*a.visible.get(i as usize)?].name.to_ascii_lowercase().ends_with(".ycd"))
+            });
+            if is_ycd == Some(true) {
+                if ui.get_file_selected() != i {
+                    select_row(ui, i as usize);
+                }
+                if let Some((model, ycd)) = with_app(|a| Some((a.suggestions.first()?.clone(), a.suggest_ycd.clone())))
+                {
+                    open_model_with_animation(ui, model, ycd);
+                }
+                return;
+            }
             let viewable = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
@@ -454,7 +482,23 @@ fn wire_callbacks(ui: &AppWindow) {
         })
     });
     let w = ui.as_weak();
+    ui.on_suggestion_open(move |i| {
+        with_ui(&w, |ui| {
+            let pick = with_app(|a| Some((a.suggestions.get(i as usize)?.clone(), a.suggest_ycd.clone())));
+            if let Some((model, ycd)) = pick {
+                open_model_with_animation(ui, model, ycd);
+            }
+        })
+    });
+    let w = ui.as_weak();
     ui.on_model_resized(move || with_ui(&w, render_model));
+    let w = ui.as_weak();
+    ui.on_model_axis(move |axis| {
+        with_ui(&w, |ui| {
+            with_app(|a| a.model_view = axis_view(axis, a.model_view));
+            render_model(ui);
+        })
+    });
     let w = ui.as_weak();
     ui.on_export_gltf(move || with_ui(&w, export_gltf));
     let w = ui.as_weak();
@@ -468,8 +512,15 @@ fn wire_callbacks(ui: &AppWindow) {
         });
         viewer::set_theme(mode);
         editor::set_theme(mode);
+        history::set_theme(mode);
     });
-    ui.on_edit_mode_changed(editor::set_editable);
+    let w = ui.as_weak();
+    ui.on_edit_mode_changed(move |on| {
+        editor::set_editable(on);
+        if let Some(ui) = w.upgrade() {
+            history::refresh(&ui);
+        }
+    });
     ui.on_quit(|| {
         let _ = slint::quit_event_loop();
     });
@@ -537,7 +588,21 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_undo(move || with_ui(&w, start_undo));
     let w = ui.as_weak();
-    ui.on_show_history(move || with_ui(&w, |ui| navigate(ui, browser::HISTORY_PATH, true)));
+    ui.on_show_history(move || {
+        with_ui(&w, |ui| {
+            if ui.get_history_in_window() {
+                history::open(ui);
+            } else {
+                navigate(ui, browser::HISTORY_PATH, true);
+            }
+        })
+    });
+    ui.on_history_window_changed(|on| {
+        with_app(|a| {
+            a.cfg.history_window = Some(on);
+            let _ = a.cfg.save();
+        })
+    });
     let w = ui.as_weak();
     ui.on_install_oiv(move || with_ui(&w, pick_package));
     let w = ui.as_weak();
@@ -1199,6 +1264,12 @@ fn select_row(ui: &AppWindow, row: usize) {
     stop_sound(ui);
     ui.set_audio_mode(false);
     with_app(|a| a.sound = None);
+    ui.set_suggestions(ModelRc::default());
+    with_app(|a| a.suggestions.clear());
+    if item.name.to_ascii_lowercase().ends_with(".ycd") && item.mark != Some(Mark::Removed) {
+        show_clip_dictionary(ui, vpath.clone(), info);
+        return;
+    }
     if item.kind == ItemKind::Sound {
         let awc = with_app(|a| match a.listing.as_ref().map(|l| &l.location) {
             Some(Location::Audio { awc }) => Some(Arc::clone(awc)),
@@ -1276,6 +1347,42 @@ fn texture_info(t: &rage_formats::texture::Texture) -> Meta {
     ]
 }
 
+/// Textures shown in a dictionary's overview.
+const SHEET_CELLS: usize = 16;
+
+/// An overview of a texture dictionary: up to 16 textures in a grid
+/// (aspect kept, transparent background).
+fn texture_sheet(textures: &[rage_formats::texture::Texture]) -> Option<Rgba> {
+    let picked: Vec<Rgba> = textures.iter().take(SHEET_CELLS).filter_map(texture_image).collect();
+    if picked.is_empty() {
+        return None;
+    }
+    if picked.len() == 1 {
+        return picked.into_iter().next();
+    }
+    let columns = (picked.len() as f32).sqrt().ceil() as usize;
+    let rows = picked.len().div_ceil(columns);
+    const CELL: usize = 192;
+    const GAP: usize = 8;
+    let (w, h) = (columns * CELL + (columns - 1) * GAP, rows * CELL + (rows - 1) * GAP);
+    let mut out = vec![0u8; w * h * 4];
+    for (i, (tw, th, rgba)) in picked.iter().enumerate() {
+        let (tw, th) = (*tw as usize, *th as usize);
+        let scale = (CELL as f32 / tw.max(th) as f32).min(1.0);
+        let (sw, sh) = (((tw as f32 * scale) as usize).max(1), ((th as f32 * scale) as usize).max(1));
+        let (cx, cy) = ((i % columns) * (CELL + GAP) + (CELL - sw) / 2, (i / columns) * (CELL + GAP) + (CELL - sh) / 2);
+        for y in 0..sh {
+            for x in 0..sw {
+                let (sx, sy) = (x * tw / sw, y * th / sh);
+                let src = (sy * tw + sx) * 4;
+                let dst = ((cy + y) * w + cx + x) * 4;
+                out[dst..dst + 4].copy_from_slice(&rgba[src..src + 4]);
+            }
+        }
+    }
+    Some((w as u32, h as u32, out))
+}
+
 fn texture_image(t: &rage_formats::texture::Texture) -> Option<Rgba> {
     t.to_rgba().map(|rgba| (t.width, t.height, rgba))
 }
@@ -1310,12 +1417,13 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, St
                 Ok(dict) => {
                     let names: Vec<&str> = dict.textures.iter().take(8).map(|t| t.name.as_str()).collect();
                     let more = if dict.textures.len() > 8 { ", …" } else { "" };
+                    let shown = dict.textures.len().min(SHEET_CELLS);
                     let meta = vec![
                         kv("Textures", dict.textures.len()),
                         kv("Contains", format!("{}{more}", names.join(", "))),
-                        note("Double-click to open the dictionary."),
+                        note(format!("The preview shows {shown} of them. Double-click to open the dictionary.")),
                     ];
-                    (meta, String::new(), dict.textures.first().and_then(texture_image))
+                    (meta, String::new(), texture_sheet(&dict.textures))
                 }
                 Err(e) => (vec![kv("Error", e)], String::new(), None),
             }
@@ -2021,6 +2129,7 @@ fn archive_delete(ui: &AppWindow) {
 
 /// Shows or hides the Undo button with the newest journal entry.
 fn refresh_undo(ui: &AppWindow) {
+    history::refresh(ui);
     let newest = with_app(|a| a.game_dir.clone())
         .and_then(|d| rage_mods::mods_dir(&d))
         .and_then(|m| openrage_app::journal::Journal::new(&m).entries().ok())
@@ -2075,12 +2184,7 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
     ui.set_preview_loading(true);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
-        let result = openrage_app::models::load(&game_dir, keys, &vpath).map(|loaded| {
-            let materials = openrage_app::render::Materials::new(&loaded);
-            let name = loaded.drawables.first().map(|(n, _)| n.clone()).unwrap_or_default();
-            let look = std::sync::RwLock::new(loaded.default_look());
-            ModelPreview { loaded, look, materials, name }
-        });
+        let result = load_model_preview(&game_dir, keys, &vpath);
         if counter.load(Ordering::SeqCst) != generation {
             return;
         }
@@ -2133,6 +2237,94 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
     });
 }
 
+fn load_model_preview(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> anyhow::Result<ModelPreview> {
+    openrage_app::models::load(game_dir, keys, vpath).map(|loaded| {
+        let materials = openrage_app::render::Materials::new(&loaded);
+        let name = loaded.drawables.first().map(|(n, _)| n.clone()).unwrap_or_default();
+        let look = std::sync::RwLock::new(loaded.default_look());
+        ModelPreview { loaded, look, materials, name }
+    })
+}
+
+/// Loads a model in the background and opens it in a viewer playing `ycd`.
+fn open_model_with_animation(ui: &AppWindow, model: String, ycd: String) {
+    let Some((game_dir, keys)) = with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone()))) else { return };
+    ui.set_status(format!("Opening {model} …").into());
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let result = load_model_preview(&game_dir, keys, &model);
+        let _ = weak.upgrade_in_event_loop(move |ui| match result {
+            Ok(m) => {
+                let name = model.rsplit('/').next().unwrap_or(&model).to_owned();
+                let (icon, tint) = badges::icon(&name, ItemKind::Resource);
+                let labels = viewer::Labels {
+                    heading: name,
+                    path: model.clone(),
+                    icon: icon.into(),
+                    tint,
+                    rows: ModelRc::default(),
+                };
+                viewer::open_with(&ui, viewer::Content::Model(Arc::new(m)), labels, Some(ycd));
+                ui.set_status(SharedString::new());
+            }
+            Err(e) => ui.set_status(format!("Cannot open {model}: {e:#}").into()),
+        });
+    });
+}
+
+/// What a clip dictionary animates and the models that fit, best first.
+fn suggest_models(ycd: &str, dict: &rage_formats::clip::ClipDictionary) -> (String, Vec<String>) {
+    let name = ycd.rsplit('/').next().unwrap_or(ycd).trim_end_matches(".ycd").to_ascii_lowercase();
+    let tags: std::collections::HashSet<u16> =
+        dict.animations.iter().flat_map(|a| a.tracks.iter().map(|t| t.bone)).collect();
+    // Pelvis, thighs, calves and feet of the human skeleton.
+    const HUMAN: [u16; 6] = [0x2E28, 0xE39F, 0xF9BB, 0x3779, 0x9000, 0x3FCF];
+    let human = HUMAN.iter().filter(|t| tags.contains(t)).count() >= 2
+        || name.starts_with("facials@")
+        || name.contains("@facial")
+        || name.starts_with("mood_");
+    if let Some(vehicle) = name.strip_prefix("va_") {
+        let found = find_files(vehicle, ".yft", 40);
+        let exact: Vec<String> = found
+            .iter()
+            .filter(|v| v.rsplit('/').next().is_some_and(|n| n.eq_ignore_ascii_case(&format!("{vehicle}.yft"))))
+            .cloned()
+            .collect();
+        return (format!("Vehicle animation for {vehicle}"), exact);
+    }
+    if let Some(rest) = name.split("creatures@").nth(1) {
+        let animal = rest.split('@').next().unwrap_or(rest);
+        let found: Vec<String> = find_files(&format!("a_c_{animal}"), ".ydd", 40);
+        return (format!("Animal animation ({animal})"), found);
+    }
+    if human {
+        const PREFIXES: [&str; 13] =
+            ["a_m_", "a_f_", "s_m_", "s_f_", "g_m_", "g_f_", "u_m_", "u_f_", "ig_", "cs_", "csb_", "mp_", "player_"];
+        let mut peds: Vec<String> = find_files(".ydd", ".ydd", 6000)
+            .into_iter()
+            .filter(|v| {
+                let n = v.rsplit('/').next().unwrap_or(v).to_ascii_lowercase();
+                PREFIXES.iter().any(|p| n.starts_with(p)) && !n.contains("_p.ydd") && v.contains("peds")
+            })
+            .collect();
+        // Female clips suggest female peds first.
+        let female = name.contains("_f@") || name.contains("female") || name.starts_with("move_f");
+        peds.sort_by_key(|v| {
+            let n = v.rsplit('/').next().unwrap_or(v).to_ascii_lowercase();
+            let is_female = n.contains("_f_") || n.starts_with("a_f") || n.starts_with("s_f");
+            (is_female != female, v.starts_with("update"), n)
+        });
+        peds.dedup_by(|a, b| a.rsplit('/').next() == b.rsplit('/').next());
+        peds.truncate(150);
+        return ("Human animation — fits all peds".into(), peds);
+    }
+    // Otherwise: models sharing the dictionary's leading name part.
+    let stem = name.split(['@', '_']).find(|p| p.len() > 2).unwrap_or(&name).to_owned();
+    let mut found = find_files(&stem, ".ydr", 40);
+    found.extend(find_files(&stem, ".yft", 40));
+    (format!("Animation ({} bones) — possible models", tags.len()), found)
+}
+
 /// Renders a model into an image of `w × h` pixels: on the GPU if there is
 /// one, else with the software renderer.
 fn render_image(
@@ -2141,22 +2333,50 @@ fn render_image(
     skin: Option<&[rage_formats::math::Mat4]>,
     w: usize,
     h: usize,
-) -> Option<slint::Image> {
+) -> Option<(slint::Image, ModelRc<GizmoAxis>)> {
     let look = model.look.read().ok()?.clone();
     let Some((lo, hi)) = openrage_app::render::bounds(&model.loaded, &look.parts) else {
         // Nothing shown: an empty (transparent) image.
         let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w as u32, h as u32);
-        return Some(slint::Image::from_rgba8_premultiplied(buffer));
+        return Some((slint::Image::from_rgba8_premultiplied(buffer), ModelRc::default()));
     };
     let camera = camera(lo, hi);
+    let gizmo = gizmo_axes(&camera);
     if std::env::var_os("OPENRAGE_SOFTWARE_RENDERER").is_none()
         && let Some(img) = gpu::render(model, &look, &camera, skin, w as u32, h as u32)
     {
-        return Some(img);
+        return Some((img, gizmo));
     }
     let rgba = openrage_app::render::render_camera(&model.loaded, &look, &model.materials, &camera, skin, w, h);
     let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w as u32, h as u32);
-    Some(slint::Image::from_rgba8(buffer))
+    Some((slint::Image::from_rgba8(buffer), gizmo))
+}
+
+/// The world axes as the camera sees them, for the orientation compass.
+fn gizmo_axes(camera: &openrage_app::render::Camera) -> ModelRc<GizmoAxis> {
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let axes: Vec<GizmoAxis> = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        .iter()
+        .map(|a| GizmoAxis { dx: dot(*a, camera.right), dy: -dot(*a, camera.up), away: dot(*a, camera.forward) > 0.0 })
+        .collect();
+    ModelRc::new(VecModel::from(axes))
+}
+
+/// Orbit angles that look along an axis (0 = X, 1 = Y, 2 = Z from above).
+fn axis_view(axis: i32, current: openrage_app::render::View) -> openrage_app::render::View {
+    let mut v = current;
+    match axis {
+        0 => {
+            v.yaw = 0.0;
+            v.pitch = 0.0;
+        }
+        1 => {
+            v.yaw = std::f32::consts::FRAC_PI_2;
+            v.pitch = 0.0;
+        }
+        _ => v.pitch = 1.5,
+    }
+    v
 }
 
 /// Renders the current model at the size of the preview area.
@@ -2164,7 +2384,10 @@ fn render_model(ui: &AppWindow) {
     let Some((model, view)) = with_app(|a| a.model.clone().map(|m| (m, a.model_view))) else { return };
     let w = (ui.get_preview_area_width() - 16.0).max(64.0) as usize;
     let h = (ui.get_preview_area_height() - 16.0).max(64.0) as usize;
-    if let Some(img) = render_image(&model, |lo, hi| openrage_app::render::orbit_camera(lo, hi, view), None, w, h) {
+    if let Some((img, gizmo)) =
+        render_image(&model, |lo, hi| openrage_app::render::orbit_camera(lo, hi, view), None, w, h)
+    {
+        ui.set_gizmo(gizmo);
         ui.set_preview_image(img);
         ui.set_has_image(true);
     }
@@ -2244,6 +2467,47 @@ fn save_png_image(img: &slint::Image, name: String, main: Weak<AppWindow>) {
 
 // ---------------------------------------------------------------------------
 // Animations
+
+/// Selecting a `.ycd`: its clips and the models it fits.
+fn show_clip_dictionary(ui: &AppWindow, vpath: String, mut info: Meta) {
+    match load_clip_dictionary(&vpath) {
+        Ok(dict) => {
+            let (kind, models) = suggest_models(&vpath, &dict);
+            info.push(kv("Clips", dict.clips.len()));
+            info.push(kv("Animations", dict.animations.len()));
+            info.push(kv("Kind", &kind));
+            let names: Vec<&str> = dict.clips.iter().take(12).map(|c| c.name.as_str()).collect();
+            let more = if dict.clips.len() > 12 { ", …" } else { "" };
+            info.push(kv("Clips", format!("{}{more}", names.join(", "))));
+            info.push(note("Pick a model to play the animation on it; double-click the file opens the first."));
+            set_meta(ui, &info);
+            let rows: Vec<ClipRow> = models
+                .iter()
+                .map(|m| {
+                    let (dir, name) = m.rsplit_once('/').unwrap_or(("", m));
+                    ClipRow { name: name.into(), info: dir.into() }
+                })
+                .collect();
+            ui.set_suggest_title(
+                if rows.is_empty() {
+                    "No fitting models found (the search index may still be building).".to_owned()
+                } else {
+                    format!("{} fitting models — click one to play the animation", rows.len())
+                }
+                .into(),
+            );
+            ui.set_suggestions(ModelRc::new(VecModel::from(rows)));
+            with_app(|a| {
+                a.suggestions = models;
+                a.suggest_ycd = vpath;
+            });
+        }
+        Err(e) => {
+            info.push(kv("Error", format!("{e:#}")));
+            set_meta(ui, &info);
+        }
+    }
+}
 
 /// Files whose name contains `query` and ends with `extension`, from the search index.
 fn find_files(query: &str, extension: &str, limit: usize) -> Vec<String> {
@@ -2639,11 +2903,21 @@ fn export_sounds(ui: &AppWindow) {
 // ---------------------------------------------------------------------------
 // History and OpenIV packages
 
-fn show_history(ui: &AppWindow, record: bool) {
-    let entries = with_app(|a| a.game_dir.clone())
+/// The journal of the mods folder, newest first.
+fn journal_entries() -> Vec<openrage_app::journal::Entry> {
+    with_app(|a| a.game_dir.clone())
         .and_then(|d| rage_mods::mods_dir(&d))
         .and_then(|m| openrage_app::journal::Journal::new(&m).entries().ok())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// Shows the history in the file list (the alternative to its own window).
+fn show_history_in_list(ui: &AppWindow) {
+    show_history(ui, true);
+}
+
+fn show_history(ui: &AppWindow, record: bool) {
+    let entries = journal_entries();
     let items: Vec<Item> = entries
         .iter()
         .map(|e| {

@@ -66,6 +66,9 @@ On first start a setup dialog detects Steam installations and derives the keys. 
 * **Menus and context menus:** every action is in the menu bar (File, Edit, View, Go, Help) with its keyboard shortcut; right-click a file for the actions that apply to it (open, view, extract, export, replace, rename, delete, copy name/path).
 * **Double-click** opens folders, archives and texture dictionaries; models and textures open in their own **viewer window** (also Ctrl+Enter) with a details panel. Several viewers can be open at once, e.g. to compare models.
 * **Text editor:** double-click a text file (`.xml`, `.meta`, `.dat`, `.ini`, …) to open it in its own window — read-only until edit mode is unlocked; **Save** (Ctrl+S) writes it into the mods folder, can be undone, and keeps the file's encoding, line endings and tabs. Right-click → *Open with system app* opens a read-only copy in your default program.
+* **Clip dictionaries** (`.ycd`): selecting one shows what it animates (human, vehicle, animal) and a list of fitting models; click one — or double-click the file — to open it in the viewer with the animation playing.
+* **Overviews:** a texture dictionary previews up to 16 of its textures at once; a drawable dictionary that is not a ped shows all its objects side by side. Files that contain other files (texture dictionaries, audio containers) carry a badge on their icon.
+* **History** opens in its own window (View → *History in its own window* switches back to the list).
 * **Address bar** with clickable breadcrumbs like a file manager; click the free space (or Ctrl+L) to type a path.
 * The info panel shows metadata as a table (type, size, version, format, mip levels, meshes, triangles …).
 * **Keyboard:** arrow keys, Page Up/Down, Home/End and Enter in the list; Backspace or Alt+Up goes up; Ctrl+L address, Ctrl+F search, F2 rename, Delete, Ctrl+Z undo. Help → Keyboard shortcuts (F1) lists them all.
@@ -98,7 +101,8 @@ Double-click opens the model in a **viewer window** (rendered on the GPU via wgp
 
 * **Orbit** (drag, wheel) or **Fly** (F): W A S D to move, Q/E down/up, Shift faster, drag to look around.
 * **Parts:** grouped (body, wheels, ped components with their variants); show or hide groups or single parts.
-* **Animation:** peds and other skinned models play clips from clip dictionaries (`.ycd`): search for a dictionary (e.g. `move_m@generic`, suggested for peds), pick a clip, play/pause, scrub, speed, loop. Skinning runs on the GPU.
+* **Animation:** peds, vehicles (convertible roofs, doors, …) and props play clips from clip dictionaries (`.ycd`): search for a dictionary (e.g. `move_m@generic`, suggested for peds), pick a clip, play/pause, scrub, speed, loop. Skinned meshes, parts bound to bones and fragment parts (wheels) all follow the skeleton; skinning runs on the GPU.
+* **Orientation compass:** the game's X/Y/Z axes in red/green/blue; click a letter to look along that axis.
 * **Materials:** every shader with a readable name (primary paint, glass, tyres, interior, …); hide it or give it a colour — paint the car. Preview and glTF export follow.
 * **Export glTF…** writes a binary glTF 2.0 file (`.glb`) with one node per shown part and the textures embedded, which Blender and other tools open directly (Z-up is converted to glTF's Y-up).
 

@@ -520,9 +520,12 @@ pub fn read_drawable(res: &Resource, ptr: u64, enhanced: bool) -> Result<Drawabl
             let mut meshes = Vec::new();
             read_models(res, list, enhanced, &mut meshes)?;
             for (mut mesh, bone) in meshes {
-                if let Some(m) = bone.and_then(|b| world.get(b)) {
+                if let Some((b, m)) = bone.and_then(|b| Some((b, world.get(b)?))) {
                     mesh.positions.iter_mut().for_each(|p| *p = math::transform_point(m, *p));
                     mesh.normals.iter_mut().for_each(|n| *n = math::transform_dir(m, *n));
+                    // Fully bound to its bone, so animations move it.
+                    mesh.bone_indices = vec![[b as u16, 0, 0, 0]; mesh.positions.len()];
+                    mesh.bone_weights = vec![[1.0, 0.0, 0.0, 0.0]; mesh.positions.len()];
                 }
                 d.meshes.push(mesh);
             }
