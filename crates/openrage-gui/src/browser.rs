@@ -17,6 +17,8 @@ pub enum ItemKind {
     Resource,
     /// A texture inside an opened texture dictionary.
     Texture,
+    /// A sound inside an opened audio container.
+    Sound,
 }
 
 impl ItemKind {
@@ -90,6 +92,16 @@ pub enum Location {
     Textures {
         dict: Arc<rage_formats::ytd::TextureDictionary>,
     },
+    /// An opened audio container (`.awc`); items are its sounds (or its one
+    /// multi-channel stream).
+    Audio {
+        awc: Arc<rage_formats::awc::Awc>,
+    },
+}
+
+/// Whether a file name is an audio container that can be opened like a folder.
+pub fn is_audio(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".awc")
 }
 
 /// Whether a file name is a texture dictionary that can be opened like a folder.
@@ -197,8 +209,8 @@ pub fn list(
     };
     let (node, origin) = match resolve(&vpath) {
         Ok(found) => found,
-        // `…/name.ytd/texture`: open the dictionary and select the texture.
-        Err(RpfError::NotFound(_)) if parent(&vpath).is_some_and(|p| is_texture_dict(&p)) => {
+        // `…/name.ytd/texture` or `…/name.awc/sound`: open the container and select the item.
+        Err(RpfError::NotFound(_)) if parent(&vpath).is_some_and(|p| is_texture_dict(&p) || is_audio(&p)) => {
             let dict_path = parent(&vpath).unwrap_or_default();
             let (listing, _) = list(game_dir, &dict_path, keys, overlay)?;
             return Ok((listing, Some(last_segment(&vpath))));
@@ -210,6 +222,9 @@ pub fn list(
             if is_texture_dict(&rpf.entry(id).name) && rpf.entry(id).resource_version().is_some() =>
         {
             Ok((list_textures(vpath, rpf, id, origin)?, None))
+        }
+        Node::ArchiveFile(rpf, id) if is_audio(&rpf.entry(id).name) => {
+            Ok((list_audio(vpath, rpf, id, origin, keys.as_deref())?, None))
         }
         Node::Dir(dir) => {
             let mut listing = list_disk(vpath, dir, origin)?;
@@ -277,6 +292,56 @@ fn list_textures(vpath: String, rpf: Arc<Rpf7>, id: EntryId, origin: Origin) -> 
         })
         .collect();
     Ok(Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict) }, items })
+}
+
+fn list_audio(
+    vpath: String,
+    rpf: Arc<Rpf7>,
+    id: EntryId,
+    origin: Origin,
+    keys: Option<&GtaVKeys>,
+) -> Result<Listing, RpfError> {
+    let data = rpf.read(id)?;
+    let awc = openrage_app::audio::parse(data, keys)
+        .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
+    let item = |name: String, size: u64, info: String| Item {
+        name,
+        kind: ItemKind::Sound,
+        size,
+        info,
+        entry: None,
+        vpath: None,
+        mark: None,
+        detail: None,
+    };
+    let items = match &awc.stream_format {
+        Some(f) => {
+            let secs = awc.sounds.first().map_or(0.0, |s| s.duration_secs());
+            let size = awc.chunk(0, rage_formats::awc::CHUNK_DATA).map_or(0, |c| c.size as u64);
+            vec![item(
+                format!("{} (stream)", last_segment(&vpath).trim_end_matches(".awc")),
+                size,
+                format!("{} · {} ch", seconds(secs), f.channels),
+            )]
+        }
+        None => awc
+            .sounds
+            .iter()
+            .map(|s| {
+                let stream = awc.streams.iter().position(|(sid, _)| *sid == s.id);
+                let size =
+                    stream.and_then(|i| awc.chunk(i, rage_formats::awc::CHUNK_DATA)).map_or(0, |c| c.size as u64);
+                item(format!("{:08x}", s.id), size, seconds(s.duration_secs()))
+            })
+            .collect(),
+    };
+    Ok(Listing { vpath, origin, location: Location::Audio { awc: Arc::new(awc) }, items })
+}
+
+/// `83.4` → `1:23.4`.
+pub fn seconds(secs: f32) -> String {
+    let m = (secs / 60.0).floor() as u32;
+    format!("{m}:{:04.1}", secs - m as f32 * 60.0)
 }
 
 fn list_disk(vpath: String, dir: PathBuf, origin: Origin) -> Result<Listing, RpfError> {

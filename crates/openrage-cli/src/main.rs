@@ -82,6 +82,9 @@ enum Command {
         /// Instead of archives, parse every model (.ydr, .yft, .ydd).
         #[arg(long, conflicts_with = "textures")]
         models: bool,
+        /// Instead of archives, decode every sound of every audio container (.awc).
+        #[arg(long, conflicts_with_all = ["textures", "models"])]
+        audio: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
         #[arg(long, requires = "textures")]
         rebuild: bool,
@@ -99,6 +102,14 @@ enum Command {
         /// Camera angle around the model for --render, in degrees.
         #[arg(long, default_value_t = -130.0, allow_hyphen_values = true)]
         yaw: f32,
+    },
+    /// List the sounds of an audio container (.awc) and optionally export them as WAV.
+    Audio {
+        /// Virtual path of the .awc file.
+        path: String,
+        /// Export every sound into this folder as .wav.
+        #[arg(long)]
+        export: Option<PathBuf>,
     },
     /// List the textures of a texture dictionary (.ytd) and optionally export them.
     Textures {
@@ -237,6 +248,7 @@ fn run() -> Result<()> {
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
+        Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
         Command::Verify { path, textures: true, rebuild, .. } => cmd_verify_textures(&game_dir, &path, rebuild, keys),
         Command::Textures { path, sets, removes, .. } if !sets.is_empty() || !removes.is_empty() => {
@@ -247,6 +259,7 @@ fn run() -> Result<()> {
         Command::Model { path, export, render, yaw } => {
             cmd_model(&game_dir, &path, export.as_deref(), render.as_deref(), yaw, keys)
         }
+        Command::Audio { path, export } => cmd_audio(&game_dir, &path, export.as_deref(), keys),
         Command::Put { file, target } => cmd_put(&game_dir, &file, &target, keys),
         Command::Rm { path } => cmd_edit(&game_dir, &path, Op::Remove, &format!("Removed {path}"), keys),
         Command::Mv { from, to } => cmd_mv(&game_dir, &from, &to, keys),
@@ -874,6 +887,139 @@ fn cmd_model(
         let ms = started.elapsed().as_millis();
         fs::write(out, rage_formats::png(960, 600, &rgba)?)?;
         outln!("Rendered {} in {ms} ms", out.display());
+    }
+    Ok(())
+}
+
+fn cmd_audio(game_dir: &Path, path: &str, export: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let awc = openrage_app::audio::load(game_dir, keys, path)?;
+    outln!("flags {:#06x}, {} streams{}", awc.flags, awc.streams.len(), if awc.encrypted { ", encrypted" } else { "" });
+    if let Some(f) = &awc.stream_format {
+        outln!(
+            "multi-channel stream: {} channels, {} blocks of {}",
+            f.channels,
+            f.block_count,
+            human(f.block_size as u64)
+        );
+    }
+    for s in &awc.sounds {
+        outln!(
+            "  {:08x}  {:>8.2}s  {:>6} Hz  {}{}",
+            s.id,
+            s.duration_secs(),
+            s.sample_rate,
+            s.codec.name(),
+            s.channel.map(|c| format!("  channel {c}")).unwrap_or_default()
+        );
+    }
+    for (i, (id, chunks)) in awc.streams.iter().enumerate().take(4) {
+        for c in chunks {
+            let head = &awc.data[c.offset..(c.offset + 32).min(c.offset + c.size)];
+            outln!("  stream {i} {id:08x} chunk {:02x} {:>8} @ {:>8}: {}", c.kind, c.size, c.offset, hex(head));
+        }
+    }
+    if let Some(dir) = export {
+        fs::create_dir_all(dir)?;
+        let stem = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".awc");
+        let started = Instant::now();
+        if awc.stream_format.is_some() {
+            let pcm = awc.decode_stream()?;
+            let out = dir.join(format!("{stem}.wav"));
+            fs::write(&out, pcm.to_wav())?;
+            outln!("Wrote {} ({:.1}s, {} channels)", out.display(), pcm.duration_secs(), pcm.channels);
+        } else {
+            for (i, s) in awc.sounds.iter().enumerate() {
+                let pcm = awc.decode_sound(i)?;
+                let out = dir.join(format!("{stem}_{:08x}.wav", s.id));
+                fs::write(&out, pcm.to_wav())?;
+                outln!("Wrote {} ({:.2}s)", out.display(), pcm.duration_secs());
+            }
+        }
+        outln!("in {} ms", started.elapsed().as_millis());
+    }
+    Ok(())
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+fn cmd_verify_audio(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let starts = archive_roots(game_dir, within, keys.clone())?;
+    let started = Instant::now();
+    // (containers, sounds, seconds, encrypted, not audio, errors)
+    let all: Vec<(usize, usize, f64, usize, usize, Vec<String>)> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let (mut files, mut sounds, mut secs, mut encrypted, mut errors) = (0, 0, 0f64, 0, Vec::new());
+            let mut not_audio = 0usize;
+            let mut nested = Vec::new();
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    if !openrage_app::audio::is_audio(&a.entry(id).name) {
+                        return;
+                    }
+                    files += 1;
+                    let result = a
+                        .read(id)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|d| openrage_app::audio::parse(d, keys.as_deref()))
+                        .and_then(|awc| {
+                            if awc.encrypted || awc.flags & 0xA != 0 {
+                                encrypted += 1;
+                            }
+                            let pcms = if awc.stream_format.is_some() {
+                                vec![awc.decode_stream()?]
+                            } else {
+                                (0..awc.sounds.len()).map(|i| awc.decode_sound(i)).collect::<Result<Vec<_>, _>>()?
+                            };
+                            Ok(pcms)
+                        });
+                    match result {
+                        Ok(pcms) => {
+                            sounds += pcms.len();
+                            secs += pcms.iter().map(|p| p.duration_secs() as f64).sum::<f64>();
+                        }
+                        // A few files only share the extension (e.g. shader caches).
+                        Err(e)
+                            if matches!(
+                                e.downcast_ref::<rage_formats::awc::AwcError>(),
+                                Some(rage_formats::awc::AwcError::NotAwc)
+                            ) =>
+                        {
+                            files -= 1;
+                            not_audio += 1;
+                        }
+                        Err(e) => errors.push(format!("{p}: {e:#}")),
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (files, sounds, secs, encrypted, not_audio, errors)
+        })
+        .collect();
+    let files: usize = all.iter().map(|x| x.0).sum();
+    let sounds: usize = all.iter().map(|x| x.1).sum();
+    let secs: f64 = all.iter().map(|x| x.2).sum();
+    let encrypted: usize = all.iter().map(|x| x.3).sum();
+    let not_audio: usize = all.iter().map(|x| x.4).sum();
+    let errors: Vec<&String> = all.iter().flat_map(|x| &x.5).collect();
+    for e in errors.iter().take(40) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{files} audio containers ({encrypted} encrypted, {not_audio} other .awc files skipped), {sounds} sounds, {:.1} hours of audio, {} errors ({:.1}s)",
+        secs / 3600.0,
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() {
+        bail!("{} errors", errors.len());
     }
     Ok(())
 }

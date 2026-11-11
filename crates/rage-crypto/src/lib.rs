@@ -11,6 +11,7 @@ mod keys;
 mod magic;
 mod ng;
 mod scan;
+pub mod xxtea;
 
 pub use aes_ecb::{decrypt_aes, encrypt_aes};
 pub use keys::{GtaVKeys, KeyCacheError};
