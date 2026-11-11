@@ -24,16 +24,16 @@
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     color-scheme: dark;
-    --bg: #111317;
-    --bg-alt: #171a1f;
-    --surface: #1c2027;
-    --text: #e8eaee;
-    --text-muted: #a3aab5;
-    --border: #2e333c;
+    --bg: #0f0f10;
+    --bg-alt: #161617;
+    --surface: #1d1d1f;
+    --text: #ececec;
+    --text-muted: #a9a9ad;
+    --border: #2f2f32;
     --accent: #fb923c;
     --accent-hover: #fdba74;
     --accent-text: #1a1206;
-    --code-bg: #242931;
+    --code-bg: #262628;
     --ok: #4ade80;
     --planned: #9ca3af;
     --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 8px 24px rgb(0 0 0 / 0.35);
@@ -42,16 +42,16 @@
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #111317;
-  --bg-alt: #171a1f;
-  --surface: #1c2027;
-  --text: #e8eaee;
-  --text-muted: #a3aab5;
-  --border: #2e333c;
+  --bg: #0f0f10;
+  --bg-alt: #161617;
+  --surface: #1d1d1f;
+  --text: #ececec;
+  --text-muted: #a9a9ad;
+  --border: #2f2f32;
   --accent: #fb923c;
   --accent-hover: #fdba74;
   --accent-text: #1a1206;
-  --code-bg: #242931;
+  --code-bg: #262628;
   --ok: #4ade80;
   --planned: #9ca3af;
   --shadow: 0 1px 2px rgb(0 0 0 / 0.4), 0 8px 24px rgb(0 0 0 / 0.35);
@@ -483,7 +483,7 @@ a.zoom { display: block; cursor: zoom-in; color: inherit; }
   box-shadow: 0 20px 60px rgb(0 0 0 / 0.45);
   overflow: hidden;
 }
-.lightbox::backdrop { background: rgb(8 10 14 / 0.75); backdrop-filter: blur(4px); }
+.lightbox::backdrop { background: rgb(8 8 8 / 0.78); backdrop-filter: blur(4px); }
 .lightbox figure { margin: 0; }
 .lightbox img { max-width: 100%; max-height: calc(94vh - 3.5rem); width: auto; margin: 0 auto; cursor: zoom-out; }
 .lightbox figcaption { padding: 0.7rem 3.2rem 0.8rem 1rem; font-size: 0.95rem; color: var(--text-muted); }
