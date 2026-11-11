@@ -316,15 +316,30 @@ component FileItem inherits Rectangle {
                 name: item.icon;
                 tint: item.tint;
             }
-            Text {
-                text: item.name;
-                vertical-alignment: center;
-                overflow: elide;
+            HorizontalLayout {
                 horizontal-stretch: 1;
                 min-width: 80px;
                 preferred-width: 100px;
                 max-width: 100000px;
-                color: root.fg;
+                spacing: Theme.space-xs;
+                Text {
+                    horizontal-stretch: 1;
+                    text: item.name;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    color: root.fg;
+                }
+                // Files that open like folders (texture dictionaries, audio containers).
+                if item.can-open && item.icon != "folder" && item.icon != "archive": Text {
+                    text: "›";
+                    vertical-alignment: center;
+                    font-weight: 700;
+                    color: selected && focused ? Theme.selection-text : Theme.accent;
+                    accessible-role: none;
+                    Tooltip {
+                        text: @markdown("\{@tr("Double-click to open its contents")}");
+                    }
+                }
             }
             Rectangle {
                 // Fixed type column, or a stretching location column for search results.
@@ -561,6 +576,8 @@ export component AppWindow inherits Window {
     in property <bool> model-mode;
     // Sound preview: waveform in the preview area, player controls above it.
     in property <bool> audio-mode;
+    // The preview image is a texture or picture (not a waveform), so it can open in the viewer.
+    in property <bool> image-viewable;
     in property <bool> audio-playing;
     in property <float> audio-position;
     in property <string> audio-time;
@@ -675,7 +692,7 @@ export component AppWindow inherits Window {
     property <length> tree-width: 260px;
     property <length> preview-width: 460px;
     property <bool> has-selection: root.file-selected >= 0;
-    property <bool> can-view: (root.model-mode || root.has-image) && !root.audio-mode;
+    property <bool> can-view: (root.model-mode || (root.has-image && root.image-viewable)) && !root.audio-mode;
     property <bool> can-edit: root.edit-mode && !root.busy;
 
     function apply-theme() {

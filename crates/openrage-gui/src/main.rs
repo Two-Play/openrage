@@ -197,6 +197,15 @@ fn debug_snapshot(ui: &AppWindow) {
         if std::env::var("OPENRAGE_EDIT").is_ok() {
             ui.set_edit_mode(true);
         }
+        if let Ok(name) = std::env::var("OPENRAGE_SELECT") {
+            let row = with_app(|a| {
+                let l = a.listing.as_ref()?;
+                a.visible.iter().position(|&i| l.items[i].name.eq_ignore_ascii_case(&name))
+            });
+            if let Some(row) = row {
+                select_row(&ui, row);
+            }
+        }
         if let Ok(path) = std::env::var("OPENRAGE_EDITOR") {
             open_editor(&ui, path);
         }
@@ -291,7 +300,16 @@ fn wire_callbacks(ui: &AppWindow) {
         })
     });
     let w = ui.as_weak();
-    ui.on_file_select(move |i| with_ui(&w, |ui| select_row(ui, i as usize)));
+    ui.on_file_select(move |i| {
+        with_ui(&w, |ui| {
+            // A click on the selected row (e.g. the first click of a
+            // double-click) must not reload its preview.
+            if ui.get_file_selected() == i && with_app(|a| a.selected.is_some()) {
+                return;
+            }
+            select_row(ui, i as usize)
+        })
+    });
     let w = ui.as_weak();
     ui.on_file_open(move |i| {
         with_ui(&w, |ui| {
@@ -1132,6 +1150,7 @@ fn select_row(ui: &AppWindow, row: usize) {
     };
     ui.set_file_selected(row as i32);
     with_app(|a| a.pending_viewer = false);
+    ui.set_image_viewable(is_viewable(&item));
     ui.set_can_extract(true);
     ui.set_texture_selected(item.kind == ItemKind::Texture);
     if with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::History))) {
@@ -1248,6 +1267,13 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, St
             }
             None => (Meta::new(), String::new(), None),
         },
+        PreviewSource::Entry(rpf, id) if browser::is_audio(&rpf.entry(id).name) => {
+            match rpf.read(id).map_err(anyhow::Error::from).and_then(|d| openrage_app::audio::parse(d, keys.as_deref()))
+            {
+                Ok(awc) => audio_container_preview(&awc),
+                Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new(), None),
+            }
+        }
         PreviewSource::Entry(rpf, id) if browser::is_texture_dict(&rpf.entry(id).name) => {
             match rpf
                 .read_resource(id)
@@ -1272,6 +1298,32 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, St
             (meta, body, None)
         }
     }
+}
+
+/// Summary of an audio container with the waveform of its first sound.
+fn audio_container_preview(awc: &rage_formats::awc::Awc) -> (Meta, String, Option<Rgba>) {
+    let codec = awc.sounds.first().map(|s| s.codec.name().replace("codec 7", "MPEG audio")).unwrap_or_default();
+    let mut meta = match &awc.stream_format {
+        Some(f) => vec![
+            kv("Contains", format!("one stream with {} channels", f.channels)),
+            kv("Duration", browser::seconds(awc.sounds.first().map_or(0.0, |s| s.duration_secs()))),
+        ],
+        None => vec![
+            kv("Contains", format!("{} sounds", awc.sounds.len())),
+            kv("Total length", browser::seconds(awc.sounds.iter().map(|s| s.duration_secs()).sum())),
+        ],
+    };
+    meta.push(kv("Codec", codec));
+    if awc.encrypted || awc.flags & 0xA != 0 {
+        meta.push(kv("Encrypted", "yes"));
+    }
+    meta.push(note("Double-click to open the container and play its sounds."));
+    let first = if awc.stream_format.is_some() { awc.decode_stream() } else { awc.decode_sound(0) };
+    let image = first.ok().map(|pcm| {
+        let (w, h) = (960, 320);
+        (w as u32, h as u32, audio::waveform(&pcm, w, h, [0x3b, 0x82, 0xf6]))
+    });
+    (meta, String::new(), image)
 }
 
 /// Returns (metadata, preview body).
