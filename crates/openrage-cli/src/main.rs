@@ -107,6 +107,9 @@ enum Command {
         /// Instead of archives, disassemble every script (.ysc) and check every jump.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths"])]
         scripts: bool,
+        /// Instead of archives, read the header of every Scaleform movie (.gfx) and Bink video (.bik).
+        #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths", "scripts"])]
+        media: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
         #[arg(long, requires = "textures")]
         rebuild: bool,
@@ -122,6 +125,8 @@ enum Command {
         #[arg(long, conflicts_with = "out")]
         tree: bool,
     },
+    /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
+    Media { path: String },
     /// Disassemble a script (.ysc): functions, jumps, strings and native calls.
     Script {
         /// Virtual path of the .ysc.
@@ -317,6 +322,7 @@ fn run() -> Result<()> {
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
+        Command::Verify { path, media: true, .. } => cmd_verify_media(&game_dir, &path, keys),
         Command::Verify { path, scripts: true, .. } => cmd_verify_scripts(&game_dir, &path, keys),
         Command::Verify { path, paths: true, .. } => cmd_verify_paths(&game_dir, &path, keys),
         Command::Verify { path, collisions: true, .. } => cmd_verify_collisions(&game_dir, &path, keys),
@@ -335,6 +341,7 @@ fn run() -> Result<()> {
             cmd_model(&game_dir, &path, export.as_deref(), render.as_deref(), yaw, anim.as_deref(), keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
+        Command::Media { path } => cmd_media(&game_dir, &path, keys),
         Command::Script { path, out, strings } => cmd_script(&game_dir, &path, out.as_deref(), strings, keys),
         Command::Particles { path } => cmd_particles(&game_dir, &path, keys),
         Command::Text { path, out } => cmd_text(&game_dir, &path, out.as_deref(), keys),
@@ -1156,6 +1163,84 @@ fn cmd_xml(game_dir: &Path, path: &str, out: Option<&Path>, tree: bool, keys: Op
             );
         }
         None => print!("{}", xml.text),
+    }
+    Ok(())
+}
+
+fn cmd_media(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
+    let data = match node {
+        Node::ArchiveFile(rpf, id) => rpf.read(id)?,
+        Node::PlainFile(p) => fs::read(p)?,
+        _ => bail!("{path} is not a file"),
+    };
+    for (k, v) in openrage_app::media::rows(path, &data)? {
+        outln!("{k:<14}{v}");
+    }
+    Ok(())
+}
+
+fn cmd_verify_media(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    use rage_formats::media;
+    let starts = archive_roots(game_dir, within, keys)?;
+    let started = Instant::now();
+    type Counts = (usize, usize, f32, usize);
+    let all: Vec<(Counts, Vec<String>)> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let mut c: Counts = (0, 0, 0.0, 0);
+            let (mut errors, mut nested) = (Vec::new(), Vec::new());
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    let name = a.entry(id).name.to_ascii_lowercase();
+                    if !media::is_media(&name) {
+                        return;
+                    }
+                    let result = a.read(id).map_err(anyhow::Error::from).and_then(|d| {
+                        if name.ends_with(".bik") {
+                            let b = media::bink(&d)?;
+                            c.1 += 1;
+                            c.2 += b.duration();
+                        } else {
+                            let g = media::gfx(&d)?;
+                            c.0 += 1;
+                            c.3 += g.exports.len();
+                        }
+                        Ok(())
+                    });
+                    if let Err(e) = result {
+                        errors.push(format!("{p}: {e:#}"));
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (c, errors)
+        })
+        .collect();
+    let mut t: Counts = (0, 0, 0.0, 0);
+    for (c, _) in &all {
+        t = (t.0 + c.0, t.1 + c.1, t.2 + c.2, t.3 + c.3);
+    }
+    let errors: Vec<&String> = all.iter().flat_map(|x| &x.1).collect();
+    for e in errors.iter().take(30) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} Scaleform movies ({} exported symbols), {} Bink videos ({:.1} min); {} errors ({:.1}s)",
+        t.0,
+        t.3,
+        t.1,
+        t.2 / 60.0,
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() {
+        bail!("{} errors", errors.len());
     }
     Ok(())
 }

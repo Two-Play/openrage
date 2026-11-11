@@ -13,6 +13,7 @@ pub mod geometry;
 pub mod gltf;
 pub mod gxt2;
 pub mod math;
+pub mod media;
 pub mod meta;
 pub mod names;
 pub mod paths;

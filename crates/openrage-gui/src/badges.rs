@@ -73,6 +73,8 @@ pub fn type_name(name: &str, kind: ItemKind) -> String {
         "ysc" => "Script",
         "awc" => "Audio container",
         "gxt2" => "Text table",
+        "gfx" => "Scaleform movie",
+        "bik" => "Bink video",
         "nametable" => "Name table",
         "ugc" => "UGC (JSON)",
         "xml" => "XML",
