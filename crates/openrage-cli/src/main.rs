@@ -136,6 +136,13 @@ enum Command {
     },
     /// Import native names for script disassembly from a NativeDB-style natives.json.
     Natives { file: PathBuf },
+    /// Inspect Red Dead Redemption 2 archives (RPF8): a file or every .rpf in a folder.
+    Rpf8 {
+        path: PathBuf,
+        /// List the entries of archives whose table is not encrypted.
+        #[arg(long)]
+        list: bool,
+    },
     /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
     Media {
         path: String,
@@ -324,6 +331,10 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    if let Command::Rpf8 { path, list } = &cli.command {
+        return cmd_rpf8(path, *list);
+    }
+
     let game_dir = game_dir.context("no game directory configured; run `openrage --game <DIR> keys` first")?;
     let keys = openrage_app::load_keys().unwrap_or_else(|e| {
         eprintln!("warning: {e}");
@@ -331,7 +342,7 @@ fn run() -> Result<()> {
     });
 
     match cli.command {
-        Command::Keys { .. } => unreachable!(),
+        Command::Keys { .. } | Command::Rpf8 { .. } => unreachable!(),
         Command::Ls { path, recursive } => cmd_ls(&game_dir, &path, recursive, keys),
         Command::Info { path } => cmd_info(&game_dir, &path, keys),
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
@@ -2239,4 +2250,85 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(p);
         }
     }
+}
+
+fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
+    use rage_rpf::rpf8::{Compression, Rpf8};
+    fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for e in std::fs::read_dir(dir)? {
+            let p = e?.path();
+            if p.is_dir() {
+                collect(&p, out)?;
+            } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rpf")) {
+                out.push(p);
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    if path.is_dir() {
+        collect(path, &mut files)?;
+        files.sort();
+    } else {
+        files.push(path.to_path_buf());
+    }
+    let (mut ok, mut plain, mut entries_total, mut failed, mut empty) = (0, 0, 0usize, 0, 0);
+    for file in &files {
+        let name =
+            file.strip_prefix(path).ok().filter(|p| !p.as_os_str().is_empty()).unwrap_or(file).display().to_string();
+        if file.metadata().is_ok_and(|m| m.len() == 0) {
+            empty += 1;
+            outln!("{name}: empty file");
+            continue;
+        }
+        match Rpf8::open(file) {
+            Ok(rpf) => {
+                ok += 1;
+                let h = rpf.header();
+                let table = if h.is_encrypted() {
+                    format!("encrypted (key {})", h.decryption_tag)
+                } else {
+                    "plaintext".to_string()
+                };
+                outln!(
+                    "{name}: {} entries, table {table}, platform '{}', {} bytes",
+                    h.entry_count,
+                    h.platform,
+                    rpf.size()
+                );
+                if let Some(entries) = rpf.entries() {
+                    plain += 1;
+                    entries_total += entries.len();
+                    for e in entries {
+                        if let Err(err) = rpf.read(e) {
+                            failed += 1;
+                            outln!("  {}: {err}", e.display_name(h.platform));
+                        }
+                        if !list {
+                            continue;
+                        }
+                        let comp = match e.compression {
+                            Compression::None => "",
+                            Compression::Deflate => " deflate",
+                            Compression::Oodle => " oodle",
+                            Compression::Unknown(_) => " ?",
+                        };
+                        let enc = if e.is_encrypted() { " encrypted" } else { "" };
+                        outln!("  {:<60} {:>10}{comp}{enc}", e.display_name(h.platform), e.size());
+                    }
+                }
+            }
+            Err(e) => {
+                failed += 1;
+                outln!("{name}: {e}");
+            }
+        }
+    }
+    outln!(
+        "\n{ok} archives read, {empty} empty, {failed} failed; {plain} with a plaintext table ({entries_total} entries). Encrypted tables need keys from the running game, which OpenRAGE cannot read yet."
+    );
+    if failed > 0 {
+        bail!("{failed} archives or entries could not be read");
+    }
+    Ok(())
 }

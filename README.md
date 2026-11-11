@@ -94,7 +94,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 |---|---|---|
 | **GTA V** (Legacy & Enhanced) | ✅ RPF7 read, incl. nested archives; edit in place in the mods folder, with undo | ✅ textures · models · audio · animations · metadata · text tables |
 | **GTA IV** | 🔜 planned (RPF3) | – |
-| **Red Dead Redemption 2** | 🔜 planned (RPF8) | – |
+| **Red Dead Redemption 2** | 🚧 RPF8: headers of all archives; tables only where not encrypted (keys needed, see below) | – |
 
 Every format is checked against the complete game (GTA V Enhanced):
 
@@ -135,6 +135,8 @@ Every format is checked against the complete game (GTA V Enhanced):
 - [x] Whole cutscenes in one scene (all actors, cutscene camera)
 - [ ] GTA IV
 - [ ] Red Dead Redemption 2
+
+**Red Dead Redemption 2:** `openrage rpf8 <game folder>` reads the header of every archive. Only `shaders_x64.rpf` opens fully; the other archives encrypt their tables and most files with keys that, unlike GTA V's, are not stored in the game's executable on disk but exist only while the game runs. How OpenRAGE will get them (from a key file you provide, or from a memory dump of your own running game) is still open, and OpenRAGE will never ship them. Compressed files use Oodle, for which an open-source decoder is still to be added.
 
 ## Installation
 
