@@ -147,6 +147,12 @@ With the keys, `openrage rpf8 <game folder>` opens all 89 archives and reads all
 
 ## Installation
 
+### Download
+
+Ready-made builds for Linux (x86-64, glibc 2.35 or newer) and Windows (x86-64) are on the [releases page](https://github.com/Two-Play/openrage/releases): unpack the archive and run `openrage-gui` (or `openrage` for the command line). `SHA256SUMS.txt` lists the checksums of the archives.
+
+Releases are made by pushing a version tag (`git tag v0.2.0 && git push origin v0.2.0`, matching the version in `Cargo.toml`); the *Release* workflow builds both systems and publishes the release. It can also be run by hand from the Actions tab to build the archives without publishing.
+
 ### Build from source
 
 Requires a recent stable Rust toolchain (the exact version is pinned in `rust-toolchain.toml`; rustup picks it up automatically). On Linux the GUI also needs the development packages of fontconfig, xkbcommon, Wayland and ALSA (audio output):
