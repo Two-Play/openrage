@@ -17,6 +17,7 @@
 use rage_resource::{Resource, ResourceError};
 
 use crate::drawable::{Drawable, Mesh, Shader};
+use crate::geometry::{Builder, add, scale, sub};
 use crate::math::{self, Mat4};
 
 pub mod kind {
@@ -45,136 +46,6 @@ pub struct Stats {
     pub materials: Vec<u8>,
 }
 
-/// Collects triangles per material type.
-#[derive(Default)]
-struct Builder {
-    meshes: Vec<(u8, Mesh)>,
-    stats: Stats,
-}
-
-impl Builder {
-    fn mesh(&mut self, material: u8) -> &mut Mesh {
-        let i = match self.meshes.iter().position(|(m, _)| *m == material) {
-            Some(i) => i,
-            None => {
-                self.meshes.push((material, Mesh::default()));
-                if !self.stats.materials.contains(&material) {
-                    self.stats.materials.push(material);
-                }
-                self.meshes.len() - 1
-            }
-        };
-        &mut self.meshes[i].1
-    }
-
-    /// Adds a triangle with a flat normal.
-    fn triangle(&mut self, material: u8, m: &Mat4, p: [[f32; 3]; 3]) {
-        let p = p.map(|v| math::transform_point(m, v));
-        let (u, v) = (sub(p[1], p[0]), sub(p[2], p[0]));
-        let n = normalize(cross(u, v));
-        if !n.iter().all(|c| c.is_finite()) {
-            return;
-        }
-        let mesh = self.mesh(material);
-        let base = mesh.positions.len() as u32;
-        for q in p {
-            mesh.positions.push(q);
-            mesh.normals.push(n);
-        }
-        mesh.indices.extend([base, base + 1, base + 2]);
-    }
-
-    fn quad(&mut self, material: u8, m: &Mat4, a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]) {
-        self.triangle(material, m, [a, b, c]);
-        self.triangle(material, m, [a, c, d]);
-    }
-
-    /// A box from its centre and three half axes.
-    fn cuboid(&mut self, material: u8, m: &Mat4, c: [f32; 3], ax: [[f32; 3]; 3]) {
-        self.stats.primitives += 1;
-        let corner = |sx: f32, sy: f32, sz: f32| add(c, add(scale(ax[0], sx), add(scale(ax[1], sy), scale(ax[2], sz))));
-        let v = [
-            corner(-1.0, -1.0, -1.0),
-            corner(1.0, -1.0, -1.0),
-            corner(1.0, 1.0, -1.0),
-            corner(-1.0, 1.0, -1.0),
-            corner(-1.0, -1.0, 1.0),
-            corner(1.0, -1.0, 1.0),
-            corner(1.0, 1.0, 1.0),
-            corner(-1.0, 1.0, 1.0),
-        ];
-        // Faces wound outwards for a right-handed set of axes; flip otherwise.
-        let flip = dot(cross(ax[0], ax[1]), ax[2]) < 0.0;
-        let faces = [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [2, 3, 7, 6], [1, 2, 6, 5], [0, 4, 7, 3]];
-        for f in faces {
-            let [a, b, c2, d] = f.map(|i| v[i]);
-            if flip { self.quad(material, m, a, d, c2, b) } else { self.quad(material, m, a, b, c2, d) }
-        }
-    }
-
-    /// A sphere (`a == b`), capsule or cylinder between two points.
-    fn round(&mut self, material: u8, m: &Mat4, a: [f32; 3], b: [f32; 3], r: f32, caps: bool) {
-        self.stats.primitives += 1;
-        if !(r.is_finite() && r > 0.0) {
-            return;
-        }
-        const SEG: usize = 16;
-        const RINGS: usize = 6;
-        let axis = sub(b, a);
-        let len = dot(axis, axis).sqrt();
-        let w = if len > 1e-6 { scale(axis, 1.0 / len) } else { [0.0, 0.0, 1.0] };
-        let helper = if w[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] };
-        let u = normalize(cross(helper, w));
-        let v = cross(w, u);
-        let at = |centre: [f32; 3], theta: f32, phi: f32| {
-            // phi: angle from the equator towards +w.
-            let (s, c) = theta.sin_cos();
-            let ring = add(scale(u, c * phi.cos() * r), scale(v, s * phi.cos() * r));
-            add(centre, add(ring, scale(w, phi.sin() * r)))
-        };
-        let tau = std::f32::consts::TAU;
-        let half = std::f32::consts::FRAC_PI_2;
-        for i in 0..SEG {
-            let (t0, t1) = (tau * i as f32 / SEG as f32, tau * (i + 1) as f32 / SEG as f32);
-            if len > 1e-6 {
-                self.quad(material, m, at(a, t0, 0.0), at(a, t1, 0.0), at(b, t1, 0.0), at(b, t0, 0.0));
-            }
-            if caps {
-                // Hemisphere at b (towards +w) and at a (towards -w).
-                for k in 0..RINGS {
-                    let (p0, p1) = (half * k as f32 / RINGS as f32, half * (k + 1) as f32 / RINGS as f32);
-                    self.quad(material, m, at(b, t0, p0), at(b, t1, p0), at(b, t1, p1), at(b, t0, p1));
-                    self.quad(material, m, at(a, t0, -p1), at(a, t1, -p1), at(a, t1, -p0), at(a, t0, -p0));
-                }
-            } else {
-                // Flat ends.
-                self.triangle(material, m, [b, at(b, t0, 0.0), at(b, t1, 0.0)]);
-                self.triangle(material, m, [a, at(a, t1, 0.0), at(a, t0, 0.0)]);
-            }
-        }
-    }
-}
-
-fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-fn scale(a: [f32; 3], s: f32) -> [f32; 3] {
-    [a[0] * s, a[1] * s, a[2] * s]
-}
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
-fn normalize(a: [f32; 3]) -> [f32; 3] {
-    let l = dot(a, a).sqrt();
-    scale(a, 1.0 / l)
-}
-
 fn vec3(res: &Resource, at: u64) -> Result<[f32; 3], ResourceError> {
     let b = res.bytes(at, 12)?;
     Ok([0, 4, 8].map(|o| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])))
@@ -184,11 +55,18 @@ fn f32_at(res: &Resource, at: u64) -> Result<f32, ResourceError> {
     Ok(f32::from_bits(res.u32(at)?))
 }
 
-fn bound(res: &Resource, at: u64, m: &Mat4, b: &mut Builder, depth: usize) -> Result<(), ResourceError> {
+fn bound(
+    res: &Resource,
+    at: u64,
+    m: &Mat4,
+    b: &mut Builder,
+    stats: &mut Stats,
+    depth: usize,
+) -> Result<(), ResourceError> {
     if depth > 8 {
         return Err(ResourceError::Format("bounds nested too deeply".into()));
     }
-    b.stats.bounds += 1;
+    stats.bounds += 1;
     let kind = res.u8(at + 0x10)?;
     let material = res.u8(at + 0x4C)?;
     match kind {
@@ -210,10 +88,10 @@ fn bound(res: &Resource, at: u64, m: &Mat4, b: &mut Builder, depth: usize) -> Re
                     // The w components hold other data.
                     (t[3], t[7], t[11], t[15]) = (0.0, 0.0, 0.0, 1.0);
                 }
-                bound(res, child, &math::mul(m, &t), b, depth + 1)?;
+                bound(res, child, &math::mul(m, &t), b, stats, depth + 1)?;
             }
         }
-        kind::GEOMETRY | kind::BVH => geometry(res, at, m, b)?,
+        kind::GEOMETRY | kind::BVH => geometry(res, at, m, b, stats)?,
         kind::SPHERE => {
             let c = vec3(res, at + 0x50)?;
             b.round(material, m, c, c, f32_at(res, at + 0x14)?, true);
@@ -247,7 +125,7 @@ fn bound(res: &Resource, at: u64, m: &Mat4, b: &mut Builder, depth: usize) -> Re
     Ok(())
 }
 
-fn geometry(res: &Resource, at: u64, m: &Mat4, b: &mut Builder) -> Result<(), ResourceError> {
+fn geometry(res: &Resource, at: u64, m: &Mat4, b: &mut Builder, stats: &mut Stats) -> Result<(), ResourceError> {
     let polys = res.u64(at + 0x88)?;
     let quantum = vec3(res, at + 0x90)?;
     let centre = vec3(res, at + 0xA0)?;
@@ -262,7 +140,7 @@ fn geometry(res: &Resource, at: u64, m: &Mat4, b: &mut Builder) -> Result<(), Re
             "implausible geometry: {vert_count} vertices, {poly_count} polygons"
         )));
     }
-    b.stats.vertices += vert_count as usize;
+    stats.vertices += vert_count as usize;
     let raw = if vert_count > 0 { res.bytes(verts_at, vert_count as usize * 6)? } else { &[][..] };
     let verts: Vec<[f32; 3]> = raw
         .as_chunks::<6>()
@@ -288,7 +166,7 @@ fn geometry(res: &Resource, at: u64, m: &Mat4, b: &mut Builder) -> Result<(), Re
             0 => {
                 if let (Some(a), Some(c), Some(d)) = (vert(u16_at(p, 4)), vert(u16_at(p, 6)), vert(u16_at(p, 8))) {
                     b.triangle(material, m, [a, c, d]);
-                    b.stats.triangles += 1;
+                    stats.triangles += 1;
                 }
             }
             1 => {
@@ -327,9 +205,12 @@ pub fn parse(res: &Resource) -> Result<(Drawable, Stats), ResourceError> {
 /// Reads bounds located at `at` (e.g. those embedded in a model).
 pub fn parse_at(res: &Resource, at: u64) -> Result<(Drawable, Stats), ResourceError> {
     let mut b = Builder::default();
-    bound(res, at, &math::IDENTITY, &mut b, 0)?;
+    let mut stats = Stats::default();
+    bound(res, at, &math::IDENTITY, &mut b, &mut stats, 0)?;
     let mut d = Drawable { name: "collision".into(), ..Default::default() };
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    stats.materials = b.meshes.iter().map(|(m, _)| *m).collect();
+    stats.materials.sort_unstable();
     for (i, (material, mesh)) in b.meshes.into_iter().enumerate() {
         for p in &mesh.positions {
             for k in 0..3 {
@@ -343,8 +224,8 @@ pub fn parse_at(res: &Resource, at: u64) -> Result<(Drawable, Stats), ResourceEr
     if lo[0] <= hi[0] {
         (d.bounds_min, d.bounds_max) = (lo, hi);
     }
-    b.stats.materials.sort_unstable();
-    Ok((d, b.stats))
+    stats.primitives = b.primitives;
+    Ok((d, stats))
 }
 
 /// Names of the material types, from the game's `materials.dat` (one material
@@ -364,26 +245,6 @@ pub fn material_names(materials_dat: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn primitives_make_closed_meshes() {
-        let mut b = Builder::default();
-        b.cuboid(1, &math::IDENTITY, [0.0; 3], [[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]]);
-        b.round(2, &math::IDENTITY, [0.0; 3], [0.0, 0.0, 2.0], 0.5, true);
-        b.round(2, &math::IDENTITY, [0.0; 3], [0.0; 3], 1.0, true);
-        assert_eq!(b.stats.primitives, 3);
-        assert_eq!(b.meshes.len(), 2);
-        let boxm = &b.meshes[0].1;
-        assert_eq!(boxm.indices.len(), 36);
-        // Box normals point away from the centre.
-        for t in boxm.indices.chunks(3) {
-            let c = scale(
-                add(add(boxm.positions[t[0] as usize], boxm.positions[t[1] as usize]), boxm.positions[t[2] as usize]),
-                1.0 / 3.0,
-            );
-            assert!(dot(boxm.normals[t[0] as usize], c) > 0.0);
-        }
-    }
 
     #[test]
     fn reads_material_names() {
