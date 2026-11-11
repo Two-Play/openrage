@@ -341,7 +341,6 @@ details.more[open] summary { margin-bottom: 1rem; }
 
 /* Docs page */
 .doc { padding: 2.5rem 0 3rem; }
-.doc .wrap { max-width: 820px; }
 .doc h1 { font-size: clamp(1.9rem, 4.5vw, 2.6rem); margin: 0 0 0.5rem; }
 .doc h2 { margin-top: 2.5rem; padding-top: 0.5rem; border-top: 1px solid var(--border); }
 .doc h3 { margin-top: 1.75rem; }
@@ -529,3 +528,16 @@ a.zoom { display: block; cursor: zoom-in; color: inherit; }
   *, *::before, *::after { animation: none !important; transition: none !important; }
   .gallery .shot:hover img, .hero-shot:hover img, .btn:hover, .features li:hover, .card:hover { transform: none; }
 }
+
+/* ---------------------------------------------------------------- Doc pages: full width, TOC sidebar */
+.doc .wrap { max-width: var(--max); }
+.doc-head { margin-bottom: 1.5rem; }
+.doc-head .lead { margin: 0; max-width: 60ch; }
+.doc-grid { display: grid; gap: 1.5rem 3rem; }
+.doc-grid .prose { min-width: 0; max-width: 78ch; }
+.doc-grid .prose > h2:first-child { margin-top: 0; border-top: 0; padding-top: 0; }
+@media (min-width: 960px) {
+  .doc-grid.has-toc { grid-template-columns: 240px minmax(0, 1fr); align-items: start; }
+  .doc-grid .toc { position: sticky; top: 84px; }
+}
+.prose h2, .prose h3, section[id] { scroll-margin-top: 80px; }
