@@ -146,7 +146,7 @@ Every format is checked against the complete game (GTA V Enhanced):
 
 In both cases the cipher tables and the IV come from your `RDR2.exe`: OpenRAGE finds their 565 pieces by SHA-256 fingerprints (checksums only). All archive keys start with the same 32 bytes; every place in the dump or key file that starts that way is tried on your archives, and the keys that open them are kept. Only the Steam version of 2 April 2024 is known so far; other versions report which pieces are missing.
 
-With the keys, `openrage rpf8 <game folder>` opens all 89 archives and the 4,874 archives nested in them, and reads all 493,592 files — decrypted, and decompressed with the open-source Oodle decoder [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract). Most files only have a hash so far, not a name; browsing in the GUI and the formats follow.
+With the keys, `openrage rpf8 <game folder>` opens all 89 archives and the 4,874 archives nested in them, and reads all 493,592 files — decrypted, and decompressed with the open-source Oodle decoder [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract). Entries carry only a hash of their name: `openrage rdr2-names <game folder>` searches the game's own files for matching strings (once, about 8 minutes) and caches the hits — 45 % of all names, and nearly all models (`.ydr`, `.ydd`, `.yft`), clip sets and particle files; the rest show as `hash/XXXXXXXX.ext`. `--import <list>` adds names from a text file (one per line). Browsing in the GUI and the formats follow.
 
 ## Installation
 
@@ -374,6 +374,7 @@ openrage media …/scaleform_generic.rpf/hud.gfx [--swf hud.swf]   # Scaleform m
 openrage natives natives.json                  # native names for script disassembly
 openrage rdr2-keys --dump RDR2.dmp <RDR2>      # RDR2 archive keys from a memory dump of the running game
 openrage rdr2-keys --file secrets.bin <RDR2>   # … or from a key file
+openrage rdr2-names <RDR2>                     # find RDR2 file names in the game's files (cached)
 openrage rpf8 --list <RDR2>/common_0.rpf       # RDR2 archive contents
 openrage world --radius 40 -- 350 4870 -60     # map objects near a point (builds the world cache)
 ```

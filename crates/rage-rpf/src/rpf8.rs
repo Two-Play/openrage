@@ -256,6 +256,8 @@ pub struct Rpf8 {
     /// `None` while the entry table is encrypted and no keys are available.
     entries: Option<Vec<Entry>>,
     keys: Option<Arc<Rdr2Keys>>,
+    /// Names found in the game's files, handed on to nested archives.
+    names: Option<Arc<crate::rpf8_names::NameIndex>>,
 }
 
 impl Rpf8 {
@@ -282,7 +284,24 @@ impl Rpf8 {
         if entry.ext_id != 0 || entry.compression != Compression::None || entry.is_encrypted() {
             return Err(RpfError::NotAnArchive(display));
         }
-        Self::open_range(&self.path, self.base + entry.offset, entry.size_on_disk, display, self.keys.clone())
+        let mut child =
+            Self::open_range(&self.path, self.base + entry.offset, entry.size_on_disk, display, self.keys.clone())?;
+        if let Some(names) = &self.names {
+            child.set_names(Arc::clone(names));
+        }
+        Ok(child)
+    }
+
+    /// Names entries that the archive's own name table left unnamed; nested
+    /// archives opened afterwards get the names too.
+    pub fn set_names(&mut self, names: Arc<crate::rpf8_names::NameIndex>) {
+        let platform = self.header.platform;
+        if let Some(entries) = &mut self.entries {
+            for e in entries.iter_mut().filter(|e| e.path.is_none()) {
+                e.path = names.name_for(e, platform);
+            }
+        }
+        self.names = Some(names);
     }
 
     fn open_range(
@@ -338,7 +357,7 @@ impl Rpf8 {
             }
             Some(entries)
         };
-        Ok(Rpf8 { path: path.to_path_buf(), base, display: name, header, size, entries, keys })
+        Ok(Rpf8 { path: path.to_path_buf(), base, display: name, header, size, entries, keys, names: None })
     }
 
     pub fn header(&self) -> Header {
