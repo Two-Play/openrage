@@ -408,6 +408,16 @@ fn wire_callbacks(ui: &AppWindow) {
                 open_xml_view(ui, vpath);
                 return;
             }
+            let script = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(i as usize)?];
+                (item.kind == ItemKind::Resource && item.name.to_ascii_lowercase().ends_with(".ysc"))
+                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = script {
+                open_script_view(ui, vpath);
+                return;
+            }
             let is_ycd = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 Some(listing.items[*a.visible.get(i as usize)?].name.to_ascii_lowercase().ends_with(".ycd"))
@@ -1606,6 +1616,11 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
             }
             if openrage_app::metadata::is_metadata(&entry.name)
                 && let Some(preview) = metadata_preview(&rpf, id)
+            {
+                return preview;
+            }
+            if entry.name.to_ascii_lowercase().ends_with(".ysc")
+                && let Some(preview) = script_preview(&rpf, id)
             {
                 return preview;
             }
@@ -2867,6 +2882,9 @@ fn read_file(ui: &AppWindow, vpath: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 fn open_editor(ui: &AppWindow, vpath: String) {
+    if vpath.to_ascii_lowercase().ends_with(".ysc") {
+        return open_script_view(ui, vpath);
+    }
     ui.set_status(format!("Opening {vpath} …").into());
     match read_file(ui, &vpath) {
         Ok(data) => match editor::Document::from_file(vpath.clone(), &data) {
@@ -2878,6 +2896,67 @@ fn open_editor(ui: &AppWindow, vpath: String) {
         },
         Err(e) => ui.set_status(format!("Cannot open {vpath}: {e:#}").into()),
     }
+}
+
+/// Disassembles a script (`.ysc`).
+fn read_script_listing(ui: &AppWindow, vpath: &str) -> anyhow::Result<String> {
+    let data = read_file(ui, vpath)?;
+    let res = rage_resource_from(&data)?;
+    let s = rage_formats::ysc::parse(&res)?;
+    let header = script_header(&s);
+    Ok(header + &s.listing(|_| None).map_err(|e| anyhow::anyhow!(e))?)
+}
+
+fn rage_resource_from(data: &[u8]) -> anyhow::Result<rage_resource::Resource> {
+    Ok(rage_resource::Resource::from_rsc7(data)?)
+}
+
+fn script_header(s: &rage_formats::ysc::Script) -> String {
+    format!(
+        "// {}: {} of code, {} natives, {} statics, {} strings\n// Native calls show the native's hash; strings are noted next to STRING.\n",
+        s.name,
+        human_size(s.code.len() as u64),
+        s.natives.len(),
+        s.statics.len(),
+        s.all_strings().len()
+    )
+}
+
+/// Shows a script's disassembly in a read-only editor window.
+fn open_script_view(ui: &AppWindow, vpath: String) {
+    ui.set_status(format!("Disassembling {vpath} …").into());
+    match read_script_listing(ui, &vpath) {
+        Ok(text) => {
+            editor::open(ui, editor::Document::script(vpath, text));
+            ui.set_status(SharedString::new());
+        }
+        Err(e) => ui.set_status(format!("Cannot disassemble {vpath}: {e:#}").into()),
+    }
+}
+
+/// A script's facts and the start of its strings, for the preview.
+fn script_preview(rpf: &Rpf7, id: EntryId) -> Option<(Meta, String)> {
+    let s = rage_formats::ysc::parse(&rpf.read_resource(id).ok()?).ok()?;
+    let functions = s.disassemble().map(|c| c.iter().filter(|i| i.name == "ENTER").count()).unwrap_or(0);
+    let strings = s.all_strings();
+    let meta = vec![
+        kv("Script", &s.name),
+        kv("Code", human_size(s.code.len() as u64)),
+        kv("Functions", functions),
+        kv("Natives", s.natives.len()),
+        kv("Statics", s.statics.len()),
+        kv("Strings", strings.len()),
+        note("Double-click to read the disassembly."),
+    ];
+    let mut text = String::from("Strings used by the script:\n\n");
+    for st in strings.iter().take(400) {
+        text.push_str(st);
+        text.push('\n');
+    }
+    if strings.len() > 400 {
+        text.push_str(&format!("… ({} in all)\n", strings.len()));
+    }
+    Some((meta, text))
 }
 
 /// Reads a metadata file and converts it to XML.

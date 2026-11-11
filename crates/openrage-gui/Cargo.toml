@@ -17,6 +17,7 @@ rage-rpf.workspace = true
 rage-index.workspace = true
 rage-mods.workspace = true
 rage-formats.workspace = true
+rage-resource.workspace = true
 anyhow.workspace = true
 rfd = "0.15"
 wgpu = "30"
