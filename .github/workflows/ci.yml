@@ -1,9 +1,21 @@
 name: CI
 
+# Changes that only touch the website or documentation skip the Rust build;
+# the website has its own checks (pages.yml).
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "site/**"
+      - "docs/**"
+      - "**/*.md"
+      - ".github/workflows/pages.yml"
   pull_request:
+    paths-ignore:
+      - "site/**"
+      - "docs/**"
+      - "**/*.md"
+      - ".github/workflows/pages.yml"
 
 # A newer push to the same branch or PR cancels the run still in progress.
 concurrency:

@@ -1,0 +1,25 @@
+# Zola configuration of the OpenRAGE website.
+# Content lives in content/ (Markdown), layout in templates/, CSS/JS in static/.
+base_url = "https://two-play.github.io/openrage"
+title = "OpenRAGE"
+description = "Free, open-source explorer and modding toolkit for Rockstar's RAGE engine games on Linux and Windows."
+default_language = "en"
+compile_sass = false
+build_search_index = false
+generate_feeds = false
+generate_sitemap = true
+generate_robots_txt = true
+
+[markdown]
+# `> [!NOTE]` / `> [!WARNING]` blocks work like on GitHub.
+github_alerts = true
+insert_anchor_links = "none"
+
+[link_checker]
+internal_level = "error"
+# External sites can be flaky; report them without failing the check.
+external_level = "warn"
+
+[extra]
+repo = "https://github.com/Two-Play/openrage"
+releases = "https://github.com/Two-Play/openrage/releases"

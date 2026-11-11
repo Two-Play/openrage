@@ -385,3 +385,31 @@ details.more[open] summary { margin-bottom: 1rem; }
 }
 .doc p > .btn + .btn { margin-left: 0.5rem; }
 .doc p > .btn { margin-bottom: 0.5rem; }
+
+/* Markdown content */
+.hero .lead p { margin: 0; }
+.notice p { margin: 0.2rem 0; }
+.prose table { display: block; overflow-x: auto; }
+.prose table code { white-space: nowrap; }
+.prose blockquote {
+  margin: 1.25rem 0;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 0.8rem 1.1rem;
+}
+.prose blockquote p { margin: 0.25rem 0; }
+.prose [class^="markdown-alert-"]::before {
+  display: block;
+  font-weight: 700;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+.prose .markdown-alert-note::before { content: "Note"; }
+.prose .markdown-alert-tip::before { content: "Tip"; }
+.prose .markdown-alert-important::before { content: "Important"; }
+.prose .markdown-alert-warning::before { content: "Warning"; }
+.prose .markdown-alert-caution::before { content: "Caution"; }

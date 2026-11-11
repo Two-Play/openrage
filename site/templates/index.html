@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{#- Landing page. All text comes from content/_index.md. -#}
+
+{% block main %}
+{%- set x = section.extra %}
+<main id="main">
+  <div class="hero">
+    <div class="wrap">
+      <h1>{{ x.headline }}</h1>
+      <div class="lead">{{ x.lead | markdown | safe }}</div>
+      <div class="actions">
+        <a class="btn btn-primary" href="{{ config.extra.releases }}/latest">
+          <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+          Download the latest release
+        </a>
+        <a class="btn btn-secondary" href="{{ get_url(path='@/getting-started.md') }}">Getting started</a>
+      </div>
+      <p class="release-note" data-release-info hidden>
+        Latest: <strong data-release="version"></strong>, released <span data-release="published"></span> · Linux and Windows, x86-64
+      </p>
+
+      <div class="hero-shot">
+        <img class="light-only" src="{{ get_url(path='images/' ~ x.hero.light) }}" width="{{ x.hero.width }}" height="{{ x.hero.height }}" alt="{{ x.hero.alt }}">
+        <img class="dark-only" src="{{ get_url(path='images/' ~ x.hero.dark) }}" width="{{ x.hero.width }}" height="{{ x.hero.height }}" alt="{{ x.hero.alt }}">
+      </div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="notice">{{ x.notice | markdown | safe }}</div>
+  </div>
+
+  <section id="features" aria-labelledby="features-title">
+    <div class="wrap">
+      <h2 id="features-title">{{ x.features_title }}</h2>
+      <p class="section-intro">{{ x.features_intro | markdown(inline=true) | safe }}</p>
+      <ul class="features">
+        {%- for f in x.features %}
+        <li><h3><span class="icon" aria-hidden="true">{{ f.icon }}</span>{{ f.title }}</h3><p>{{ f.text | markdown(inline=true) | safe }}</p></li>
+        {%- endfor %}
+      </ul>
+    </div>
+  </section>
+
+  <section id="screenshots" class="alt" aria-labelledby="screenshots-title">
+    <div class="wrap">
+      <h2 id="screenshots-title">{{ x.screenshots_title }}</h2>
+      <p class="section-intro">{{ x.screenshots_intro | markdown(inline=true) | safe }}</p>
+      <div class="gallery">
+        {%- for s in x.screenshots %}
+        <figure>
+          {%- if s.dark %}
+          <img class="light-only" src="{{ get_url(path='images/' ~ s.image) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s.alt }}">
+          <img class="dark-only" src="{{ get_url(path='images/' ~ s.dark) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s.dark_alt | default(value=s.alt) }}">
+          {%- else %}
+          <img src="{{ get_url(path='images/' ~ s.image) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s.alt }}">
+          {%- endif %}
+          <figcaption><strong>{{ s.title }}</strong> — {{ s.caption | markdown(inline=true) | safe }}</figcaption>
+        </figure>
+        {%- endfor %}
+      </div>
+    </div>
+  </section>
+
+  <section id="status" aria-labelledby="status-title">
+    <div class="wrap">
+      <h2 id="status-title">{{ x.games_title }}</h2>
+      <p class="section-intro">{{ x.games_intro | markdown(inline=true) | safe }}</p>
+      {%- set labels = x.status_labels %}
+      <div class="table-scroll">
+        <table class="stack">
+          <thead>
+            <tr><th scope="col">Game</th><th scope="col">Archives</th><th scope="col">Formats</th></tr>
+          </thead>
+          <tbody>
+            {%- for g in x.games %}
+            <tr>
+              <th scope="row">{{ g.name }}{% if g.variant %} <span class="muted">({{ g.variant }})</span>{% endif %}</th>
+              <td data-label="Archives"><span class="status {{ g.archives_status }}">{{ labels[g.archives_status] }}</span>{% if g.archives %}<br>{{ g.archives | markdown(inline=true) | safe }}{% endif %}</td>
+              <td data-label="Formats"><span class="status {{ g.formats_status }}">{{ labels[g.formats_status] }}</span>{% if g.formats %}<br>{{ g.formats | markdown(inline=true) | safe }}{% endif %}</td>
+            </tr>
+            {%- endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      {%- if section.content %}
+      <details class="more">
+        <summary>{{ x.details_summary }}</summary>
+        <div class="prose">{{ section.content | safe }}</div>
+      </details>
+      {%- endif %}
+    </div>
+  </section>
+
+  <section id="download" class="alt" aria-labelledby="download-title">
+    <div class="wrap">
+      <h2 id="download-title">Download</h2>
+      <p class="section-intro">{{ x.download_intro | markdown(inline=true) | safe }}</p>
+      <div class="downloads">
+        <div class="card">
+          <h3>Linux</h3>
+          <p>x86-64, glibc 2.35 or newer (<code>.tar.gz</code>).</p>
+          <a class="btn btn-primary" data-release="linux" href="{{ config.extra.releases }}/latest">Download for Linux<span data-size></span></a>
+        </div>
+        <div class="card">
+          <h3>Windows</h3>
+          <p>x86-64 (<code>.zip</code>).</p>
+          <a class="btn btn-primary" data-release="windows" href="{{ config.extra.releases }}/latest">Download for Windows<span data-size></span></a>
+        </div>
+        <div class="card">
+          <h3>Build from source</h3>
+          <p>Rust toolchain plus a few system libraries on Linux.</p>
+          <a class="btn btn-secondary" href="{{ get_url(path='@/getting-started.md') }}#build">Build instructions</a>
+        </div>
+      </div>
+      <p>
+        Checksums: <a data-release="sums" href="{{ config.extra.releases }}/latest">SHA256SUMS.txt</a> ·
+        <a href="{{ config.extra.releases }}">All releases</a>
+      </p>
+    </div>
+  </section>
+</main>
+{% endblock main %}
