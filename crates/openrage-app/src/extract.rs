@@ -23,6 +23,80 @@ pub struct ExtractSummary {
     pub cancelled: bool,
 }
 
+/// Extracts from a Red Dead Redemption 2 archive into `out`: one file
+/// (`file`), or everything below folder `dir` including nested archives,
+/// which become folders. Files are written decrypted and decompressed
+/// (resources without their 16-byte header). Unreadable files are listed in
+/// `failures` and skipped.
+pub fn extract_rpf8(
+    rpf: &rage_rpf::Rpf8,
+    dir: &str,
+    file: Option<usize>,
+    out: &Path,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&ExtractSummary, &str),
+) -> Result<ExtractSummary> {
+    let mut summary = ExtractSummary { target: out.to_path_buf(), ..Default::default() };
+    let mut write = |rpf: &rage_rpf::Rpf8, i: usize, rel: &str, s: &mut ExtractSummary| -> Result<()> {
+        let target = out.join(vfs::safe_relative_path(rel).with_context(|| format!("unsafe path {rel}"))?);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match rpf.read(&rpf.entries().expect("entries")[i]) {
+            Ok(data) => {
+                fs::write(&target, &data)?;
+                s.files += 1;
+                s.bytes += data.len() as u64;
+            }
+            Err(e) => s.failures.push(e.to_string()),
+        }
+        progress(s, rel);
+        Ok(())
+    };
+    if let Some(i) = file {
+        let name = rpf.entry_name(i);
+        let base = name.rsplit('/').next().unwrap_or(&name).to_owned();
+        write(rpf, i, &base, &mut summary)?;
+        summary.target = out.join(base);
+        return Ok(summary);
+    }
+    #[allow(clippy::type_complexity)]
+    fn walk(
+        rpf: &rage_rpf::Rpf8,
+        dir: &str,
+        prefix: &str,
+        cancel: &AtomicBool,
+        s: &mut ExtractSummary,
+        write: &mut dyn FnMut(&rage_rpf::Rpf8, usize, &str, &mut ExtractSummary) -> Result<()>,
+    ) -> Result<()> {
+        let (dirs, files) = rpf.list_dir(dir);
+        for d in dirs {
+            let sub = if dir.is_empty() { d.clone() } else { format!("{dir}/{d}") };
+            walk(rpf, &sub, &format!("{prefix}{d}/"), cancel, s, write)?;
+        }
+        for i in files {
+            if cancel.load(Ordering::Relaxed) {
+                s.cancelled = true;
+                return Ok(());
+            }
+            let name = rpf.entry_name(i);
+            let base = name.rsplit('/').next().unwrap_or(&name).to_owned();
+            let e = &rpf.entries().expect("entries")[i];
+            if e.ext_id == 0 {
+                match rpf.open_child(e) {
+                    Ok(child) => walk(&child, "", &format!("{prefix}{base}/"), cancel, s, write)?,
+                    Err(err) => s.failures.push(err.to_string()),
+                }
+            } else {
+                write(rpf, i, &format!("{prefix}{base}"), s)?;
+            }
+        }
+        Ok(())
+    }
+    walk(rpf, dir, "", cancel, &mut summary, &mut write)?;
+    Ok(summary)
+}
+
 /// Extracts one entry (file, directory, or nested archive) into `out`.
 ///
 /// `progress` is called after every written file with the running summary and

@@ -109,7 +109,8 @@ fn main() -> anyhow::Result<()> {
     let ui = AppWindow::new()?;
     let cfg = Config::load();
     let keys = load_keys().unwrap_or(None);
-    let game_dir = cfg.game_dir.clone().filter(|d| detect::is_gta5_dir(d));
+    let game_dir = cfg.game_dir.clone().filter(|d| detect::is_gta5_dir(d) || is_rdr2_dir(d));
+    let rdr2_ready = game_dir.as_deref().is_some_and(|d| is_rdr2_dir(d) && register_rdr2(d));
 
     APP.with(|a| {
         *a.borrow_mut() = Some(App {
@@ -160,7 +161,7 @@ fn main() -> anyhow::Result<()> {
     }));
     wire_callbacks(&ui);
 
-    let ready = with_app(|app| app.game_dir.is_some() && app.keys.is_some());
+    let ready = with_app(|app| app.game_dir.is_some() && (app.keys.is_some() || rdr2_ready));
     if ready {
         start_browsing(&ui);
     } else {
@@ -1346,6 +1347,15 @@ fn show_folder_info(ui: &AppWindow) {
                 return Some((name.clone(), l.vpath.clone(), meta, ("audio", badges::NEUTRAL)));
             }
             Location::Disk(p) => vec![kv("Type", "Folder"), kv("On disk", p.display())],
+            Location::Rpf8(rpf, _) => {
+                let h = rpf.header();
+                vec![
+                    kv("Type", "Inside a Red Dead Redemption 2 archive"),
+                    kv("Archive", rpf.display_name().rsplit('/').next().unwrap_or_default()),
+                    kv("Entries", grouped(h.entry_count as usize)),
+                    note("Read-only. Names come from `openrage rdr2-names`; unnamed files are under hash/."),
+                ]
+            }
             Location::Archive(rpf, _) => vec![
                 kv("Type", "Inside an archive"),
                 kv("Archive", rpf.name()),
@@ -1379,6 +1389,8 @@ enum PreviewSource {
     DiskFile(PathBuf),
     DiskArchive(PathBuf),
     Entry(Arc<Rpf7>, EntryId),
+    /// A file in a Red Dead Redemption 2 archive (index into its entries).
+    Rpf8(Arc<rage_rpf::Rpf8>, usize),
     /// A texture of an opened texture dictionary (index into its textures).
     Texture(Arc<rage_formats::ytd::TextureDictionary>, usize),
     /// A search hit; resolved in the worker. `query` is set for text hits to show the matching line.
@@ -1435,6 +1447,9 @@ fn select_row(ui: &AppWindow, row: usize) {
             }
             (Location::Archive(rpf, _), Some(id)) if item.kind != ItemKind::Dir => {
                 Some(PreviewSource::Entry(Arc::clone(rpf), id))
+            }
+            (Location::Rpf8(rpf, dir), _) if item.kind != ItemKind::Dir => {
+                rpf.find(&browser::join(dir, &item.name)).map(|i| PreviewSource::Rpf8(Arc::clone(rpf), i))
             }
             _ => None,
         };
@@ -1702,8 +1717,11 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
             Ok(Node::ArchiveDir(rpf, id)) if id == Rpf7::ROOT => (archive_info(&rpf), String::new()),
             Ok(Node::ArchiveDir(..)) | Ok(Node::Dir(_)) => (Meta::new(), String::new()),
             Ok(Node::PlainFile(p)) => load_preview_text(PreviewSource::DiskFile(p), keys),
+            Ok(Node::Rpf8File(rpf, i)) => rpf8_preview(&rpf, i),
+            Ok(Node::Rpf8Dir(..)) => (Meta::new(), String::new()),
             Err(e) => (vec![kv("Error", e)], String::new()),
         },
+        PreviewSource::Rpf8(rpf, i) => rpf8_preview(&rpf, i),
         PreviewSource::Texture(..) => (Meta::new(), String::new()),
         PreviewSource::DiskFile(path)
             if openrage_app::metadata::is_metadata(&path.file_name().unwrap_or_default().to_string_lossy()) =>
@@ -1853,6 +1871,43 @@ fn metadata_lines(xml: openrage_app::metadata::Xml) -> (Meta, String) {
     (meta, text)
 }
 
+/// Facts about a file in an RDR2 archive, and its text when it is text.
+fn rpf8_preview(rpf: &rage_rpf::Rpf8, i: usize) -> (Meta, String) {
+    use rage_rpf::rpf8::Compression;
+    let Some(e) = rpf.entries().and_then(|es| es.get(i)) else { return (Meta::new(), String::new()) };
+    // Type and size are already in the file's general info.
+    let mut meta = Meta::new();
+    meta.push(kv("Stored", openrage_app::extract::human_size(e.size_on_disk)));
+    meta.push(kv(
+        "Compression",
+        match e.compression {
+            Compression::None => "none".to_owned(),
+            Compression::Deflate => "deflate".to_owned(),
+            Compression::Oodle => "Oodle".to_owned(),
+            Compression::Unknown(n) => format!("unknown ({n})"),
+        },
+    ));
+    meta.push(kv("Encrypted", if e.is_encrypted() { format!("yes (key {})", e.key_id) } else { "no".to_owned() }));
+    if let Some(v) = e.resource_version() {
+        meta.push(kv("Resource version", v));
+    }
+    meta.push(kv("Hash", format!("0x{:08X}", e.hash)));
+    if e.ext_id == 0 || e.is_resource || e.size() > 4 << 20 {
+        return (meta, String::new());
+    }
+    match rpf.read(e) {
+        Ok(data) => {
+            let text = String::from_utf8_lossy(&data[..data.len().min(256 << 10)]).replace('\t', "    ");
+            let printable = text.chars().filter(|c| !c.is_control() || c.is_whitespace()).count();
+            if printable * 100 >= text.chars().count().max(1) * 95 { (meta, text) } else { (meta, String::new()) }
+        }
+        Err(err) => {
+            meta.push(kv("Error", err));
+            (meta, String::new())
+        }
+    }
+}
+
 fn archive_info(rpf: &Rpf7) -> Meta {
     let (mut dirs, mut files, mut resources, mut archives) = (0, 0, 0, 0);
     for e in rpf.entries() {
@@ -1878,7 +1933,8 @@ fn archive_info(rpf: &Rpf7) -> Meta {
 
 fn start_index_update(ui: &AppWindow) {
     let Some((game_dir, keys)) = with_app(|a| {
-        if a.index_running {
+        // The search index covers GTA V's archives; RDR2 is browsed without it for now.
+        if a.index_running || a.game_dir.as_deref().is_some_and(is_rdr2_dir) {
             return None;
         }
         a.index_running = true;
@@ -3829,6 +3885,49 @@ fn start_extract(ui: &AppWindow) {
         export_sounds(ui);
         return;
     }
+    // Red Dead Redemption 2: the selected file or folder, or the whole folder.
+    let rdr2 = with_app(|a| {
+        let listing = a.listing.as_ref()?;
+        let Location::Rpf8(rpf, dir) = &listing.location else { return None };
+        let item = a.selected.map(|s| &listing.items[s]);
+        Some(match item {
+            Some(item) if item.kind == ItemKind::Dir => (Arc::clone(rpf), browser::join(dir, &item.name), None),
+            Some(item) => (Arc::clone(rpf), dir.clone(), rpf.find(&browser::join(dir, &item.name))),
+            None => (Arc::clone(rpf), dir.clone(), None),
+        })
+    });
+    if let Some((rpf, dir, file)) = rdr2 {
+        let cancel = with_app(|a| {
+            a.cancel.store(false, Ordering::Relaxed);
+            Arc::clone(&a.cancel)
+        });
+        let weak = ui.as_weak();
+        std::thread::spawn(move || {
+            let Some(out) = rfd::FileDialog::new().set_title("Extract to folder").pick_folder() else { return };
+            let _ = weak.upgrade_in_event_loop(|ui| set_busy(&ui, true, "Extracting…".into()));
+            let mut last = Instant::now();
+            let result = openrage_app::extract::extract_rpf8(&rpf, &dir, file, &out, &cancel, &mut |s, path| {
+                if last.elapsed() > Duration::from_millis(100) {
+                    last = Instant::now();
+                    let msg = format!("Extracting… {} files, {} — {path}", s.files, human_size(s.bytes));
+                    let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+                }
+            });
+            let msg = match result {
+                Ok(s) if s.cancelled => format!("Cancelled after {} files.", s.files),
+                Ok(s) => {
+                    let mut m = format!("Extracted {} files ({}) to {}", s.files, human_size(s.bytes), out.display());
+                    if !s.failures.is_empty() {
+                        m.push_str(&format!(" — {} could not be read", s.failures.len()));
+                    }
+                    m
+                }
+                Err(e) => format!("Extraction failed: {e:#}"),
+            };
+            let _ = weak.upgrade_in_event_loop(move |ui| set_busy(&ui, false, msg));
+        });
+        return;
+    }
     let target = with_app(|a| -> Result<(Arc<Rpf7>, EntryId), String> {
         let listing = a.listing.as_ref().ok_or("nothing to extract")?;
         let item = a.selected.map(|s| &listing.items[s]);
@@ -3897,6 +3996,26 @@ fn set_busy(ui: &AppWindow, busy: bool, status: String) {
 // ---------------------------------------------------------------------------
 // Setup
 
+/// Whether a folder is a Red Dead Redemption 2 installation.
+fn is_rdr2_dir(dir: &Path) -> bool {
+    dir.join("RDR2.exe").is_file()
+}
+
+/// Loads the RDR2 archive keys (from `openrage rdr2-keys`) and the cached file
+/// names for archives opened through the virtual file system; false without keys.
+fn register_rdr2(game_dir: &Path) -> bool {
+    use rage_rpf::rpf8_keys::KeyStore;
+    use rage_rpf::rpf8_names::NameIndex;
+    let keys = KeyStore::default_path()
+        .and_then(|p| KeyStore::load(&p).ok().flatten())
+        .and_then(|s| s.to_keys())
+        .map(Arc::new);
+    let names = NameIndex::default_path(game_dir).and_then(|p| NameIndex::load(&p).ok().flatten()).map(Arc::new);
+    let ok = keys.is_some();
+    rage_rpf::rpf8::set_defaults(keys, names);
+    ok
+}
+
 fn show_setup(ui: &AppWindow, can_cancel: bool) {
     let detected: Vec<String> = detect::find_gta5_installs().iter().map(|p| p.display().to_string()).collect();
     with_app(|a| {
@@ -3904,7 +4023,9 @@ fn show_setup(ui: &AppWindow, can_cancel: bool) {
         let game = game.or_else(|| detected.first().cloned()).unwrap_or_default();
         ui.set_setup_game_dir(game.into());
         ui.set_setup_magic_path(a.cfg.magic_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default().into());
-        ui.set_setup_can_cancel(can_cancel && a.keys.is_some() && a.game_dir.is_some());
+        ui.set_setup_can_cancel(
+            can_cancel && (a.keys.is_some() || rage_rpf::rpf8::has_default_keys()) && a.game_dir.is_some(),
+        );
     });
     let model: Vec<SharedString> = detected.into_iter().map(Into::into).collect();
     ui.set_setup_detected(ModelRc::new(VecModel::from(model)));
@@ -3925,8 +4046,30 @@ fn pick_path(w: Weak<AppWindow>, file: bool, title: &'static str, apply: fn(&App
 fn run_setup(ui: &AppWindow) {
     let game_dir = PathBuf::from(ui.get_setup_game_dir().trim());
     let magic = Some(ui.get_setup_magic_path().trim().to_owned()).filter(|s| !s.is_empty()).map(PathBuf::from);
+    if is_rdr2_dir(&game_dir) {
+        if !register_rdr2(&game_dir) {
+            ui.set_setup_log(
+                "This is Red Dead Redemption 2. Its archive keys exist only while the game runs: make a memory dump of the running game and run\n  openrage rdr2-keys --dump <dump file> <game folder>\nonce (see the README), then try again. `openrage rdr2-names <game folder>` adds file names."
+                    .into(),
+            );
+            return;
+        }
+        let saved = with_app(|a| {
+            a.game_dir = Some(game_dir.clone());
+            a.cfg.game_dir = Some(game_dir);
+            a.cfg.save()
+        });
+        ui.set_setup_visible(false);
+        start_browsing(ui);
+        if let Err(e) = saved {
+            ui.set_status(format!("Could not save the settings: {e}").into());
+        }
+        return;
+    }
     if !detect::is_gta5_dir(&game_dir) {
-        ui.set_setup_log(format!("{} does not contain GTA5_Enhanced.exe or GTA5.exe.", game_dir.display()).into());
+        ui.set_setup_log(
+            format!("{} does not contain GTA5_Enhanced.exe, GTA5.exe or RDR2.exe.", game_dir.display()).into(),
+        );
         return;
     }
     ui.set_setup_running(true);

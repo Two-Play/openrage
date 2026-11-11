@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use rage_crypto::GtaVKeys;
 
-use crate::{EntryId, Rpf7, RpfError};
+use crate::{EntryId, Rpf7, Rpf8, RpfError};
 
 /// What a virtual path points to.
 pub enum Node {
@@ -21,6 +21,11 @@ pub enum Node {
     ArchiveDir(Arc<Rpf7>, EntryId),
     /// A file inside an archive.
     ArchiveFile(Arc<Rpf7>, EntryId),
+    /// A folder inside an RDR2 archive ("" for its top): RPF8 archives have no
+    /// directories of their own, folders come from the entries' paths.
+    Rpf8Dir(Arc<Rpf8>, String),
+    /// A file inside an RDR2 archive (index into its entries).
+    Rpf8File(Arc<Rpf8>, usize),
 }
 
 fn is_rpf(name: &str) -> bool {
@@ -44,6 +49,10 @@ pub fn resolve(root: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
             continue;
         }
         if is_rpf(&comp) {
+            if Rpf8::file_is_rpf8(&next) {
+                let rest: Vec<String> = components.collect();
+                return resolve_rpf8(Arc::new(Rpf8::open_default(&next)?), &rest, vpath);
+            }
             archive = Some(Arc::new(Rpf7::open(&next, keys.clone())?));
             break;
         }
@@ -71,6 +80,36 @@ pub fn resolve(root: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
         }
     }
     Ok(Node::ArchiveDir(archive, cur))
+}
+
+/// Walks the rest of a path inside an RDR2 archive: folders come from entry
+/// paths, nested archives are entered.
+fn resolve_rpf8(mut archive: Arc<Rpf8>, rest: &[String], vpath: &str) -> Result<Node, RpfError> {
+    if archive.entries().is_none() {
+        return Err(RpfError::KeysRequired(archive.display_name().to_owned()));
+    }
+    let mut dir = String::new();
+    for (i, comp) in rest.iter().enumerate() {
+        let path = if dir.is_empty() { comp.clone() } else { format!("{dir}/{comp}") };
+        if let Some(idx) = archive.find(&path) {
+            let entry = &archive.entries().expect("entries")[idx];
+            if entry.ext_id == 0 {
+                archive = Arc::new(archive.open_child(entry)?);
+                dir.clear();
+                continue;
+            }
+            if i + 1 == rest.len() {
+                return Ok(Node::Rpf8File(archive, idx));
+            }
+            return Err(RpfError::NotFound(vpath.to_owned()));
+        }
+        if archive.is_dir(&path) {
+            dir = path;
+        } else {
+            return Err(RpfError::NotFound(vpath.to_owned()));
+        }
+    }
+    Ok(Node::Rpf8Dir(archive, dir))
 }
 
 /// Finds `name` inside `dir`, ignoring ASCII case (game files keep Windows

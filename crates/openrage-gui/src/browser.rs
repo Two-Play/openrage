@@ -77,6 +77,8 @@ pub struct Item {
 pub enum Location {
     Disk(PathBuf),
     Archive(Arc<Rpf7>, EntryId),
+    /// A folder inside a Red Dead Redemption 2 archive (read-only).
+    Rpf8(Arc<rage_rpf::Rpf8>, String),
     /// Results of a search; `summary` describes hash lookups etc.
     Search {
         query: String,
@@ -242,7 +244,8 @@ pub fn list(
             Ok((listing, None))
         }
         Node::ArchiveDir(rpf, dir) => Ok((list_archive(vpath, rpf, dir, origin), None)),
-        Node::ArchiveFile(..) | Node::PlainFile(_) => {
+        Node::Rpf8Dir(rpf, dir) => Ok((list_rpf8(vpath, rpf, dir, origin), None)),
+        Node::ArchiveFile(..) | Node::PlainFile(_) | Node::Rpf8File(..) => {
             let name = last_segment(&vpath);
             let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys, overlay)?;
             Ok((listing, Some(name)))
@@ -381,6 +384,51 @@ fn list_disk(vpath: String, dir: PathBuf, origin: Origin) -> Result<Listing, Rpf
         items.push(Item { name, kind, size, info: String::new(), entry: None, vpath: None, mark: None, detail: None });
     }
     Ok(Listing { vpath, origin, location: Location::Disk(dir), items })
+}
+
+/// A folder of an RDR2 archive: folders from the entries' paths, nested
+/// archives, files (unnamed ones under `hash/`).
+fn list_rpf8(vpath: String, rpf: Arc<rage_rpf::Rpf8>, dir: String, origin: Origin) -> Listing {
+    use rage_rpf::rpf8::Compression;
+    let (dirs, files) = rpf.list_dir(&dir);
+    let mut items: Vec<Item> = dirs
+        .into_iter()
+        .map(|name| Item {
+            name,
+            kind: ItemKind::Dir,
+            size: 0,
+            info: String::new(),
+            entry: None,
+            vpath: None,
+            mark: None,
+            detail: None,
+        })
+        .collect();
+    let entries = rpf.entries().unwrap_or_default();
+    for i in files {
+        let e = &entries[i];
+        let full = rpf.entry_name(i);
+        let name = full.rsplit('/').next().unwrap_or(&full).to_owned();
+        let (kind, info) = if e.ext_id == 0 {
+            (ItemKind::Archive, String::new())
+        } else {
+            let mut info = Vec::new();
+            if let Some(v) = e.resource_version() {
+                info.push(format!("v{v}"));
+            }
+            match e.compression {
+                Compression::Oodle => info.push("oodle".into()),
+                Compression::Deflate => info.push("deflate".into()),
+                _ => {}
+            }
+            if e.is_encrypted() {
+                info.push("enc".into());
+            }
+            (if e.is_resource { ItemKind::Resource } else { ItemKind::File }, info.join(", "))
+        };
+        items.push(Item { name, kind, size: e.size(), info, entry: None, vpath: None, mark: None, detail: None });
+    }
+    Listing { vpath, origin, location: Location::Rpf8(rpf, dir), items }
 }
 
 fn list_archive(vpath: String, rpf: Arc<Rpf7>, dir: EntryId, origin: Origin) -> Listing {
