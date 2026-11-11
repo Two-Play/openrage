@@ -334,9 +334,9 @@ impl Rpf8 {
         self.entries.as_deref()
     }
 
-    /// Reads an entry's data: decrypted, and decompressed when stored or
-    /// deflated (Oodle is not supported yet). Resources come without their
-    /// 16-byte on-disk prefix.
+    /// Reads an entry's data: decrypted and decompressed (deflate or Oodle).
+    /// Resources come without their 16-byte on-disk prefix: virtual pages,
+    /// then physical pages.
     pub fn read(&self, entry: &Entry) -> Result<Vec<u8>, RpfError> {
         let archive = self.path.display().to_string();
         let name = entry.display_name(self.header.platform);
@@ -381,10 +381,28 @@ impl Rpf8 {
                     .map_err(|source| RpfError::Inflate { archive, entry: name, source })?;
                 Ok(out)
             }
-            other => Err(RpfError::Inflate {
+            Compression::Oodle => {
+                let expected = entry.size() as usize;
+                let mut out = vec![0u8; expected];
+                let n =
+                    oozextract::Extractor::new().read_from_slice(&data, &mut out).map_err(|e| RpfError::Inflate {
+                        archive: archive.clone(),
+                        entry: name.clone(),
+                        source: std::io::Error::other(e.to_string()),
+                    })?;
+                if n != expected {
+                    return Err(RpfError::Inflate {
+                        archive,
+                        entry: name,
+                        source: std::io::Error::other(format!("Oodle gave {n} bytes, expected {expected}")),
+                    });
+                }
+                Ok(out)
+            }
+            Compression::Unknown(n) => Err(RpfError::Inflate {
                 archive,
                 entry: name,
-                source: std::io::Error::other(format!("{other:?} compression is not supported yet")),
+                source: std::io::Error::other(format!("unknown compression {n}")),
             }),
         }
     }

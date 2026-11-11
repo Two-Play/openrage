@@ -15,4 +15,5 @@ flate2.workspace = true
 rayon.workspace = true
 sha2.workspace = true
 memchr.workspace = true
+oozextract.workspace = true
 thiserror.workspace = true
