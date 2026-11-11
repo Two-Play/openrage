@@ -772,6 +772,8 @@ export component AppWindow inherits Window {
     // Models suggested for the selected clip dictionary.
     in property <[ClipRow]> suggestions;
     in property <string> suggest-title;
+    // Icon of the rows: "model" for suggested models, "audio" for a container's sounds.
+    in property <string> suggest-icon: "model";
     // Sound preview: waveform in the preview area, player controls above it.
     in property <bool> audio-mode;
     // The preview image is a texture or picture (not a waveform), so it can open in the viewer.
@@ -1839,93 +1841,127 @@ export component AppWindow inherits Window {
                 }
 
                 if root.audio-mode: Rectangle {
+                    height: 50px;
                     border-radius: Theme.radius;
                     background: Theme.surface;
                     border-width: 1px;
                     border-color: Theme.border;
+                    // Every control sits centred in a cell spanning the row's height.
                     HorizontalLayout {
-                        padding: Theme.space-xs;
                         padding-left: Theme.space-s;
+                        padding-right: Theme.space-s;
                         spacing: 2px;
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/prev.svg");
-                            label: @tr("Previous sound");
-                            enabled: root.audio-has-prev;
-                            clicked => { root.audio-step(-1); }
-                        }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/back5.svg");
-                            label: @tr("Back 5 seconds");
-                            clicked => { root.audio-skip(-5); }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/prev.svg");
+                                label: @tr("Previous sound");
+                                enabled: root.audio-has-prev;
+                                clicked => { root.audio-step(-1); }
+                            }
                         }
                         Rectangle {
-                            y: (parent.height - self.height) / 2;
-                            width: 38px;
-                            height: 38px;
-                            border-radius: 19px;
-                            background: play-ta.has-hover ? Theme.accent.darker(0.1) : Theme.accent;
-                            accessible-role: button;
-                            accessible-label: root.audio-playing ? @tr("Pause") : @tr("Play");
-                            accessible-action-default => { root.audio-toggle(); }
-                            Image {
-                                width: 18px;
-                                height: 18px;
-                                // Centred; the play triangle needs a nudge to look centred.
-                                x: (parent.width - self.width) / 2 + (root.audio-playing ? 0px : 1.5px);
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
                                 y: (parent.height - self.height) / 2;
-                                source: root.audio-playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
-                                colorize: Palette.accent-foreground;
-                            }
-                            play-ta := TouchArea {
-                                clicked => { root.audio-toggle(); }
-                            }
-                            Tooltip {
-                                text: @markdown("\{@tr("Play / pause (Space)")}");
+                                icon: @image-url("icons/back5.svg");
+                                label: @tr("Back 5 seconds");
+                                clicked => { root.audio-skip(-5); }
                             }
                         }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/fwd5.svg");
-                            label: @tr("Forward 5 seconds");
-                            clicked => { root.audio-skip(5); }
+                        Rectangle {
+                            width: 44px;
+                            Rectangle {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                width: 38px;
+                                height: 38px;
+                                border-radius: 19px;
+                                background: play-ta.has-hover ? Theme.accent.darker(0.1) : Theme.accent;
+                                accessible-role: button;
+                                accessible-label: root.audio-playing ? @tr("Pause") : @tr("Play");
+                                accessible-action-default => { root.audio-toggle(); }
+                                Image {
+                                    width: 16px;
+                                    height: 16px;
+                                    // The play triangle's visual centre is left of its box.
+                                    x: (parent.width - self.width) / 2 + (root.audio-playing ? 0px : 1.5px);
+                                    y: (parent.height - self.height) / 2;
+                                    source: root.audio-playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
+                                    colorize: Palette.accent-foreground;
+                                }
+                                play-ta := TouchArea {
+                                    clicked => { root.audio-toggle(); }
+                                }
+                                Tooltip {
+                                    text: @markdown("\{@tr("Play / pause (Space)")}");
+                                }
+                            }
                         }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/next.svg");
-                            label: @tr("Next sound");
-                            enabled: root.audio-has-next;
-                            clicked => { root.audio-step(1); }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/fwd5.svg");
+                                label: @tr("Forward 5 seconds");
+                                clicked => { root.audio-skip(5); }
+                            }
                         }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/stop.svg");
-                            label: @tr("Stop");
-                            clicked => { root.audio-stop(); }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/next.svg");
+                                label: @tr("Next sound");
+                                enabled: root.audio-has-next;
+                                clicked => { root.audio-step(1); }
+                            }
+                        }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/stop.svg");
+                                label: @tr("Stop");
+                                clicked => { root.audio-stop(); }
+                            }
                         }
                         Text {
                             horizontal-stretch: 1;
                             horizontal-alignment: center;
-                            text: root.audio-time;
                             vertical-alignment: center;
+                            text: root.audio-time;
                             font-family: root.mono-font;
                             font-size: Theme.font-small;
                             color: Theme.text-muted;
                         }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/repeat.svg");
-                            label: root.audio-play-all ? @tr("Playing all sounds in a row (click to stop after this one)") : @tr("Play all sounds in a row");
-                            active: root.audio-play-all;
-                            clicked => { root.audio-play-all = !root.audio-play-all; }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/repeat.svg");
+                                label: root.audio-play-all ? @tr("Playing all sounds in a row (click to stop after this one)") : @tr("Play all sounds in a row");
+                                active: root.audio-play-all;
+                                clicked => { root.audio-play-all = !root.audio-play-all; }
+                            }
                         }
-                        IconButton {
-                            y: (parent.height - self.height) / 2;
-                            icon: @image-url("icons/extract.svg");
-                            label: @tr("Save WAV…");
-                            enabled: !root.busy;
-                            clicked => { root.audio-save-wav(); }
+                        Rectangle {
+                            width: 32px;
+                            IconButton {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                icon: @image-url("icons/extract.svg");
+                                label: @tr("Save WAV…");
+                                enabled: !root.busy;
+                                clicked => { root.audio-save-wav(); }
+                            }
                         }
                     }
                 }
@@ -2019,8 +2055,8 @@ export component AppWindow inherits Window {
                                     spacing: Theme.space-s;
                                     FormatIcon {
                                         y: (parent.height - self.height) / 2;
-                                        name: "model";
-                                        tint: #3b82f6;
+                                        name: root.suggest-icon;
+                                        tint: root.suggest-icon == "audio" ? #db4f8a : #3b82f6;
                                     }
                                     VerticalLayout {
                                         horizontal-stretch: 1;
@@ -2849,6 +2885,7 @@ export component ViewerWindow inherits Window {
                                             Rectangle {
                                                 width: 34px;
                                                 height: 34px;
+                                                y: (parent.height - self.height) / 2;
                                                 border-radius: 17px;
                                                 background: Theme.accent;
                                                 Image {

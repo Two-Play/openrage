@@ -85,9 +85,11 @@ struct App {
     /// Play the selected sound as soon as it is decoded (double-click).
     play_when_ready: bool,
     audio_timer: slint::Timer,
-    /// Models suggested for the selected clip dictionary, and its path.
+    /// The list in the preview area: models suggested for a clip dictionary
+    /// (`suggest_ycd` set), or the sounds of an audio container (`suggest_awc`).
     suggestions: Vec<String>,
     suggest_ycd: String,
+    suggest_awc: String,
     index_running: bool,
 }
 
@@ -137,6 +139,7 @@ fn main() -> anyhow::Result<()> {
             audio_timer: slint::Timer::default(),
             suggestions: Vec::new(),
             suggest_ycd: String::new(),
+            suggest_awc: String::new(),
             index_running: false,
         })
     });
@@ -484,9 +487,17 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_suggestion_open(move |i| {
         with_ui(&w, |ui| {
-            let pick = with_app(|a| Some((a.suggestions.get(i as usize)?.clone(), a.suggest_ycd.clone())));
-            if let Some((model, ycd)) = pick {
-                open_model_with_animation(ui, model, ycd);
+            let pick = with_app(|a| {
+                Some((a.suggestions.get(i as usize)?.clone(), a.suggest_ycd.clone(), a.suggest_awc.clone()))
+            });
+            match pick {
+                // A sound of the selected audio container: open it and play.
+                Some((sound, _, awc)) if !awc.is_empty() => {
+                    with_app(|a| a.play_when_ready = true);
+                    navigate(ui, &browser::join(&awc, &sound), true);
+                }
+                Some((model, ycd, _)) => open_model_with_animation(ui, model, ycd),
+                None => {}
             }
         })
     });
@@ -1265,9 +1276,17 @@ fn select_row(ui: &AppWindow, row: usize) {
     ui.set_audio_mode(false);
     with_app(|a| a.sound = None);
     ui.set_suggestions(ModelRc::default());
-    with_app(|a| a.suggestions.clear());
+    with_app(|a| {
+        a.suggestions.clear();
+        a.suggest_ycd.clear();
+        a.suggest_awc.clear();
+    });
     if item.name.to_ascii_lowercase().ends_with(".ycd") && item.mark != Some(Mark::Removed) {
         show_clip_dictionary(ui, vpath.clone(), info);
+        return;
+    }
+    if browser::is_audio(&item.name) && item.kind == ItemKind::File && item.mark != Some(Mark::Removed) {
+        show_audio_container(ui, vpath.clone(), info);
         return;
     }
     if item.kind == ItemKind::Sound {
@@ -1401,13 +1420,6 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, St
             }
             None => (Meta::new(), String::new(), None),
         },
-        PreviewSource::Entry(rpf, id) if browser::is_audio(&rpf.entry(id).name) => {
-            match rpf.read(id).map_err(anyhow::Error::from).and_then(|d| openrage_app::audio::parse(d, keys.as_deref()))
-            {
-                Ok(awc) => audio_container_preview(&awc),
-                Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new(), None),
-            }
-        }
         PreviewSource::Entry(rpf, id) if browser::is_texture_dict(&rpf.entry(id).name) => {
             match rpf
                 .read_resource(id)
@@ -1433,32 +1445,6 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, St
             (meta, body, None)
         }
     }
-}
-
-/// Summary of an audio container with the waveform of its first sound.
-fn audio_container_preview(awc: &rage_formats::awc::Awc) -> (Meta, String, Option<Rgba>) {
-    let codec = awc.sounds.first().map(|s| s.codec.name().replace("codec 7", "MPEG audio")).unwrap_or_default();
-    let mut meta = match &awc.stream_format {
-        Some(f) => vec![
-            kv("Contains", format!("one stream with {} channels", f.channels)),
-            kv("Duration", browser::seconds(awc.sounds.first().map_or(0.0, |s| s.duration_secs()))),
-        ],
-        None => vec![
-            kv("Contains", format!("{} sounds", awc.sounds.len())),
-            kv("Total length", browser::seconds(awc.sounds.iter().map(|s| s.duration_secs()).sum())),
-        ],
-    };
-    meta.push(kv("Codec", codec));
-    if awc.encrypted || awc.flags & 0xA != 0 {
-        meta.push(kv("Encrypted", "yes"));
-    }
-    meta.push(note("Double-click to open the container and play its sounds."));
-    let first = if awc.stream_format.is_some() { awc.decode_stream() } else { awc.decode_sound(0) };
-    let image = first.ok().map(|pcm| {
-        let (w, h) = (960, 320);
-        (w as u32, h as u32, audio::waveform(&pcm, w, h, [0x3b, 0x82, 0xf6]))
-    });
-    (meta, String::new(), image)
 }
 
 /// Returns (metadata, preview body).
@@ -2468,6 +2454,59 @@ fn save_png_image(img: &slint::Image, name: String, main: Weak<AppWindow>) {
 // ---------------------------------------------------------------------------
 // Animations
 
+/// Selecting an `.awc`: its sounds as a list (click one to play it).
+fn show_audio_container(ui: &AppWindow, vpath: String, mut info: Meta) {
+    let keys = with_app(|a| a.keys.clone());
+    match read_file(ui, &vpath).and_then(|d| openrage_app::audio::parse(d, keys.as_deref())) {
+        Ok(awc) => {
+            let (names, rows): (Vec<String>, Vec<ClipRow>) = match &awc.stream_format {
+                Some(f) => {
+                    let stem = vpath.rsplit('/').next().unwrap_or(&vpath).trim_end_matches(".awc").to_owned();
+                    let secs = awc.sounds.first().map_or(0.0, |s| s.duration_secs());
+                    let name = format!("{stem} (stream)");
+                    let info = format!("{} · {} channels · music/stream", browser::seconds(secs), f.channels);
+                    (vec![name.clone()], vec![ClipRow { name: name.into(), info: info.into() }])
+                }
+                None => awc
+                    .sounds
+                    .iter()
+                    .map(|s| {
+                        let name = format!("{:08x}", s.id);
+                        let info = format!(
+                            "{} · {} Hz · {}",
+                            browser::seconds(s.duration_secs()),
+                            s.sample_rate,
+                            s.codec.name().replace("codec 7", "MPEG")
+                        );
+                        (name.clone(), ClipRow { name: name.into(), info: info.into() })
+                    })
+                    .unzip(),
+            };
+            let total: f32 = awc.sounds.iter().map(|s| s.duration_secs()).sum();
+            info.push(kv("Contains", format!("{} sound(s)", rows.len())));
+            if awc.stream_format.is_none() {
+                info.push(kv("Total length", browser::seconds(total)));
+            }
+            if awc.encrypted || awc.flags & 0xA != 0 {
+                info.push(kv("Encrypted", "yes"));
+            }
+            info.push(note("Click a sound to play it, or double-click the container to open it."));
+            set_meta(ui, &info);
+            ui.set_suggest_icon("audio".into());
+            ui.set_suggest_title(format!("{} sound(s) in this container", rows.len()).into());
+            ui.set_suggestions(ModelRc::new(VecModel::from(rows)));
+            with_app(|a| {
+                a.suggestions = names;
+                a.suggest_awc = vpath;
+            });
+        }
+        Err(e) => {
+            info.push(kv("Error", format!("{e:#}")));
+            set_meta(ui, &info);
+        }
+    }
+}
+
 /// Selecting a `.ycd`: its clips and the models it fits.
 fn show_clip_dictionary(ui: &AppWindow, vpath: String, mut info: Meta) {
     match load_clip_dictionary(&vpath) {
@@ -2496,6 +2535,7 @@ fn show_clip_dictionary(ui: &AppWindow, vpath: String, mut info: Meta) {
                 }
                 .into(),
             );
+            ui.set_suggest_icon("model".into());
             ui.set_suggestions(ModelRc::new(VecModel::from(rows)));
             with_app(|a| {
                 a.suggestions = models;
