@@ -7,6 +7,7 @@
 pub mod editor;
 mod error;
 mod rpf7;
+pub mod rpf8;
 mod toc;
 pub mod vfs;
 pub mod writer;
@@ -14,4 +15,5 @@ pub mod writer;
 pub use editor::{ArchiveEditor, Backup, CommitStats};
 pub use error::RpfError;
 pub use rpf7::{Encryption, Entry, EntryId, EntryKind, Rpf7};
+pub use rpf8::Rpf8;
 pub use writer::{ArchiveWriter, RawEntry, entry_for, file_entry, resource_entry};

@@ -1,0 +1,412 @@
+//! RPF8 archives (Red Dead Redemption 2).
+//!
+//! Layout (all little-endian):
+//! - 16-byte header: magic `RPF8`, entry count, names length, decryption tag
+//!   (0xFF = table in plaintext), platform character (`'y'` = PC).
+//! - 256-byte signature.
+//! - `entry count` × 24-byte entries, sorted by name hash. There are no
+//!   directories: every entry is a file, identified by the hash of its path.
+//! - File data, then (for some archives) a table of the paths, NUL-separated,
+//!   in the last `names length` bytes.
+//!
+//! Most of the game's archives encrypt the entry table and many files with a
+//! cipher whose keys only exist in the running game; reading those needs keys
+//! the user provides. Without keys, the header is still readable and
+//! plaintext archives open fully.
+
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use rage_core::hash::joaat;
+
+use crate::RpfError;
+
+const MAGIC: u32 = 0x5250_4638;
+const HEADER_LEN: u64 = 16;
+const SIGNATURE_LEN: u64 = 256;
+const ENTRY_LEN: usize = 24;
+/// Decryption tag of an archive whose entry table is not encrypted.
+pub const PLAINTEXT: u16 = 0xFF;
+
+/// The 16-byte header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Header {
+    pub entry_count: u32,
+    pub names_length: u32,
+    /// Which key encrypts the entry table ([`PLAINTEXT`] = none).
+    pub decryption_tag: u16,
+    /// Platform character: `'y'` for PC.
+    pub platform: char,
+}
+
+impl Header {
+    pub fn parse(b: &[u8]) -> Option<Header> {
+        if b.len() < HEADER_LEN as usize || u32::from_le_bytes(b[0..4].try_into().ok()?) != MAGIC {
+            return None;
+        }
+        Some(Header {
+            entry_count: u32::from_le_bytes(b[4..8].try_into().ok()?),
+            names_length: u32::from_le_bytes(b[8..12].try_into().ok()?),
+            decryption_tag: u16::from_le_bytes(b[12..14].try_into().ok()?),
+            platform: char::from(b[14]),
+        })
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.decryption_tag != PLAINTEXT
+    }
+}
+
+/// How an entry's data is compressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    None,
+    /// Raw deflate, no zlib header.
+    Deflate,
+    Oodle,
+    Unknown(u8),
+}
+
+/// One entry of the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// Hash of the path (without extension when the extension is in `ext_id`).
+    pub hash: u32,
+    /// Index into [`EXTENSIONS`], or 0xFF when the hash covers the full path.
+    pub ext_id: u8,
+    /// Key id of the file data (0xFF = not encrypted).
+    pub key_id: u8,
+    /// Which parts of the data are encrypted.
+    pub encryption_config: u8,
+    pub is_resource: bool,
+    /// The last 256 bytes of the data are a signature.
+    pub signed: bool,
+    /// Byte offset of the data in the archive.
+    pub offset: u64,
+    /// Size of the data on disk.
+    pub size_on_disk: u64,
+    pub compression: Compression,
+    /// Binary files: uncompressed size. Resources: virtual and physical flags.
+    pub size_or_flags: u64,
+    /// The path, when the archive's name table or a name list knows it.
+    pub path: Option<String>,
+}
+
+/// Extensions by id; `#` stands for the platform character.
+const EXTENSIONS: [(u8, &str); 38] = [
+    (0, "rpf"),
+    (1, "#mf"),
+    (2, "#dr"),
+    (3, "#ft"),
+    (4, "#dd"),
+    (5, "#td"),
+    (6, "#bn"),
+    (7, "#bd"),
+    (8, "#pd"),
+    (9, "#bs"),
+    (10, "#sd"),
+    (11, "#mt"),
+    (12, "#sc"),
+    (13, "#cs"),
+    (64, "mrf"),
+    (65, "cut"),
+    (66, "gfx"),
+    (67, "#cd"),
+    (68, "#ld"),
+    (69, "#pmd"),
+    (70, "#pm"),
+    (71, "#ed"),
+    (72, "#pt"),
+    (73, "#map"),
+    (74, "#typ"),
+    (75, "#ch"),
+    (76, "#ldb"),
+    (77, "#jd"),
+    (78, "#ad"),
+    (79, "#nv"),
+    (80, "#hn"),
+    (81, "#pl"),
+    (82, "#nd"),
+    (83, "#vr"),
+    (84, "#wr"),
+    (85, "#nh"),
+    (86, "#fd"),
+    (87, "#as"),
+];
+
+/// The extension for an id on a platform (`None` for 0xFF and unknown ids).
+pub fn extension(ext_id: u8, platform: char) -> Option<String> {
+    let (_, ext) = EXTENSIONS.iter().find(|(id, _)| *id == ext_id)?;
+    Some(ext.replace('#', &platform.to_string()))
+}
+
+/// The id of an extension (`None` when it is stored as part of the hashed path).
+pub fn extension_id(ext: &str, platform: char) -> Option<u8> {
+    EXTENSIONS.iter().find(|(_, e)| e.replace('#', &platform.to_string()) == ext).map(|(id, _)| *id)
+}
+
+/// The hash an entry with this path carries.
+pub fn path_hash(path: &str, platform: char) -> (u32, u8) {
+    let path = path.to_ascii_lowercase().replace('\\', "/");
+    if let Some((stem, ext)) = path.rsplit_once('.')
+        && !stem.ends_with('/')
+        && let Some(id) = extension_id(ext, platform)
+    {
+        return (joaat(stem), id);
+    }
+    (joaat(&path), 0xFF)
+}
+
+impl Entry {
+    pub fn parse(b: &[u8]) -> Entry {
+        let q = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
+        let (q0, q1, q2) = (q(0), q(1), q(2));
+        Entry {
+            hash: q0 as u32,
+            encryption_config: (q0 >> 32) as u8,
+            key_id: (q0 >> 40) as u8,
+            ext_id: (q0 >> 48) as u8,
+            is_resource: q0 >> 56 & 1 == 1,
+            signed: q0 >> 57 & 1 == 1,
+            size_on_disk: (q1 & 0x0FFF_FFFF) << 4,
+            offset: (q1 >> 28 & 0x7FFF_FFFF) << 4,
+            compression: match (q1 >> 59) as u8 {
+                0 => Compression::None,
+                1 => Compression::Deflate,
+                2 => Compression::Oodle,
+                n => Compression::Unknown(n),
+            },
+            size_or_flags: q2,
+            path: None,
+        }
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.key_id != 0xFF
+    }
+
+    /// Size of the file once read: uncompressed size, or both resource page sizes.
+    pub fn size(&self) -> u64 {
+        if self.is_resource {
+            (self.size_or_flags & 0xFFFF_FFF0) + (self.size_or_flags >> 32 & 0xFFFF_FFF0)
+        } else {
+            self.size_or_flags
+        }
+    }
+
+    /// Resource version, from the low nibbles of the two flags.
+    pub fn resource_version(&self) -> Option<u32> {
+        self.is_resource.then_some(((self.size_or_flags as u32 & 0xF) << 4) | ((self.size_or_flags >> 32) as u32 & 0xF))
+    }
+
+    /// The entry's name: its path when known, else `hash/XXXXXXXX.ext`.
+    pub fn display_name(&self, platform: char) -> String {
+        if let Some(p) = &self.path {
+            return p.clone();
+        }
+        match extension(self.ext_id, platform) {
+            Some(ext) => format!("hash/{:08X}.{ext}", self.hash),
+            None => format!("hash/{:08X}", self.hash),
+        }
+    }
+}
+
+/// An opened RPF8 archive.
+#[derive(Debug)]
+pub struct Rpf8 {
+    path: PathBuf,
+    header: Header,
+    size: u64,
+    /// `None` while the entry table is encrypted and no keys are available.
+    entries: Option<Vec<Entry>>,
+}
+
+impl Rpf8 {
+    /// Whether these bytes start an RPF8 archive.
+    pub fn is_rpf8(start: &[u8]) -> bool {
+        Header::parse(start).is_some()
+    }
+
+    /// Opens an archive. Encrypted entry tables are left unread.
+    pub fn open(path: &Path) -> Result<Rpf8, RpfError> {
+        let name = path.display().to_string();
+        let mut f = File::open(path)?;
+        let size = f.metadata()?.len();
+        let mut head = [0u8; HEADER_LEN as usize];
+        f.read_exact(&mut head)?;
+        let header = Header::parse(&head).ok_or_else(|| {
+            RpfError::BadMagic(name.clone(), u32::from_le_bytes(head[0..4].try_into().unwrap_or_default()))
+        })?;
+        let table_end = HEADER_LEN + SIGNATURE_LEN + u64::from(header.entry_count) * ENTRY_LEN as u64;
+        if table_end > size || u64::from(header.names_length) > size {
+            return Err(RpfError::CorruptToc { archive: name, reason: "entry table larger than the file".into() });
+        }
+        let entries = if header.is_encrypted() {
+            None
+        } else {
+            f.seek(SeekFrom::Start(HEADER_LEN + SIGNATURE_LEN))?;
+            let mut table = vec![0u8; header.entry_count as usize * ENTRY_LEN];
+            f.read_exact(&mut table)?;
+            let mut entries: Vec<Entry> = table.as_chunks::<ENTRY_LEN>().0.iter().map(|c| Entry::parse(c)).collect();
+            for e in &entries {
+                if e.offset + e.size_on_disk > size {
+                    return Err(RpfError::OutOfBounds { archive: name, entry: e.display_name(header.platform) });
+                }
+            }
+            if header.names_length > 0 {
+                f.seek(SeekFrom::Start(size - u64::from(header.names_length)))?;
+                let mut names = vec![0u8; header.names_length as usize];
+                f.read_exact(&mut names)?;
+                apply_names(&mut entries, &names, header.platform);
+            }
+            Some(entries)
+        };
+        Ok(Rpf8 { path: path.to_path_buf(), header, size, entries })
+    }
+
+    pub fn header(&self) -> Header {
+        self.header
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The entries, or `None` while the table is encrypted.
+    pub fn entries(&self) -> Option<&[Entry]> {
+        self.entries.as_deref()
+    }
+
+    /// Reads an entry's data (only unencrypted, uncompressed or deflated binary files for now).
+    pub fn read(&self, entry: &Entry) -> Result<Vec<u8>, RpfError> {
+        let archive = self.path.display().to_string();
+        let name = entry.display_name(self.header.platform);
+        if entry.is_encrypted() {
+            return Err(RpfError::KeysRequired(format!("{archive}/{name}")));
+        }
+        let mut f = File::open(&self.path)?;
+        f.seek(SeekFrom::Start(entry.offset))?;
+        let mut data = vec![0u8; entry.size_on_disk as usize];
+        f.read_exact(&mut data)?;
+        if entry.signed && data.len() >= SIGNATURE_LEN as usize {
+            data.truncate(data.len() - SIGNATURE_LEN as usize);
+        }
+        match entry.compression {
+            Compression::None => {
+                if !entry.is_resource {
+                    data.truncate(entry.size_or_flags as usize);
+                }
+                Ok(data)
+            }
+            Compression::Deflate => {
+                let mut out = Vec::new();
+                flate2::read::DeflateDecoder::new(&data[..])
+                    .read_to_end(&mut out)
+                    .map_err(|source| RpfError::Inflate { archive, entry: name, source })?;
+                Ok(out)
+            }
+            other => Err(RpfError::Inflate {
+                archive,
+                entry: name,
+                source: std::io::Error::other(format!("{other:?} compression is not supported yet")),
+            }),
+        }
+    }
+}
+
+/// Matches the NUL-separated paths of a name table to the entries.
+fn apply_names(entries: &mut [Entry], names: &[u8], platform: char) {
+    for name in names.split(|&b| b == 0).filter(|n| !n.is_empty()) {
+        let Ok(name) = std::str::from_utf8(name) else { continue };
+        let (hash, ext) = path_hash(name, platform);
+        if let Some(e) = entries.iter_mut().find(|e| e.hash == hash && (e.ext_id == ext || ext == 0xFF)) {
+            e.path = Some(name.replace('\\', "/"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry_bytes(hash: u32, ext: u8, key: u8, offset: u64, disk: u64, comp: u64, size: u64) -> Vec<u8> {
+        let q0 = u64::from(hash) | u64::from(key) << 40 | u64::from(ext) << 48;
+        let q1 = disk >> 4 | (offset >> 4) << 28 | comp << 59;
+        [q0.to_le_bytes(), q1.to_le_bytes(), size.to_le_bytes()].concat()
+    }
+
+    fn archive(entries: &[Vec<u8>], data: &[u8], names: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(MAGIC.to_le_bytes());
+        out.extend((entries.len() as u32).to_le_bytes());
+        out.extend((names.len() as u32).to_le_bytes());
+        out.extend(PLAINTEXT.to_le_bytes());
+        out.extend([b'y', 0]);
+        out.extend([0u8; 256]);
+        for e in entries {
+            out.extend(e);
+        }
+        out.resize(0x200, 0);
+        out.extend(data);
+        out.extend(names);
+        out
+    }
+
+    #[test]
+    fn reads_a_plaintext_archive_with_names() {
+        let text = b"hello rdr";
+        let mut deflated = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = flate2::write::DeflateEncoder::new(&mut deflated, flate2::Compression::default());
+            enc.write_all(text).unwrap();
+        }
+        let mut data = vec![0u8; 0x10];
+        data[..text.len()].copy_from_slice(text);
+        let second = 0x210;
+        data.extend(&deflated);
+        data.resize(0x10 + deflated.len().next_multiple_of(16), 0);
+        let (h1, x1) = path_hash("common/data/a.txt", 'y');
+        let (h2, x2) = path_hash("common/data/b.ymt", 'y');
+        assert_eq!(x1, 0xFF);
+        assert_eq!(x2, 11);
+        let bytes = archive(
+            &[
+                entry_bytes(h1, x1, 0xFF, 0x200, 0x10, 0, text.len() as u64),
+                entry_bytes(h2, x2, 0xFF, second, (deflated.len() as u64).next_multiple_of(16), 1, text.len() as u64),
+            ],
+            &data,
+            b"common/data/a.txt\0common/data/b.ymt\0",
+        );
+        let dir = std::env::temp_dir().join(format!("openrage-rpf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.rpf");
+        std::fs::write(&path, bytes).unwrap();
+        let rpf = Rpf8::open(&path).unwrap();
+        let entries = rpf.entries().unwrap();
+        assert_eq!(entries[0].path.as_deref(), Some("common/data/a.txt"));
+        assert_eq!(entries[1].path.as_deref(), Some("common/data/b.ymt"));
+        assert_eq!(rpf.read(&entries[0]).unwrap(), text);
+        assert_eq!(rpf.read(&entries[1]).unwrap(), text);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn encrypted_tables_stay_closed() {
+        let mut bytes = archive(&[entry_bytes(1, 5, 3, 0x200, 0, 0, 0)], &[], b"");
+        bytes[12] = 0x44;
+        bytes[13] = 0;
+        let h = Header::parse(&bytes).unwrap();
+        assert!(h.is_encrypted());
+        assert_eq!(h.platform, 'y');
+        assert_eq!(extension(5, 'y').as_deref(), Some("ytd"));
+        let e = Entry::parse(&entry_bytes(0xABCD, 5, 3, 0x1230, 0x40, 2, 7));
+        assert_eq!((e.offset, e.size_on_disk, e.compression, e.key_id), (0x1230, 0x40, Compression::Oodle, 3));
+        assert_eq!(e.display_name('y'), "hash/0000ABCD.ytd");
+    }
+}
