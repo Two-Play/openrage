@@ -12,7 +12,7 @@ An open-source explorer and modding toolkit for games built on Rockstar's RAGE e
 | GTA IV | planned (RPF3) | – |
 | Red Dead Redemption 2 | planned (RPF8) | – |
 
-Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF, complete vehicles and peds, GPU viewer) (done) → audio (`.awc` playback, WAV export) (done) → animations → **6** GTA IV → **7** RDR2.
+Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF, complete vehicles and peds, GPU viewer) (done) → audio (`.awc` playback, WAV export) (done) → animations (`.ycd` clips on skinned models) (done) → **6** GTA IV → **7** RDR2.
 
 ## Build
 
@@ -98,10 +98,11 @@ Double-click opens the model in a **viewer window** (rendered on the GPU via wgp
 
 * **Orbit** (drag, wheel) or **Fly** (F): W A S D to move, Q/E down/up, Shift faster, drag to look around.
 * **Parts:** grouped (body, wheels, ped components with their variants); show or hide groups or single parts.
+* **Animation:** peds and other skinned models play clips from clip dictionaries (`.ycd`): search for a dictionary (e.g. `move_m@generic`, suggested for peds), pick a clip, play/pause, scrub, speed, loop. Skinning runs on the GPU.
 * **Materials:** every shader with a readable name (primary paint, glass, tyres, interior, …); hide it or give it a colour — paint the car. Preview and glTF export follow.
 * **Export glTF…** writes a binary glTF 2.0 file (`.glb`) with one node per shown part and the textures embedded, which Blender and other tools open directly (Z-up is converted to glTF's Y-up).
 
-All 168,000+ models of GTA V Enhanced load, as do the Legacy formats. Not yet: animations and skinning poses, vehicle mods and tuning parts, map placements (ymap/ytyp).
+All 168,000+ models of GTA V Enhanced load, as do the Legacy formats. Not yet: vehicle mods and tuning parts, map placements (ymap/ytyp).
 
 ### Audio
 
@@ -165,6 +166,9 @@ openrage model …/adder.yft --render adder.png [--yaw 1.2]      # software-rend
 openrage verify --models                       # parse every model of the game
 openrage audio x64/audio/sfx/RADIO_02_POP.rpf/alright.awc --export out/   # sounds → .wav
 openrage verify --audio                        # decode every sound of the game
+openrage clips x64c.rpf/anim/ingame/clip_move_.rpf/move_m@generic.ycd     # clips of a .ycd
+openrage model …/a_m_y_hipster_01.ydd --render pose.png --anim "…/move_m@generic.ycd:walk@0.5"
+openrage verify --animations                   # parse every clip dictionary, evaluate all frames
 openrage mods                                  # files in the OpenIV mods folder
 openrage mods --changes [--deep]               # every added/removed/modified entry
 ```

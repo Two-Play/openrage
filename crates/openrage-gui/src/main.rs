@@ -179,6 +179,15 @@ fn debug_snapshot(ui: &AppWindow) {
             if let Ok(tab) = std::env::var("OPENRAGE_TAB") {
                 v.set_panel_tab(tab.parse().unwrap_or(0));
             }
+            if let Ok(spec) = std::env::var("OPENRAGE_ANIM") {
+                use slint::Model;
+                let (result, clip) = spec.split_once(':').unwrap_or(("0", "walk"));
+                v.invoke_anim_open(result.parse().unwrap_or(0));
+                let rows = v.get_anim_clips();
+                if let Some(i) = (0..rows.row_count()).find(|&i| rows.row_data(i).is_some_and(|r| r.name == clip)) {
+                    v.invoke_anim_select(i as i32);
+                }
+            }
             if let Ok(hex) = std::env::var("OPENRAGE_PAINT") {
                 use slint::Model;
                 let rows = v.get_materials();
@@ -2129,6 +2138,7 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
 fn render_image(
     model: &Arc<ModelPreview>,
     camera: impl FnOnce([f32; 3], [f32; 3]) -> openrage_app::render::Camera,
+    skin: Option<&[rage_formats::math::Mat4]>,
     w: usize,
     h: usize,
 ) -> Option<slint::Image> {
@@ -2140,11 +2150,11 @@ fn render_image(
     };
     let camera = camera(lo, hi);
     if std::env::var_os("OPENRAGE_SOFTWARE_RENDERER").is_none()
-        && let Some(img) = gpu::render(model, &look, &camera, w as u32, h as u32)
+        && let Some(img) = gpu::render(model, &look, &camera, skin, w as u32, h as u32)
     {
         return Some(img);
     }
-    let rgba = openrage_app::render::render_camera(&model.loaded, &look, &model.materials, &camera, w, h);
+    let rgba = openrage_app::render::render_camera(&model.loaded, &look, &model.materials, &camera, skin, w, h);
     let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w as u32, h as u32);
     Some(slint::Image::from_rgba8(buffer))
 }
@@ -2154,7 +2164,7 @@ fn render_model(ui: &AppWindow) {
     let Some((model, view)) = with_app(|a| a.model.clone().map(|m| (m, a.model_view))) else { return };
     let w = (ui.get_preview_area_width() - 16.0).max(64.0) as usize;
     let h = (ui.get_preview_area_height() - 16.0).max(64.0) as usize;
-    if let Some(img) = render_image(&model, |lo, hi| openrage_app::render::orbit_camera(lo, hi, view), w, h) {
+    if let Some(img) = render_image(&model, |lo, hi| openrage_app::render::orbit_camera(lo, hi, view), None, w, h) {
         ui.set_preview_image(img);
         ui.set_has_image(true);
     }
@@ -2230,6 +2240,35 @@ fn save_png_image(img: &slint::Image, name: String, main: Weak<AppWindow>) {
         };
         let _ = main.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
     });
+}
+
+// ---------------------------------------------------------------------------
+// Animations
+
+/// Files whose name contains `query` and ends with `extension`, from the search index.
+fn find_files(query: &str, extension: &str, limit: usize) -> Vec<String> {
+    let Some(game_dir) = with_app(|a| a.game_dir.clone()) else { return Vec::new() };
+    let Some(path) = openrage_app::index_path(&game_dir).filter(|p| p.exists()) else { return Vec::new() };
+    let Ok(index) = rage_index::Index::open(&path) else { return Vec::new() };
+    let Ok(results) = index.search(query, limit * 4, None) else { return Vec::new() };
+    let mut out: Vec<String> = results
+        .hits
+        .into_iter()
+        .filter(|h| h.name.to_ascii_lowercase().ends_with(extension))
+        .map(|h| h.vpath)
+        .collect();
+    // The base game first, then updates and DLC.
+    out.sort_by_key(|v| (v.starts_with("update"), v.len()));
+    out.truncate(limit);
+    out
+}
+
+fn load_clip_dictionary(vpath: &str) -> anyhow::Result<rage_formats::clip::ClipDictionary> {
+    let (game_dir, keys) = with_app(|a| (a.game_dir.clone(), a.keys.clone()));
+    let game_dir = game_dir.ok_or_else(|| anyhow::anyhow!("no game folder"))?;
+    let (node, _) = rage_mods::resolve(&game_dir, vpath, keys)?;
+    let Node::ArchiveFile(rpf, id) = node else { anyhow::bail!("{vpath} is not a file inside an archive") };
+    Ok(rage_formats::clip::parse_ycd(&rpf.read_resource(id)?)?)
 }
 
 // ---------------------------------------------------------------------------

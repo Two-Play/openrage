@@ -85,6 +85,9 @@ enum Command {
         /// Instead of archives, decode every sound of every audio container (.awc).
         #[arg(long, conflicts_with_all = ["textures", "models"])]
         audio: bool,
+        /// Instead of archives, parse every clip dictionary (.ycd) and evaluate every frame.
+        #[arg(long, conflicts_with_all = ["textures", "models", "audio"])]
+        animations: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
         #[arg(long, requires = "textures")]
         rebuild: bool,
@@ -260,6 +263,7 @@ fn run() -> Result<()> {
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
+        Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
         Command::Verify { path, textures: true, rebuild, .. } => cmd_verify_textures(&game_dir, &path, rebuild, keys),
         Command::Textures { path, sets, removes, .. } if !sets.is_empty() || !removes.is_empty() => {
@@ -1038,6 +1042,91 @@ fn cmd_audio(game_dir: &Path, path: &str, export: Option<&Path>, keys: Option<Ar
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+/// Per archive: files, clips, animations, frame-count mismatches, bad values, errors.
+type AnimStats = (usize, usize, usize, usize, usize, Vec<String>);
+
+fn cmd_verify_animations(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let starts = archive_roots(game_dir, within, keys)?;
+    let started = Instant::now();
+    let all: Vec<AnimStats> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let (mut files, mut clips, mut anims, mut mismatch, mut badq) = (0, 0, 0, 0, 0);
+            let mut errors = Vec::new();
+            let mut nested = Vec::new();
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    if !a.entry(id).name.to_ascii_lowercase().ends_with(".ycd")
+                        || a.entry(id).resource_version().is_none()
+                    {
+                        return;
+                    }
+                    files += 1;
+                    let parsed = a
+                        .read_resource(id)
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| rage_formats::clip::parse_ycd(&r).map_err(|e| e.to_string()));
+                    match parsed {
+                        Ok(d) => {
+                            clips += d.clips.len();
+                            anims += d.animations.len();
+                            for an in &d.animations {
+                                let blocks = an.block_frames();
+                                let sum: usize = blocks.iter().sum();
+                                let overlapped = sum.saturating_sub(blocks.len().saturating_sub(1));
+                                if sum != an.frames && overlapped != an.frames {
+                                    mismatch += 1;
+                                }
+                                for (t, tr) in an.tracks.iter().enumerate() {
+                                    for f in (0..an.frames).step_by(7) {
+                                        match an.value(t, f as f32) {
+                                            Some(v) if tr.format == 1 => {
+                                                let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                                                if !(0.99..=1.01).contains(&n) {
+                                                    badq += 1;
+                                                }
+                                            }
+                                            Some(v) if v.iter().any(|x| !x.is_finite()) => badq += 1,
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => errors.push(format!("{p}: {e}")),
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (files, clips, anims, mismatch, badq, errors)
+        })
+        .collect();
+    let sum = |f: fn(&AnimStats) -> usize| all.iter().map(f).sum::<usize>();
+    let errors: Vec<&String> = all.iter().flat_map(|x| &x.5).collect();
+    for e in errors.iter().take(40) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} clip dictionaries, {} clips, {} animations; {} with unexpected frame counts, {} bad values; {} errors ({:.1}s)",
+        sum(|x| x.0),
+        sum(|x| x.1),
+        sum(|x| x.2),
+        sum(|x| x.3),
+        sum(|x| x.4),
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() {
+        bail!("{} errors", errors.len());
+    }
+    Ok(())
 }
 
 fn cmd_verify_audio(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {

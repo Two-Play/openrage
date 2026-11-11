@@ -2,7 +2,7 @@
 // All user-visible strings go through @tr() so the UI can be translated.
 // Spacing, sizes and colors come from the Theme tokens (theme.slint).
 
-import { Button, CheckBox, LineEdit, ComboBox, ScrollView, ListView, Palette, Spinner, TabWidget, TextEdit } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ComboBox, ScrollView, ListView, Palette, Slider, Spinner, TabWidget, TextEdit } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 
 export struct TreeRow {
@@ -36,6 +36,12 @@ export struct MaterialRow {
     color: color,
     paint: bool,
     textured: bool,
+}
+
+export struct ClipRow {
+    name: string,
+    // Length, e.g. "2.1 s".
+    info: string,
 }
 
 export struct Crumb {
@@ -2260,6 +2266,19 @@ export component ViewerWindow inherits Window {
     in property <bool> fly-mode;
     in property <[PartRow]> parts;
     in property <[MaterialRow]> materials;
+    // Animation: whether the model can be animated, dictionaries found by the
+    // search, the opened dictionary's clips and the player state.
+    in property <bool> has-skeleton;
+    in property <[ClipRow]> anim-results;
+    in property <string> anim-dictionary;
+    in property <[ClipRow]> anim-clips;
+    in property <int> anim-clip: -1;
+    in property <bool> anim-playing;
+    in property <float> anim-position;
+    in property <string> anim-time;
+    in property <string> anim-status;
+    in-out property <int> anim-speed-index: 2;
+    in-out property <bool> anim-loop: true;
     in-out property <int> panel-tab;
     property <int> editing-material: -1;
     out property <length> area-width: area.width;
@@ -2282,6 +2301,12 @@ export component ViewerWindow inherits Window {
     callback material-color(int, color);
     callback material-hex(int, string);
     callback material-reset(int);
+    callback anim-search(string);
+    callback anim-open(int);
+    callback anim-select(int);
+    callback anim-toggle();
+    callback anim-seek(float);
+    callback anim-speed(int);
 
     changed area-width => { root.resized(); }
     changed area-height => { root.resized(); }
@@ -2562,6 +2587,153 @@ export component ViewerWindow inherits Window {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                        Tab {
+                            title: @tr("Animation");
+                            VerticalLayout {
+                                padding: Theme.space-m;
+                                spacing: Theme.space-s;
+                                if !root.has-skeleton: Text {
+                                    text: @tr("This model has no skeleton to animate. Peds (.ydd with a .yft next to it) and other skinned models can be animated.");
+                                    wrap: word-wrap;
+                                    color: Theme.text-muted;
+                                }
+                                if root.has-skeleton: LineEdit {
+                                    placeholder-text: @tr("Find clip dictionaries, e.g. move_m@generic");
+                                    accepted(text) => { root.anim-search(text); }
+                                }
+                                if root.has-skeleton && root.anim-dictionary == "": ListView {
+                                    vertical-stretch: 1;
+                                    for r[i] in root.anim-results: Rectangle {
+                                        height: 40px;
+                                        border-radius: Theme.radius-s;
+                                        background: res-ta.has-hover ? Theme.hover : transparent;
+                                        res-ta := TouchArea {
+                                            clicked => { root.anim-open(i); }
+                                        }
+                                        VerticalLayout {
+                                            padding-left: Theme.space-s;
+                                            alignment: center;
+                                            Text {
+                                                text: r.name;
+                                                overflow: elide;
+                                                color: Theme.text;
+                                            }
+                                            Text {
+                                                text: r.info;
+                                                font-size: Theme.font-small;
+                                                overflow: elide;
+                                                color: Theme.text-faint;
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.anim-dictionary != "": HorizontalLayout {
+                                    spacing: Theme.space-s;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: root.anim-dictionary;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        color: Theme.text;
+                                    }
+                                    Button {
+                                        text: @tr("Other…");
+                                        clicked => { root.anim-open(-1); }
+                                    }
+                                }
+                                if root.anim-dictionary != "": ListView {
+                                    vertical-stretch: 1;
+                                    for c[i] in root.anim-clips: Rectangle {
+                                        height: 28px;
+                                        border-radius: Theme.radius-s;
+                                        background: i == root.anim-clip ? Theme.accent-subtle : clip-ta.has-hover ? Theme.hover : transparent;
+                                        clip-ta := TouchArea {
+                                            clicked => { root.anim-select(i); }
+                                        }
+                                        HorizontalLayout {
+                                            padding-left: Theme.space-s;
+                                            padding-right: Theme.space-s;
+                                            Text {
+                                                horizontal-stretch: 1;
+                                                text: c.name;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                                font-weight: i == root.anim-clip ? 600 : 400;
+                                                color: Theme.text;
+                                            }
+                                            Text {
+                                                text: c.info;
+                                                vertical-alignment: center;
+                                                font-size: Theme.font-small;
+                                                color: Theme.text-faint;
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.anim-clip >= 0: Rectangle {
+                                    border-radius: Theme.radius;
+                                    background: Theme.background;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    VerticalLayout {
+                                        padding: Theme.space-s;
+                                        spacing: Theme.space-xs;
+                                        HorizontalLayout {
+                                            spacing: Theme.space-s;
+                                            Rectangle {
+                                                width: 34px;
+                                                height: 34px;
+                                                border-radius: 17px;
+                                                background: Theme.accent;
+                                                Image {
+                                                    width: 16px;
+                                                    height: 16px;
+                                                    source: root.anim-playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
+                                                    colorize: Palette.accent-foreground;
+                                                }
+                                                TouchArea {
+                                                    clicked => { root.anim-toggle(); }
+                                                }
+                                            }
+                                            Slider {
+                                                horizontal-stretch: 1;
+                                                minimum: 0;
+                                                maximum: 1;
+                                                value: root.anim-position;
+                                                changed(v) => { root.anim-seek(v); }
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: Theme.space-s;
+                                            Text {
+                                                horizontal-stretch: 1;
+                                                text: root.anim-time;
+                                                vertical-alignment: center;
+                                                font-size: Theme.font-small;
+                                                color: Theme.text-muted;
+                                            }
+                                            ComboBox {
+                                                width: 90px;
+                                                model: ["0.25×", "0.5×", "1×", "2×"];
+                                                current-index <=> root.anim-speed-index;
+                                                selected => { root.anim-speed(self.current-index); }
+                                            }
+                                            CheckBox {
+                                                text: @tr("Loop");
+                                                checked <=> root.anim-loop;
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.anim-status != "": Text {
+                                    text: root.anim-status;
+                                    wrap: word-wrap;
+                                    font-size: Theme.font-small;
+                                    color: Theme.text-muted;
                                 }
                             }
                         }

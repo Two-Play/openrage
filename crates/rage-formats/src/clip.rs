@@ -439,6 +439,11 @@ impl Animation {
         None
     }
 
+    /// Frames per sequence block (for checks).
+    pub fn block_frames(&self) -> Vec<usize> {
+        self.blocks.iter().map(|b| b.frames).collect()
+    }
+
     /// The frame (fractional) shown at `time` seconds.
     pub fn frame_at(&self, time: f32) -> f32 {
         if self.duration <= 0.0 || self.frames < 2 {
