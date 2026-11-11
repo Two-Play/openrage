@@ -94,7 +94,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 |---|---|---|
 | **GTA V** (Legacy & Enhanced) | ✅ RPF7 read, incl. nested archives; edit in place in the mods folder, with undo | ✅ textures · models · audio · animations · metadata · text tables |
 | **GTA IV** | 🔜 planned (RPF3) | – |
-| **Red Dead Redemption 2** | 🚧 RPF8: headers of all archives; tables only where not encrypted (keys needed, see below) | – |
+| **Red Dead Redemption 2** | ✅ RPF8 read: decryption with keys from your own game, Oodle decompression (CLI) | – |
 
 Every format is checked against the complete game (GTA V Enhanced):
 
@@ -143,7 +143,7 @@ Every format is checked against the complete game (GTA V Enhanced):
 
 In both cases the cipher tables and the IV come from your `RDR2.exe`: OpenRAGE finds their 565 pieces by SHA-256 fingerprints (checksums only). All archive keys start with the same 32 bytes; every place in the dump or key file that starts that way is tried on your archives, and the keys that open them are kept. Only the Steam version of 2 April 2024 is known so far; other versions report which pieces are missing.
 
-Compressed files use Oodle, for which an open-source decoder is still to be added.
+With the keys, `openrage rpf8 <game folder>` opens all 89 archives and reads all 20,518 files — decrypted, and decompressed with the open-source Oodle decoder [oozextract](https://github.com/lvlvllvlvllvlvl/oozextract). Most files only have a hash so far, not a name; browsing in the GUI and the formats follow.
 
 ## Installation
 

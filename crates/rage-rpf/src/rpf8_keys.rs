@@ -231,7 +231,8 @@ fn opens_table(ctx: &Context, key: &Key, a: &Archive) -> bool {
 
 /// Whether decrypted data starts like an Oodle block.
 fn looks_like_oodle(b: &[u8]) -> bool {
-    b.len() >= 2 && b[0] & 0x3F == 0x0C && matches!(b[1] & 0x7F, 6 | 10 | 11 | 12 | 13)
+    // Low nibble 0xC, bits 4-5 clear; then the decoder type (Kraken = 6, …).
+    b.len() >= 2 && b[0] & 0x3F == 0x0C && b[1] & 0x7F <= 13
 }
 
 /// Finds the cipher tables, IV and keys among the candidates by trying them on the archives.
@@ -390,7 +391,8 @@ mod tests {
     fn oodle_start() {
         assert!(looks_like_oodle(&[0x8C, 0x06]));
         assert!(looks_like_oodle(&[0xCC, 0x0A]));
-        assert!(!looks_like_oodle(&[0x8C, 0x07]));
+        assert!(looks_like_oodle(&[0x8C, 0x02]));
+        assert!(!looks_like_oodle(&[0x8C, 0x27]));
         assert!(!looks_like_oodle(&[0x00, 0x06]));
     }
 }
