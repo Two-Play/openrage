@@ -15,6 +15,7 @@ pub mod render;
 pub mod repack;
 pub mod setup;
 pub mod suggest;
+pub mod texttable;
 pub mod textures;
 
 use std::sync::Arc;

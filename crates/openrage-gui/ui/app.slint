@@ -83,6 +83,8 @@ export struct FileRow {
     can-edit-text: bool,
     // Binary metadata (.ymap, .ytyp, .ymt, …) shown as XML.
     is-meta: bool,
+    // Text table (.gxt2, .nametable) edited as text.
+    is-table: bool,
 }
 
 component FormatIcon inherits Rectangle {
@@ -290,6 +292,11 @@ component FileItem inherits Rectangle {
                 title: @tr("Show as XML");
                 icon: @image-url("icons/menu/text.svg");
                 activated => { root.action("xml-view"); }
+            }
+            if item.is-table: MenuItem {
+                title: @tr("Export as text…");
+                icon: @image-url("icons/menu/export.svg");
+                activated => { root.action("text-export"); }
             }
             if item.is-meta: MenuItem {
                 title: @tr("Export XML…");
