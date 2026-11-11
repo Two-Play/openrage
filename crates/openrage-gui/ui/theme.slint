@@ -39,11 +39,17 @@ export global Theme {
     out property <color> text-muted: Palette.foreground.with-alpha(0.68);
     out property <color> text-faint: Palette.foreground.with-alpha(0.5);
 
+    // Accent color: 0 = the widget style's, 1 = OpenRAGE orange (the logo's),
+    // 2 = a color of the user's choice. Set from View → Accent color.
+    in-out property <int> accent-mode: 0;
+    in-out property <color> accent-custom: #c2410c;
+
     // Accent and states (contrast ≥ 4.5:1 on the respective background)
-    out property <color> accent: Palette.accent-background;
-    out property <color> accent-subtle: Palette.accent-background.with-alpha(dark ? 0.16 : 0.10);
-    out property <color> selection: Palette.selection-background;
-    out property <color> selection-text: Palette.selection-foreground;
+    out property <color> accent: accent-mode == 1 ? (dark ? #fb923c : #c2410c) : accent-mode == 2 ? accent-custom : Palette.accent-background;
+    out property <color> accent-subtle: accent.with-alpha(dark ? 0.16 : 0.10);
+    out property <color> selection: accent-mode == 0 ? Palette.selection-background : accent;
+    // Text on the accent: dark on light accents, white on dark ones.
+    out property <color> selection-text: accent-mode == 0 ? Palette.selection-foreground : (accent.red * 299 + accent.green * 587 + accent.blue * 114) / 1000 > 150 ? #1a1206 : #ffffff;
     out property <color> success: dark ? #4cc38a : #1a7f4f;
     out property <color> warning: dark ? #e5b454 : #8a5a00;
     out property <color> danger: dark ? #f2777b : #c0282d;
