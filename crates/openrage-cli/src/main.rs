@@ -125,8 +125,15 @@ enum Command {
         #[arg(long, conflicts_with = "out")]
         tree: bool,
     },
+    /// Import native names for script disassembly from a NativeDB-style natives.json.
+    Natives { file: PathBuf },
     /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
-    Media { path: String },
+    Media {
+        path: String,
+        /// For a .gfx: write it as a Flash file (.swf) for Flash tools such as JPEXS or Ruffle.
+        #[arg(long)]
+        swf: Option<PathBuf>,
+    },
     /// Disassemble a script (.ysc): functions, jumps, strings and native calls.
     Script {
         /// Virtual path of the .ysc.
@@ -341,7 +348,12 @@ fn run() -> Result<()> {
             cmd_model(&game_dir, &path, export.as_deref(), render.as_deref(), yaw, anim.as_deref(), keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
-        Command::Media { path } => cmd_media(&game_dir, &path, keys),
+        Command::Natives { file } => {
+            let n = openrage_app::natives::import(&file)?;
+            outln!("Imported {n} native names; script disassemblies now show them.");
+            Ok(())
+        }
+        Command::Media { path, swf } => cmd_media(&game_dir, &path, swf.as_deref(), keys),
         Command::Script { path, out, strings } => cmd_script(&game_dir, &path, out.as_deref(), strings, keys),
         Command::Particles { path } => cmd_particles(&game_dir, &path, keys),
         Command::Text { path, out } => cmd_text(&game_dir, &path, out.as_deref(), keys),
@@ -1162,12 +1174,12 @@ fn cmd_xml(game_dir: &Path, path: &str, out: Option<&Path>, tree: bool, keys: Op
                 if xml.errors.is_empty() { String::new() } else { format!(", {} problems", xml.errors.len()) }
             );
         }
-        None => print!("{}", xml.text),
+        None => outln!("{}", xml.text.trim_end()),
     }
     Ok(())
 }
 
-fn cmd_media(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+fn cmd_media(game_dir: &Path, path: &str, swf: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
     let data = match node {
         Node::ArchiveFile(rpf, id) => rpf.read(id)?,
@@ -1176,6 +1188,10 @@ fn cmd_media(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result
     };
     for (k, v) in openrage_app::media::rows(path, &data)? {
         outln!("{k:<14}{v}");
+    }
+    if let Some(out) = swf {
+        fs::write(out, rage_formats::media::gfx_to_swf(&data)?)?;
+        outln!("Wrote {}", out.display());
     }
     Ok(())
 }
@@ -1267,14 +1283,14 @@ fn cmd_script(
             s.all_strings().len(),
             s.table.map_or("unknown (jumps do not line up)".to_owned(), |t| format!("{t:?}"))
         );
-        header + &s.listing(|_| None).map_err(|e| anyhow::anyhow!(e))?
+        header + &s.listing(openrage_app::natives::name).map_err(|e| anyhow::anyhow!(e))?
     };
     match out {
         Some(file) => {
             fs::write(file, &text)?;
             outln!("Wrote {}", file.display());
         }
-        None => print!("{text}"),
+        None => outln!("{}", text.trim_end()),
     }
     Ok(())
 }
@@ -1590,7 +1606,7 @@ fn cmd_text(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<Gt
             fs::write(file, &text)?;
             outln!("Wrote {} ({count} entries)", file.display());
         }
-        None => print!("{text}"),
+        None => outln!("{}", text.trim_end()),
     }
     Ok(())
 }

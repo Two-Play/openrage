@@ -12,6 +12,7 @@ pub mod journal;
 pub mod media;
 pub mod metadata;
 pub mod models;
+pub mod natives;
 pub mod oiv;
 pub mod render;
 pub mod repack;

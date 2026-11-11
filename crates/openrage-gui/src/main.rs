@@ -418,6 +418,19 @@ fn wire_callbacks(ui: &AppWindow) {
                 open_script_view(ui, vpath);
                 return;
             }
+            let video = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(i as usize)?];
+                item.name
+                    .to_ascii_lowercase()
+                    .ends_with(".bik")
+                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = video {
+                // Video players built on FFmpeg (VLC, mpv, …) play Bink.
+                open_with_system(ui, vpath);
+                return;
+            }
             let is_ycd = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 Some(listing.items[*a.visible.get(i as usize)?].name.to_ascii_lowercase().ends_with(".ycd"))
@@ -681,6 +694,24 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_texture_add(move || with_ui(&w, |ui| edit_texture(ui, TextureAction::Add)));
     let w = ui.as_weak();
+    ui.on_load_natives(move || {
+        let w = w.clone();
+        std::thread::spawn(move || {
+            let Some(file) = rfd::FileDialog::new()
+                .set_title("Load native names (natives.json in NativeDB format)")
+                .add_filter("JSON", &["json"])
+                .pick_file()
+            else {
+                return;
+            };
+            let msg = match openrage_app::natives::import(&file) {
+                Ok(n) => format!("Loaded {n} native names; script disassemblies show them from now on."),
+                Err(e) => format!("Cannot load native names: {e:#}"),
+            };
+            let _ = w.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+        });
+    });
+    let w = ui.as_weak();
     ui.on_texture_remove(move || with_ui(&w, |ui| edit_texture(ui, TextureAction::Remove)));
     ui.on_cancel_task(|| with_app(|a| a.cancel.store(true, Ordering::Relaxed)));
     let w = ui.as_weak();
@@ -737,6 +768,16 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
                 } else {
                     open_with_system(ui, vpath);
                 }
+            }
+        }
+        "swf" => {
+            let vpath = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(row)?];
+                Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = vpath {
+                export_swf(ui, vpath);
             }
         }
         "text-export" => {
@@ -1104,6 +1145,7 @@ fn file_row(item: &Item) -> FileRow {
         is_model: is_model_item(item),
         can_edit_text: is_text_file(item),
         is_meta: is_meta_file(item),
+        is_gfx: item.name.to_ascii_lowercase().ends_with(".gfx"),
         is_table: is_text_file(item) && openrage_app::texttable::is_text_table(&item.name),
         kind: match &item.vpath {
             Some(_) if item.detail.is_some() => item.detail.clone().unwrap_or_default().into(),
@@ -1550,11 +1592,44 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, St
                 Err(e) => (vec![kv("Error", e)], String::new(), None),
             }
         }
+        PreviewSource::Entry(rpf, id) if rpf.entry(id).name.to_ascii_lowercase().ends_with(".bik") => {
+            let name = rpf.entry(id).name.clone();
+            let (meta, body) = load_preview_text(PreviewSource::Entry(Arc::clone(&rpf), id), keys);
+            let frame = rpf.read(id).ok().and_then(|d| video_frame(&name, &d));
+            (meta, body, frame)
+        }
         other => {
             let (meta, body) = load_preview_text(other, keys);
             (meta, body, None)
         }
     }
+}
+
+/// A frame from the middle of a Bink video, if FFmpeg is installed (it
+/// decodes Bink; OpenRAGE has no decoder of its own).
+fn video_frame(name: &str, data: &[u8]) -> Option<Rgba> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let b = rage_formats::media::bink(data).ok()?;
+    if b.width == 0 || b.height == 0 {
+        return None;
+    }
+    let (w, h) = (640u32.min(b.width), (640u32.min(b.width) * b.height / b.width).max(1) & !1);
+    let dir = std::env::temp_dir().join("openrage-preview");
+    std::fs::create_dir_all(&dir).ok()?;
+    let file = dir.join(format!("{:08x}.bik", rage_core::hash::joaat(name)));
+    std::fs::File::create(&file).ok()?.write_all(data).ok()?;
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", &format!("{:.2}", b.duration() / 2.0), "-i"])
+        .arg(&file)
+        .args(["-frames:v", "1", "-vf", &format!("scale={w}:{h}"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok();
+    let _ = std::fs::remove_file(&file);
+    let pixels = output?.stdout;
+    (pixels.len() == (w * h * 4) as usize).then_some((w, h, pixels))
 }
 
 /// Returns (metadata, preview body).
@@ -1625,9 +1700,11 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
                 return match openrage_app::media::rows(&entry.name, &data) {
                     Ok(rows) => {
                         let mut meta: Meta = rows.into_iter().filter(|(_, v)| !v.is_empty()).collect();
-                        meta.push(note(
-                            "Playing videos and Scaleform movies is not supported; Extract… saves the file.",
-                        ));
+                        meta.push(note(if entry.name.to_ascii_lowercase().ends_with(".bik") {
+                            "Double-click plays it in your video player (VLC, mpv and other FFmpeg-based players play Bink)."
+                        } else {
+                            "Right-click → Export as SWF… opens it in Flash tools such as JPEXS or Ruffle."
+                        }));
                         (meta, String::new())
                     }
                     Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new()),
@@ -2921,7 +2998,7 @@ fn read_script_listing(ui: &AppWindow, vpath: &str) -> anyhow::Result<String> {
     let res = rage_resource_from(&data)?;
     let s = rage_formats::ysc::parse(&res)?;
     let header = script_header(&s);
-    Ok(header + &s.listing(|_| None).map_err(|e| anyhow::anyhow!(e))?)
+    Ok(header + &s.listing(openrage_app::natives::name).map_err(|e| anyhow::anyhow!(e))?)
 }
 
 fn rage_resource_from(data: &[u8]) -> anyhow::Result<rage_resource::Resource> {
@@ -2930,12 +3007,17 @@ fn rage_resource_from(data: &[u8]) -> anyhow::Result<rage_resource::Resource> {
 
 fn script_header(s: &rage_formats::ysc::Script) -> String {
     format!(
-        "// {}: {} of code, {} natives, {} statics, {} strings\n// Native calls show the native's hash; strings are noted next to STRING.\n",
+        "// {}: {} of code, {} natives, {} statics, {} strings\n// {}\n",
         s.name,
         human_size(s.code.len() as u64),
         s.natives.len(),
         s.statics.len(),
-        s.all_strings().len()
+        s.all_strings().len(),
+        if openrage_app::natives::count() > 0 {
+            "Native calls show the native's name and hash; strings are noted next to STRING."
+        } else {
+            "Native calls show the native's hash (Help → Load native names… adds names); strings are noted next to STRING."
+        }
     )
 }
 
@@ -2991,6 +3073,32 @@ fn open_xml_view(ui: &AppWindow, vpath: String) {
         }
         Err(e) => ui.set_status(format!("Cannot convert {vpath}: {e:#}").into()),
     }
+}
+
+/// Asks for a file name and writes a Scaleform movie as `.swf` for Flash tools.
+fn export_swf(ui: &AppWindow, vpath: String) {
+    let swf = match read_file(ui, &vpath).and_then(|d| Ok(rage_formats::media::gfx_to_swf(&d)?)) {
+        Ok(s) => s,
+        Err(e) => return ui.set_status(format!("Cannot convert {vpath}: {e:#}").into()),
+    };
+    let name = vpath.rsplit('/').next().unwrap_or(&vpath);
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s).to_owned();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export as SWF")
+            .set_file_name(format!("{stem}.swf"))
+            .add_filter("Flash movie", &["swf"])
+            .save_file()
+        else {
+            return;
+        };
+        let msg = match std::fs::write(&path, &swf) {
+            Ok(()) => format!("Exported {} (open it with a Flash tool such as JPEXS or Ruffle)", path.display()),
+            Err(e) => format!("Export failed: {e}"),
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+    });
 }
 
 /// Asks for a file name and writes a text table as text (`.oxt` for `.gxt2`, like OpenIV).
