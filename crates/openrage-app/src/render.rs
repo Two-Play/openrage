@@ -39,47 +39,61 @@ impl Image {
     }
 }
 
-/// Decoded base textures, shared between frames.
+/// Decoded textures, shared between frames.
 pub struct Materials {
     images: Vec<Image>,
-    /// Index into `images` per drawable and shader.
-    per_shader: Vec<Vec<Option<usize>>>,
+    /// Indices into `images` per drawable and shader: base colour and the
+    /// overlay drawn over it on the second UV set (liveries, signs).
+    per_shader: Vec<Vec<(Option<usize>, Option<usize>)>>,
 }
 
 impl Materials {
-    /// Decodes the base texture of every shader of every drawable.
+    /// Decodes the base and overlay textures of every shader of every drawable.
     pub fn new(model: &LoadedModel) -> Self {
         let mut by_name: HashMap<String, Option<usize>> = HashMap::new();
         let mut images: Vec<Image> = Vec::new();
+        let mut decode = |d: &rage_formats::drawable::Drawable, name: Option<&str>| {
+            let name = name?;
+            *by_name.entry(name.to_ascii_lowercase()).or_insert_with(|| {
+                let t = model.texture(d, name)?;
+                let rgba = t.to_rgba()?;
+                images.push(Image { w: t.width.max(1) as usize, h: t.height.max(1) as usize, rgba });
+                Some(images.len() - 1)
+            })
+        };
         let per_shader = model
             .drawables
             .iter()
             .map(|(_, d)| {
-                d.shaders
-                    .iter()
-                    .map(|s| {
-                        s.base_texture().and_then(|name| {
-                            *by_name.entry(name.to_ascii_lowercase()).or_insert_with(|| {
-                                let t = model.texture(d, name)?;
-                                let rgba = t.to_rgba()?;
-                                images.push(Image { w: t.width.max(1) as usize, h: t.height.max(1) as usize, rgba });
-                                Some(images.len() - 1)
-                            })
-                        })
-                    })
-                    .collect()
+                d.shaders.iter().map(|s| (decode(d, s.base_texture()), decode(d, s.overlay_texture()))).collect()
             })
             .collect();
         Self { images, per_shader }
     }
 
+    fn slot(&self, drawable: usize, shader: u16) -> (Option<usize>, Option<usize>) {
+        self.per_shader.get(drawable).and_then(|s| s.get(shader as usize)).copied().unwrap_or_default()
+    }
+
     fn image(&self, drawable: usize, shader: u16) -> Option<&Image> {
-        self.per_shader.get(drawable)?.get(shader as usize).copied().flatten().map(|i| &self.images[i])
+        self.slot(drawable, shader).0.map(|i| &self.images[i])
+    }
+
+    fn overlay_image(&self, drawable: usize, shader: u16) -> Option<&Image> {
+        self.slot(drawable, shader).1.map(|i| &self.images[i])
     }
 
     /// RGBA pixels of the base texture of a drawable's shader (for GPU upload).
     pub fn texture(&self, drawable: usize, shader: u16) -> Option<(usize, usize, usize, &[u8])> {
-        let i = self.per_shader.get(drawable)?.get(shader as usize).copied().flatten()?;
+        let i = self.slot(drawable, shader).0?;
+        let img = &self.images[i];
+        Some((i, img.w, img.h, &img.rgba))
+    }
+
+    /// RGBA pixels of the overlay texture of a drawable's shader, drawn over
+    /// the base colour with its alpha on the second UV set (for GPU upload).
+    pub fn overlay(&self, drawable: usize, shader: u16) -> Option<(usize, usize, usize, &[u8])> {
+        let i = self.slot(drawable, shader).1?;
         let img = &self.images[i];
         Some((i, img.w, img.h, &img.rgba))
     }
@@ -203,6 +217,8 @@ pub fn render_camera(
             let Some(tint) = model.tint(look, part.drawable, mesh.shader) else { continue };
             let img = materials.image(part.drawable, mesh.shader);
             let has_uv = mesh.uvs.len() == mesh.positions.len();
+            let overlay =
+                materials.overlay_image(part.drawable, mesh.shader).filter(|_| mesh.uvs1.len() == mesh.positions.len());
             let has_n = mesh.normals.len() == mesh.positions.len();
             // Skinning acts in model space: after the part's placement. Parts
             // attached to a bone follow that bone; others use the mesh weights.
@@ -276,6 +292,16 @@ pub fn render_camera(
                         }
                         for k in 0..3 {
                             base[k] *= tint[k];
+                        }
+                        if let Some(img) = overlay {
+                            let uv = &mesh.uvs1;
+                            let u = q0 * uv[a][0] + q1 * uv[b][0] + q2 * uv[c][0];
+                            let v = q0 * uv[a][1] + q1 * uv[b][1] + q2 * uv[c][1];
+                            let t = img.sample(u, v);
+                            let alpha = t[3] as f32 / 255.0;
+                            for k in 0..3 {
+                                base[k] += (t[k] as f32 / 255.0 - base[k]) * alpha;
+                            }
                         }
                         let n = if has_n {
                             let (na, nb, nc) = (normals[a], normals[b], normals[c]);
