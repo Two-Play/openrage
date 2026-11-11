@@ -2,7 +2,7 @@
 // All user-visible strings go through @tr() so the UI can be translated.
 // Spacing, sizes and colors come from the Theme tokens (theme.slint).
 
-import { Button, CheckBox, LineEdit, ComboBox, ScrollView, ListView, Palette, Spinner, TabWidget } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ComboBox, ScrollView, ListView, Palette, Spinner, TabWidget, TextEdit } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 
 export struct TreeRow {
@@ -58,6 +58,8 @@ export struct FileRow {
     // Has a 3D or image view (model, texture).
     can-view: bool,
     is-model: bool,
+    // A text file (opens in the text editor).
+    can-edit-text: bool,
 }
 
 component FormatIcon inherits Image {
@@ -231,6 +233,16 @@ component FileItem inherits Rectangle {
                 title: @tr("Open in viewer");
                 icon: @image-url("icons/menu/expand.svg");
                 activated => { root.action("view"); }
+            }
+            if item.can-edit-text: MenuItem {
+                title: @tr("Open in text editor");
+                icon: @image-url("icons/menu/text.svg");
+                activated => { root.action("edit"); }
+            }
+            if !root.history-mode && item.kind != "Folder": MenuItem {
+                title: @tr("Open with system app (read-only copy)");
+                icon: @image-url("icons/menu/export.svg");
+                activated => { root.action("system"); }
             }
             if !root.history-mode: MenuItem {
                 title: @tr("Extract…");
@@ -649,6 +661,7 @@ export component AppWindow inherits Window {
     callback setup-pick-detected(string);
     callback setup-run();
     callback theme-changed(int);
+    callback edit-mode-changed(bool);
     callback quit();
 
     preview-area-width: preview-area.width;
@@ -656,6 +669,7 @@ export component AppWindow inherits Window {
     changed preview-area-width => { root.model-resized(); }
     changed preview-area-height => { root.model-resized(); }
     changed theme-mode => { root.apply-theme(); }
+    changed edit-mode => { root.edit-mode-changed(root.edit-mode); }
     init => { root.apply-theme(); }
 
     property <length> tree-width: 260px;
@@ -958,6 +972,9 @@ export component AppWindow inherits Window {
                             activated => { root.address-editing = false; }
                         }
                         LineEdit {
+                            // Fill the whole address bar (a FocusScope does not lay out its child).
+                            width: parent.width;
+                            height: parent.height;
                             text <=> root.address;
                             placeholder-text: @tr("Path, e.g. x64e.rpf/levels/gta5/vehicles.rpf");
                             accessible-label: @tr("Address");
@@ -2451,5 +2468,209 @@ export component ViewerWindow inherits Window {
                 }
             }
         }
+    }
+}
+
+// Text editor window: read-only until edit mode is unlocked in the main window;
+// saving writes into the mods folder like every other change.
+export component EditorWindow inherits Window {
+    title: (root.modified ? "• " : "") + root.heading + " — OpenRAGE";
+    icon: @image-url("icon.png");
+    preferred-width: 980px;
+    preferred-height: 760px;
+    min-width: 480px;
+    min-height: 320px;
+    background: Theme.background;
+    default-font-size: Theme.font-body;
+    default-font-family: root.mono-font;
+
+    in-out property <int> theme-mode;
+    in property <string> heading;
+    in property <string> path;
+    in property <string> mono-font: "monospace";
+    in-out property <string> text;
+    // Edit mode of the main window.
+    in property <bool> editable;
+    // Why it cannot be saved at all (e.g. not UTF-8), empty if it can.
+    in property <string> locked-reason;
+    in-out property <bool> modified;
+    in property <bool> saving;
+    in property <string> status;
+    in-out property <bool> confirm-close;
+    in-out property <bool> wrap: false;
+
+    callback save();
+    callback unlock();
+    callback discard-and-close();
+    callback reload();
+
+    changed theme-mode => { root.apply-theme(); }
+
+    function apply-theme() {
+        Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+
+    property <bool> can-save: root.editable && root.locked-reason == "" && root.modified && !root.saving;
+
+    scope := FocusScope {
+        KeyBinding {
+            keys: @keys(Control + S);
+            activated => {
+                if (root.can-save) {
+                    root.save();
+                }
+            }
+        }
+        VerticalLayout {
+            Rectangle {
+                background: Theme.surface;
+                HorizontalLayout {
+                    padding: Theme.space-s;
+                    padding-left: Theme.space-l;
+                    spacing: Theme.space-s;
+                    FormatIcon {
+                        y: (parent.height - self.height) / 2;
+                        width: 20px;
+                        height: 20px;
+                        name: "text";
+                        tint: #7c8592;
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+                        Text {
+                            text: (root.modified ? "• " : "") + root.heading;
+                            font-size: Theme.font-title;
+                            font-weight: 600;
+                            overflow: elide;
+                            color: Theme.text;
+                        }
+                        Text {
+                            text: root.path;
+                            font-family: root.mono-font;
+                            font-size: Theme.font-small;
+                            overflow: elide;
+                            color: Theme.text-muted;
+                        }
+                    }
+                    Button {
+                        text: root.wrap ? @tr("No wrap") : @tr("Wrap lines");
+                        clicked => { root.wrap = !root.wrap; }
+                    }
+                    Button {
+                        text: @tr("Reload");
+                        enabled: !root.saving;
+                        clicked => { root.reload(); }
+                    }
+                    Button {
+                        text: @tr("Save (Ctrl+S)");
+                        icon: @image-url("icons/import.svg");
+                        colorize-icon: true;
+                        primary: true;
+                        enabled: root.can-save;
+                        clicked => { root.save(); }
+                    }
+                }
+            }
+            // Protection banner
+            if !root.editable || root.locked-reason != "": Rectangle {
+                background: Theme.accent-subtle;
+                HorizontalLayout {
+                    padding: Theme.space-s;
+                    padding-left: Theme.space-l;
+                    spacing: Theme.space-s;
+                    Image {
+                        y: (parent.height - self.height) / 2;
+                        width: 16px;
+                        height: 16px;
+                        source: @image-url("icons/lock.svg");
+                        colorize: Theme.text-muted;
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                        color: Theme.text;
+                        text: root.locked-reason != "" ? root.locked-reason
+                            : @tr("Read-only. Unlock editing to change this file; saving writes it into the mods folder and can be undone.");
+                    }
+                    if root.locked-reason == "": Button {
+                        text: @tr("Unlock editing…");
+                        icon: @image-url("icons/unlock.svg");
+                        colorize-icon: true;
+                        clicked => { root.unlock(); }
+                    }
+                }
+            }
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+            editor := TextEdit {
+                vertical-stretch: 1;
+                text <=> root.text;
+                read-only: !root.editable || root.locked-reason != "" || root.saving;
+                font-size: 13px;
+                wrap: root.wrap ? TextWrap.word-wrap : TextWrap.no-wrap;
+                edited => { root.modified = true; }
+            }
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+            Rectangle {
+                background: Theme.surface;
+                HorizontalLayout {
+                    padding-left: Theme.space-l;
+                    padding-right: Theme.space-l;
+                    height: 28px;
+                    Text {
+                        text: root.status;
+                        vertical-alignment: center;
+                        font-size: Theme.font-small;
+                        overflow: elide;
+                        color: Theme.text-muted;
+                    }
+                }
+            }
+        }
+    }
+
+    if root.confirm-close: Dialog {
+        title: @tr("Unsaved changes");
+        panel-width: 440px;
+        panel-height: 190px;
+        close => { root.confirm-close = false; }
+        Text {
+            text: @tr("Save the changes to {} before closing?", root.heading);
+            wrap: word-wrap;
+            color: Theme.text;
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: Theme.space-s;
+            Button {
+                text: @tr("Discard");
+                clicked => { root.discard-and-close(); }
+            }
+            Button {
+                text: @tr("Cancel");
+                clicked => { root.confirm-close = false; }
+            }
+            Button {
+                text: @tr("Save");
+                primary: true;
+                enabled: root.editable && root.locked-reason == "";
+                clicked => {
+                    root.confirm-close = false;
+                    root.save();
+                }
+            }
+        }
+    }
+
+    init => {
+        root.apply-theme();
+        editor.focus();
     }
 }
