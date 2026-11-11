@@ -12,7 +12,7 @@ An open-source explorer and modding toolkit for games built on Rockstar's RAGE e
 | GTA IV | planned (RPF3) | – |
 | Red Dead Redemption 2 | planned (RPF8) | – |
 
-Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF) (done) → **6** GTA IV → **7** RDR2.
+Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF, complete vehicles and peds, GPU viewer) (done) → audio → animations → **6** GTA IV → **7** RDR2.
 
 ## Build
 
@@ -72,9 +72,16 @@ Both layouts are supported: GTA V Legacy (resource version 13, Direct3D 9 format
 
 ### Models
 
-Selecting a model (`.ydr` drawable, `.yft` fragment such as a vehicle, `.ydd` drawable dictionary) shows it in 3D: drag to rotate, scroll to zoom. Textures are taken from the model itself, the `.ytd` next to it (`adder.ytd`, `adder+hi.ytd`) and, for vehicles, `vehshare.ytd`. **Export glTF…** writes a binary glTF 2.0 file (`.glb`) with the textures embedded, which Blender and other tools open directly. Coordinates are converted from the game's Z-up to glTF's Y-up.
+Selecting a model (`.ydr` drawable, `.yft` fragment such as a vehicle, `.ydd` drawable dictionary) shows it in 3D: drag to rotate, scroll to zoom. Models are shown **complete**: vehicles with their wheels on every wheel bone, peds assembled from their components (head, hair, upper body, legs, accessories — the first variant of each), parts rigidly attached to bones in place. Textures are taken from the model itself, the `.ytd` next to it (`adder.ytd`, `adder+hi.ytd`) and, for vehicles, `vehshare.ytd`.
 
-All 168,000+ models of GTA V Enhanced load, as do the Legacy formats. Not shown yet: wheels and other child drawables of fragments, and skeletons.
+Double-click opens the model in a **viewer window** (rendered on the GPU via wgpu — Vulkan, DirectX 12, Metal or OpenGL — with a software fallback):
+
+* **Orbit** (drag, wheel) or **Fly** (F): W A S D to move, Q/E down/up, Shift faster, drag to look around.
+* **Parts:** grouped (body, wheels, ped components with their variants); show or hide groups or single parts.
+* **Materials:** every shader with a readable name (primary paint, glass, tyres, interior, …); hide it or give it a colour — paint the car. Preview and glTF export follow.
+* **Export glTF…** writes a binary glTF 2.0 file (`.glb`) with one node per shown part and the textures embedded, which Blender and other tools open directly (Z-up is converted to glTF's Y-up).
+
+All 168,000+ models of GTA V Enhanced load, as do the Legacy formats. Not yet: animations and skinning poses, vehicle mods and tuning parts, map placements (ymap/ytyp).
 
 ### Editing archives
 

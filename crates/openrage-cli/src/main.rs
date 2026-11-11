@@ -835,18 +835,42 @@ fn cmd_model(
     for (name, dict) in &model.external {
         outln!("textures from {name}: {}", dict.textures.len());
     }
+    let shown = model.parts.iter().filter(|p| p.visible).count();
+    outln!("{} parts ({shown} shown):", model.parts.len());
+    for p in &model.parts {
+        let [x, y, z] = [p.transform[12], p.transform[13], p.transform[14]];
+        let mark = if p.visible { "*" } else { " " };
+        outln!(
+            "  {mark} {:<20} {:<12} at ({x:.2}, {y:.2}, {z:.2})  {}",
+            p.name,
+            p.group,
+            model.drawables[p.drawable].0
+        );
+    }
+    outln!("{} materials:", model.materials.len());
+    for m in &model.materials {
+        let kind = if m.paint {
+            "paint"
+        } else if m.textured {
+            "textured"
+        } else {
+            "plain"
+        };
+        outln!("  {:<24} {kind}", m.label);
+    }
+    let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("model");
     if let Some(out) = export {
-        let glb = openrage_app::models::to_glb(&model, 0).context("model has no drawable")?;
+        let glb =
+            openrage_app::models::to_glb(&model, stem, &model.default_look()).context("model has nothing to export")?;
         fs::write(out, &glb).with_context(|| format!("writing {}", out.display()))?;
         outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
     }
     if let Some(out) = render {
         use openrage_app::render;
-        let (_, d) = model.drawables.first().context("model has no drawable")?;
-        let materials = render::Materials::new(d, &|t| model.texture(d, t));
+        let materials = render::Materials::new(&model);
         let view = render::View { yaw: yaw.to_radians(), ..Default::default() };
         let started = Instant::now();
-        let rgba = render::render(d, &materials, view, 960, 600);
+        let rgba = render::render(&model, &model.default_look(), &materials, view, 960, 600);
         let ms = started.elapsed().as_millis();
         fs::write(out, rage_formats::png(960, 600, &rgba)?)?;
         outln!("Rendered {} in {ms} ms", out.display());
@@ -878,7 +902,9 @@ fn cmd_verify_models(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>)
                         let r = if n.ends_with(".ydd") {
                             drawable::parse_ydd(&r).map(|v| v.into_iter().map(|(_, d)| d).collect::<Vec<_>>())
                         } else if n.ends_with(".yft") {
-                            drawable::parse_yft(&r).map(|d| vec![d])
+                            drawable::parse_fragment(&r).map(|f| {
+                                std::iter::once(f.drawable).chain(f.children.into_iter().map(|c| c.drawable)).collect()
+                            })
                         } else {
                             drawable::parse_ydr(&r).map(|d| vec![d])
                         };

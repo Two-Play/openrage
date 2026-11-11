@@ -14,9 +14,20 @@
 //!
 //! Shaders reference textures by name; the names are resolved by the caller
 //! (embedded texture dictionary, a `.ytd` next to the model, …).
+//!
+//! Skeletons (`0x18` of a drawable): `0x20` bones (0x50 bytes each: rotation
+//! quaternion, translation, scale, parent index at `0x32`, name at `0x38`,
+//! tag at `0x44`), bone count at `0x5E`. A model's skeleton binding (`0x28`)
+//! says whether it is skinned (byte 1) or rigidly attached to a bone (byte 3).
+//!
+//! Fragments (`.yft`): main drawable at `0x30`, name at `0x58`, physics LOD
+//! group at `0xF0` → LOD (`0x10`) → children (`0xD0`, count at `0x11E`); a child
+//! has its bone tag at `0x12` and its drawable at `0xA0`. Vehicle wheels are
+//! such children.
 
 use rage_resource::{Resource, ResourceError};
 
+use crate::math::{self, Mat4};
 use crate::ytd::{self, TextureDictionary};
 
 /// Resource versions of drawable resources.
@@ -36,6 +47,48 @@ pub struct Mesh {
     pub indices: Vec<u32>,
     /// Index into [`Drawable::shaders`].
     pub shader: u16,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Bone {
+    pub name: String,
+    pub tag: u16,
+    /// Index of the parent bone, `-1` for the root.
+    pub parent: i16,
+    pub translation: [f32; 3],
+    /// Quaternion `x, y, z, w`.
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Skeleton {
+    pub bones: Vec<Bone>,
+}
+
+impl Skeleton {
+    /// Model-space transform of every bone (parents applied).
+    pub fn world_transforms(&self) -> Vec<Mat4> {
+        let mut out: Vec<Mat4> = Vec::with_capacity(self.bones.len());
+        for (i, b) in self.bones.iter().enumerate() {
+            let local = math::from_trs(b.translation, b.rotation, b.scale);
+            // Parents come before their children; guard against bad indices anyway.
+            let world = match usize::try_from(b.parent).ok().filter(|&p| p < i) {
+                Some(p) => math::mul(&out[p], &local),
+                None => local,
+            };
+            out.push(world);
+        }
+        out
+    }
+
+    pub fn find_tag(&self, tag: u16) -> Option<usize> {
+        self.bones.iter().position(|b| b.tag == tag)
+    }
+
+    pub fn find_name(&self, name: &str) -> Option<usize> {
+        self.bones.iter().position(|b| b.name.eq_ignore_ascii_case(name))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -75,6 +128,21 @@ pub struct Drawable {
     pub textures: Option<TextureDictionary>,
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
+    pub skeleton: Option<Skeleton>,
+}
+
+/// A child drawable of a fragment, attached to a bone of the main skeleton.
+#[derive(Debug, Clone)]
+pub struct FragmentChild {
+    pub bone_tag: u16,
+    pub drawable: Drawable,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Fragment {
+    pub drawable: Drawable,
+    /// Children with meshes of their own (e.g. wheels).
+    pub children: Vec<FragmentChild>,
 }
 
 impl Drawable {
@@ -305,7 +373,14 @@ fn read_geometry(res: &Resource, g: u64, enhanced: bool) -> Result<Mesh, Resourc
     Ok(mesh)
 }
 
-fn read_models(res: &Resource, list: u64, enhanced: bool, out: &mut Vec<Mesh>) -> Result<(), ResourceError> {
+/// Reads the models of one LOD. Meshes of models rigidly attached to a bone
+/// come with that bone's index.
+fn read_models(
+    res: &Resource,
+    list: u64,
+    enhanced: bool,
+    out: &mut Vec<(Mesh, Option<usize>)>,
+) -> Result<(), ResourceError> {
     let ptr = res.u64(list)?;
     let count = res.u16(list + 8)? as u64;
     for m in 0..count {
@@ -316,10 +391,13 @@ fn read_models(res: &Resource, list: u64, enhanced: bool, out: &mut Vec<Mesh>) -
         let geoms = res.u64(model + 0x08)?;
         let gcount = res.u16(model + 0x10)? as u64;
         let mapping = res.u64(model + 0x20)?;
+        let binding = res.u32(model + 0x28)?;
+        let skinned = (binding >> 8) & 0xFF != 0;
+        let bone = (!skinned && binding >> 24 != 0).then_some((binding >> 24) as usize);
         for i in 0..gcount {
             let mut mesh = read_geometry(res, res.u64(geoms + i * 8)?, enhanced)?;
             mesh.shader = if mapping != 0 { res.u16(mapping + i * 2)? } else { 0 };
-            out.push(mesh);
+            out.push((mesh, bone));
         }
     }
     Ok(())
@@ -373,14 +451,51 @@ fn read_shaders(res: &Resource, group: u64, enhanced: bool) -> Result<Vec<Shader
     Ok(shaders)
 }
 
-/// Reads the drawable structure at `ptr`.
+fn read_skeleton(res: &Resource, ptr: u64) -> Result<Skeleton, ResourceError> {
+    let bones = res.u64(ptr + 0x20)?;
+    let count = res.u16(ptr + 0x5E)? as u64;
+    if bones == 0 || count > 2048 {
+        return Err(bad("invalid skeleton"));
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let b = bones + i * 0x50;
+        let f = |o: u64| -> Result<f32, ResourceError> { Ok(f32::from_bits(res.u32(b + o)?)) };
+        let name_ptr = res.u64(b + 0x38)?;
+        out.push(Bone {
+            name: if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() },
+            tag: res.u16(b + 0x44)?,
+            parent: res.u16(b + 0x32)? as i16,
+            rotation: [f(0x00)?, f(0x04)?, f(0x08)?, f(0x0C)?],
+            translation: [f(0x10)?, f(0x14)?, f(0x18)?],
+            scale: [f(0x20)?, f(0x24)?, f(0x28)?],
+        });
+    }
+    Ok(Skeleton { bones: out })
+}
+
+/// Reads the drawable structure at `ptr`. Meshes rigidly attached to a bone
+/// are moved to their place in model space.
 pub fn read_drawable(res: &Resource, ptr: u64, enhanced: bool) -> Result<Drawable, ResourceError> {
     let mut d =
         Drawable { bounds_min: vec3(res, ptr + 0x30)?, bounds_max: vec3(res, ptr + 0x40)?, ..Default::default() };
+    let skel = res.u64(ptr + 0x18)?;
+    if skel != 0 {
+        d.skeleton = read_skeleton(res, skel).ok();
+    }
+    let world = d.skeleton.as_ref().map(Skeleton::world_transforms).unwrap_or_default();
     for lod in 0..4 {
         let list = res.u64(ptr + 0x50 + lod * 8)?;
         if list != 0 {
-            read_models(res, list, enhanced, &mut d.meshes)?;
+            let mut meshes = Vec::new();
+            read_models(res, list, enhanced, &mut meshes)?;
+            for (mut mesh, bone) in meshes {
+                if let Some(m) = bone.and_then(|b| world.get(b)) {
+                    mesh.positions.iter_mut().for_each(|p| *p = math::transform_point(m, *p));
+                    mesh.normals.iter_mut().for_each(|n| *n = math::transform_dir(m, *n));
+                }
+                d.meshes.push(mesh);
+            }
             if !d.meshes.is_empty() {
                 break;
             }
@@ -412,16 +527,54 @@ pub fn parse_ydr(res: &Resource) -> Result<Drawable, ResourceError> {
 
 /// A `.yft` file: its main drawable.
 pub fn parse_yft(res: &Resource) -> Result<Drawable, ResourceError> {
+    Ok(parse_fragment(res)?.drawable)
+}
+
+/// A `.yft` file with the child drawables (wheels and other parts).
+pub fn parse_fragment(res: &Resource) -> Result<Fragment, ResourceError> {
     let enhanced = is_enhanced(res.version)?;
-    let drawable = res.u64(Resource::ROOT + 0x30)?;
+    let root = Resource::ROOT;
+    let drawable = res.u64(root + 0x30)?;
     if drawable == 0 {
         return Err(bad("fragment without drawable"));
     }
     let mut d = read_drawable(res, drawable, enhanced)?;
-    if let Ok(name) = res.u64(Resource::ROOT + 0x58).and_then(|p| res.string(p)) {
-        d.name = name;
+    if let Ok(name) = res.u64(root + 0x58).and_then(|p| res.string(p)) {
+        d.name = name.strip_prefix("pack:/").unwrap_or(&name).to_owned();
     }
-    Ok(d)
+    // Children are optional extras: a fragment without readable ones is still fine.
+    let children = read_fragment_children(res, enhanced).unwrap_or_default();
+    Ok(Fragment { drawable: d, children })
+}
+
+fn read_fragment_children(res: &Resource, enhanced: bool) -> Result<Vec<FragmentChild>, ResourceError> {
+    let group = res.u64(Resource::ROOT + 0xF0)?;
+    if group == 0 {
+        return Ok(Vec::new());
+    }
+    let Some(lod) = (0..3).map(|i| res.u64(group + 0x10 + i * 8)).find_map(|p| p.ok().filter(|&p| p != 0)) else {
+        return Ok(Vec::new());
+    };
+    let list = res.u64(lod + 0xD0)?;
+    let count = res.u8(lod + 0x11E)? as u64;
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for i in 0..count {
+        let child = res.u64(list + i * 8)?;
+        if child == 0 {
+            continue;
+        }
+        let ptr = res.u64(child + 0xA0)?;
+        if ptr == 0 || seen.contains(&ptr) {
+            continue;
+        }
+        seen.push(ptr);
+        let drawable = read_drawable(res, ptr, enhanced)?;
+        if !drawable.meshes.is_empty() {
+            out.push(FragmentChild { bone_tag: res.u16(child + 0x12)?, drawable });
+        }
+    }
+    Ok(out)
 }
 
 /// A `.ydd` file: all drawables with their name hashes.

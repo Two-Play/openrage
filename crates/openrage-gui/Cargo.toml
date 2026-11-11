@@ -19,6 +19,9 @@ rage-mods.workspace = true
 rage-formats.workspace = true
 anyhow.workspace = true
 rfd = "0.15"
+wgpu = "30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "renderer-software", "accessibility"] }
 
