@@ -19,6 +19,7 @@ pub mod rbf;
 pub mod shaders;
 pub mod texture;
 pub mod xml;
+pub mod ypt;
 pub mod ytd;
 pub mod ytd_write;
 

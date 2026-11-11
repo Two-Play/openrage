@@ -993,6 +993,9 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
     }));
     let texture_mode = with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { .. })));
     ui.set_texture_mode(texture_mode);
+    ui.set_textures_locked(with_app(|a| {
+        matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { read_only: true, .. }))
+    }));
     ui.set_texture_selected(texture_mode && selected_row.is_some());
     let history_mode = with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::History)));
     ui.set_history_mode(history_mode);
@@ -2340,6 +2343,8 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
     ui.set_preview_loading(true);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
+        let extra =
+            if browser::is_particles(&vpath) { particle_rows(&game_dir, keys.clone(), &vpath) } else { Meta::new() };
         let result = load_model_preview(&game_dir, keys, &vpath);
         if counter.load(Ordering::SeqCst) != generation {
             return;
@@ -2352,6 +2357,7 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
             match result {
                 Ok(m) => {
                     let mut meta = info.clone();
+                    meta.extend(extra.iter().cloned());
                     let l = &m.loaded;
                     let (mut meshes, mut shaders, mut textured) = (0, 0, 0);
                     let vis = l.default_visibility();
@@ -2385,12 +2391,46 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
                 }
                 Err(e) => {
                     let mut meta = info.clone();
-                    meta.push(kv("Error", format!("Cannot read the model: {e:#}")));
+                    // Particle dictionaries without models still have effects to show.
+                    if extra.is_empty() {
+                        meta.push(kv("Error", format!("Cannot read the model: {e:#}")));
+                    } else {
+                        meta.extend(extra.iter().cloned());
+                    }
                     set_meta(&ui, &meta);
                 }
             }
         });
     });
+}
+
+/// Summary rows of a particle dictionary: counts and the first effect names.
+fn particle_rows(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Meta {
+    let read = || -> anyhow::Result<rage_formats::ypt::ParticleDictionary> {
+        let (node, _) = rage_mods::resolve(game_dir, vpath, keys)?;
+        let Node::ArchiveFile(rpf, id) = node else { anyhow::bail!("not in an archive") };
+        Ok(rage_formats::ypt::parse(&rpf.read_resource(id)?)?)
+    };
+    match read() {
+        Ok(p) => {
+            let mut rows = vec![
+                kv("Effects", p.effects.len()),
+                kv("Emitters", p.emitters.len()),
+                kv("Particle rules", p.particles.len()),
+                kv("Textures", p.textures.as_ref().map_or(0, |t| t.textures.len())),
+                kv("Models", p.drawables.len()),
+            ];
+            let mut names: Vec<&str> = p.effects.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            let more = if names.len() > 12 { format!(", … ({} in all)", names.len()) } else { String::new() };
+            if !names.is_empty() {
+                rows.push(kv("Effect names", format!("{}{more}", names[..names.len().min(12)].join(", "))));
+            }
+            rows.push(note("Double-click to browse its textures; Open in viewer shows its models."));
+            rows
+        }
+        Err(e) => vec![kv("Error", format!("Cannot read the particle dictionary: {e:#}"))],
+    }
 }
 
 fn load_model_preview(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> anyhow::Result<ModelPreview> {
@@ -3443,6 +3483,13 @@ enum TextureAction {
 /// Replaces, adds or removes a texture of the open dictionary and writes the
 /// result into the mods folder (in the background).
 fn edit_texture(ui: &AppWindow, action: TextureAction) {
+    if with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { read_only: true, .. })))
+    {
+        ui.set_status(
+            "Textures inside particle dictionaries (.ypt) can be viewed and extracted, not changed yet.".into(),
+        );
+        return;
+    }
     let Some((game_dir, keys, ytd, selected)) = with_app(|a| {
         let l = a.listing.as_ref()?;
         if !matches!(l.location, Location::Textures { .. }) {

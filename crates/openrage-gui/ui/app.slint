@@ -978,7 +978,9 @@ export component AppWindow inherits Window {
     property <length> preview-width: 460px;
     property <bool> has-selection: root.file-selected >= 0;
     property <bool> can-view: (root.model-mode || (root.has-image && root.image-viewable)) && !root.audio-mode;
-    property <bool> can-edit: root.edit-mode && !root.busy;
+    property <bool> can-edit: root.edit-mode && !root.busy && !root.textures-locked;
+    // The open texture list belongs to a particle dictionary and cannot be changed.
+    in property <bool> textures-locked;
 
     function apply-theme() {
         Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
@@ -1589,7 +1591,18 @@ export component AppWindow inherits Window {
                         clicked => { root.archive-delete(); }
                     }
                 }
-                if root.texture-mode: ContextBar {
+                if root.texture-mode && root.textures-locked: ContextBar {
+                    title: @tr("Particle textures");
+                    description: @tr("The textures inside a particle dictionary: view and extract them (changing them is not supported yet).");
+                    Button {
+                        text: @tr("Save PNG…");
+                        icon: @image-url("icons/image.svg");
+                        colorize-icon: true;
+                        enabled: !root.busy;
+                        clicked => { root.save-png(); }
+                    }
+                }
+                if root.texture-mode && !root.textures-locked: ContextBar {
                     title: @tr("Texture dictionary");
                     description: !root.edit-mode ? @tr("Read-only. Unlock editing to change textures.")
                         : root.in-mods ? @tr("Changes apply to the copy in the mods folder.")
