@@ -1,6 +1,7 @@
 //! Application logic shared by the OpenRAGE CLI and GUI:
 //! settings, key setup and game detection.
 
+pub mod audio;
 pub mod config;
 pub mod detect;
 pub mod extract;
@@ -23,7 +24,18 @@ pub fn load_keys() -> Result<Option<Arc<GtaVKeys>>, rage_crypto::KeyCacheError> 
     if !path.exists() {
         return Ok(None);
     }
-    GtaVKeys::load(&path).map(|k| Some(Arc::new(k)))
+    let mut keys = GtaVKeys::load(&path)?;
+    // Key caches from before audio support lack the AWC key: take it from the
+    // remembered key blob once.
+    if keys.awc_key.is_none()
+        && let Some(magic) = config::Config::load().magic_path
+        && let Ok(blob) = std::fs::read(&magic)
+        && let Ok(contents) = rage_crypto::decode_codewalker_magic(&blob, &keys.aes_key)
+    {
+        keys.awc_key = Some(contents.awc_key);
+        let _ = keys.save(&path);
+    }
+    Ok(Some(Arc::new(keys)))
 }
 
 /// Location of the search index for a game installation

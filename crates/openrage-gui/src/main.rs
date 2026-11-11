@@ -2,6 +2,7 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod audio;
 mod badges;
 mod browser;
 mod gpu;
@@ -74,6 +75,14 @@ struct App {
     model_view: openrage_app::render::View,
     /// Open a viewer window as soon as the current preview has loaded.
     pending_viewer: bool,
+    /// The selected sound, decoded, and the audio output playing it.
+    sound: Option<Arc<rage_formats::awc::Pcm>>,
+    output: Option<audio::Output>,
+    /// Where playback starts (seconds), set by seeking while stopped.
+    sound_start: f32,
+    /// Play the selected sound as soon as it is decoded (double-click).
+    play_when_ready: bool,
+    audio_timer: slint::Timer,
     index_running: bool,
 }
 
@@ -116,6 +125,11 @@ fn main() -> anyhow::Result<()> {
             model: None,
             model_view: openrage_app::render::View::default(),
             pending_viewer: false,
+            sound: None,
+            output: None,
+            sound_start: 0.0,
+            play_when_ready: false,
+            audio_timer: slint::Timer::default(),
             index_running: false,
         })
     });
@@ -276,6 +290,20 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_file_open(move |i| {
         with_ui(&w, |ui| {
+            let is_sound = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                Some(listing.items[*a.visible.get(i as usize)?].kind == ItemKind::Sound)
+            });
+            if is_sound == Some(true) {
+                if ui.get_file_selected() != i {
+                    with_app(|a| a.play_when_ready = true);
+                    select_row(ui, i as usize);
+                } else {
+                    stop_sound(ui);
+                    toggle_sound(ui);
+                }
+                return;
+            }
             let viewable = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
@@ -299,7 +327,8 @@ fn wire_callbacks(ui: &AppWindow) {
                     return if item.mark == Some(Mark::Removed) { browser::parent(vpath) } else { Some(vpath.clone()) };
                 }
                 let opens = item.kind.is_container()
-                    || (item.kind == ItemKind::Resource && browser::is_texture_dict(&item.name));
+                    || (item.kind == ItemKind::Resource && browser::is_texture_dict(&item.name))
+                    || (item.kind == ItemKind::File && browser::is_audio(&item.name));
                 opens.then(|| browser::join(&listing.vpath, &item.name))
             });
             if let Some(p) = target {
@@ -400,6 +429,14 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_quit(|| {
         let _ = slint::quit_event_loop();
     });
+    let w = ui.as_weak();
+    ui.on_audio_toggle(move || with_ui(&w, toggle_sound));
+    let w = ui.as_weak();
+    ui.on_audio_stop(move || with_ui(&w, stop_sound));
+    let w = ui.as_weak();
+    ui.on_audio_seek(move |f| with_ui(&w, |ui| seek_sound(ui, f)));
+    let w = ui.as_weak();
+    ui.on_audio_save_wav(move || with_ui(&w, save_wav));
     let w = ui.as_weak();
     ui.on_save_png(move || with_ui(&w, |ui| export_textures(ui, true)));
     let w = ui.as_weak();
@@ -741,6 +778,9 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
         ui.set_history_group(SharedString::new());
     }
     let archive_mode = with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Archive(..))));
+    ui.set_audio_mode_folder(with_app(|a| {
+        matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Audio { .. }))
+    }));
     ui.set_in_mods(with_app(|a| a.listing.as_ref().is_some_and(|l| l.origin != Origin::Base)));
     ui.set_archive_mode(archive_mode);
     ui.set_entry_selected(archive_mode && selected_row.is_some());
@@ -775,6 +815,7 @@ fn is_openable(item: &Item) -> bool {
     item.vpath.is_some()
         || item.kind.is_container()
         || (item.kind == ItemKind::Resource && browser::is_texture_dict(&item.name))
+        || (item.kind == ItemKind::File && browser::is_audio(&item.name))
 }
 
 fn file_row(item: &Item) -> FileRow {
@@ -932,6 +973,23 @@ fn show_folder_info(ui: &AppWindow) {
                     badges::icon(&name, ItemKind::Resource),
                 ));
             }
+            Location::Audio { awc } => {
+                let mut meta = vec![kv("Type", "Audio container")];
+                match &awc.stream_format {
+                    Some(f) => {
+                        meta.push(kv("Content", format!("one stream with {} channels", f.channels)));
+                        if let Some(s) = awc.sounds.first() {
+                            meta.push(kv("Duration", browser::seconds(s.duration_secs())));
+                        }
+                    }
+                    None => meta.push(kv("Sounds", awc.sounds.len())),
+                }
+                if awc.encrypted {
+                    meta.push(kv("Encrypted", "yes"));
+                }
+                meta.push(note("Double-click a sound to play it; Extract… saves WAV files."));
+                return Some((name.clone(), l.vpath.clone(), meta, ("audio", badges::NEUTRAL)));
+            }
             Location::Disk(p) => vec![kv("Type", "Folder"), kv("On disk", p.display())],
             Location::Archive(rpf, _) => vec![
                 kv("Type", "Inside an archive"),
@@ -1041,7 +1099,7 @@ fn select_row(ui: &AppWindow, row: usize) {
     ui.set_entry_selected(item.entry.is_some());
 
     let mut info = vec![kv("Type", badges::type_name(&item.name, item.kind)), kv("Size", human_size(item.size))];
-    if !item.info.is_empty() {
+    if !item.info.is_empty() && item.kind != ItemKind::Sound {
         // Resources show their version ("v171"); other items a short note.
         let is_version = item.info.strip_prefix('v').is_some_and(|v| v.chars().all(|c| c.is_ascii_digit()));
         info.push(kv(if is_version { "Version" } else { "Details" }, &item.info));
@@ -1051,6 +1109,20 @@ fn select_row(ui: &AppWindow, row: usize) {
     ui.set_has_image(false);
     ui.set_model_mode(false);
     with_app(|a| a.model = None);
+    stop_sound(ui);
+    ui.set_audio_mode(false);
+    with_app(|a| a.sound = None);
+    if item.kind == ItemKind::Sound {
+        let awc = with_app(|a| match a.listing.as_ref().map(|l| &l.location) {
+            Some(Location::Audio { awc }) => Some(Arc::clone(awc)),
+            _ => None,
+        });
+        if let Some(awc) = awc {
+            let index = with_app(|a| a.selected).unwrap_or(0);
+            start_sound_preview(ui, awc, index, info, generation);
+        }
+        return;
+    }
     if is_model_item(&item) {
         start_model_preview(ui, vpath.clone(), info, generation);
         return;
@@ -2050,6 +2122,211 @@ fn save_png_image(img: &slint::Image, name: String, main: Weak<AppWindow>) {
 }
 
 // ---------------------------------------------------------------------------
+// Sounds
+
+fn start_sound_preview(ui: &AppWindow, awc: Arc<rage_formats::awc::Awc>, index: usize, info: Meta, generation: u64) {
+    let counter = with_app(|a| Arc::clone(&a.preview_generation));
+    ui.set_preview_loading(true);
+    let (w, h) = (
+        (ui.get_preview_area_width() - 16.0).max(64.0) as usize,
+        (ui.get_preview_area_height() - 16.0).max(64.0) as usize,
+    );
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let sound = awc.sounds.get(index).cloned();
+        let result = if awc.stream_format.is_some() { awc.decode_stream() } else { awc.decode_sound(index) };
+        let wave = result.as_ref().ok().map(|pcm| audio::waveform(pcm, w, h, [0x3b, 0x82, 0xf6]));
+        if counter.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if counter.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            ui.set_preview_loading(false);
+            let mut meta = info.clone();
+            match result {
+                Ok(pcm) => {
+                    meta.push(kv("Duration", browser::seconds(pcm.duration_secs())));
+                    meta.push(kv("Sample rate", format!("{} Hz", pcm.sample_rate)));
+                    meta.push(kv("Channels", pcm.channels));
+                    if let Some(s) = &sound {
+                        meta.push(kv("Codec", s.codec.name().replace("codec 7", "MPEG audio")));
+                    }
+                    if awc.encrypted {
+                        meta.push(kv("Encrypted", "yes"));
+                    }
+                    set_meta(&ui, &meta);
+                    if let Some(rgba) = wave {
+                        let buffer =
+                            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w as u32, h as u32);
+                        ui.set_preview_image(slint::Image::from_rgba8(buffer));
+                        ui.set_has_image(true);
+                    }
+                    let pcm = Arc::new(pcm);
+                    with_app(|a| {
+                        a.sound = Some(Arc::clone(&pcm));
+                        a.sound_start = 0.0;
+                    });
+                    ui.set_audio_mode(true);
+                    update_sound_ui(&ui);
+                    if with_app(|a| std::mem::take(&mut a.play_when_ready)) {
+                        toggle_sound(&ui);
+                    }
+                }
+                Err(e) => {
+                    meta.push(kv("Error", e));
+                    set_meta(&ui, &meta);
+                }
+            }
+        });
+    });
+}
+
+/// Play, pause or resume the selected sound.
+fn toggle_sound(ui: &AppWindow) {
+    let Some(pcm) = with_app(|a| a.sound.clone()) else { return };
+    let action = with_app(|a| match &a.output {
+        Some(o) if Arc::ptr_eq(o.pcm(), &pcm) && !o.finished() => {
+            if o.is_playing() {
+                o.pause();
+            } else {
+                o.resume();
+            }
+            None
+        }
+        _ => Some(a.sound_start),
+    });
+    if let Some(start) = action {
+        match audio::Output::play(Arc::clone(&pcm), Duration::from_secs_f32(start)) {
+            Ok(out) => with_app(|a| a.output = Some(out)),
+            Err(e) => {
+                ui.set_status(format!("Cannot play audio: {e}").into());
+                return;
+            }
+        }
+    }
+    let weak = ui.as_weak();
+    with_app(|a| {
+        a.audio_timer.start(slint::TimerMode::Repeated, Duration::from_millis(50), move || {
+            if let Some(ui) = weak.upgrade() {
+                update_sound_ui(&ui);
+            }
+        })
+    });
+    update_sound_ui(ui);
+}
+
+fn stop_sound(ui: &AppWindow) {
+    with_app(|a| {
+        a.output = None;
+        a.sound_start = 0.0;
+        a.audio_timer.stop();
+    });
+    update_sound_ui(ui);
+}
+
+/// Jumps to `fraction` (0..1) of the selected sound.
+fn seek_sound(ui: &AppWindow, fraction: f32) {
+    let Some(pcm) = with_app(|a| a.sound.clone()) else { return };
+    let secs = pcm.duration_secs() * fraction.clamp(0.0, 1.0);
+    with_app(|a| match &a.output {
+        Some(o) if Arc::ptr_eq(o.pcm(), &pcm) && !o.finished() => o.seek(Duration::from_secs_f32(secs)),
+        _ => a.sound_start = secs,
+    });
+    update_sound_ui(ui);
+}
+
+/// Position, time and play state of the player controls.
+fn update_sound_ui(ui: &AppWindow) {
+    let Some(pcm) = with_app(|a| a.sound.clone()) else { return };
+    let total = pcm.duration_secs().max(0.001);
+    let (pos, playing, finished) = with_app(|a| match &a.output {
+        Some(o) if Arc::ptr_eq(o.pcm(), &pcm) => (o.position().as_secs_f32(), o.is_playing(), o.finished()),
+        _ => (a.sound_start, false, false),
+    });
+    let pos = if finished { 0.0 } else { pos.min(total) };
+    if finished {
+        with_app(|a| {
+            a.output = None;
+            a.audio_timer.stop();
+        });
+    }
+    ui.set_audio_position(pos / total);
+    ui.set_audio_playing(playing && !finished);
+    ui.set_audio_time(format!("{} / {}", browser::seconds(pos), browser::seconds(total)).into());
+}
+
+fn save_wav(ui: &AppWindow) {
+    let Some(pcm) = with_app(|a| a.sound.clone()) else { return };
+    let name = ui.get_info_title().to_string();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let stem = name.trim_end_matches(" (stream)").to_owned();
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save WAV")
+            .set_file_name(format!("{stem}.wav"))
+            .add_filter("WAV audio", &["wav"])
+            .save_file()
+        else {
+            return;
+        };
+        let msg = match std::fs::write(&path, pcm.to_wav()) {
+            Ok(()) => format!("Saved {}", path.display()),
+            Err(e) => format!("Saving failed: {e}"),
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+    });
+}
+
+/// Saves every sound of the opened container (or the selected one) as WAV.
+fn export_sounds(ui: &AppWindow) {
+    let Some((awc, selected, name)) = with_app(|a| {
+        let l = a.listing.as_ref()?;
+        let Location::Audio { awc } = &l.location else { return None };
+        let name = l.vpath.rsplit('/').next().unwrap_or("audio").trim_end_matches(".awc").to_owned();
+        Some((Arc::clone(awc), a.selected, name))
+    }) else {
+        return;
+    };
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let Some(out) = rfd::FileDialog::new().set_title("Save WAV files to folder").pick_folder() else { return };
+        let mut jobs: Vec<(String, Result<rage_formats::awc::Pcm, String>)> = Vec::new();
+        if awc.stream_format.is_some() {
+            jobs.push((format!("{name}.wav"), awc.decode_stream().map_err(|e| e.to_string())));
+        } else {
+            let picked: Vec<usize> = match selected {
+                Some(i) => vec![i],
+                None => (0..awc.sounds.len()).collect(),
+            };
+            for i in picked {
+                let file = format!("{name}_{:08x}.wav", awc.sounds[i].id);
+                jobs.push((file, awc.decode_sound(i).map_err(|e| e.to_string())));
+            }
+        }
+        // Several sounds go into a subfolder named after the container, like OpenIV.
+        let dir = if jobs.len() > 1 { out.join(&name) } else { out };
+        let mut written = 0;
+        let mut problems = Vec::new();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            problems.push(e.to_string());
+        }
+        for (file, pcm) in jobs {
+            match pcm.and_then(|p| std::fs::write(dir.join(&file), p.to_wav()).map_err(|e| e.to_string())) {
+                Ok(()) => written += 1,
+                Err(e) => problems.push(format!("{file}: {e}")),
+            }
+        }
+        let mut msg = format!("Saved {written} WAV file(s) to {}", dir.display());
+        if let Some(first) = problems.first() {
+            msg.push_str(&format!(" — {} problem(s), first: {first}", problems.len()));
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+    });
+}
+
+// ---------------------------------------------------------------------------
 // History and OpenIV packages
 
 fn show_history(ui: &AppWindow, record: bool) {
@@ -2309,6 +2586,10 @@ fn edit_texture(ui: &AppWindow, action: TextureAction) {
 fn start_extract(ui: &AppWindow) {
     if with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { .. }))) {
         export_textures(ui, false);
+        return;
+    }
+    if with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Audio { .. }))) {
+        export_sounds(ui);
         return;
     }
     let target = with_app(|a| -> Result<(Arc<Rpf7>, EntryId), String> {

@@ -20,6 +20,7 @@ rage-formats.workspace = true
 anyhow.workspace = true
 rfd = "0.15"
 wgpu = "30"
+rodio = { version = "0.23", default-features = false, features = ["playback"] }
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }

@@ -12,11 +12,11 @@ An open-source explorer and modding toolkit for games built on Rockstar's RAGE e
 | GTA IV | planned (RPF3) | – |
 | Red Dead Redemption 2 | planned (RPF8) | – |
 
-Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF, complete vehicles and peds, GPU viewer) (done) → audio → animations → **6** GTA IV → **7** RDR2.
+Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF, complete vehicles and peds, GPU viewer) (done) → audio (`.awc` playback, WAV export) (done) → animations → **6** GTA IV → **7** RDR2.
 
 ## Build
 
-Requires a recent stable Rust toolchain.
+Requires a recent stable Rust toolchain. On Linux the GUI also needs the development packages of fontconfig, xkbcommon, Wayland and ALSA (audio output), e.g. `sudo dnf install fontconfig-devel libxkbcommon-devel wayland-devel alsa-lib-devel` or `sudo apt install libfontconfig1-dev libxkbcommon-dev libwayland-dev libasound2-dev`.
 
 ```sh
 cargo build --release
@@ -83,7 +83,12 @@ Double-click opens the model in a **viewer window** (rendered on the GPU via wgp
 
 All 168,000+ models of GTA V Enhanced load, as do the Legacy formats. Not yet: animations and skinning poses, vehicle mods and tuning parts, map placements (ymap/ytyp).
 
-### Editing archives
+### Audio
+
+Audio containers (`.awc`) open like folders: effects and dialogue list their sounds, music and radio tracks show one multi-channel stream. Selecting a sound shows its waveform, length, sample rate and codec; **Play** (or double-click, or Space) plays it, clicking the waveform jumps. **Save WAV…** and **Extract…** write `.wav` files (16-bit PCM, like OpenIV).
+
+Supported: PCM and IMA ADPCM (GTA V Legacy), MPEG audio (GTA V Enhanced), single sounds and block-based multi-channel streams, and Rockstar's audio encryption (whole files, sound data or stream blocks). The audio key comes from the key blob used during setup; key caches from older versions are upgraded automatically.
+
 
 Inside an archive, **Import…** (or dropping files onto the list, where the platform supports it), **Replace…**, **Rename…**, **New folder…** and **Delete** change the game the OpenIV way: the archive is copied to the `mods` folder once and then edited **in place** — new data is appended and only the table of contents is rewritten, so a change to a 2 GB archive takes milliseconds. Changes inside nested archives rebuild just that nested archive. Your game files are never touched.
 
@@ -138,6 +143,8 @@ openrage model …/vehicles.rpf/adder.yft                       # meshes, shader
 openrage model …/adder.yft --export adder.glb                  # glTF with embedded textures
 openrage model …/adder.yft --render adder.png [--yaw 1.2]      # software-rendered image
 openrage verify --models                       # parse every model of the game
+openrage audio x64/audio/sfx/RADIO_02_POP.rpf/alright.awc --export out/   # sounds → .wav
+openrage verify --audio                        # decode every sound of the game
 openrage mods                                  # files in the OpenIV mods folder
 openrage mods --changes [--deep]               # every added/removed/modified entry
 ```

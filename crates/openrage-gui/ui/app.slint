@@ -547,6 +547,12 @@ export component AppWindow inherits Window {
     in property <bool> has-image;
     // Model preview: drag to orbit, wheel to zoom.
     in property <bool> model-mode;
+    // Sound preview: waveform in the preview area, player controls above it.
+    in property <bool> audio-mode;
+    in property <bool> audio-playing;
+    in property <float> audio-position;
+    in property <string> audio-time;
+    in property <bool> audio-mode-folder;
     out property <length> preview-area-width;
     out property <length> preview-area-height;
     in property <bool> texture-mode;
@@ -616,6 +622,10 @@ export component AppWindow inherits Window {
     callback model-zoom(float);
     callback model-resized();
     callback export-gltf();
+    callback audio-toggle();
+    callback audio-stop();
+    callback audio-seek(float);
+    callback audio-save-wav();
     callback open-viewer();
     callback archive-import();
     callback archive-replace();
@@ -651,7 +661,7 @@ export component AppWindow inherits Window {
     property <length> tree-width: 260px;
     property <length> preview-width: 460px;
     property <bool> has-selection: root.file-selected >= 0;
-    property <bool> can-view: root.model-mode || root.has-image;
+    property <bool> can-view: (root.model-mode || root.has-image) && !root.audio-mode;
     property <bool> can-edit: root.edit-mode && !root.busy;
 
     function apply-theme() {
@@ -1288,6 +1298,17 @@ export component AppWindow inherits Window {
                         clicked => { root.texture-remove(); }
                     }
                 }
+                if root.audio-mode-folder: ContextBar {
+                    title: @tr("Audio container");
+                    description: @tr("Double-click a sound to play it. Extract… saves WAV files.");
+                    Button {
+                        text: @tr("Save all as WAV…");
+                        icon: @image-url("icons/extract.svg");
+                        colorize-icon: true;
+                        enabled: !root.busy;
+                        clicked => { root.extract-selected(); }
+                    }
+                }
                 if root.search-mode: ContextBar {
                     title: @tr("Search results");
                     description: root.search-summary;
@@ -1394,6 +1415,11 @@ export component AppWindow inherits Window {
                                 keys: @keys(Backspace);
                                 enabled: root.can-up;
                                 activated => { root.go-up(); }
+                            }
+                            KeyBinding {
+                                keys: @keys(" ");
+                                enabled: root.audio-mode;
+                                activated => { root.audio-toggle(); }
                             }
                             KeyBinding {
                                 keys: @keys(Delete);
@@ -1559,6 +1585,33 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                if root.audio-mode: HorizontalLayout {
+                    spacing: Theme.space-s;
+                    Button {
+                        text: root.audio-playing ? @tr("Pause") : @tr("Play");
+                        primary: true;
+                        clicked => { root.audio-toggle(); }
+                    }
+                    Button {
+                        text: @tr("Stop");
+                        clicked => { root.audio-stop(); }
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.audio-time;
+                        vertical-alignment: center;
+                        font-family: root.mono-font;
+                        font-size: Theme.font-small;
+                        color: Theme.text-muted;
+                    }
+                    Button {
+                        text: @tr("Save WAV…");
+                        icon: @image-url("icons/extract.svg");
+                        colorize-icon: true;
+                        enabled: !root.busy;
+                        clicked => { root.audio-save-wav(); }
+                    }
+                }
                 preview-area := Rectangle {
                     vertical-stretch: 1;
                     border-radius: Theme.radius;
@@ -1576,6 +1629,22 @@ export component AppWindow inherits Window {
                         image-rendering: smooth;
                         accessible-role: image;
                         accessible-label: @tr("Preview of {}", root.info-title);
+                    }
+                    if root.audio-mode: Rectangle {
+                        x: 8px + (parent.width - 16px) * root.audio-position;
+                        width: 2px;
+                        background: Theme.accent;
+                    }
+                    if root.audio-mode: TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.audio-seek(max(0, min(1, (self.mouse-x - 8px) / (self.width - 16px)))); }
+                    }
+                    if root.audio-mode: Text {
+                        x: Theme.space-s;
+                        y: parent.height - self.height - Theme.space-s;
+                        text: @tr("Click the waveform to jump · Space plays and pauses");
+                        font-size: Theme.font-small;
+                        color: Theme.text-faint;
                     }
                     if root.model-mode: ModelControls {
                         orbit(dx, dy) => { root.model-orbit(dx, dy); }

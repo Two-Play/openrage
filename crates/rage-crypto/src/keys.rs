@@ -29,6 +29,8 @@ pub struct GtaVKeys {
     pub hash_lut: [u8; 256],
     pub ng_keys: Vec<NgKey>,
     pub ng_tables: Box<NgTables>,
+    /// Key for encrypted audio containers (`.awc`); from the key blob.
+    pub awc_key: Option<[u8; 16]>,
 }
 
 impl GtaVKeys {
@@ -44,7 +46,7 @@ impl GtaVKeys {
         for (i, w) in tw.into_iter().enumerate() {
             tables[i / 4096][(i / 256) % 16][i % 256] = w;
         }
-        Some(Self { aes_key, hash_lut, ng_keys, ng_tables: tables })
+        Some(Self { aes_key, hash_lut, ng_keys, ng_tables: tables, awc_key: None })
     }
 
     /// Builds a key set entirely from an executable scan (works for GTA V Legacy).
@@ -61,7 +63,20 @@ impl GtaVKeys {
 
     /// Builds a key set from a decoded CodeWalker key blob.
     pub fn from_magic(aes_key: [u8; 32], magic: &MagicContents) -> Option<Self> {
-        Self::from_parts(aes_key, magic.hash_lut, &magic.ng_keys, &magic.ng_tables)
+        let mut keys = Self::from_parts(aes_key, magic.hash_lut, &magic.ng_keys, &magic.ng_tables)?;
+        keys.awc_key = Some(magic.awc_key);
+        Some(keys)
+    }
+
+    /// Decrypts an encrypted part of an audio container in place (needs the AWC key).
+    pub fn decrypt_awc(&self, data: &mut [u8]) -> bool {
+        match &self.awc_key {
+            Some(key) => {
+                crate::xxtea::decrypt(data, key);
+                true
+            }
+            None => false,
+        }
     }
 
     /// RAGE's LUT-based file name hash, used to pick the NG key for a file.
@@ -106,6 +121,9 @@ impl GtaVKeys {
         for w in self.ng_tables.iter().flatten().flatten() {
             out.extend_from_slice(&w.to_le_bytes());
         }
+        if let Some(k) = &self.awc_key {
+            out.extend_from_slice(k);
+        }
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(io)?;
         }
@@ -117,17 +135,22 @@ impl GtaVKeys {
     pub fn load(path: &Path) -> Result<Self, KeyCacheError> {
         let data = fs::read(path).map_err(|source| KeyCacheError::Io { path: path.to_owned(), source })?;
         let corrupt = || KeyCacheError::Corrupt(path.to_owned());
-        if data.len() != 8 + 32 + 256 + NG_KEYS_LEN + NG_TABLES_LEN || &data[..8] != CACHE_MAGIC {
+        // An optional AWC key (16 bytes) follows the NG tables.
+        let base = 8 + 32 + 256 + NG_KEYS_LEN + NG_TABLES_LEN;
+        if (data.len() != base && data.len() != base + 16) || &data[..8] != CACHE_MAGIC {
             return Err(corrupt());
         }
+        let awc_key: Option<[u8; 16]> = data.get(base..base + 16).map(|k| k.try_into().unwrap());
         let aes: [u8; 32] = data[8..40].try_into().unwrap();
         if <[u8; 20]>::from(Sha1::digest(aes)) != key_hashes::AES_KEY {
             return Err(corrupt());
         }
         let lut: [u8; 256] = data[40..296].try_into().unwrap();
         let ng_keys = &data[296..296 + NG_KEYS_LEN];
-        let ng_tables = &data[296 + NG_KEYS_LEN..];
-        Self::from_parts(aes, lut, ng_keys, ng_tables).ok_or_else(corrupt)
+        let ng_tables = &data[296 + NG_KEYS_LEN..base];
+        let mut keys = Self::from_parts(aes, lut, ng_keys, ng_tables).ok_or_else(corrupt)?;
+        keys.awc_key = awc_key;
+        Ok(keys)
     }
 }
 

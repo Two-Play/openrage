@@ -23,6 +23,7 @@ pub fn icon(name: &str, kind: ItemKind) -> (&'static str, Color) {
         ItemKind::Dir => return ("folder", rgb(0xC7962C)),
         ItemKind::Archive => return ("archive", rgb(0xD9822B)),
         ItemKind::Texture => return ("texture", rgb(0x9061D8)),
+        ItemKind::Sound => return ("audio", rgb(0xDB4F8A)),
         _ => {}
     }
     match extension(name).as_str() {
@@ -50,6 +51,7 @@ pub fn type_name(name: &str, kind: ItemKind) -> String {
         _ if kind == ItemKind::Dir => "Folder",
         _ if kind == ItemKind::Archive => "Archive",
         _ if kind == ItemKind::Texture => "Texture",
+        _ if kind == ItemKind::Sound => "Sound",
         "ytd" => "Texture dict",
         "ydr" => "Drawable",
         "ydd" => "Drawable dict",

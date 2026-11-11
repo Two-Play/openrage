@@ -4,6 +4,7 @@
 //! * [`texture`]: pixel formats, decoding to RGBA
 //! * [`dds`], [`png`]: export, compatible with OpenIV/CodeWalker output
 
+pub mod awc;
 pub mod dds;
 pub mod drawable;
 pub mod gltf;

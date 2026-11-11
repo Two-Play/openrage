@@ -10,4 +10,5 @@ rage-core.workspace = true
 rage-resource.workspace = true
 png = "0.18"
 texture2ddecoder = "0.1"
+symphonia = { version = "0.6", default-features = false, features = ["mp3"] }
 thiserror.workspace = true
