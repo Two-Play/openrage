@@ -10,6 +10,7 @@ pub mod clip;
 pub mod dds;
 pub mod drawable;
 pub mod gltf;
+pub mod gxt2;
 pub mod math;
 pub mod meta;
 pub mod names;

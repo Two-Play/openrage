@@ -91,6 +91,10 @@ enum Command {
         /// Instead of archives, convert every metadata file (.ymap, .ytyp, .ymt, .ymf, .cut, .pso) to XML.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations"])]
         meta: bool,
+        /// Instead of archives, convert every text table (.gxt2, .nametable) to text and back,
+        /// checking that the result is identical.
+        #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta"])]
+        text: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
         #[arg(long, requires = "textures")]
         rebuild: bool,
@@ -100,6 +104,14 @@ enum Command {
         /// Virtual path of the file.
         path: String,
         /// Write the XML to this file instead of printing it.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// Show a text table (.gxt2 as OpenIV .oxt text, .nametable one name per line).
+    Text {
+        /// Virtual path of the file.
+        path: String,
+        /// Write the text to this file instead of printing it.
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
@@ -274,6 +286,7 @@ fn run() -> Result<()> {
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
+        Command::Verify { path, text: true, .. } => cmd_verify_text(&game_dir, &path, keys),
         Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
@@ -287,6 +300,7 @@ fn run() -> Result<()> {
             cmd_model(&game_dir, &path, export.as_deref(), render.as_deref(), yaw, anim.as_deref(), keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
+        Command::Text { path, out } => cmd_text(&game_dir, &path, out.as_deref(), keys),
         Command::Xml { path, out } => cmd_xml(&game_dir, &path, out.as_deref(), keys),
         Command::Audio { path, export } => cmd_audio(&game_dir, &path, export.as_deref(), keys),
         Command::Put { file, target } => cmd_put(&game_dir, &file, &target, keys),
@@ -1074,6 +1088,81 @@ fn cmd_xml(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<Gta
             );
         }
         None => print!("{}", xml.text),
+    }
+    Ok(())
+}
+
+fn cmd_text(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    use openrage_app::texttable::{self, Kind};
+    let kind = Kind::of(path).context("not a text table (.gxt2 or .nametable)")?;
+    if let Ok(names) = open_index(game_dir).and_then(|i| Ok(i.known_names()?)) {
+        rage_formats::names::register(names);
+    }
+    let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
+    let data = match node {
+        Node::ArchiveFile(rpf, id) => rpf.read(id)?,
+        Node::PlainFile(p) => fs::read(p)?,
+        _ => bail!("{path} is not a file"),
+    };
+    let (text, count) = texttable::to_text(kind, &data)?;
+    match out {
+        Some(file) => {
+            fs::write(file, &text)?;
+            outln!("Wrote {} ({count} entries)", file.display());
+        }
+        None => print!("{text}"),
+    }
+    Ok(())
+}
+
+fn cmd_verify_text(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    use openrage_app::texttable::{self, Kind};
+    let starts = archive_roots(game_dir, within, keys)?;
+    let started = Instant::now();
+    let all: Vec<(usize, usize, Vec<String>)> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let (mut files, mut entries, mut errors) = (0, 0, Vec::new());
+            let mut nested = Vec::new();
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    let Some(kind) = Kind::of(&a.entry(id).name) else { return };
+                    files += 1;
+                    let result = a.read(id).map_err(anyhow::Error::from).and_then(|data| {
+                        let (text, n) = texttable::to_text(kind, &data)?;
+                        let back = texttable::from_text(kind, &text)?;
+                        if back != data {
+                            bail!("converting back changes the file ({} → {} bytes)", data.len(), back.len());
+                        }
+                        Ok(n)
+                    });
+                    match result {
+                        Ok(n) => entries += n,
+                        Err(e) => errors.push(format!("{p}: {e:#}")),
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (files, entries, errors)
+        })
+        .collect();
+    let (files, entries): (usize, usize) = all.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+    let errors: Vec<&String> = all.iter().flat_map(|x| &x.2).collect();
+    for e in errors.iter().take(30) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{files} text tables, {entries} strings and names, {} errors ({:.1}s)",
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() {
+        bail!("{} errors", errors.len());
     }
     Ok(())
 }

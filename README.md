@@ -12,7 +12,7 @@ An open-source explorer and modding toolkit for games built on Rockstar's RAGE e
 | GTA IV | planned (RPF3) | – |
 | Red Dead Redemption 2 | planned (RPF8) | – |
 
-Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF, complete vehicles and peds, GPU viewer) (done) → audio (`.awc` playback, WAV export) (done) → animations (`.ycd` clips on skinned models) (done) → metadata as XML (`.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.cut`) (done) → **6** GTA IV → **7** RDR2.
+Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF, complete vehicles and peds, GPU viewer) (done) → audio (`.awc` playback, WAV export) (done) → animations (`.ycd` clips on skinned models) (done) → metadata as XML (`.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.cut`) (done) → text tables (`.gxt2`, `.nametable`, `.ugc`) (done) → **6** GTA IV → **7** RDR2.
 
 ## Build
 
@@ -123,6 +123,10 @@ Every change is recorded in `mods/.openrage/journal` and can be reverted with **
 
 Map placements (`.ymap`), archetypes (`.ytyp`), `.ymt`, manifests (`.ymf`), cutscenes (`.cut`) and `.pso` files are shown as XML, formatted like CodeWalker's export: the preview shows the start, double-click (or **Show as XML**) opens all of it in a read-only window, **Export XML…** saves `name.ymap.xml`. All three binary encodings are read: RSC meta resources, PSO and RBF. Hashes are shown as names where the name is known: field and type names from a built-in list, model, texture and other asset names from the search index; unknown ones as `hash_XXXXXXXX`. Saving XML back into the game files will come later.
 
+### Text tables
+
+Game text (`.gxt2`) opens in the text editor in OpenIV's `.oxt` form, one `0xHASH = text` line per string (label names are used where the search index knows them). Audio name tables (`.nametable`) show one name per line, and `.ugc` files open as the JSON they are. After **Unlock editing**, saving converts the text back to `.gxt2` or `.nametable` and writes it into the mods folder; the conversion is lossless for every text table of the game. **Export as text…** writes `.oxt` or `.txt`.
+
 ### OpenIV packages (`.oiv`)
 
 **Install .oiv…** (or `openrage-gui package.oiv`) shows the package — name, author, description — and exactly what installing it would change, before anything is written. Packages of format 2.x are supported: files added to or deleted from the game and from archives (also nested ones), new archives and DLC packs (`createIfNotExist`), text edits (`add`, `insert`, `replace`, `delete` with Equal/StartWith/Mask) and XML edits by XPath (`add` First/Last/Before/After, `replace`, `remove`) that keep the file's formatting. Changes go to the `mods` folder; loose files that are new (such as `.asi` plugins) go to the game folder, as loaders expect them there.
@@ -179,6 +183,8 @@ openrage model …/a_m_y_hipster_01.ydd --render pose.png --anim "…/move_m@gen
 openrage verify --animations                   # parse every clip dictionary, evaluate all frames
 openrage xml …/ufo.ymap [-o ufo.ymap.xml]      # metadata (.ymap/.ytyp/.ymt/.ymf/.cut/.pso) → XML
 openrage verify --meta                         # convert every metadata file of the game
+openrage text …/american_rel.rpf/iap.gxt2 [-o iap.oxt]   # text table → OpenIV .oxt text
+openrage verify --text                         # every .gxt2/.nametable → text → back, identical
 openrage mods                                  # files in the OpenIV mods folder
 openrage mods --changes [--deep]               # every added/removed/modified entry
 ```

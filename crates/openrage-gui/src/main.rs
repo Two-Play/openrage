@@ -717,6 +717,16 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
                 }
             }
         }
+        "text-export" => {
+            let vpath = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(row)?];
+                Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = vpath {
+                export_text_table(ui, vpath);
+            }
+        }
         "xml-view" | "xml" => {
             let vpath = with_app(|a| {
                 let listing = a.listing.as_ref()?;
@@ -1013,8 +1023,25 @@ fn is_viewable(item: &Item) -> bool {
 /// Files that open in the text editor (by extension; binary contents are
 /// detected when opening).
 fn is_text_file(item: &Item) -> bool {
-    const TEXT: [&str; 14] =
-        ["xml", "meta", "txt", "ini", "cfg", "json", "ide", "ipl", "lua", "csv", "log", "dat", "gxt", "list"];
+    const TEXT: [&str; 17] = [
+        "xml",
+        "meta",
+        "txt",
+        "ini",
+        "cfg",
+        "json",
+        "ide",
+        "ipl",
+        "lua",
+        "csv",
+        "log",
+        "dat",
+        "gxt",
+        "list",
+        "ugc",
+        "gxt2",
+        "nametable",
+    ];
     let ext = item.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
     matches!(item.kind, ItemKind::File) && item.mark != Some(Mark::Removed) && TEXT.contains(&ext.as_str())
 }
@@ -1052,6 +1079,7 @@ fn file_row(item: &Item) -> FileRow {
         is_model: is_model_item(item),
         can_edit_text: is_text_file(item),
         is_meta: is_meta_file(item),
+        is_table: is_text_file(item) && openrage_app::texttable::is_text_table(&item.name),
         kind: match &item.vpath {
             Some(_) if item.detail.is_some() => item.detail.clone().unwrap_or_default().into(),
             Some(vpath) => browser::short_location(&browser::parent(vpath).unwrap_or_default(), 40).into(),
@@ -1566,6 +1594,11 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
             {
                 return preview;
             }
+            if let Some(kind) = openrage_app::texttable::Kind::of(&entry.name)
+                && let Ok(data) = rpf.read(id)
+            {
+                return text_table_preview(kind, &data);
+            }
             match entry.kind {
                 EntryKind::Resource { size, .. } => {
                     let (sys, gfx) = entry.resource_page_sizes().unwrap_or_default();
@@ -1602,6 +1635,28 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
                 EntryKind::Directory { .. } => (Meta::new(), String::new()),
             }
         }
+    }
+}
+
+/// A text table shown as text in the preview.
+fn text_table_preview(kind: openrage_app::texttable::Kind, data: &[u8]) -> (Meta, String) {
+    const LIMIT: usize = 256 * 1024;
+    match openrage_app::texttable::to_text(kind, data) {
+        Ok((text, count)) => {
+            // The preview font has no tab glyph.
+            let mut text = text.replace('\t', "    ");
+            let mut meta = vec![kv("Format", kind.name()), kv("Entries", count)];
+            if text.len() > LIMIT {
+                let cut = (0..=LIMIT).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+                text.truncate(cut);
+                text.push_str("\n…\n");
+                meta.push(note("Showing the start; double-click to open all of it in the editor."));
+            } else {
+                meta.push(note("Double-click to open it in the editor."));
+            }
+            (meta, text)
+        }
+        Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new()),
     }
 }
 
@@ -2762,12 +2817,12 @@ fn read_file(ui: &AppWindow, vpath: &str) -> anyhow::Result<Vec<u8>> {
 fn open_editor(ui: &AppWindow, vpath: String) {
     ui.set_status(format!("Opening {vpath} …").into());
     match read_file(ui, &vpath) {
-        Ok(data) => match editor::Document::from_bytes(vpath.clone(), &data) {
-            Some(doc) => {
+        Ok(data) => match editor::Document::from_file(vpath.clone(), &data) {
+            Ok(doc) => {
                 editor::open(ui, doc);
                 ui.set_status(SharedString::new());
             }
-            None => ui.set_status(format!("{vpath} is not a text file; use Extract… instead.").into()),
+            Err(e) => ui.set_status(format!("Cannot open {vpath} as text ({e}); use Extract… instead.").into()),
         },
         Err(e) => ui.set_status(format!("Cannot open {vpath}: {e:#}").into()),
     }
@@ -2788,6 +2843,35 @@ fn open_xml_view(ui: &AppWindow, vpath: String) {
         }
         Err(e) => ui.set_status(format!("Cannot convert {vpath}: {e:#}").into()),
     }
+}
+
+/// Asks for a file name and writes a text table as text (`.oxt` for `.gxt2`, like OpenIV).
+fn export_text_table(ui: &AppWindow, vpath: String) {
+    use openrage_app::texttable::{self, Kind};
+    let Some(kind) = Kind::of(&vpath) else { return };
+    let text = match read_file(ui, &vpath).and_then(|d| texttable::to_text(kind, &d)) {
+        Ok((t, _)) => t,
+        Err(e) => return ui.set_status(format!("Cannot convert {vpath}: {e:#}").into()),
+    };
+    let name = vpath.rsplit('/').next().unwrap_or(&vpath);
+    let stem = name.rsplit_once('.').map_or(name, |(s, _)| s).to_owned();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let ext = kind.text_extension();
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export as text")
+            .set_file_name(format!("{stem}.{ext}"))
+            .add_filter(kind.name(), &[ext])
+            .save_file()
+        else {
+            return;
+        };
+        let msg = match std::fs::write(&path, &text) {
+            Ok(()) => format!("Exported {}", path.display()),
+            Err(e) => format!("Export failed: {e}"),
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+    });
 }
 
 /// Asks for a file name and writes a metadata file as XML (`name.ymap.xml`, like CodeWalker).

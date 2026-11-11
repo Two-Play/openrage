@@ -7,6 +7,8 @@ use std::rc::Rc;
 
 use slint::ComponentHandle;
 
+use openrage_app::texttable::{self, Kind};
+
 use crate::{AppWindow, EditorWindow};
 
 /// How tabs are shown in the editor (the text field has no glyph for a
@@ -29,6 +31,8 @@ pub struct Document {
     pub locked_reason: String,
     /// Converted from this binary format for viewing (e.g. "PSO").
     pub converted: Option<String>,
+    /// A binary text table shown as text; saving converts it back.
+    pub table: Option<Kind>,
 }
 
 impl Document {
@@ -48,7 +52,17 @@ impl Document {
                 if tab_mark {
                     text = text.replace('\t', &TAB_HIDDEN.to_string());
                 }
-                Some(Self { vpath, name, text, crlf, bom, tab_mark, locked_reason: String::new(), converted: None })
+                Some(Self {
+                    vpath,
+                    name,
+                    text,
+                    crlf,
+                    bom,
+                    tab_mark,
+                    locked_reason: String::new(),
+                    converted: None,
+                    table: None,
+                })
             }
             _ => {
                 // Other encodings are shown but not saved (it would change the file's encoding).
@@ -63,6 +77,7 @@ impl Document {
                     locked_reason: "This file is not UTF-8 text; it is shown read-only so its encoding stays intact."
                         .into(),
                     converted: None,
+                    table: None,
                 })
             }
         }
@@ -83,6 +98,41 @@ impl Document {
             tab_mark: false,
             locked_reason,
             converted: Some(format.to_owned()),
+            table: None,
+        }
+    }
+
+    /// Opens a file: text tables (`.gxt2`, `.nametable`) as editable text that
+    /// is converted back on saving, other files via [`from_bytes`](Self::from_bytes).
+    pub fn from_file(vpath: String, data: &[u8]) -> Result<Self, String> {
+        let Some(kind) = Kind::of(&vpath) else {
+            return Self::from_bytes(vpath, data).ok_or_else(|| "not a text file".to_owned());
+        };
+        let (mut text, _) = texttable::to_text(kind, data).map_err(|e| format!("{e:#}"))?;
+        let name = vpath.rsplit('/').next().unwrap_or(&vpath).to_owned();
+        let tab_mark = text.contains('\t') && !text.contains(TAB_SHOWN) && !text.contains(TAB_HIDDEN);
+        if tab_mark {
+            text = text.replace('\t', &TAB_HIDDEN.to_string());
+        }
+        Ok(Self {
+            vpath,
+            name,
+            text,
+            crlf: false,
+            bom: false,
+            tab_mark,
+            locked_reason: String::new(),
+            converted: None,
+            table: Some(kind),
+        })
+    }
+
+    /// What saving writes: the text, or for text tables the converted file.
+    pub fn save_bytes(&self, text: &str) -> Result<Vec<u8>, String> {
+        let bytes = self.encode(text);
+        match self.table {
+            Some(kind) => texttable::from_text(kind, &String::from_utf8_lossy(&bytes)).map_err(|e| format!("{e:#}")),
+            None => Ok(bytes),
         }
     }
 
@@ -137,7 +187,13 @@ pub fn open(ui: &AppWindow, doc: Document) {
         let (Some(win), Some(ui)) = (w.upgrade(), main.upgrade()) else { return };
         let text = win.get_text().to_string();
         let doc = d.borrow();
-        let bytes = doc.encode(&text);
+        let bytes = match doc.save_bytes(&text) {
+            Ok(b) => b,
+            Err(e) => {
+                win.set_status(format!("Cannot save: {e}").into());
+                return;
+            }
+        };
         win.set_saving(true);
         win.set_status("Saving into the mods folder…".into());
         let w2 = w.clone();
@@ -183,7 +239,7 @@ pub fn open(ui: &AppWindow, doc: Document) {
         let new = if converted {
             crate::read_xml(&ui, &vpath).map(|x| Some(Document::converted(vpath, x.text, x.encoding.name())))
         } else {
-            crate::read_file(&ui, &vpath).map(|data| Document::from_bytes(vpath, &data))
+            crate::read_file(&ui, &vpath).map(|data| Document::from_file(vpath, &data).ok())
         };
         match new {
             Ok(Some(new)) => {
@@ -236,6 +292,9 @@ fn status_line(doc: &Document) -> String {
     let tabs = if doc.tab_mark { " · contains tabs" } else { "" };
     if let Some(format) = &doc.converted {
         return format!("{lines} lines · XML converted from {format}");
+    }
+    if let Some(kind) = doc.table {
+        return format!("{lines} lines · {}, saved back in its own format", kind.name());
     }
     let encoding = if !doc.locked_reason.is_empty() {
         "other encoding"
