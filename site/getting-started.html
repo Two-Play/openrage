@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Getting started · OpenRAGE</title>
+  <meta name="description" content="Install OpenRAGE from a release or build it from source, then set up the archive keys from your own copy of GTA V or Red Dead Redemption 2.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f7f8fa" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#111317" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script>
+    try { var t = localStorage.getItem("openrage-theme"); if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t); } catch (e) {}
+  </script>
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="./">
+        <svg aria-hidden="true" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#c2410c"/><path d="M7 10.5 16 6l9 4.5v11L16 26l-9-4.5z" fill="none" stroke="#fff" stroke-width="2.2" stroke-linejoin="round"/><path d="M7 10.5 16 15l9-4.5M16 15v11" fill="none" stroke="#fff" stroke-width="2.2" stroke-linejoin="round"/></svg>
+        OpenRAGE
+      </a>
+      <nav class="site-nav" aria-label="Main">
+        <ul>
+          <li class="optional"><a href="./#features">Features</a></li>
+          <li class="optional"><a href="./#status">Status</a></li>
+          <li><a href="getting-started.html" aria-current="page">Get started</a></li>
+          <li><a href="https://github.com/Two-Play/openrage">GitHub</a></li>
+        </ul>
+      </nav>
+      <button class="theme-toggle" type="button" aria-label="Switch colour theme" hidden>
+        <svg class="sun" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <svg class="moon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="main" class="doc">
+    <div class="wrap">
+      <h1>Getting started</h1>
+      <p class="lead">Install OpenRAGE, point it at your game and let it take the archive keys from your own copy.</p>
+
+      <nav class="toc" aria-label="On this page">
+        <strong>On this page</strong>
+        <ol>
+          <li><a href="#download">Download a release</a></li>
+          <li><a href="#build">Build from source</a></li>
+          <li><a href="#gtav">Set up GTA V</a></li>
+          <li><a href="#rdr2">Set up Red Dead Redemption 2</a></li>
+          <li><a href="#next">Next steps</a></li>
+        </ol>
+      </nav>
+
+      <h2 id="download">1. Download a release</h2>
+      <p>
+        Ready-made builds for <strong>Linux</strong> (x86-64, glibc 2.35 or newer) and <strong>Windows</strong> (x86-64) are on the
+        <a href="https://github.com/Two-Play/openrage/releases/latest">releases page</a>.
+        Unpack the archive and run <code>openrage-gui</code>, or <code>openrage</code> for the command line.
+        <code>SHA256SUMS.txt</code> lists the checksums of the archives.
+      </p>
+      <p>
+        <a class="btn btn-primary" data-release="linux" href="https://github.com/Two-Play/openrage/releases/latest">Linux (.tar.gz)<span data-size></span></a>
+        <a class="btn btn-primary" data-release="windows" href="https://github.com/Two-Play/openrage/releases/latest">Windows (.zip)<span data-size></span></a>
+      </p>
+      <p>To check a download on Linux:</p>
+<pre><code>sha256sum --check --ignore-missing SHA256SUMS.txt</code></pre>
+
+      <h2 id="build">2. Build from source</h2>
+      <p>
+        You need a recent stable <a href="https://rustup.rs">Rust toolchain</a>; the exact version is pinned in
+        <code>rust-toolchain.toml</code> and rustup picks it up automatically.
+        On Linux the GUI also needs the development packages of fontconfig, xkbcommon, Wayland and ALSA:
+      </p>
+<pre><code><span class="c"># Fedora</span>
+sudo dnf install fontconfig-devel libxkbcommon-devel wayland-devel alsa-lib-devel
+<span class="c"># Debian / Ubuntu</span>
+sudo apt install libfontconfig1-dev libxkbcommon-dev libwayland-dev libasound2-dev</code></pre>
+      <p>Then clone and build:</p>
+<pre><code>git clone https://github.com/Two-Play/openrage.git
+cd openrage
+cargo build --release
+<span class="c"># binaries: target/release/openrage (CLI) and target/release/openrage-gui</span></code></pre>
+      <p>
+        For a reproducible environment there is a container image based on Fedora's toolbx image (<code>dev/Containerfile</code>);
+        see <a href="https://github.com/Two-Play/openrage#reproducible-build-environment">Reproducible build environment</a> in the README.
+      </p>
+
+      <h2 id="gtav">3. Set up GTA V</h2>
+      <p>
+        OpenRAGE needs the archive keys from <em>your own</em> game installation. On first start the GUI shows a setup dialog that
+        detects Steam installations and derives the keys. On the command line:
+      </p>
+<pre><code>openrage --game "/path/to/Grand Theft Auto V" keys</code></pre>
+      <p>
+        The keys are extracted once and cached at <code>~/.config/openrage/gtav.keys</code> (Linux) or
+        <code>%APPDATA%\openrage\gtav.keys</code> (Windows). The game directory is remembered after this step.
+      </p>
+      <ul>
+        <li><strong>GTA V Legacy</strong> (<code>GTA5.exe</code>): all keys are found in the executable.</li>
+        <li>
+          <strong>GTA V Enhanced</strong> (<code>GTA5_Enhanced.exe</code>): the executable only contains the AES key; the NG keys are no
+          longer stored in plain form. Pass a CodeWalker key blob you obtained yourself:
+          <code>openrage keys --magic /path/to/magic.dat</code>. The blob is decrypted with the AES key from your executable and verified
+          against <code>common.rpf</code> before it is cached.
+        </li>
+      </ul>
+      <div class="callout" role="note">
+        <p><strong>Never share the key cache.</strong> It contains keys taken from your copy of the game.</p>
+      </div>
+
+      <h2 id="rdr2">4. Set up Red Dead Redemption 2</h2>
+      <p>
+        Reading RDR2 archives works on the command line. Unlike GTA V's, most RDR2 archive keys are not stored in the executable on disk;
+        they exist only while the game runs. OpenRAGE takes them from your own game and never ships them. There are two ways:
+      </p>
+      <h3>From a key file</h3>
+<pre><code>openrage rdr2-keys --file secrets.bin "/path/to/Red Dead Redemption 2"</code></pre>
+      <p>The file holds length-prefixed key blocks, such as the <code>secrets.bin</code> Swage writes.</p>
+      <h3>From a memory dump of your running game</h3>
+      <ol>
+        <li>Start RDR2 in story mode (not Red Dead Online) and wait for the main menu, or load a save.</li>
+        <li>
+          Dump the process. On Windows: Task Manager → Details → right-click <code>RDR2.exe</code> → <em>Create dump file</em>.
+          Under Proton/Linux: <code>gcore &lt;pid of RDR2.exe&gt;</code> (from gdb).
+        </li>
+        <li>Run <code>openrage rdr2-keys --dump &lt;dump file&gt; "/path/to/Red Dead Redemption 2"</code>.</li>
+      </ol>
+      <div class="callout" role="note">
+        <p>
+          <strong>Delete the dump afterwards.</strong> It is several gigabytes and holds everything the game had in memory,
+          including login data.
+        </p>
+      </div>
+      <p>
+        The keys are stored in OpenRAGE's config folder (<code>rdr2.keys</code>). Then list or read the archives:
+      </p>
+<pre><code>openrage rpf8 "/path/to/Red Dead Redemption 2"
+openrage rpf8 --list "/path/to/Red Dead Redemption 2/common_0.rpf"</code></pre>
+      <p>
+        Only the Steam version of 2 April 2024 is known so far; other versions report which pieces are missing.
+        Browsing RDR2 in the GUI and its file formats follow.
+      </p>
+
+      <h2 id="next">5. Next steps</h2>
+      <p>Start the explorer, or try a few commands. Paths are virtual: archives, including archives inside archives, behave like folders.</p>
+<pre><code>openrage-gui
+openrage ls x64a.rpf/data
+openrage find adder.yft
+openrage search 0xB779A091                     <span class="c"># hash lookup</span>
+openrage extract common.rpf/data/cargens.meta -o out/
+openrage model …/adder.yft --export adder.glb  <span class="c"># glTF for Blender</span></code></pre>
+      <p>
+        Edits never touch your game files: they go to OpenIV's <code>mods</code> folder and can be undone. The
+        <a href="https://github.com/Two-Play/openrage#readme">README</a> documents every part of the GUI and the complete
+        <a href="https://github.com/Two-Play/openrage#command-line">command line</a>.
+        Found a bug or missing a format? <a href="https://github.com/Two-Play/openrage/issues">Open an issue</a>.
+      </p>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <ul class="links">
+        <li><a href="https://github.com/Two-Play/openrage">Source on GitHub</a></li>
+        <li><a href="https://github.com/Two-Play/openrage#readme">Documentation (README)</a></li>
+        <li><a href="https://github.com/Two-Play/openrage/issues">Issues</a></li>
+        <li><a href="https://github.com/Two-Play/openrage/blob/main/LICENSE">License: GPL-3.0</a></li>
+        <li><a href="https://github.com/Two-Play/openrage/blob/main/NOTICE.md">Third-party notices</a></li>
+      </ul>
+      <p>
+        OpenRAGE is free software under the GPL-3.0-only; <code>crates/rage-tfit2</code> is AGPL-3.0-only.
+        It ships no Rockstar keys and no game files.
+      </p>
+      <p>
+        Grand Theft Auto, Red Dead Redemption, RAGE and Rockstar Games are trademarks of Take-Two Interactive Software, Inc.
+        OpenRAGE is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive.
+      </p>
+    </div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenRAGE</title>
+  <meta name="description" content="OpenRAGE is a free, open-source explorer and modding toolkit for Rockstar's RAGE engine games on Linux and Windows: archives, textures, models, audio, animations, metadata and OpenIV-compatible mods.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f7f8fa" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#111317" media="(prefers-color-scheme: dark)">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="OpenRAGE">
+  <meta property="og:description" content="Open-source explorer and modding toolkit for Rockstar's RAGE engine games — on Linux and Windows.">
+  <meta property="og:image" content="https://two-play.github.io/openrage/images/explorer-dark.png">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script>
+    try { var t = localStorage.getItem("openrage-theme"); if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t); } catch (e) {}
+  </script>
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="./">
+        <svg aria-hidden="true" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#c2410c"/><path d="M7 10.5 16 6l9 4.5v11L16 26l-9-4.5z" fill="none" stroke="#fff" stroke-width="2.2" stroke-linejoin="round"/><path d="M7 10.5 16 15l9-4.5M16 15v11" fill="none" stroke="#fff" stroke-width="2.2" stroke-linejoin="round"/></svg>
+        OpenRAGE
+      </a>
+      <nav class="site-nav" aria-label="Main">
+        <ul>
+          <li class="optional"><a href="#features">Features</a></li>
+          <li class="optional"><a href="#status">Status</a></li>
+          <li><a href="getting-started.html">Get started</a></li>
+          <li><a href="https://github.com/Two-Play/openrage">GitHub</a></li>
+        </ul>
+      </nav>
+      <button class="theme-toggle" type="button" aria-label="Switch colour theme" hidden>
+        <svg class="sun" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <svg class="moon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="main">
+    <div class="hero">
+      <div class="wrap">
+        <h1>Explore and mod RAGE engine games</h1>
+        <p class="lead">
+          OpenRAGE is a free, open-source explorer and modding toolkit for Rockstar's RAGE engine games, on Linux and Windows.
+          Browse and search every archive, preview textures, models, sounds and animations, read metadata as XML,
+          edit game text and install <code>.oiv</code> packages — compatible with OpenIV's <code>mods</code> folder, with undo.
+        </p>
+        <div class="actions">
+          <a class="btn btn-primary" href="https://github.com/Two-Play/openrage/releases/latest">
+            <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+            Download the latest release
+          </a>
+          <a class="btn btn-secondary" href="getting-started.html">Getting started</a>
+        </div>
+        <p class="release-note" data-release-info hidden>
+          Latest: <strong data-release="version"></strong>, released <span data-release="published"></span> · Linux and Windows, x86-64
+        </p>
+
+        <div class="hero-shot">
+          <img class="light-only" src="images/explorer-light.png" width="1512" height="945"
+               alt="OpenRAGE explorer showing the vehicles archive of GTA V with a 3D preview of a car">
+          <img class="dark-only" src="images/explorer-dark.png" width="1512" height="945"
+               alt="OpenRAGE explorer showing the vehicles archive of GTA V with a 3D preview of a car">
+        </div>
+      </div>
+    </div>
+
+    <div class="wrap">
+      <p class="notice">
+        OpenRAGE is an independent community project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive.
+        It contains <strong>no game files and no encryption keys</strong>: keys are taken from your own copy of the game at runtime.
+      </p>
+    </div>
+
+    <section id="features" aria-labelledby="features-title">
+      <div class="wrap">
+        <h2 id="features-title">Highlights</h2>
+        <p class="section-intro">Everything you need to look inside the game and change it safely — from the explorer or the command line.</p>
+        <ul class="features">
+          <li><h3><span class="icon" aria-hidden="true">🗂️</span>Explorer</h3><p>Archives — even nested ones — behave like folders. Breadcrumbs, format icons, context menus, keyboard navigation, light and dark mode.</p></li>
+          <li><h3><span class="icon" aria-hidden="true">🔎</span>Search everything</h3><p>Names, hashes (<code>0xB779A091</code> → <code>adder</code>) and full text of the whole game in milliseconds, from an index that updates itself.</p></li>
+          <li><h3><span class="icon" aria-hidden="true">🖼️</span>Textures</h3><p>All formats of GTA V Legacy and Enhanced (incl. BC7); DDS/PNG export identical to OpenIV; replace, add and remove.</p></li>
+          <li><h3><span class="icon" aria-hidden="true">🚗</span>Models</h3><p>Complete vehicles and peds in a GPU viewer: orbit or fly, show/hide parts, paint materials, export glTF for Blender.</p></li>
+          <li><h3><span class="icon" aria-hidden="true">🔊</span>Audio</h3><p>Plays every sound and radio track of the game, with waveform, seeking and WAV export.</p></li>
+          <li><h3><span class="icon" aria-hidden="true">🏃</span>Animations</h3><p>Clip dictionaries play on skinned models; fitting models are suggested from the bones a clip moves.</p></li>
+          <li><h3><span class="icon" aria-hidden="true">📄</span>Metadata</h3><p><code>.ymap</code>, <code>.ytyp</code>, <code>.ymt</code>, <code>.ymf</code>, <code>.cut</code> and <code>.pso</code> as XML (RSC meta, PSO and RBF), compatible with CodeWalker.</p></li>
+          <li><h3><span class="icon" aria-hidden="true">🎬</span>Cutscenes</h3><p>Play a whole cutscene: every actor animated in one scene, through the cutscene camera or a free camera.</p></li>
+          <li><h3><span class="icon" aria-hidden="true">🧱</span>Collisions, paths, nav meshes</h3><p><code>.ybn</code>, <code>.ynd</code>, <code>.ynv</code>, <code>.yvr</code> and <code>.ywr</code> in 3D, coloured by material or kind.</p></li>
+          <li><h3><span class="icon" aria-hidden="true">📜</span>Scripts and particles</h3><p>Disassembles compiled scripts (<code>.ysc</code>); lists effects, textures and models of particle dictionaries (<code>.ypt</code>).</p></li>
+          <li><h3><span class="icon" aria-hidden="true">🌐</span>Game text</h3><p>Edit <code>.gxt2</code> text tables in OpenIV's <code>.oxt</code> form and save them back losslessly.</p></li>
+          <li><h3><span class="icon" aria-hidden="true">🧩</span>Mods, safely</h3><p>Changes go to OpenIV's <code>mods</code> folder, never into your game files; every change and every <code>.oiv</code> package can be undone.</p></li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="screenshots" class="alt" aria-labelledby="screenshots-title">
+      <div class="wrap">
+        <h2 id="screenshots-title">Screenshots</h2>
+        <p class="section-intro">The screenshots show OpenRAGE displaying files from the author's own copy of the game.</p>
+        <div class="gallery">
+          <figure>
+            <img src="images/viewer.png" width="1155" height="798" loading="lazy" alt="Viewer window with a car painted blue and its list of materials">
+            <figcaption><strong>Model viewer</strong> — materials, paint, parts and animations</figcaption>
+          </figure>
+          <figure>
+            <img src="images/metadata.png" width="1512" height="945" loading="lazy" alt="Archetype file of a map shown as XML in the preview">
+            <figcaption><strong>Metadata as XML</strong> — maps, archetypes, cutscenes, …</figcaption>
+          </figure>
+          <figure>
+            <img src="images/text-table.png" width="1512" height="945" loading="lazy" alt="Game text table shown as OpenIV oxt text">
+            <figcaption><strong>Game text</strong> — <code>.gxt2</code> as editable <code>.oxt</code></figcaption>
+          </figure>
+          <figure>
+            <img class="light-only" src="images/explorer-dark.png" width="1512" height="945" loading="lazy" alt="OpenRAGE explorer in dark mode">
+            <img class="dark-only" src="images/explorer-light.png" width="1512" height="945" loading="lazy" alt="OpenRAGE explorer in light mode">
+            <figcaption><strong>Light and dark mode</strong> — follows the system or your choice</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section id="status" aria-labelledby="status-title">
+      <div class="wrap">
+        <h2 id="status-title">Supported games</h2>
+        <p class="section-intro">GTA V comes first; Red Dead Redemption 2 archives can be read, GTA IV is planned.</p>
+        <div class="table-scroll">
+          <table class="stack">
+            <thead>
+              <tr><th scope="col">Game</th><th scope="col">Archives</th><th scope="col">Formats</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th scope="row">GTA V <span class="muted">(Legacy &amp; Enhanced)</span></th>
+                <td data-label="Archives"><span class="status ok">✓ Supported</span><br>RPF7 read, incl. nested archives; edit in place in the mods folder, with undo</td>
+                <td data-label="Formats"><span class="status ok">✓ Supported</span><br>textures · models · audio · animations · metadata · text tables · cutscenes · scripts · collisions · paths</td>
+              </tr>
+              <tr>
+                <th scope="row">Red Dead Redemption 2</th>
+                <td data-label="Archives"><span class="status partial">◐ Read</span><br>RPF8 read: decryption with keys from your own game, Oodle decompression (command line)</td>
+                <td data-label="Formats"><span class="status planned">– Not yet</span></td>
+              </tr>
+              <tr>
+                <th scope="row">GTA IV</th>
+                <td data-label="Archives"><span class="status planned">○ Planned</span><br>RPF3</td>
+                <td data-label="Formats"><span class="status planned">– Not yet</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <details class="more">
+          <summary>Checked against the whole game</summary>
+          <p>Every format is verified against the complete game (GTA V Enhanced):</p>
+          <div class="table-scroll">
+            <table class="stack">
+              <thead>
+                <tr><th scope="col">Format</th><th scope="col">Files checked</th><th scope="col">Result</th></tr>
+              </thead>
+              <tbody>
+                <tr><th scope="row">Textures (<code>.ytd</code>)</th><td data-label="Files checked">89,817 dictionaries, 341,701 textures</td><td data-label="Result">all decode; every dictionary rebuilds and reads back identically</td></tr>
+                <tr><th scope="row">Models (<code>.ydr</code>, <code>.yft</code>, <code>.ydd</code>)</th><td data-label="Files checked">168,779 models</td><td data-label="Result">all load (583 million triangles)</td></tr>
+                <tr><th scope="row">Audio (<code>.awc</code>)</th><td data-label="Files checked">7,758 containers, 252,742 sounds</td><td data-label="Result">all decode (279.8 hours)</td></tr>
+                <tr><th scope="row">Animations (<code>.ycd</code>)</th><td data-label="Files checked">25,961 dictionaries, 332,771 clips</td><td data-label="Result">all evaluate</td></tr>
+                <tr><th scope="row">Metadata</th><td data-label="Files checked">30,280 files</td><td data-label="Result">all convert to XML</td></tr>
+                <tr><th scope="row">Text tables (<code>.gxt2</code>, <code>.nametable</code>)</th><td data-label="Files checked">19,858 files, 9.16 million strings</td><td data-label="Result">text → binary is byte-identical</td></tr>
+                <tr><th scope="row">Particles (<code>.ypt</code>)</th><td data-label="Files checked">1,544 dictionaries, 12,987 effects</td><td data-label="Result">all read, incl. 1,694 textures and 1,223 models</td></tr>
+                <tr><th scope="row">Collisions (<code>.ybn</code>)</th><td data-label="Files checked">14,692 files, 70,454 bounds</td><td data-label="Result">all read (101 million triangles, 4.7 million shapes)</td></tr>
+                <tr><th scope="row">Paths (<code>.ynd</code>, <code>.yvr</code>, <code>.ywr</code>)</th><td data-label="Files checked">9,922 files, 232,982 nodes, 1.37 million recorded points</td><td data-label="Result">all read (521 hours of vehicle recordings)</td></tr>
+                <tr><th scope="row">Nav meshes (<code>.ynv</code>)</th><td data-label="Files checked">10,567 files, 18.9 million polygons</td><td data-label="Result">all read</td></tr>
+                <tr><th scope="row">Scripts (<code>.ysc</code>)</th><td data-label="Files checked">1,864 scripts, 383 million instructions</td><td data-label="Result">all disassemble, every jump lands on an instruction</td></tr>
+                <tr><th scope="row">Scaleform (<code>.gfx</code>), Bink (<code>.bik</code>)</th><td data-label="Files checked">1,163 movies, 415 videos</td><td data-label="Result">all read (29,490 exported symbols, 207 minutes of video)</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <section id="download" class="alt" aria-labelledby="download-title">
+      <div class="wrap">
+        <h2 id="download-title">Download</h2>
+        <p class="section-intro">
+          Unpack the archive and run <code>openrage-gui</code> (or <code>openrage</code> for the command line).
+          On first start the GUI detects your game and sets up the keys.
+        </p>
+        <div class="downloads">
+          <div class="card">
+            <h3>Linux</h3>
+            <p>x86-64, glibc 2.35 or newer (<code>.tar.gz</code>).</p>
+            <a class="btn btn-primary" data-release="linux" href="https://github.com/Two-Play/openrage/releases/latest">Download for Linux<span data-size></span></a>
+          </div>
+          <div class="card">
+            <h3>Windows</h3>
+            <p>x86-64 (<code>.zip</code>).</p>
+            <a class="btn btn-primary" data-release="windows" href="https://github.com/Two-Play/openrage/releases/latest">Download for Windows<span data-size></span></a>
+          </div>
+          <div class="card">
+            <h3>Build from source</h3>
+            <p>Rust toolchain plus a few system libraries on Linux.</p>
+            <a class="btn btn-secondary" href="getting-started.html#build">Build instructions</a>
+          </div>
+        </div>
+        <p>
+          Checksums: <a data-release="sums" href="https://github.com/Two-Play/openrage/releases/latest">SHA256SUMS.txt</a> ·
+          <a href="https://github.com/Two-Play/openrage/releases">All releases</a>
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <ul class="links">
+        <li><a href="https://github.com/Two-Play/openrage">Source on GitHub</a></li>
+        <li><a href="https://github.com/Two-Play/openrage#readme">Documentation (README)</a></li>
+        <li><a href="https://github.com/Two-Play/openrage/issues">Issues</a></li>
+        <li><a href="https://github.com/Two-Play/openrage/blob/main/LICENSE">License: GPL-3.0</a></li>
+        <li><a href="https://github.com/Two-Play/openrage/blob/main/NOTICE.md">Third-party notices</a></li>
+      </ul>
+      <p>
+        OpenRAGE is free software under the GPL-3.0-only; <code>crates/rage-tfit2</code> is AGPL-3.0-only.
+        It ships no Rockstar keys and no game files.
+      </p>
+      <p>
+        Grand Theft Auto, Red Dead Redemption, RAGE and Rockstar Games are trademarks of Take-Two Interactive Software, Inc.
+        OpenRAGE is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive.
+        The screenshots show OpenRAGE displaying files from the author's own copy of the game.
+      </p>
+    </div>
+  </footer>
+</body>
+</html>

@@ -7,6 +7,9 @@
 Browse and search every archive, preview textures, models, sounds and animations, read metadata as XML,<br>
 edit game text and install `.oiv` packages — compatible with OpenIV's `mods` folder, with undo.
 
+**[Website](https://two-play.github.io/openrage/)** · **[Download](https://github.com/Two-Play/openrage/releases/latest)**
+
+[![Website](https://img.shields.io/badge/website-two--play.github.io%2Fopenrage-c2410c.svg)](https://two-play.github.io/openrage/)
 [![CI](https://github.com/Two-Play/openrage/actions/workflows/ci.yml/badge.svg)](https://github.com/Two-Play/openrage/actions/workflows/ci.yml)
 [![Dev environment](https://github.com/Two-Play/openrage/actions/workflows/dev-env.yml/badge.svg)](https://github.com/Two-Play/openrage/actions/workflows/dev-env.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
