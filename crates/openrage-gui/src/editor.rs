@@ -244,6 +244,7 @@ pub fn open(ui: &AppWindow, doc: Document) {
         match new {
             Ok(Some(new)) => {
                 win.set_text(show_tabs(&new.text, win.get_tabs_shown()).into());
+                reset_view_soon(&win);
                 win.set_has_tabs(new.tab_mark);
                 win.set_locked_reason(new.locked_reason.clone().into());
                 win.set_modified(false);
@@ -273,8 +274,19 @@ pub fn open(ui: &AppWindow, doc: Document) {
     });
 
     if win.show().is_ok() {
+        reset_view_soon(&win);
         OPEN.with(|o| o.borrow_mut().push((id, win)));
     }
+}
+
+/// Scrolls to the top left once the window has its size.
+fn reset_view_soon(win: &EditorWindow) {
+    let weak = win.as_weak();
+    slint::Timer::single_shot(std::time::Duration::from_millis(80), move || {
+        if let Some(w) = weak.upgrade() {
+            w.invoke_reset_view();
+        }
+    });
 }
 
 /// Switches how tabs look in the editor text.
