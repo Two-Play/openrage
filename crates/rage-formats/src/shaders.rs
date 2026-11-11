@@ -2,7 +2,7 @@
 //! show which material is which, and friendly labels for the common ones.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use rage_core::hash::joaat;
 
@@ -273,9 +273,33 @@ pub fn name(hash: u32) -> Option<&'static str> {
     table().get(&hash).copied()
 }
 
+/// Materials that are not game shaders (collision materials, path types, …):
+/// a label and the colour to show them in.
+type Registry = RwLock<HashMap<u32, (String, [f32; 4])>>;
+
+fn registered() -> &'static Registry {
+    static EXTRA: OnceLock<Registry> = OnceLock::new();
+    EXTRA.get_or_init(Default::default)
+}
+
+/// Gives a material hash a label and a colour (e.g. `CONCRETE` for collisions).
+pub fn register(hash: u32, label: impl Into<String>, color: [f32; 4]) {
+    if let Ok(mut map) = registered().write() {
+        map.insert(hash, (label.into(), color));
+    }
+}
+
+/// The colour registered for a material, if any.
+pub fn color(hash: u32) -> Option<[f32; 4]> {
+    registered().read().ok()?.get(&hash).map(|(_, c)| *c)
+}
+
 /// A label for people: vehicle paints, glass, tyres, … get readable names;
 /// other shaders their technical name.
 pub fn label(hash: u32) -> String {
+    if let Some((label, _)) = registered().read().ok().and_then(|m| m.get(&hash).cloned()) {
+        return label;
+    }
     let Some(name) = name(hash) else { return format!("Shader {hash:08x}") };
     let base = name.trim_end_matches("_enveff");
     let friendly = match base {

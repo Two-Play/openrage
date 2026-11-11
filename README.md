@@ -60,6 +60,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 | 🏃 **Animations** | Clip dictionaries play on skinned models; fitting models are suggested from the bones a clip moves. |
 | 📄 **Metadata** | `.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.cut` and `.pso` as XML (RSC meta, PSO and RBF), compatible with CodeWalker. |
 | ✨ **Particles** | `.ypt` effect dictionaries: effect, emitter and particle rule names, their textures and models. |
+| 🧱 **Collisions** | `.ybn` collision meshes and shapes in 3D, coloured by material (concrete, metal, grass, …). |
 | 🌐 **Game text** | Edit `.gxt2` text tables in OpenIV's `.oxt` form and save them back losslessly. |
 | 🧩 **Mods, safely** | Changes go to OpenIV's `mods` folder, never into your game files; every change and every `.oiv` package can be undone. |
 
@@ -103,6 +104,7 @@ Every format is checked against the complete game (GTA V Enhanced):
 | Metadata (`.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.cut`, `.pso`) | 30,280 files | all convert to XML |
 | Text tables (`.gxt2`, `.nametable`) | 19,858 files, 9.16 million strings | text → binary is byte-identical |
 | Particles (`.ypt`) | 1,544 dictionaries, 12,987 effects | all read, incl. 1,694 textures and 1,223 models |
+| Collisions (`.ybn`) | 14,692 files, 70,454 bounds | all read (101 million triangles, 4.7 million shapes) |
 
 **Roadmap**
 
@@ -117,7 +119,8 @@ Every format is checked against the complete game (GTA V Enhanced):
 - [x] Text tables (`.gxt2`, `.nametable`, `.ugc`)
 - [x] Readable metadata view (structure tree, highlighted XML)
 - [x] Particles (`.ypt`): effects, textures, models
-- [ ] Collisions and paths in 3D, scripts (`.ysc`), cutscene viewer, `.gfx`/`.bik` info
+- [x] Collisions (`.ybn`) in 3D
+- [ ] Paths and nav meshes in 3D, scripts (`.ysc`), cutscene viewer, `.gfx`/`.bik` info
 - [ ] GTA IV
 - [ ] Red Dead Redemption 2
 
@@ -248,6 +251,10 @@ Map placements (`.ymap`), archetypes (`.ytyp`), `.ymt`, manifests (`.ymf`), cuts
 
 Particle dictionaries (`.ypt`) list their effects (the names the game and scripts use, e.g. `bul_gravel_heli`), emitter and particle rules in the info panel. Their models — debris, shells, bottles, sparks — are shown side by side at the same size and open in the viewer; double-click the file to browse its textures like a texture dictionary (view, Save PNG, Extract; changing them is not supported yet).
 
+### Collisions
+
+Collision files (`.ybn`) open like models: the triangle meshes and the spheres, capsules, boxes and cylinders the game uses for physics, with each composite part in place. Surfaces are coloured by their material, whose names come from your game's `materials.dat` (CONCRETE, METAL_SOLID_MEDIUM, GRASS, …); in the viewer's Materials tab every material can be hidden or recoloured, and the collision exports to glTF like any model.
+
 ### Text tables
 
 Game text (`.gxt2`) opens in the text editor in OpenIV's `.oxt` form, one `0xHASH = text` line per string (label names are used where the search index knows them). Audio name tables (`.nametable`) show one name per line, and `.ugc` files open as the JSON they are. After **Unlock editing**, saving converts the text back to `.gxt2` or `.nametable` and writes it into the mods folder; the conversion is lossless for every text table of the game. **Export as text…** writes `.oxt` or `.txt`.
@@ -348,6 +355,7 @@ openrage verify --animations                   # parse every clip dictionary, ev
 openrage verify --meta                         # convert every metadata file of the game
 openrage verify --text                         # every .gxt2/.nametable → text → back, identical
 openrage verify --particles                    # parse every particle dictionary
+openrage verify --collisions                   # build the meshes of every collision file
 ```
 
 </details>
