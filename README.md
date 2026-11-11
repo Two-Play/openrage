@@ -136,7 +136,12 @@ Every format is checked against the complete game (GTA V Enhanced):
 - [ ] GTA IV
 - [ ] Red Dead Redemption 2
 
-**Red Dead Redemption 2:** `openrage rpf8 <game folder>` reads the header of every archive. Only `shaders_x64.rpf` opens fully; the other archives encrypt their tables and most files with keys that, unlike GTA V's, are not stored in the game's executable on disk but exist only while the game runs. How OpenRAGE will get them (from a key file you provide, or from a memory dump of your own running game) is still open, and OpenRAGE will never ship them. Compressed files use Oodle, for which an open-source decoder is still to be added.
+**Red Dead Redemption 2:** `openrage rpf8 <game folder>` reads every archive. Most archives encrypt their tables and many files with keys that, unlike GTA V's, are not stored in the game's executable on disk but exist only while the game runs, so OpenRAGE takes them from your own game and never ships them:
+
+- **Key file:** `openrage rdr2-keys --file secrets.bin <game folder>` reads a file of length-prefixed blocks (such as the `secrets.bin` Swage writes). OpenRAGE works out which block is what by decrypting your archives' tables with them — it carries no keys or fingerprints — and stores the result in its config folder (`rdr2.keys`).
+- **Memory dump of your running game:** planned next.
+
+Compressed files use Oodle, for which an open-source decoder is still to be added.
 
 ## Installation
 
@@ -356,6 +361,8 @@ openrage particles …/ptfx.rpf/core.ypt         # effects, emitters, textures a
 openrage script …/script_rel.rpf/omega2.ysc [-o omega2.txt] [--strings]   # disassemble a script
 openrage media …/scaleform_generic.rpf/hud.gfx [--swf hud.swf]   # Scaleform movie or Bink video facts
 openrage natives natives.json                  # native names for script disassembly
+openrage rdr2-keys --file secrets.bin <RDR2>   # RDR2 archive keys from a key file
+openrage rpf8 --list <RDR2>/common_0.rpf       # RDR2 archive contents
 openrage world --radius 40 -- 350 4870 -60     # map objects near a point (builds the world cache)
 ```
 

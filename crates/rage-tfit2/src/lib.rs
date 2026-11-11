@@ -54,7 +54,8 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
 }
 
 impl Context {
-    /// Reads the tables from their in-memory layout ([`CONTEXT_LEN`] bytes).
+    /// Reads the tables from their in-memory layout ([`CONTEXT_LEN`] bytes);
+    /// `None` when the bytes cannot be cipher tables.
     pub fn from_bytes(b: &[u8]) -> Option<Context> {
         if b.len() != CONTEXT_LEN {
             return None;
@@ -80,6 +81,9 @@ impl Context {
                     *m = u64_at(b, at + i * 8);
                 }
                 let xor = u32::from_le_bytes(b[at + 128..at + 132].try_into().expect("4 bytes"));
+                if xor >= 4096 {
+                    return None; // would index past the lookup table: not cipher tables
+                }
                 blocks.push(Block { masks, xor });
                 at += BLOCK_LEN;
             }

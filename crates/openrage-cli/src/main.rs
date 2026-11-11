@@ -136,6 +136,16 @@ enum Command {
     },
     /// Import native names for script disassembly from a NativeDB-style natives.json.
     Natives { file: PathBuf },
+    /// Set up the Red Dead Redemption 2 archive keys from your own game and store them locally.
+    ///
+    /// The pieces are recognised by decrypting your archives' tables; OpenRAGE ships no keys.
+    Rdr2Keys {
+        /// The RDR2 game folder (its archives are used to recognise the keys).
+        game: PathBuf,
+        /// A key file of length-prefixed blocks, such as Swage's secrets.bin.
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Inspect Red Dead Redemption 2 archives (RPF8): a file or every .rpf in a folder.
     Rpf8 {
         path: PathBuf,
@@ -334,6 +344,9 @@ fn run() -> Result<()> {
     if let Command::Rpf8 { path, list } = &cli.command {
         return cmd_rpf8(path, *list);
     }
+    if let Command::Rdr2Keys { game, file } = &cli.command {
+        return cmd_rdr2_keys(game, file);
+    }
 
     let game_dir = game_dir.context("no game directory configured; run `openrage --game <DIR> keys` first")?;
     let keys = openrage_app::load_keys().unwrap_or_else(|e| {
@@ -342,7 +355,7 @@ fn run() -> Result<()> {
     });
 
     match cli.command {
-        Command::Keys { .. } | Command::Rpf8 { .. } => unreachable!(),
+        Command::Keys { .. } | Command::Rpf8 { .. } | Command::Rdr2Keys { .. } => unreachable!(),
         Command::Ls { path, recursive } => cmd_ls(&game_dir, &path, recursive, keys),
         Command::Info { path } => cmd_info(&game_dir, &path, keys),
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
@@ -2254,6 +2267,7 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
     use rage_rpf::rpf8::{Compression, Rpf8};
+    let keys = rdr2_keys()?;
     fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         for e in std::fs::read_dir(dir)? {
             let p = e?.path();
@@ -2281,7 +2295,7 @@ fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
             outln!("{name}: empty file");
             continue;
         }
-        match Rpf8::open(file) {
+        match Rpf8::open_with_keys(file, keys.clone()) {
             Ok(rpf) => {
                 ok += 1;
                 let h = rpf.header();
@@ -2325,10 +2339,58 @@ fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
         }
     }
     outln!(
-        "\n{ok} archives read, {empty} empty, {failed} failed; {plain} with a plaintext table ({entries_total} entries). Encrypted tables need keys from the running game, which OpenRAGE cannot read yet."
+        "\n{ok} archives read, {empty} empty, {failed} failed; {plain} with a readable table ({entries_total} entries).{}",
+        if keys.is_some() {
+            ""
+        } else {
+            " Encrypted tables need keys from your game: see `openrage rdr2-keys --help`."
+        }
     );
     if failed > 0 {
         bail!("{failed} archives or entries could not be read");
+    }
+    Ok(())
+}
+
+/// The stored RDR2 keys, if `openrage rdr2-keys` was run.
+fn rdr2_keys() -> Result<Option<std::sync::Arc<rage_rpf::rpf8::Rdr2Keys>>> {
+    use rage_rpf::rpf8_keys::KeyStore;
+    let Some(path) = KeyStore::default_path() else { return Ok(None) };
+    let Some(store) = KeyStore::load(&path)? else { return Ok(None) };
+    let keys =
+        store.to_keys().with_context(|| format!("{} is damaged; run `openrage rdr2-keys` again", path.display()))?;
+    Ok(Some(std::sync::Arc::new(keys)))
+}
+
+fn cmd_rdr2_keys(game: &Path, file: &Path) -> Result<()> {
+    use rage_rpf::rpf8_keys::{Candidates, KeyStore, archives_under, identify, parse_secrets};
+    let started = Instant::now();
+    let blocks = parse_secrets(&std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?);
+    let candidates = Candidates::from_blocks(blocks);
+    outln!(
+        "{}: {} cipher table blocks, {} IV candidates, {} key candidates",
+        file.display(),
+        candidates.contexts.len(),
+        candidates.ivs.len(),
+        candidates.keys.len()
+    );
+    let archives = archives_under(game);
+    if archives.is_empty() {
+        bail!("no .rpf archives under {}", game.display());
+    }
+    let found = identify(&candidates, &archives)?;
+    let path = KeyStore::default_path().context("no config folder")?;
+    found.store.save(&path)?;
+    outln!(
+        "{} keys recognised; {} of {} encrypted archive tables open; stored in {} ({:.1} s)",
+        found.store.keys.len(),
+        found.tables.0,
+        found.tables.1,
+        path.display(),
+        started.elapsed().as_secs_f32()
+    );
+    if !found.missing.is_empty() {
+        outln!("Still unknown: key ids {:?} (their files stay closed)", found.missing);
     }
     Ok(())
 }

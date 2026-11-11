@@ -37,6 +37,8 @@ fn random_context() -> Context {
 fn layout_sizes() {
     assert_eq!(CONTEXT_LEN, 631_952);
     assert_eq!(KEY_LEN, 288);
+    // Random bytes are rejected instead of indexing past the lookup tables.
+    assert!(Context::from_bytes(&XorShift(7).fill(CONTEXT_LEN)).is_none());
 }
 
 #[test]

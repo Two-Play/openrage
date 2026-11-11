@@ -10,5 +10,7 @@ rage-core.workspace = true
 rage-crypto.workspace = true
 rage-resource.workspace = true
 rage-tfit2.workspace = true
+dirs.workspace = true
 flate2.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
