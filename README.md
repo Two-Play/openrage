@@ -111,6 +111,7 @@ Every format is checked against the complete game (GTA V Enhanced):
 | Paths (`.ynd`, `.yvr`, `.ywr`) | 9,922 files, 232,982 nodes, 1.37 million recorded points | all read (521 hours of vehicle recordings) |
 | Nav meshes (`.ynv`) | 10,567 files, 18.9 million polygons | all read |
 | Scripts (`.ysc`) | 1,864 scripts, 383 million instructions | all disassemble, every jump lands on an instruction |
+| Scaleform movies (`.gfx`), Bink videos (`.bik`) | 1,163 movies, 415 videos | all read (29,490 exported symbols, 207 minutes of video) |
 
 **Roadmap**
 
@@ -130,7 +131,8 @@ Every format is checked against the complete game (GTA V Enhanced):
 - [x] Nav meshes (`.ynv`) in 3D
 - [x] Scripts (`.ysc`) disassembler
 - [x] Cutscenes: cast and actor animations over the whole cutscene
-- [ ] Whole cutscenes in one scene (all actors, camera), `.gfx`/`.bik` info
+- [x] Scaleform movies (`.gfx`) and Bink videos (`.bik`): facts and names
+- [ ] Whole cutscenes in one scene (all actors, camera)
 - [ ] GTA IV
 - [ ] Red Dead Redemption 2
 
@@ -277,6 +279,10 @@ A cutscene (`.cut`) opens in the metadata window with a **Cutscene** tab: its le
 
 Compiled scripts (`.ysc`) show their name, code size, number of functions, natives, statics and their strings in the preview; double-click opens the disassembly: one instruction per line with its address, functions (with their names where the compiler kept them), labels at jump targets, the text next to every `STRING` and the hash of every native call. Both opcode tables of GTA V (older builds, and newer ones with `STATIC_U24` and `IS_BIT_SET`) are recognised automatically by checking that every jump lands on an instruction.
 
+### Scaleform movies and videos
+
+Scaleform movies (`.gfx`, the game's menus and HUD) show their stage size, frame rate, the symbols they export and the texture images they load; Bink videos (`.bik`) their size, frame rate, length and audio tracks. Neither is played back — Extract… saves the file for tools that can.
+
 ### Text tables
 
 Game text (`.gxt2`) opens in the text editor in OpenIV's `.oxt` form, one `0xHASH = text` line per string (label names are used where the search index knows them). Audio name tables (`.nametable`) show one name per line, and `.ugc` files open as the JSON they are. After **Unlock editing**, saving converts the text back to `.gxt2` or `.nametable` and writes it into the mods folder; the conversion is lossless for every text table of the game. **Export as text…** writes `.oxt` or `.txt`.
@@ -344,6 +350,7 @@ openrage xml …/ufo.ymap --tree                 # the readable structure, as in
 openrage text …/american_rel.rpf/iap.gxt2 [-o iap.oxt]   # text table → OpenIV .oxt text
 openrage particles …/ptfx.rpf/core.ypt         # effects, emitters, textures and models of a .ypt
 openrage script …/script_rel.rpf/omega2.ysc [-o omega2.txt] [--strings]   # disassemble a script
+openrage media …/scaleform_generic.rpf/hud.gfx # Scaleform movie or Bink video facts
 ```
 
 </details>
@@ -382,6 +389,7 @@ openrage verify --particles                    # parse every particle dictionary
 openrage verify --collisions                   # build the meshes of every collision file
 openrage verify --paths                        # read every path node file, recording and nav mesh
 openrage verify --scripts                      # disassemble every script and check every jump
+openrage verify --media                        # read every Scaleform movie and Bink video
 ```
 
 </details>

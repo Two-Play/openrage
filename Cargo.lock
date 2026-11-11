@@ -4104,6 +4104,7 @@ dependencies = [
 name = "rage-formats"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "png",
  "rage-core",
  "rage-resource",

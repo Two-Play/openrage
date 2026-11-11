@@ -9,6 +9,7 @@ pub mod detect;
 pub mod extract;
 pub mod install;
 pub mod journal;
+pub mod media;
 pub mod metadata;
 pub mod models;
 pub mod oiv;

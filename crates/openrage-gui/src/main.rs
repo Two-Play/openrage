@@ -1619,6 +1619,20 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
             {
                 return preview;
             }
+            if openrage_app::media::is_media(&entry.name)
+                && let Ok(data) = rpf.read(id)
+            {
+                return match openrage_app::media::rows(&entry.name, &data) {
+                    Ok(rows) => {
+                        let mut meta: Meta = rows.into_iter().filter(|(_, v)| !v.is_empty()).collect();
+                        meta.push(note(
+                            "Playing videos and Scaleform movies is not supported; Extract… saves the file.",
+                        ));
+                        (meta, String::new())
+                    }
+                    Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new()),
+                };
+            }
             if entry.name.to_ascii_lowercase().ends_with(".ysc")
                 && let Some(preview) = script_preview(&rpf, id)
             {
