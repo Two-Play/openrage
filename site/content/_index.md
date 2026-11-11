@@ -23,7 +23,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 screenshots_title = "Screenshots"
 screenshots_intro = "The screenshots show OpenRAGE displaying files from the author's own copy of the game."
 games_title = "Supported games"
-games_intro = "GTA V comes first; Red Dead Redemption 2 archives can be read, GTA IV is planned."
+games_intro = "GTA V comes first; Red Dead Redemption 2 archives and textures work, GTA IV is planned."
 details_summary = "Checked against the whole game"
 download_intro = "Unpack the archive and run `openrage-gui` (or `openrage` for the command line). On first start the GUI detects your game and sets up the keys."
 why_title = "Why OpenRAGE"
@@ -163,9 +163,10 @@ formats = "textures · models · audio · animations · metadata · text tables 
 
 [[extra.games]]
 name = "Red Dead Redemption 2"
-archives_status = "partial"
-archives = "RPF8 read: decryption with keys from your own game, Oodle decompression (command line)"
-formats_status = "none"
+archives_status = "ok"
+archives = "RPF8 read: decryption with keys from your own game, Oodle decompression, browsing and extracting in the GUI"
+formats_status = "partial"
+formats = "textures (preview, viewer, DDS/PNG export); models and other formats follow"
 
 [[extra.games]]
 name = "GTA IV"
@@ -237,7 +238,7 @@ edge = "openrage"
 [[extra.compare]]
 feature = "Games"
 openiv = "GTA IV, EFLC, GTA V, Max Payne 3"
-openrage = "GTA V; RDR2 archives; GTA IV planned"
+openrage = "GTA V; RDR2 archives and textures; GTA IV planned"
 edge = "openiv"
 
 [[extra.compare]]
