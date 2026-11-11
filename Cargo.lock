@@ -3645,6 +3645,7 @@ dependencies = [
  "rage-formats",
  "rage-index",
  "rage-mods",
+ "rage-resource",
  "rage-rpf",
  "rfd",
  "rodio",

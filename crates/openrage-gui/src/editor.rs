@@ -16,6 +16,9 @@ use crate::{AppWindow, EditorWindow};
 pub const TAB_SHOWN: char = '→';
 pub const TAB_HIDDEN: char = '\u{a0}';
 
+/// `Document::converted` value of script disassemblies.
+const SCRIPT: &str = "script";
+
 /// A file loaded for editing.
 pub struct Document {
     pub vpath: String,
@@ -98,6 +101,22 @@ impl Document {
             tab_mark: false,
             locked_reason,
             converted: Some(format.to_owned()),
+            table: None,
+        }
+    }
+
+    /// A read-only view of a script's disassembly.
+    pub fn script(vpath: String, text: String) -> Self {
+        let name = format!("{} (disassembly)", vpath.rsplit('/').next().unwrap_or(&vpath));
+        Self {
+            vpath,
+            name,
+            text,
+            crlf: false,
+            bom: false,
+            tab_mark: false,
+            locked_reason: "Disassembled from the compiled script for reading; scripts cannot be edited here.".into(),
+            converted: Some(SCRIPT.into()),
             table: None,
         }
     }
@@ -236,7 +255,9 @@ pub fn open(ui: &AppWindow, doc: Document) {
             let doc = d.borrow();
             (doc.vpath.clone(), doc.converted.is_some())
         };
-        let new = if converted {
+        let new = if converted && vpath.to_ascii_lowercase().ends_with(".ysc") {
+            crate::read_script_listing(&ui, &vpath).map(|text| Some(Document::script(vpath, text)))
+        } else if converted {
             crate::read_xml(&ui, &vpath).map(|x| Some(Document::converted(vpath, x.text, x.encoding.name())))
         } else {
             crate::read_file(&ui, &vpath).map(|data| Document::from_file(vpath, &data).ok())
@@ -303,6 +324,9 @@ fn status_line(doc: &Document) -> String {
     let endings = if doc.crlf { "CRLF" } else { "LF" };
     let tabs = if doc.tab_mark { " · contains tabs" } else { "" };
     if let Some(format) = &doc.converted {
+        if format == SCRIPT {
+            return format!("{lines} lines · script disassembly");
+        }
         return format!("{lines} lines · XML converted from {format}");
     }
     if let Some(kind) = doc.table {

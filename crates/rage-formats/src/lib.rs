@@ -23,6 +23,7 @@ pub mod texture;
 pub mod xml;
 pub mod ybn;
 pub mod ypt;
+pub mod ysc;
 pub mod ytd;
 pub mod ytd_write;
 

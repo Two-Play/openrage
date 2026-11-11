@@ -62,6 +62,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 | ✨ **Particles** | `.ypt` effect dictionaries: effect, emitter and particle rule names, their textures and models. |
 | 🧱 **Collisions** | `.ybn` collision meshes and shapes in 3D, coloured by material (concrete, metal, grass, …). |
 | 🛣️ **Paths** | Road and footpath networks (`.ynd`), nav meshes (`.ynv`), vehicle and waypoint recordings (`.yvr`, `.ywr`) in 3D. |
+| 📜 **Scripts** | Disassembles compiled game scripts (`.ysc`): functions, jumps, strings and native calls. |
 | 🌐 **Game text** | Edit `.gxt2` text tables in OpenIV's `.oxt` form and save them back losslessly. |
 | 🧩 **Mods, safely** | Changes go to OpenIV's `mods` folder, never into your game files; every change and every `.oiv` package can be undone. |
 
@@ -108,6 +109,7 @@ Every format is checked against the complete game (GTA V Enhanced):
 | Collisions (`.ybn`) | 14,692 files, 70,454 bounds | all read (101 million triangles, 4.7 million shapes) |
 | Paths (`.ynd`, `.yvr`, `.ywr`) | 9,922 files, 232,982 nodes, 1.37 million recorded points | all read (521 hours of vehicle recordings) |
 | Nav meshes (`.ynv`) | 10,567 files, 18.9 million polygons | all read |
+| Scripts (`.ysc`) | 1,864 scripts, 383 million instructions | all disassemble, every jump lands on an instruction |
 
 **Roadmap**
 
@@ -124,7 +126,9 @@ Every format is checked against the complete game (GTA V Enhanced):
 - [x] Particles (`.ypt`): effects, textures, models
 - [x] Collisions (`.ybn`) in 3D
 - [x] Paths (`.ynd`) and recordings (`.yvr`, `.ywr`) in 3D
-- [x] Nav meshes (`.ynv`) in 3D, scripts (`.ysc`), cutscene viewer, `.gfx`/`.bik` info
+- [x] Nav meshes (`.ynv`) in 3D
+- [x] Scripts (`.ysc`) disassembler
+- [ ] Cutscene viewer, `.gfx`/`.bik` info
 - [ ] GTA IV
 - [ ] Red Dead Redemption 2
 
@@ -263,6 +267,10 @@ Collision files (`.ybn`) open like models: the triangle meshes and the spheres, 
 
 Path node files (`.ynd`) show the road and footpath network of their map area: vehicle nodes in blue, pedestrian nodes in orange, with the links between them. Vehicle recordings (`.yvr`, the routes cars drive in missions) and waypoint recordings (`.ywr`, the routes people walk) show their route with start and end marked. Nav meshes (`.ynv`) show where peds can walk, coloured by kind: ground, pavement, road, water, interiors, train tracks and steep slopes. Each part can be hidden or recoloured in the viewer's Materials tab; a few of the game's recordings contain garbage points far outside the map, which are left out.
 
+### Scripts
+
+Compiled scripts (`.ysc`) show their name, code size, number of functions, natives, statics and their strings in the preview; double-click opens the disassembly: one instruction per line with its address, functions (with their names where the compiler kept them), labels at jump targets, the text next to every `STRING` and the hash of every native call. Both opcode tables of GTA V (older builds, and newer ones with `STATIC_U24` and `IS_BIT_SET`) are recognised automatically by checking that every jump lands on an instruction.
+
 ### Text tables
 
 Game text (`.gxt2`) opens in the text editor in OpenIV's `.oxt` form, one `0xHASH = text` line per string (label names are used where the search index knows them). Audio name tables (`.nametable`) show one name per line, and `.ugc` files open as the JSON they are. After **Unlock editing**, saving converts the text back to `.gxt2` or `.nametable` and writes it into the mods folder; the conversion is lossless for every text table of the game. **Export as text…** writes `.oxt` or `.txt`.
@@ -328,6 +336,7 @@ openrage xml …/ufo.ymap [-o ufo.ymap.xml]      # metadata (.ymap/.ytyp/.ymt/.y
 openrage xml …/ufo.ymap --tree                 # the readable structure, as in the GUI
 openrage text …/american_rel.rpf/iap.gxt2 [-o iap.oxt]   # text table → OpenIV .oxt text
 openrage particles …/ptfx.rpf/core.ypt         # effects, emitters, textures and models of a .ypt
+openrage script …/script_rel.rpf/omega2.ysc [-o omega2.txt] [--strings]   # disassemble a script
 ```
 
 </details>
@@ -364,7 +373,8 @@ openrage verify --meta                         # convert every metadata file of 
 openrage verify --text                         # every .gxt2/.nametable → text → back, identical
 openrage verify --particles                    # parse every particle dictionary
 openrage verify --collisions                   # build the meshes of every collision file
-openrage verify --paths                        # read every path node file and recording
+openrage verify --paths                        # read every path node file, recording and nav mesh
+openrage verify --scripts                      # disassemble every script and check every jump
 ```
 
 </details>
