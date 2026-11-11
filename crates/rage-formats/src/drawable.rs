@@ -43,6 +43,9 @@ pub struct Mesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
+    /// Second UV set (vehicle liveries and signs, see [`param::DIFFUSE_TEX2`]);
+    /// empty if the mesh has none.
+    pub uvs1: Vec<[f32; 2]>,
     pub colors: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
     /// Index into [`Drawable::shaders`].
@@ -95,16 +98,67 @@ impl Skeleton {
     }
 }
 
+/// Texture parameter names (joaat), Enhanced (`…Tex`) and Legacy (`…Sampler`).
+pub mod param {
+    /// `DiffuseTex`: the base colour.
+    pub const DIFFUSE_TEX: u32 = 0xc8e8c282;
+    /// `DiffuseSampler`: the base colour (Legacy).
+    pub const DIFFUSE_SAMPLER: u32 = 0xf1fe2b71;
+    /// `DiffuseTex2`: a second colour layer on the second UV set (vehicle liveries and signs).
+    pub const DIFFUSE_TEX2: u32 = 0x0df47048;
+    /// `DiffuseSampler2` (Legacy).
+    pub const DIFFUSE_SAMPLER2: u32 = 0x0ad3a268;
+    /// `DirtTex`, `SpecularTex`, `BumpTex`, `DamageTexture`.
+    pub const DIRT_TEX: u32 = 0xa6f4cf58;
+    pub const SPECULAR_TEX: u32 = 0xc6f46e79;
+    pub const BUMP_TEX: u32 = 0x1e77bf4c;
+    pub const DAMAGE_TEXTURE: u32 = 0xdf186a0e;
+    /// Legacy: `DirtSampler`, `SpecSampler`, `BumpSampler`.
+    pub const DIRT_SAMPLER: u32 = 0x7e9a27fe;
+    pub const SPEC_SAMPLER: u32 = 0x608799c6;
+    pub const BUMP_SAMPLER: u32 = 0x46b7c64f;
+
+    /// Parameters that hold the base colour.
+    pub const BASE: [u32; 2] = [DIFFUSE_TEX, DIFFUSE_SAMPLER];
+    /// Parameters that never hold the base colour.
+    pub const NOT_BASE: [u32; 9] = [
+        DIFFUSE_TEX2,
+        DIFFUSE_SAMPLER2,
+        DIRT_TEX,
+        SPECULAR_TEX,
+        BUMP_TEX,
+        DAMAGE_TEXTURE,
+        DIRT_SAMPLER,
+        SPEC_SAMPLER,
+        BUMP_SAMPLER,
+    ];
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Shader {
     /// joaat of the shader name (e.g. `vehicle_paint1`).
     pub name_hash: u32,
-    /// Names of the textures the shader uses.
+    /// Names of the textures the shader uses (each once).
     pub textures: Vec<String>,
+    /// Texture parameters: (parameter name hash, see [`param`]; 0 if unknown,
+    /// texture name).
+    pub samplers: Vec<(u32, String)>,
 }
 
 impl Shader {
-    /// The texture most likely to be the base colour (not a normal/specular/…).
+    /// The texture bound to a parameter.
+    pub fn sampler(&self, hash: u32) -> Option<&str> {
+        self.samplers.iter().find(|(h, _)| *h == hash).map(|(_, n)| n.as_str())
+    }
+
+    /// The base colour texture: the one bound to `DiffuseTex`/`DiffuseSampler`,
+    /// else the first texture that is not bound to a known other parameter
+    /// and does not look like a normal/specular/… map by its name.
+    ///
+    /// Vehicle shaders sometimes bind a placeholder or a grime map to
+    /// `DiffuseTex` (paint: `vehicle_generic_smallspecmap`, its colour comes
+    /// from the paint; decals: `roof_dirt`, alpha-blended in the game): those
+    /// have no base colour texture.
     pub fn base_texture(&self) -> Option<&str> {
         let is_detail = |n: &str| {
             let n = n.to_ascii_lowercase();
@@ -117,8 +171,25 @@ impl Shader {
                 || n.contains("mud")
                 || n.starts_with("detail")
         };
+        if let Some(name) = param::BASE.iter().find_map(|&h| self.sampler(h)) {
+            let vehicle = crate::shaders::name(self.name_hash).is_some_and(|n| n.starts_with("vehicle_"));
+            let placeholder = vehicle && is_detail(name);
+            return (!placeholder).then_some(name);
+        }
+        // Bound only to parameters that are known not to be the base colour
+        // (e.g. a livery in `DiffuseTex2`, which uses the second UV set).
+        let secondary = |n: &str| {
+            let mut bound = self.samplers.iter().filter(|(_, s)| s == n).peekable();
+            bound.peek().is_some() && bound.all(|(h, _)| param::NOT_BASE.contains(h))
+        };
         // No fallback: shaders like vehicle paint have no colour texture at all.
-        self.textures.iter().find(|t| !is_detail(t)).map(String::as_str)
+        self.textures.iter().find(|t| !is_detail(t) && !secondary(t)).map(String::as_str)
+    }
+
+    /// A second colour layer drawn over the base colour with its alpha, on
+    /// the second UV set (vehicle liveries and signs: `DiffuseTex2`).
+    pub fn overlay_texture(&self) -> Option<&str> {
+        self.sampler(param::DIFFUSE_TEX2).or_else(|| self.sampler(param::DIFFUSE_SAMPLER2))
     }
 }
 
@@ -246,6 +317,7 @@ struct VertexLayout {
     position: Option<(usize, Encoding)>,
     normal: Option<(usize, Encoding)>,
     uv: Option<(usize, Encoding)>,
+    uv1: Option<(usize, Encoding)>,
     color: Option<(usize, Encoding)>,
     weights: Option<(usize, Encoding)>,
     indices: Option<(usize, Encoding)>,
@@ -288,6 +360,7 @@ fn legacy_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayou
                 3 => layout.normal = slot,
                 4 => layout.color = slot,
                 6 => layout.uv = slot,
+                7 => layout.uv1 = slot,
                 _ => {}
             }
         }
@@ -311,8 +384,8 @@ fn gen9_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayout,
         34 => Some(Encoding::Half2),
         _ => None,
     };
-    // Slots: 0 position, 4 normal, 16 blend weights, 20 blend indices, 24 colour, 28 uv0.
-    for (slot, target) in [(0usize, 0u8), (4, 1), (24, 2), (28, 3), (16, 4), (20, 5)] {
+    // Slots: 0 position, 4 normal, 16 blend weights, 20 blend indices, 24 colour, 28 uv0, 29 uv1.
+    for (slot, target) in [(0usize, 0u8), (4, 1), (24, 2), (28, 3), (16, 4), (20, 5), (29, 6)] {
         let t = types[slot];
         if t == 0 {
             continue;
@@ -326,7 +399,8 @@ fn gen9_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayout,
             2 => layout.color = v,
             3 => layout.uv = v,
             4 => layout.weights = v,
-            _ => layout.indices = v,
+            5 => layout.indices = v,
+            _ => layout.uv1 = v,
         }
     }
     Ok(layout)
@@ -366,6 +440,9 @@ fn read_geometry(res: &Resource, g: u64, enhanced: bool) -> Result<Mesh, Resourc
         }
         if let Some(t) = attr(layout.uv, i) {
             mesh.uvs.push([t[0], t[1]]);
+        }
+        if let Some(t) = attr(layout.uv1, i) {
+            mesh.uvs1.push([t[0], t[1]]);
         }
         if let Some(c) = attr(layout.color, i) {
             mesh.colors.push(c);
@@ -446,32 +523,63 @@ fn read_shaders(res: &Resource, group: u64, enhanced: bool) -> Result<Vec<Shader
     for i in 0..count.min(512) {
         let s = res.u64(list + i * 8)?;
         let mut shader = Shader::default();
+        // (parameter hash or 0, texture structure) per texture reference.
+        let mut refs: Vec<(u32, u64)> = Vec::new();
         if enhanced {
             shader.name_hash = res.u32(s)?;
-            // Texture references: a pointer array, its length is in the parameter info block.
-            let refs = res.u64(s + 0x10)?;
+            // Texture references: a pointer array at 0x10. The parameter info
+            // block (0x20) has the number of textures at 1, the number of
+            // parameters at 4 and from 8 on (name hash, slot) pairs; the low
+            // two bits of a slot are its kind (0 = texture), the rest its index.
+            let ptrs = res.u64(s + 0x10)?;
             let infos = res.u64(s + 0x20)?;
-            let num = if infos != 0 { res.u8(infos + 1).unwrap_or(0) as u64 } else { 0 };
-            if refs != 0 {
-                for t in 0..num.min(32) {
-                    if let Some(name) =
-                        res.u64(refs + t * 8).ok().filter(|&p| p != 0).and_then(|p| texture_name(res, p))
-                        && !shader.textures.contains(&name)
-                    {
-                        shader.textures.push(name);
+            let (num, total) = if infos != 0 {
+                (res.u8(infos + 1).unwrap_or(0) as u64, res.u8(infos + 4).unwrap_or(0) as u64)
+            } else {
+                (0, 0)
+            };
+            let mut hashes = vec![0u32; num.min(32) as usize];
+            for k in 0..total.min(128) {
+                let (Ok(hash), Ok(slot)) = (res.u32(infos + 8 + k * 8), res.u32(infos + 12 + k * 8)) else { break };
+                if slot & 3 == 0
+                    && let Some(h) = hashes.get_mut((slot >> 2) as usize)
+                {
+                    *h = hash;
+                }
+            }
+            if ptrs != 0 {
+                for (t, hash) in hashes.into_iter().enumerate() {
+                    if let Some(p) = res.u64(ptrs + t as u64 * 8).ok().filter(|&p| p != 0) {
+                        refs.push((hash, p));
                     }
                 }
             }
         } else {
+            // Parameters: 16 bytes each (data type at 0, 0 = texture; data
+            // pointer at 8), then the data of the other parameters (data type
+            // × 16 bytes each), then one name hash per parameter.
             let params = res.u64(s)?;
             shader.name_hash = res.u32(s + 0x08)?;
             let pcount = res.u8(s + 0x10)? as u64;
+            let mut types = Vec::new();
             for p in 0..pcount {
-                let at = params + p * 16;
-                if res.u8(at)? == 0
-                    && let Some(name) = res.u64(at + 8).ok().filter(|&p| p != 0).and_then(|p| texture_name(res, p))
-                    && !shader.textures.contains(&name)
+                types.push(res.u8(params + p * 16)? as u64);
+            }
+            let data: u64 = types.iter().sum::<u64>() * 16;
+            let hashes = params + pcount * 16 + data;
+            for (p, &t) in types.iter().enumerate() {
+                let p = p as u64;
+                if t == 0
+                    && let Some(ptr) = res.u64(params + p * 16 + 8).ok().filter(|&ptr| ptr != 0)
                 {
+                    refs.push((res.u32(hashes + p * 4).unwrap_or(0), ptr));
+                }
+            }
+        }
+        for (hash, ptr) in refs {
+            if let Some(name) = texture_name(res, ptr) {
+                shader.samplers.push((hash, name.clone()));
+                if !shader.textures.contains(&name) {
                     shader.textures.push(name);
                 }
             }
@@ -628,6 +736,54 @@ pub fn parse_ydd(res: &Resource) -> Result<Vec<(u32, Drawable)>, ResourceError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameter_hashes() {
+        use rage_core::hash::joaat;
+        for (name, hash) in [
+            ("DiffuseTex", param::DIFFUSE_TEX),
+            ("DiffuseSampler", param::DIFFUSE_SAMPLER),
+            ("DiffuseTex2", param::DIFFUSE_TEX2),
+            ("DiffuseSampler2", param::DIFFUSE_SAMPLER2),
+            ("DirtTex", param::DIRT_TEX),
+            ("SpecularTex", param::SPECULAR_TEX),
+            ("BumpTex", param::BUMP_TEX),
+            ("DamageTexture", param::DAMAGE_TEXTURE),
+            ("DirtSampler", param::DIRT_SAMPLER),
+            ("SpecSampler", param::SPEC_SAMPLER),
+            ("BumpSampler", param::BUMP_SAMPLER),
+        ] {
+            assert_eq!(joaat(name), hash, "{name}");
+        }
+    }
+
+    #[test]
+    fn base_texture_by_parameter() {
+        let s = |samplers: &[(u32, &str)]| Shader {
+            name_hash: 0,
+            textures: samplers.iter().map(|(_, n)| n.to_string()).collect(),
+            samplers: samplers.iter().map(|(h, n)| (*h, n.to_string())).collect(),
+        };
+        // The livery in DiffuseTex2 is not the base colour.
+        let paint = s(&[
+            (param::DIFFUSE_TEX, "vehicle_generic_smallspecmap"),
+            (param::DIFFUSE_TEX2, "ambulance_sign_1"),
+            (param::DIRT_TEX, "vehicle_genericmud_car"),
+        ]);
+        // Not paint: DiffuseTex is the base colour.
+        assert_eq!(paint.base_texture(), Some("vehicle_generic_smallspecmap"));
+        assert_eq!(paint.overlay_texture(), Some("ambulance_sign_1"));
+        // Paint: the placeholder in DiffuseTex is no colour texture.
+        let paint = Shader { name_hash: rage_core::hash::joaat("vehicle_paint3"), ..paint };
+        assert_eq!(paint.base_texture(), None);
+        assert_eq!(paint.overlay_texture(), Some("ambulance_sign_1"));
+        // Without DiffuseTex, a texture bound only to DiffuseTex2 is skipped.
+        let livery_only = s(&[(param::DIFFUSE_TEX2, "airbus_sign_1"), (0, "airbus_body")]);
+        assert_eq!(livery_only.base_texture(), Some("airbus_body"));
+        // Unknown parameters: by name.
+        let unknown = s(&[(0, "plate01_n"), (0, "plate01")]);
+        assert_eq!(unknown.base_texture(), Some("plate01"));
+    }
 
     #[test]
     fn half_floats() {

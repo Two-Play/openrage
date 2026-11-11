@@ -285,7 +285,7 @@ mod tests {
                 shader: 0,
                 ..Default::default()
             }],
-            shaders: vec![Shader { name_hash: 1, textures: vec!["body".into()] }],
+            shaders: vec![Shader { name_hash: 1, textures: vec!["body".into()], samplers: Vec::new() }],
             ..Default::default()
         };
         let glb = write_glb(&d, "tri", &|_| None);
