@@ -7,11 +7,8 @@ description = "OpenRAGE is a free, open-source explorer and modding toolkit for 
 
 [extra]
 headline = "Explore and mod RAGE engine games"
-lead = """
-OpenRAGE is a free, open-source explorer and modding toolkit for Rockstar's RAGE engine games, on Linux and Windows.
-Browse and search every archive, preview textures, models, sounds and animations, read metadata as XML,
-edit game text and install `.oiv` packages — compatible with OpenIV's `mods` folder, with undo.
-"""
+# One short line under the headline; the longer description belongs in features_intro.
+lead = "Free, open-source explorer and modding toolkit for Rockstar's RAGE engine games."
 notice = """
 OpenRAGE is an independent community project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive.
 It contains **no game files and no encryption keys**: keys are taken from your own copy of the game at runtime.
@@ -19,7 +16,10 @@ It contains **no game files and no encryption keys**: keys are taken from your o
 
 # Section titles and intros
 features_title = "Highlights"
-features_intro = "Everything you need to look inside the game and change it safely — from the explorer or the command line."
+features_intro = """
+Browse and search every archive, preview textures, models, sounds and animations, read metadata as XML,
+edit game text and install `.oiv` packages — compatible with OpenIV's `mods` folder, with undo.
+"""
 screenshots_title = "Screenshots"
 screenshots_intro = "The screenshots show OpenRAGE displaying files from the author's own copy of the game."
 games_title = "Supported games"

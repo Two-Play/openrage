@@ -7,7 +7,7 @@
   <div class="hero">
     <div class="wrap">
       <h1>{{ x.headline }}</h1>
-      <div class="lead">{{ x.lead | markdown | safe }}</div>
+      <p class="lead">{{ x.lead | markdown(inline=true) | safe }}</p>
       <div class="actions">
         <a class="btn btn-primary" href="{{ config.extra.releases }}/latest">
           <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
@@ -15,14 +15,17 @@
         </a>
         <a class="btn btn-secondary" href="{{ get_url(path='@/getting-started.md') }}">Getting started</a>
       </div>
-      <p class="release-note" data-release-info hidden>
-        Latest: <strong data-release="version"></strong>, released <span data-release="published"></span> · Linux and Windows, x86-64
-      </p>
+      <ul class="facts" aria-label="At a glance">
+        <li><span data-release="version">Latest release</span></li>
+        <li>Linux &amp; Windows</li>
+        <li>GTA V · RDR2 archives</li>
+        <li>GPL-3.0</li>
+      </ul>
 
-      <div class="hero-shot">
+      <a class="hero-shot zoom" href="{{ get_url(path='images/' ~ x.hero.light) }}" data-caption="{{ x.hero.alt }}">
         <img class="light-only" src="{{ get_url(path='images/' ~ x.hero.light) }}" width="{{ x.hero.width }}" height="{{ x.hero.height }}" alt="{{ x.hero.alt }}">
         <img class="dark-only" src="{{ get_url(path='images/' ~ x.hero.dark) }}" width="{{ x.hero.width }}" height="{{ x.hero.height }}" alt="{{ x.hero.alt }}">
-      </div>
+      </a>
     </div>
   </div>
 
@@ -33,10 +36,10 @@
   <section id="features" aria-labelledby="features-title">
     <div class="wrap">
       <h2 id="features-title">{{ x.features_title }}</h2>
-      <p class="section-intro">{{ x.features_intro | markdown(inline=true) | safe }}</p>
+      <div class="section-intro">{{ x.features_intro | markdown | safe }}</div>
       <ul class="features">
         {%- for f in x.features %}
-        <li><h3><span class="icon" aria-hidden="true">{{ f.icon }}</span>{{ f.title }}</h3><p>{{ f.text | markdown(inline=true) | safe }}</p></li>
+        <li class="reveal"><h3><span class="icon" aria-hidden="true">{{ f.icon }}</span>{{ f.title }}</h3><p>{{ f.text | markdown(inline=true) | safe }}</p></li>
         {%- endfor %}
       </ul>
     </div>
@@ -48,13 +51,15 @@
       <p class="section-intro">{{ x.screenshots_intro | markdown(inline=true) | safe }}</p>
       <div class="gallery">
         {%- for s in x.screenshots %}
-        <figure>
+        <figure class="reveal">
+          <a class="shot zoom" href="{{ get_url(path='images/' ~ s.image) }}">
           {%- if s?.dark %}
-          <img class="light-only" src="{{ get_url(path='images/' ~ s.image) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s.alt }}">
-          <img class="dark-only" src="{{ get_url(path='images/' ~ s.dark) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s?.dark_alt or s.alt }}">
+            <img class="light-only" src="{{ get_url(path='images/' ~ s.image) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s.alt }}">
+            <img class="dark-only" src="{{ get_url(path='images/' ~ s.dark) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s?.dark_alt or s.alt }}">
           {%- else %}
-          <img src="{{ get_url(path='images/' ~ s.image) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s.alt }}">
+            <img src="{{ get_url(path='images/' ~ s.image) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s.alt }}">
           {%- endif %}
+          </a>
           <figcaption><strong>{{ s.title }}</strong> — {{ s.caption | markdown(inline=true) | safe }}</figcaption>
         </figure>
         {%- endfor %}
@@ -98,17 +103,17 @@
       <h2 id="download-title">Download</h2>
       <p class="section-intro">{{ x.download_intro | markdown(inline=true) | safe }}</p>
       <div class="downloads">
-        <div class="card">
+        <div class="card reveal">
           <h3>Linux</h3>
           <p>x86-64, glibc 2.35 or newer (<code>.tar.gz</code>).</p>
-          <a class="btn btn-primary" data-release="linux" href="{{ config.extra.releases }}/latest">Download for Linux<span data-size></span></a>
+          <a class="btn btn-primary" data-release="linux" href="{{ config.extra.releases }}/latest"><span>Download for Linux<span class="size" data-size></span></span></a>
         </div>
-        <div class="card">
+        <div class="card reveal">
           <h3>Windows</h3>
           <p>x86-64 (<code>.zip</code>).</p>
-          <a class="btn btn-primary" data-release="windows" href="{{ config.extra.releases }}/latest">Download for Windows<span data-size></span></a>
+          <a class="btn btn-primary" data-release="windows" href="{{ config.extra.releases }}/latest"><span>Download for Windows<span class="size" data-size></span></span></a>
         </div>
-        <div class="card">
+        <div class="card reveal">
           <h3>Build from source</h3>
           <p>Rust toolchain plus a few system libraries on Linux.</p>
           <a class="btn btn-secondary" href="{{ get_url(path='@/getting-started.md') }}#build-from-source">Build instructions</a>
