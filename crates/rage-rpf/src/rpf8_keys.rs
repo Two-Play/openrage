@@ -147,8 +147,10 @@ pub struct Found {
 pub enum IdentifyError {
     #[error("no cipher tables found (expected a valid block of {CONTEXT_LEN} bytes)")]
     NoContext,
-    #[error("none of the keys decrypts an archive table; the key data does not belong to this game version")]
-    NoTableKey,
+    #[error(
+        "none of the {0} key candidates decrypts an archive table; the archive keys exist only in the running game's memory, so a dump taken while RDR2 runs (in the main menu or later) is needed"
+    )]
+    NoTableKey(usize),
     #[error("no IV found that fits the decrypted tables")]
     NoIv,
     #[error("I/O error: {0}")]
@@ -349,7 +351,7 @@ pub fn identify(c: &Candidates, archive_files: &[PathBuf]) -> Result<Found, Iden
         return Ok(Found { store, tables: (opened, archives.len()), missing });
     }
     if c.contexts.iter().any(|b| Context::from_bytes(b).is_some()) {
-        Err(IdentifyError::NoTableKey)
+        Err(IdentifyError::NoTableKey(c.keys.len()))
     } else {
         Err(IdentifyError::NoContext)
     }

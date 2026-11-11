@@ -138,13 +138,17 @@ enum Command {
     Natives { file: PathBuf },
     /// Set up the Red Dead Redemption 2 archive keys from your own game and store them locally.
     ///
-    /// The pieces are recognised by decrypting your archives' tables; OpenRAGE ships no keys.
+    /// The cipher tables come from RDR2.exe; the keys from a memory dump of your running
+    /// game or a key file, recognised by decrypting your archives. OpenRAGE ships no keys.
     Rdr2Keys {
-        /// The RDR2 game folder (its archives are used to recognise the keys).
+        /// The RDR2 game folder (with RDR2.exe and the archives).
         game: PathBuf,
+        /// A memory dump of the running game (e.g. from Task Manager: "Create dump file").
+        #[arg(long)]
+        dump: Option<PathBuf>,
         /// A key file of length-prefixed blocks, such as Swage's secrets.bin.
         #[arg(long)]
-        file: PathBuf,
+        file: Option<PathBuf>,
     },
     /// Inspect Red Dead Redemption 2 archives (RPF8): a file or every .rpf in a folder.
     Rpf8 {
@@ -344,8 +348,8 @@ fn run() -> Result<()> {
     if let Command::Rpf8 { path, list } = &cli.command {
         return cmd_rpf8(path, *list);
     }
-    if let Command::Rdr2Keys { game, file } = &cli.command {
-        return cmd_rdr2_keys(game, file);
+    if let Command::Rdr2Keys { game, dump, file } = &cli.command {
+        return cmd_rdr2_keys(game, dump.as_deref(), file.as_deref());
     }
 
     let game_dir = game_dir.context("no game directory configured; run `openrage --game <DIR> keys` first")?;
@@ -2362,18 +2366,36 @@ fn rdr2_keys() -> Result<Option<std::sync::Arc<rage_rpf::rpf8::Rdr2Keys>>> {
     Ok(Some(std::sync::Arc::new(keys)))
 }
 
-fn cmd_rdr2_keys(game: &Path, file: &Path) -> Result<()> {
+fn cmd_rdr2_keys(game: &Path, dump: Option<&Path>, file: Option<&Path>) -> Result<()> {
+    use rage_rpf::rpf8_exe::{keys_in_dump, tables_from_exe};
     use rage_rpf::rpf8_keys::{Candidates, KeyStore, archives_under, identify, parse_secrets};
     let started = Instant::now();
-    let blocks = parse_secrets(&std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?);
-    let candidates = Candidates::from_blocks(blocks);
-    outln!(
-        "{}: {} cipher table blocks, {} IV candidates, {} key candidates",
-        file.display(),
-        candidates.contexts.len(),
-        candidates.ivs.len(),
-        candidates.keys.len()
-    );
+    if dump.is_none() && file.is_none() {
+        bail!("pass --dump <memory dump of the running game> or --file <key file>");
+    }
+    let exe_path = game.join("RDR2.exe");
+    let exe = std::fs::read(&exe_path).with_context(|| format!("cannot read {}", exe_path.display()))?;
+    let tables = tables_from_exe(&exe)?;
+    drop(exe);
+    outln!("RDR2.exe: cipher tables and IV found");
+    let mut candidates = Candidates { contexts: vec![tables.context], ivs: vec![tables.iv], keys: tables.keys };
+    if let Some(file) = file {
+        let blocks = parse_secrets(&std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?);
+        let before = candidates.keys.len();
+        candidates.keys.extend(Candidates::from_blocks(blocks).keys);
+        outln!("{}: {} key candidates", file.display(), candidates.keys.len() - before);
+    }
+    if let Some(dump) = dump {
+        let found = keys_in_dump(dump, &tables.key_start, |done, total| {
+            eprint!("\rsearching the dump: {} %", done * 100 / total.max(1));
+        })
+        .with_context(|| format!("cannot read {}", dump.display()))?;
+        eprintln!();
+        outln!("{}: {} key candidates", dump.display(), found.len());
+        candidates.keys.extend(found);
+        candidates.keys.sort();
+        candidates.keys.dedup();
+    }
     let archives = archives_under(game);
     if archives.is_empty() {
         bail!("no .rpf archives under {}", game.display());
