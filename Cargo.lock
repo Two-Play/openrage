@@ -4150,11 +4150,13 @@ dependencies = [
 name = "rage-rpf"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "flate2",
  "rage-core",
  "rage-crypto",
  "rage-resource",
  "rage-tfit2",
+ "rayon",
  "thiserror 2.0.21",
 ]
 
