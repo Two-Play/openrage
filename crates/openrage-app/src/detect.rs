@@ -65,6 +65,20 @@ pub fn is_gta5_dir(dir: &Path) -> bool {
     EXECUTABLES.iter().any(|exe| dir.join(exe).is_file())
 }
 
+/// Short name of the game installed in `dir`: "GTA V Enhanced", "GTA V",
+/// "RDR2", or `None` when no known executable is there.
+pub fn game_name(dir: &Path) -> Option<&'static str> {
+    if dir.join("RDR2.exe").is_file() {
+        Some("RDR2")
+    } else if dir.join("GTA5_Enhanced.exe").is_file() {
+        Some("GTA V Enhanced")
+    } else if dir.join("GTA5.exe").is_file() {
+        Some("GTA V")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

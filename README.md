@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="crates/openrage-gui/ui/logo.svg" alt="OpenRAGE logo" width="72">
+
 # OpenRAGE
 
 **An open-source explorer and modding toolkit for Rockstar's RAGE engine games — on Linux and Windows.**
@@ -230,6 +232,9 @@ The explorer shows a folder tree in which archives (including nested ones) behav
 - **Keyboard:** arrow keys, Page Up/Down, Home/End and Enter in the list; Backspace or Alt+Up goes up; Ctrl+L address, Ctrl+F search, F2 rename, Delete, Ctrl+Z undo. Help → Keyboard shortcuts (F1) lists them all.
 - **Edit mode, like OpenIV:** OpenRAGE starts read-only. **Read-only → Editing** in the toolbar (or Edit → Unlock editing…) asks once per session; only then can archives, textures and packages be changed. The bar above the list says whether you are looking at an original game archive (changes are copied to `mods`) or the copy in `mods`.
 - **Light and dark mode:** follows the system, or pick one under View → Theme (the sun/moon button switches quickly). The choice is remembered.
+
+
+**Settings** (gear button or File → Settings…, Ctrl+,): light, dark or system theme; the accent color — the style's default, OpenRAGE orange (the logo's), a preset or any color of your own; the configured game (GTA V, GTA V Enhanced or RDR2, shown in the address bar) with *Change game or keys…*; and whether the history opens in its own window and the mods overlay is shown.
 
 ### Search
 

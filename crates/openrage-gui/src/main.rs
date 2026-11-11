@@ -2,6 +2,7 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod accent;
 mod audio;
 mod badges;
 mod browser;
@@ -152,6 +153,9 @@ fn main() -> anyhow::Result<()> {
 
     ui.set_mono_font(mono_font().into());
     ui.set_theme_mode(with_app(|a| theme_mode(a.cfg.theme.as_deref())));
+    let (mode, color) = with_app(|a| accent::from_setting(a.cfg.accent.as_deref()));
+    accent::set(mode, color);
+    accent::apply(&ui);
     ui.set_history_in_window(with_app(|a| a.cfg.history_window.unwrap_or(true)));
     let languages: Vec<SharedString> =
         std::iter::once("All languages".into()).chain(LANGUAGES.iter().map(|l| capitalize(l).into())).collect();
@@ -221,6 +225,9 @@ fn debug_snapshot(ui: &AppWindow) {
         }
         if std::env::var("OPENRAGE_EDIT").is_ok() {
             ui.set_edit_mode(true);
+        }
+        if std::env::var("OPENRAGE_SETTINGS").is_ok() {
+            ui.invoke_open_settings();
         }
         if let Ok(name) = std::env::var("OPENRAGE_SELECT") {
             let row = with_app(|a| {
@@ -627,6 +634,23 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_open_viewer(move || with_ui(&w, open_viewer));
     let w = ui.as_weak();
     ui.on_row_action(move |i, action| with_ui(&w, |ui| row_action(ui, i as usize, &action)));
+    let w = ui.as_weak();
+    ui.on_accent_chosen(move |mode, color| {
+        accent::set(mode, color);
+        with_app(|a| {
+            a.cfg.accent = Some(accent::to_setting(mode, color));
+            let _ = a.cfg.save();
+        });
+        if let Some(ui) = w.upgrade() {
+            accent::apply(&ui);
+        }
+        viewer::set_accent();
+        editor::set_accent();
+        xmlview::set_accent();
+        history::set_accent();
+    });
+    ui.on_color_hex(accent::hex_string);
+    ui.on_parse_hex(|s| accent::parse_hex(&s).unwrap_or(slint::Color::from_argb_u8(0, 0, 0, 0)));
     ui.on_theme_changed(|mode| {
         with_app(|a| {
             a.cfg.theme = Some(theme_name(mode).to_owned());
@@ -932,6 +956,12 @@ fn with_ui(w: &Weak<AppWindow>, f: impl FnOnce(&AppWindow)) {
 // Browsing
 
 fn start_browsing(ui: &AppWindow) {
+    let label = with_app(|a| a.game_dir.as_deref().and_then(detect::game_name)).unwrap_or("Game");
+    GAME_LABEL.with(|l| *l.borrow_mut() = label.to_owned());
+    ui.set_settings_game(label.into());
+    ui.set_settings_game_dir(
+        with_app(|a| a.game_dir.as_ref().map(|d| d.display().to_string())).unwrap_or_default().into(),
+    );
     let mods = with_app(|a| a.game_dir.as_deref().and_then(rage_mods::mods_dir).is_some());
     with_app(|a| a.overlay = mods);
     ui.set_mods_available(mods);
@@ -1213,7 +1243,7 @@ fn set_location(ui: &AppWindow, vpath: &str) {
 
 fn crumbs(vpath: &str) -> Vec<Crumb> {
     let crumb = |label: &str, path: &str| Crumb { label: label.into(), path: path.into() };
-    let mut out = vec![crumb("Game", "")];
+    let mut out = vec![crumb(&game_label(), "")];
     if let Some(q) = browser::search_query(vpath) {
         out.push(crumb(&format!("Search: {q}"), vpath));
         return out;
@@ -1250,8 +1280,18 @@ fn location_title(l: &Listing) -> String {
         Location::Search { query, .. } => format!("Search: {query}"),
         Location::Changes { .. } => "Mod changes".into(),
         Location::History => "History".into(),
-        _ => l.vpath.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("Game folder").to_owned(),
+        _ => l.vpath.rsplit('/').next().filter(|n| !n.is_empty()).map_or_else(game_label, str::to_owned),
     }
+}
+
+thread_local! {
+    /// The game's short name, set when browsing starts (read while `APP` may be borrowed).
+    static GAME_LABEL: std::cell::RefCell<String> = std::cell::RefCell::new("Game".to_owned());
+}
+
+/// The game's short name ("GTA V Enhanced", "RDR2"), for the address bar and headings.
+fn game_label() -> String {
+    GAME_LABEL.with(|l| l.borrow().clone())
 }
 
 /// Fills the info panel header and metadata table.

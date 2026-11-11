@@ -62,6 +62,7 @@ thread_local! {
 pub fn open(ui: &AppWindow, cut_path: String, cut: Cutscene, models: Vec<Option<String>>) {
     let Ok(win) = SceneWindow::new() else { return };
     win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(&win);
     let name = cut_path.rsplit('/').next().unwrap_or(&cut_path).to_owned();
     win.set_heading(name.into());
     win.set_path(cut_path.clone().into());

@@ -142,6 +142,7 @@ pub struct Labels {
 pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Option<String>) {
     let Ok(win) = ViewerWindow::new() else { return };
     win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(&win);
     win.set_mono_font(ui.get_mono_font());
     win.set_heading(labels.heading.into());
     win.set_path(labels.path.into());
@@ -751,4 +752,9 @@ pub fn set_theme(mode: i32) {
 #[cfg(debug_assertions)]
 pub fn newest() -> Option<ViewerWindow> {
     OPEN.with(|o| o.borrow().last().map(|(_, w)| w.clone_strong()))
+}
+
+/// Applies a changed accent color to every open window of this kind.
+pub fn set_accent() {
+    OPEN.with(|o| o.borrow().iter().for_each(|(_, w)| crate::accent::apply(w)));
 }

@@ -134,6 +134,7 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
     let Ok(win) = XmlWindow::new() else { return };
     let name = vpath.rsplit('/').next().unwrap_or(&vpath).to_owned();
     win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(&win);
     win.set_mono_font(ui.get_mono_font());
     win.set_heading(name.clone().into());
     win.set_path(vpath.clone().into());
@@ -350,4 +351,9 @@ pub fn set_theme(mode: i32) {
             w.set_theme_mode(mode);
         }
     });
+}
+
+/// Applies a changed accent color to every open window of this kind.
+pub fn set_accent() {
+    OPEN.with(|o| o.borrow().iter().for_each(|(_, w)| crate::accent::apply(w)));
 }

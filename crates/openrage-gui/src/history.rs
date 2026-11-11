@@ -49,6 +49,7 @@ pub fn open(ui: &AppWindow) {
         }
     };
     win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(&win);
     refresh(ui);
     let _ = win.show();
 }
@@ -104,4 +105,13 @@ fn ago(secs: u64) -> String {
         3600..86_400 => format!("{} h ago", secs / 3600),
         _ => format!("{} days ago", secs / 86_400),
     }
+}
+
+/// Applies a changed accent color to the history window.
+pub fn set_accent() {
+    WINDOW.with(|w| {
+        if let Some(win) = w.borrow().as_ref() {
+            crate::accent::apply(win);
+        }
+    });
 }

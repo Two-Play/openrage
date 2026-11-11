@@ -187,6 +187,7 @@ pub fn open(ui: &AppWindow, doc: Document) {
     }
     let Ok(win) = EditorWindow::new() else { return };
     win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(&win);
     win.set_mono_font(ui.get_mono_font());
     win.set_heading(doc.name.clone().into());
     win.set_path(doc.vpath.clone().into());
@@ -361,6 +362,11 @@ pub fn set_theme(mode: i32) {
 #[cfg(debug_assertions)]
 pub fn newest() -> Option<EditorWindow> {
     OPEN.with(|o| o.borrow().last().map(|(_, w)| w.clone_strong()))
+}
+
+/// Applies a changed accent color to every open window of this kind.
+pub fn set_accent() {
+    OPEN.with(|o| o.borrow().iter().for_each(|(_, w)| crate::accent::apply(w)));
 }
 
 #[cfg(test)]
