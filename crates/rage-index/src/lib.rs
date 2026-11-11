@@ -88,6 +88,25 @@ impl Index {
         &self.path
     }
 
+    /// Every name the index knows: file names without their extension and the
+    /// strings of the hash dictionary; used to turn hashes back into names.
+    pub fn known_names(&self) -> Result<Vec<String>, IndexError> {
+        let mut out = Vec::new();
+        let mut stmt = self.conn.prepare("SELECT DISTINCT name FROM entries")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for name in rows {
+            let name = name?;
+            let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s);
+            out.push(stem.to_owned());
+        }
+        let mut stmt = self.conn.prepare("SELECT string FROM hashes")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for s in rows {
+            out.push(s?);
+        }
+        Ok(out)
+    }
+
     pub fn stats(&self) -> Result<IndexStats, IndexError> {
         let count =
             |sql: &str| -> Result<u64, IndexError> { Ok(self.conn.query_row(sql, [], |r| r.get::<_, i64>(0))? as u64) };

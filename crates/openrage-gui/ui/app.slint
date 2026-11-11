@@ -81,6 +81,8 @@ export struct FileRow {
     is-model: bool,
     // A text file (opens in the text editor).
     can-edit-text: bool,
+    // Binary metadata (.ymap, .ytyp, .ymt, …) shown as XML.
+    is-meta: bool,
 }
 
 component FormatIcon inherits Rectangle {
@@ -283,6 +285,16 @@ component FileItem inherits Rectangle {
                 title: @tr("Open in text editor");
                 icon: @image-url("icons/menu/text.svg");
                 activated => { root.action("edit"); }
+            }
+            if item.is-meta: MenuItem {
+                title: @tr("Show as XML");
+                icon: @image-url("icons/menu/text.svg");
+                activated => { root.action("xml-view"); }
+            }
+            if item.is-meta: MenuItem {
+                title: @tr("Export XML…");
+                icon: @image-url("icons/menu/export.svg");
+                activated => { root.action("xml"); }
             }
             if !root.history-mode && item.kind != "Folder": MenuItem {
                 title: @tr("Open with system app (read-only copy)");

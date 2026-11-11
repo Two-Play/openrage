@@ -88,9 +88,20 @@ enum Command {
         /// Instead of archives, parse every clip dictionary (.ycd) and evaluate every frame.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio"])]
         animations: bool,
+        /// Instead of archives, convert every metadata file (.ymap, .ytyp, .ymt, .ymf, .cut, .pso) to XML.
+        #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations"])]
+        meta: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
         #[arg(long, requires = "textures")]
         rebuild: bool,
+    },
+    /// Convert a metadata file (.ymap, .ytyp, .ymt, .ymf, .cut, .pso) to XML.
+    Xml {
+        /// Virtual path of the file.
+        path: String,
+        /// Write the XML to this file instead of printing it.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
     },
     /// Show a model (.ydr, .yft, .ydd) and optionally export it as glTF (.glb).
     Model {
@@ -263,6 +274,7 @@ fn run() -> Result<()> {
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
+        Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
         Command::Verify { path, textures: true, rebuild, .. } => cmd_verify_textures(&game_dir, &path, rebuild, keys),
@@ -275,6 +287,7 @@ fn run() -> Result<()> {
             cmd_model(&game_dir, &path, export.as_deref(), render.as_deref(), yaw, anim.as_deref(), keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
+        Command::Xml { path, out } => cmd_xml(&game_dir, &path, out.as_deref(), keys),
         Command::Audio { path, export } => cmd_audio(&game_dir, &path, export.as_deref(), keys),
         Command::Put { file, target } => cmd_put(&game_dir, &file, &target, keys),
         Command::Rm { path } => cmd_edit(&game_dir, &path, Op::Remove, &format!("Removed {path}"), keys),
@@ -1036,6 +1049,104 @@ fn cmd_audio(game_dir: &Path, path: &str, export: Option<&Path>, keys: Option<Ar
             }
         }
         outln!("in {} ms", started.elapsed().as_millis());
+    }
+    Ok(())
+}
+
+fn cmd_xml(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    // Names of models, textures, … from the search index, so hashes read as names.
+    if let Ok(names) = open_index(game_dir).and_then(|i| Ok(i.known_names()?)) {
+        rage_formats::names::register(names);
+    }
+    let xml = openrage_app::metadata::load(game_dir, keys, path)?;
+    for e in xml.errors.iter().take(20) {
+        eprintln!("warning: {e}");
+    }
+    match out {
+        Some(file) => {
+            fs::write(file, &xml.text)?;
+            outln!(
+                "Wrote {} ({}, {}{})",
+                file.display(),
+                xml.encoding.name(),
+                xml.root.as_deref().unwrap_or("?"),
+                if xml.errors.is_empty() { String::new() } else { format!(", {} problems", xml.errors.len()) }
+            );
+        }
+        None => print!("{}", xml.text),
+    }
+    Ok(())
+}
+
+fn cmd_verify_meta(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    use openrage_app::metadata;
+    use std::collections::BTreeMap;
+    let starts = archive_roots(game_dir, within, keys)?;
+    let started = Instant::now();
+    type Counts = BTreeMap<String, (usize, usize)>;
+    let all: Vec<(Counts, Vec<String>, Vec<String>)> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let (mut counts, mut errors, mut problems) = (Counts::new(), Vec::new(), Vec::new());
+            let mut nested = Vec::new();
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    let name = &a.entry(id).name;
+                    if !metadata::is_metadata(name) {
+                        return;
+                    }
+                    let ext = name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+                    let result = a.read(id).map_err(anyhow::Error::from).and_then(|d| metadata::from_bytes(&d));
+                    let c = counts.entry(ext).or_insert((0, 0));
+                    c.0 += 1;
+                    match result {
+                        Ok(x) => {
+                            c.1 += x.text.len();
+                            if let Some(e) = x.errors.first() {
+                                problems.push(format!("{p}: {} problems, first: {e}", x.errors.len()));
+                            }
+                        }
+                        Err(e) => errors.push(format!("{p}: {e:#}")),
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (counts, errors, problems)
+        })
+        .collect();
+    let mut counts = BTreeMap::<String, (usize, usize)>::new();
+    for (c, _, _) in &all {
+        for (k, v) in c {
+            let e = counts.entry(k.clone()).or_default();
+            e.0 += v.0;
+            e.1 += v.1;
+        }
+    }
+    let errors: Vec<&String> = all.iter().flat_map(|x| &x.1).collect();
+    let problems: Vec<&String> = all.iter().flat_map(|x| &x.2).collect();
+    for e in errors.iter().take(30) {
+        outln!("FAIL {e}");
+    }
+    for e in problems.iter().take(30) {
+        outln!("PART {e}");
+    }
+    for (ext, (n, bytes)) in &counts {
+        outln!("  .{ext:<5} {n:>6} files, {} of XML", human(*bytes as u64));
+    }
+    let total: usize = counts.values().map(|c| c.0).sum();
+    outln!(
+        "{total} metadata files, {} errors, {} with unreadable parts ({:.1}s)",
+        errors.len(),
+        problems.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() || !problems.is_empty() {
+        bail!("{} errors, {} partial", errors.len(), problems.len());
     }
     Ok(())
 }
