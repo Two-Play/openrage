@@ -5,6 +5,7 @@
 mod audio;
 mod badges;
 mod browser;
+mod editor;
 mod gpu;
 mod preview;
 mod viewer;
@@ -196,15 +197,28 @@ fn debug_snapshot(ui: &AppWindow) {
         if std::env::var("OPENRAGE_EDIT").is_ok() {
             ui.set_edit_mode(true);
         }
+        if let Ok(name) = std::env::var("OPENRAGE_SELECT") {
+            let row = with_app(|a| {
+                let l = a.listing.as_ref()?;
+                a.visible.iter().position(|&i| l.items[i].name.eq_ignore_ascii_case(&name))
+            });
+            if let Some(row) = row {
+                select_row(&ui, row);
+            }
+        }
+        if let Ok(path) = std::env::var("OPENRAGE_EDITOR") {
+            open_editor(&ui, path);
+        }
         if std::env::var("OPENRAGE_UNLOCK").is_ok() {
             ui.set_unlock_visible(true);
         }
         let weak = ui.as_weak();
         slint::Timer::single_shot(Duration::from_secs(2), move || {
             let Some(ui) = weak.upgrade() else { return };
-            let snap = match viewer::newest() {
-                Some(v) => v.window().take_snapshot(),
-                None => ui.window().take_snapshot(),
+            let snap = match (viewer::newest(), editor::newest()) {
+                (Some(v), _) => v.window().take_snapshot(),
+                (None, Some(e)) => e.window().take_snapshot(),
+                (None, None) => ui.window().take_snapshot(),
             };
             match snap {
                 Ok(img) => {
@@ -286,7 +300,16 @@ fn wire_callbacks(ui: &AppWindow) {
         })
     });
     let w = ui.as_weak();
-    ui.on_file_select(move |i| with_ui(&w, |ui| select_row(ui, i as usize)));
+    ui.on_file_select(move |i| {
+        with_ui(&w, |ui| {
+            // A click on the selected row (e.g. the first click of a
+            // double-click) must not reload its preview.
+            if ui.get_file_selected() == i && with_app(|a| a.selected.is_some()) {
+                return;
+            }
+            select_row(ui, i as usize)
+        })
+    });
     let w = ui.as_weak();
     ui.on_file_open(move |i| {
         with_ui(&w, |ui| {
@@ -302,6 +325,16 @@ fn wire_callbacks(ui: &AppWindow) {
                     stop_sound(ui);
                     toggle_sound(ui);
                 }
+                return;
+            }
+            let text = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(i as usize)?];
+                is_text_file(item)
+                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = text {
+                open_editor(ui, vpath);
                 return;
             }
             let viewable = with_app(|a| {
@@ -425,7 +458,9 @@ fn wire_callbacks(ui: &AppWindow) {
             let _ = a.cfg.save();
         });
         viewer::set_theme(mode);
+        editor::set_theme(mode);
     });
+    ui.on_edit_mode_changed(editor::set_editable);
     ui.on_quit(|| {
         let _ = slint::quit_event_loop();
     });
@@ -437,6 +472,24 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_audio_seek(move |f| with_ui(&w, |ui| seek_sound(ui, f)));
     let w = ui.as_weak();
     ui.on_audio_save_wav(move || with_ui(&w, save_wav));
+    let w = ui.as_weak();
+    ui.on_audio_step(move |d| {
+        with_ui(&w, |ui| {
+            step_sound(ui, d, true);
+        })
+    });
+    let w = ui.as_weak();
+    ui.on_audio_skip(move |secs| {
+        with_ui(&w, |ui| {
+            let Some(pcm) = with_app(|a| a.sound.clone()) else { return };
+            let total = pcm.duration_secs().max(0.001);
+            let now = with_app(|a| match &a.output {
+                Some(o) if Arc::ptr_eq(o.pcm(), &pcm) && !o.finished() => o.position().as_secs_f32(),
+                _ => a.sound_start,
+            });
+            seek_sound(ui, ((now + secs) / total).clamp(0.0, 1.0));
+        })
+    });
     let w = ui.as_weak();
     ui.on_save_png(move || with_ui(&w, |ui| export_textures(ui, true)));
     let w = ui.as_weak();
@@ -531,6 +584,20 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
     match action {
         "open" => ui.invoke_file_open(row as i32),
         "view" => open_viewer(ui),
+        "edit" | "system" => {
+            let vpath = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(row)?];
+                Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = vpath {
+                if action == "edit" {
+                    open_editor(ui, vpath);
+                } else {
+                    open_with_system(ui, vpath);
+                }
+            }
+        }
         "extract" => ui.invoke_extract_selected(),
         "gltf" => {
             if with_app(|a| a.model.is_some()) {
@@ -810,6 +877,15 @@ fn is_viewable(item: &Item) -> bool {
     is_model_item(item) || item.kind == ItemKind::Texture || [".ytd", ".dds", ".png"].iter().any(|e| lower.ends_with(e))
 }
 
+/// Files that open in the text editor (by extension; binary contents are
+/// detected when opening).
+fn is_text_file(item: &Item) -> bool {
+    const TEXT: [&str; 14] =
+        ["xml", "meta", "txt", "ini", "cfg", "json", "ide", "ipl", "lua", "csv", "log", "dat", "gxt", "list"];
+    let ext = item.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    matches!(item.kind, ItemKind::File) && item.mark != Some(Mark::Removed) && TEXT.contains(&ext.as_str())
+}
+
 /// Double-click navigates into it (or, for search hits and changes, to it).
 fn is_openable(item: &Item) -> bool {
     item.vpath.is_some()
@@ -834,6 +910,7 @@ fn file_row(item: &Item) -> FileRow {
         can_open: is_openable(item),
         can_view: is_viewable(item),
         is_model: is_model_item(item),
+        can_edit_text: is_text_file(item),
         kind: match &item.vpath {
             Some(_) if item.detail.is_some() => item.detail.clone().unwrap_or_default().into(),
             Some(vpath) => browser::short_location(&browser::parent(vpath).unwrap_or_default(), 40).into(),
@@ -1091,6 +1168,7 @@ fn select_row(ui: &AppWindow, row: usize) {
     };
     ui.set_file_selected(row as i32);
     with_app(|a| a.pending_viewer = false);
+    ui.set_image_viewable(is_viewable(&item));
     ui.set_can_extract(true);
     ui.set_texture_selected(item.kind == ItemKind::Texture);
     if with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::History))) {
@@ -1207,6 +1285,13 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, St
             }
             None => (Meta::new(), String::new(), None),
         },
+        PreviewSource::Entry(rpf, id) if browser::is_audio(&rpf.entry(id).name) => {
+            match rpf.read(id).map_err(anyhow::Error::from).and_then(|d| openrage_app::audio::parse(d, keys.as_deref()))
+            {
+                Ok(awc) => audio_container_preview(&awc),
+                Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new(), None),
+            }
+        }
         PreviewSource::Entry(rpf, id) if browser::is_texture_dict(&rpf.entry(id).name) => {
             match rpf
                 .read_resource(id)
@@ -1231,6 +1316,32 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, St
             (meta, body, None)
         }
     }
+}
+
+/// Summary of an audio container with the waveform of its first sound.
+fn audio_container_preview(awc: &rage_formats::awc::Awc) -> (Meta, String, Option<Rgba>) {
+    let codec = awc.sounds.first().map(|s| s.codec.name().replace("codec 7", "MPEG audio")).unwrap_or_default();
+    let mut meta = match &awc.stream_format {
+        Some(f) => vec![
+            kv("Contains", format!("one stream with {} channels", f.channels)),
+            kv("Duration", browser::seconds(awc.sounds.first().map_or(0.0, |s| s.duration_secs()))),
+        ],
+        None => vec![
+            kv("Contains", format!("{} sounds", awc.sounds.len())),
+            kv("Total length", browser::seconds(awc.sounds.iter().map(|s| s.duration_secs()).sum())),
+        ],
+    };
+    meta.push(kv("Codec", codec));
+    if awc.encrypted || awc.flags & 0xA != 0 {
+        meta.push(kv("Encrypted", "yes"));
+    }
+    meta.push(note("Double-click to open the container and play its sounds."));
+    let first = if awc.stream_format.is_some() { awc.decode_stream() } else { awc.decode_sound(0) };
+    let image = first.ok().map(|pcm| {
+        let (w, h) = (960, 320);
+        (w as u32, h as u32, audio::waveform(&pcm, w, h, [0x3b, 0x82, 0xf6]))
+    });
+    (meta, String::new(), image)
 }
 
 /// Returns (metadata, preview body).
@@ -2122,6 +2233,126 @@ fn save_png_image(img: &slint::Image, name: String, main: Weak<AppWindow>) {
 }
 
 // ---------------------------------------------------------------------------
+// Text editor and system apps
+
+/// Reads a file as the game sees it (mods included).
+fn read_file(ui: &AppWindow, vpath: &str) -> anyhow::Result<Vec<u8>> {
+    let _ = ui;
+    let (game_dir, keys) = with_app(|a| (a.game_dir.clone(), a.keys.clone()));
+    let game_dir = game_dir.ok_or_else(|| anyhow::anyhow!("no game folder"))?;
+    match rage_mods::resolve(&game_dir, vpath, keys)?.0 {
+        Node::ArchiveFile(rpf, id) => Ok(rpf.read(id)?),
+        Node::PlainFile(p) => Ok(std::fs::read(p)?),
+        _ => anyhow::bail!("{vpath} is not a file"),
+    }
+}
+
+fn open_editor(ui: &AppWindow, vpath: String) {
+    ui.set_status(format!("Opening {vpath} …").into());
+    match read_file(ui, &vpath) {
+        Ok(data) => match editor::Document::from_bytes(vpath.clone(), &data) {
+            Some(doc) => {
+                editor::open(ui, doc);
+                ui.set_status(SharedString::new());
+            }
+            None => ui.set_status(format!("{vpath} is not a text file; use Extract… instead.").into()),
+        },
+        Err(e) => ui.set_status(format!("Cannot open {vpath}: {e:#}").into()),
+    }
+}
+
+/// Saves a file into the mods folder (inside an archive or as a loose file),
+/// recorded in the journal; calls `done` on the UI thread.
+fn save_file(
+    ui: &AppWindow,
+    vpath: String,
+    data: Vec<u8>,
+    description: String,
+    done: impl FnOnce(Result<String, String>) + Send + 'static,
+) {
+    let Some((game_dir, keys)) = with_app(|a| Some((a.game_dir.clone()?, a.keys.clone()))) else { return };
+    let current = with_app(|a| a.listing.as_ref().map(|l| l.vpath.clone())).unwrap_or_default();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<String> {
+            match install::split(&game_dir, &vpath) {
+                Some(t) => {
+                    let applied =
+                        install::apply(&game_dir, keys, &t.archive, &[(t.inner, Op::Set(data))], &description)?;
+                    Ok(if applied.created {
+                        format!("Saved into mods/{} (archive copied there first)", t.archive)
+                    } else {
+                        format!("Saved into mods/{}", t.archive)
+                    })
+                }
+                None => {
+                    let rel = vpath.strip_prefix("mods/").unwrap_or(&vpath).to_owned();
+                    let mods = rage_mods::mods_dir(&game_dir)
+                        .unwrap_or_else(|| game_dir.join(rage_mods::overlay::MODS_FOLDER));
+                    std::fs::create_dir_all(&mods)?;
+                    let path =
+                        openrage_app::journal::Journal::new(&mods).write_file(false, &rel, &data, &description)?;
+                    Ok(format!("Saved {}", path.display()))
+                }
+            }
+        })();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if result.is_ok() {
+                after_mods_change(&ui, &current);
+            }
+            done(result.map_err(|e| format!("{e:#}")));
+        });
+    });
+}
+
+/// Opens a read-only copy of a file with the system's default application.
+fn open_with_system(ui: &AppWindow, vpath: String) {
+    let data = match read_file(ui, &vpath) {
+        Ok(d) => d,
+        Err(e) => {
+            ui.set_status(format!("Cannot open {vpath}: {e:#}").into());
+            return;
+        }
+    };
+    let name = vpath.rsplit('/').next().unwrap_or("file").to_owned();
+    let result = (|| -> std::io::Result<PathBuf> {
+        let dir = std::env::temp_dir().join("openrage-open").join(format!("{:x}", rage_core::hash::joaat(&vpath)));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(vfs::safe_relative_path(&name).unwrap_or_else(|| "file".into()));
+        if path.exists() {
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(&path, perms)?;
+        }
+        std::fs::write(&path, &data)?;
+        let mut perms = std::fs::metadata(&path)?.permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms)?;
+        Ok(path)
+    })();
+    let path = match result {
+        Ok(p) => p,
+        Err(e) => {
+            ui.set_status(format!("Cannot write a copy: {e}").into());
+            return;
+        }
+    };
+    let launched = if cfg!(target_os = "windows") {
+        std::process::Command::new("cmd").args(["/C", "start", ""]).arg(&path).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&path).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(&path).spawn()
+    };
+    let msg = match launched {
+        Ok(_) => format!("Opened a read-only copy: {}", path.display()),
+        Err(e) => format!("Cannot start the system app: {e}"),
+    };
+    ui.set_status(msg.into());
+}
+
+// ---------------------------------------------------------------------------
 // Sounds
 
 fn start_sound_preview(ui: &AppWindow, awc: Arc<rage_formats::awc::Awc>, index: usize, info: Meta, generation: u64) {
@@ -2169,6 +2400,7 @@ fn start_sound_preview(ui: &AppWindow, awc: Arc<rage_formats::awc::Awc>, index: 
                         a.sound_start = 0.0;
                     });
                     ui.set_audio_mode(true);
+                    update_sound_neighbours(&ui);
                     update_sound_ui(&ui);
                     if with_app(|a| std::mem::take(&mut a.play_when_ready)) {
                         toggle_sound(&ui);
@@ -2181,6 +2413,36 @@ fn start_sound_preview(ui: &AppWindow, awc: Arc<rage_formats::awc::Awc>, index: 
             }
         });
     });
+}
+
+/// Selects the previous/next sound of the opened container (and plays it).
+fn step_sound(ui: &AppWindow, delta: i32, play: bool) -> bool {
+    let target = ui.get_file_selected() + delta;
+    let is_sound = with_app(|a| {
+        let l = a.listing.as_ref()?;
+        let i = *a.visible.get(usize::try_from(target).ok()?)?;
+        Some(l.items[i].kind == ItemKind::Sound)
+    });
+    if is_sound != Some(true) {
+        return false;
+    }
+    with_app(|a| a.play_when_ready = play);
+    ui.invoke_select_row(target);
+    true
+}
+
+/// Whether there are sounds before/after the selected one.
+fn update_sound_neighbours(ui: &AppWindow) {
+    let row = ui.get_file_selected();
+    let is_sound = |r: i32| {
+        with_app(|a| {
+            let l = a.listing.as_ref()?;
+            let i = *a.visible.get(usize::try_from(r).ok()?)?;
+            Some(l.items[i].kind == ItemKind::Sound)
+        }) == Some(true)
+    };
+    ui.set_audio_has_prev(is_sound(row - 1));
+    ui.set_audio_has_next(is_sound(row + 1));
 }
 
 /// Play, pause or resume the selected sound.
@@ -2251,6 +2513,15 @@ fn update_sound_ui(ui: &AppWindow) {
             a.output = None;
             a.audio_timer.stop();
         });
+        // "Play all": continue with the next sound (outside this timer tick).
+        if ui.get_audio_play_all() {
+            let weak = ui.as_weak();
+            slint::Timer::single_shot(Duration::ZERO, move || {
+                if let Some(ui) = weak.upgrade() {
+                    step_sound(&ui, 1, true);
+                }
+            });
+        }
     }
     ui.set_audio_position(pos / total);
     ui.set_audio_playing(playing && !finished);

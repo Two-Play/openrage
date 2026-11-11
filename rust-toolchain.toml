@@ -1,0 +1,5 @@
+# The Rust version OpenRAGE is built and checked with (host, toolbox and CI).
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

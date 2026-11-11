@@ -1,0 +1,28 @@
+name: Dev environment
+
+# Keeps dev/Containerfile working: builds the image and OpenRAGE inside it
+# whenever the environment or the dependencies change.
+on:
+  push:
+    branches: [main]
+    paths: ["dev/**", "rust-toolchain.toml", "Cargo.lock", ".github/workflows/dev-env.yml"]
+  pull_request:
+    paths: ["dev/**", "rust-toolchain.toml", "Cargo.lock", ".github/workflows/dev-env.yml"]
+
+concurrency:
+  group: dev-env-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the image
+        run: |
+          cp rust-toolchain.toml dev/
+          podman build -t localhost/openrage-dev -f dev/Containerfile dev
+      - name: Build OpenRAGE in the container
+        run: |
+          podman run --rm -v "$PWD":/src -w /src localhost/openrage-dev \
+            cargo build --locked --workspace

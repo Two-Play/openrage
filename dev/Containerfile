@@ -1,0 +1,35 @@
+# Reproducible build environment for OpenRAGE (Fedora, toolbx-compatible).
+#
+#   dev/toolbox.sh                      # build the image, create the "openrage" toolbox
+#   toolbox enter openrage
+#   cargo build --release
+#
+# Also usable without toolbx:
+#   podman build -t localhost/openrage-dev -f dev/Containerfile dev
+#   podman run --rm -v "$PWD":/src:Z -w /src localhost/openrage-dev cargo build --release
+FROM registry.fedoraproject.org/fedora-toolbox:44
+
+# Build tools and the libraries the GUI links against (Slint: fontconfig,
+# xkbcommon, Wayland; audio output: ALSA), plus Vulkan for the GPU renderer.
+RUN dnf -y install \
+        gcc gcc-c++ make pkgconf-pkg-config git \
+        fontconfig-devel freetype-devel libxkbcommon-devel libxkbcommon-x11-devel \
+        wayland-devel libX11-devel libXcursor-devel libXrandr-devel libXi-devel \
+        alsa-lib-devel systemd-devel \
+        mesa-vulkan-drivers vulkan-loader mesa-libEGL mesa-libGL \
+        rustup \
+    && dnf clean all
+
+# A Rust toolchain for container-only use (podman run). Inside a toolbox the
+# user's own ~/.rustup is used instead; rust-toolchain.toml pins the version
+# either way.
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+COPY rust-toolchain.toml /tmp/rust-toolchain.toml
+RUN rustup-init -y --no-modify-path --profile minimal \
+        --default-toolchain "$(sed -n 's/^channel = "\(.*\)"/\1/p' /tmp/rust-toolchain.toml)" \
+        --component clippy --component rustfmt \
+    && chmod -R a+rwX /opt/rustup /opt/cargo
+
+LABEL com.github.containers.toolbox="true" \
+      name="openrage-dev" \
+      summary="Build environment for OpenRAGE"

@@ -23,6 +23,25 @@ cargo build --release
 # binary: target/release/openrage
 ```
 
+### Reproducible build environment
+
+The Rust version is pinned in `rust-toolchain.toml` (rustup picks it up automatically). For the system libraries there is a container image based on Fedora's toolbx image, `dev/Containerfile`:
+
+```sh
+dev/toolbox.sh            # build the image and create the "openrage" toolbox
+toolbox enter openrage
+cargo run --release -p openrage-gui
+```
+
+Inside the toolbox the GUI runs as usual (Wayland/X11, GPU, audio and your home folder, including the game, are shared). Without toolbx the image works with plain Podman or Docker:
+
+```sh
+cp rust-toolchain.toml dev/ && podman build -t localhost/openrage-dev -f dev/Containerfile dev
+podman run --rm -v "$PWD":/src:Z -w /src localhost/openrage-dev cargo build --release
+```
+
+CI builds the image and OpenRAGE inside it whenever the environment or the dependencies change.
+
 ## Getting started (GTA V)
 
 OpenRAGE needs the archive keys from your own game installation. They are extracted once and cached at `~/.config/openrage/gtav.keys` (Linux) or `%APPDATA%\openrage\gtav.keys` (Windows). Never share that file.
@@ -46,6 +65,7 @@ On first start a setup dialog detects Steam installations and derives the keys. 
 
 * **Menus and context menus:** every action is in the menu bar (File, Edit, View, Go, Help) with its keyboard shortcut; right-click a file for the actions that apply to it (open, view, extract, export, replace, rename, delete, copy name/path).
 * **Double-click** opens folders, archives and texture dictionaries; models and textures open in their own **viewer window** (also Ctrl+Enter) with a details panel. Several viewers can be open at once, e.g. to compare models.
+* **Text editor:** double-click a text file (`.xml`, `.meta`, `.dat`, `.ini`, …) to open it in its own window — read-only until edit mode is unlocked; **Save** (Ctrl+S) writes it into the mods folder, can be undone, and keeps the file's encoding, line endings and tabs. Right-click → *Open with system app* opens a read-only copy in your default program.
 * **Address bar** with clickable breadcrumbs like a file manager; click the free space (or Ctrl+L) to type a path.
 * The info panel shows metadata as a table (type, size, version, format, mip levels, meshes, triangles …).
 * **Keyboard:** arrow keys, Page Up/Down, Home/End and Enter in the list; Backspace or Alt+Up goes up; Ctrl+L address, Ctrl+F search, F2 rename, Delete, Ctrl+Z undo. Help → Keyboard shortcuts (F1) lists them all.
