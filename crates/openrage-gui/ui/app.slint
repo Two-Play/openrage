@@ -31,6 +31,13 @@ export struct XmlSpan {
     kind: int,
 }
 
+export struct CastRow {
+    kind: string,
+    name: string,
+    // Has a model and an animation to play.
+    playable: bool,
+}
+
 export struct XmlLine {
     number: int,
     spans: [XmlSpan],
@@ -3366,6 +3373,11 @@ export component XmlWindow inherits Window {
     in property <[InfoRow]> fields;
     in property <[XmlLine]> lines;
     in property <string> status;
+    // Cutscenes (.cut): a tab with the cast.
+    in property <bool> is-cutscene;
+    in property <string> cutscene-summary;
+    in property <[CastRow]> cast;
+    callback play-actor(int);
     in-out property <string> filter;
     property <length> tree-width: 380px;
 
@@ -3582,6 +3594,54 @@ export component XmlWindow inherits Window {
                                 font-family: root.mono-font;
                                 font-size: 12px;
                                 color: root.span-color(s.kind);
+                            }
+                        }
+                    }
+                }
+            }
+            Tab {
+                title: root.is-cutscene ? @tr("Cutscene") : @tr("Overview");
+                VerticalLayout {
+                    padding: Theme.space-l;
+                    spacing: Theme.space-s;
+                    Text {
+                        text: root.cutscene-summary;
+                        wrap: word-wrap;
+                        color: Theme.text-muted;
+                    }
+                    ListView {
+                        vertical-stretch: 1;
+                        for a[i] in root.cast: Rectangle {
+                            height: 36px;
+                            background: Math.mod(i, 2) == 1 ? Theme.stripe : transparent;
+                            HorizontalLayout {
+                                padding-left: Theme.space-s;
+                                padding-right: Theme.space-s;
+                                spacing: Theme.space-m;
+                                Text {
+                                    width: 90px;
+                                    text: a.kind;
+                                    vertical-alignment: center;
+                                    color: Theme.text-muted;
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: a.name;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    color: Theme.text;
+                                }
+                                if a.playable: Rectangle {
+                                    width: 150px;
+                                    Button {
+                                        y: (parent.height - self.height) / 2;
+                                        width: parent.width;
+                                        text: @tr("Play animation");
+                                        icon: @image-url("icons/play.svg");
+                                        colorize-icon: true;
+                                        clicked => { root.play-actor(i); }
+                                    }
+                                }
                             }
                         }
                     }

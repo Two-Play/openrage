@@ -62,6 +62,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 | ✨ **Particles** | `.ypt` effect dictionaries: effect, emitter and particle rule names, their textures and models. |
 | 🧱 **Collisions** | `.ybn` collision meshes and shapes in 3D, coloured by material (concrete, metal, grass, …). |
 | 🛣️ **Paths** | Road and footpath networks (`.ynd`), nav meshes (`.ynv`), vehicle and waypoint recordings (`.yvr`, `.ywr`) in 3D. |
+| 🎬 **Cutscenes** | The cast of every cutscene; play any actor with its animation over the whole cutscene. |
 | 📜 **Scripts** | Disassembles compiled game scripts (`.ysc`): functions, jumps, strings and native calls. |
 | 🌐 **Game text** | Edit `.gxt2` text tables in OpenIV's `.oxt` form and save them back losslessly. |
 | 🧩 **Mods, safely** | Changes go to OpenIV's `mods` folder, never into your game files; every change and every `.oiv` package can be undone. |
@@ -128,7 +129,8 @@ Every format is checked against the complete game (GTA V Enhanced):
 - [x] Paths (`.ynd`) and recordings (`.yvr`, `.ywr`) in 3D
 - [x] Nav meshes (`.ynv`) in 3D
 - [x] Scripts (`.ysc`) disassembler
-- [ ] Cutscene viewer, `.gfx`/`.bik` info
+- [x] Cutscenes: cast and actor animations over the whole cutscene
+- [ ] Whole cutscenes in one scene (all actors, camera), `.gfx`/`.bik` info
 - [ ] GTA IV
 - [ ] Red Dead Redemption 2
 
@@ -267,6 +269,10 @@ Collision files (`.ybn`) open like models: the triangle meshes and the spheres, 
 
 Path node files (`.ynd`) show the road and footpath network of their map area: vehicle nodes in blue, pedestrian nodes in orange, with the links between them. Vehicle recordings (`.yvr`, the routes cars drive in missions) and waypoint recordings (`.ywr`, the routes people walk) show their route with start and end marked. Nav meshes (`.ynv`) show where peds can walk, coloured by kind: ground, pavement, road, water, interiors, train tracks and steep slopes. Each part can be hidden or recoloured in the viewer's Materials tab; a few of the game's recordings contain garbage points far outside the map, which are left out.
 
+### Cutscenes
+
+A cutscene (`.cut`) opens in the metadata window with a **Cutscene** tab: its length and its cast — people, vehicles, props, the camera, lights and audio. **Play animation** opens an actor's model in the viewer with its animation over the whole cutscene: the cutscene's sections (`name-0.ycd`, `name-1.ycd`, … 4 seconds each) are joined into one clip per actor. Playing all actors together in one scene, with the cutscene camera, will come later.
+
 ### Scripts
 
 Compiled scripts (`.ysc`) show their name, code size, number of functions, natives, statics and their strings in the preview; double-click opens the disassembly: one instruction per line with its address, functions (with their names where the compiler kept them), labels at jump targets, the text next to every `STRING` and the hash of every native call. Both opcode tables of GTA V (older builds, and newer ones with `STATIC_U24` and `IS_BIT_SET`) are recognised automatically by checking that every jump lands on an instruction.
@@ -332,6 +338,7 @@ openrage model …/adder.yft --render adder.png [--yaw 1.2]      # software-rend
 openrage audio x64/audio/sfx/RADIO_02_POP.rpf/alright.awc --export out/   # sounds → .wav
 openrage clips x64c.rpf/anim/ingame/clip_move_.rpf/move_m@generic.ycd     # clips of a .ycd
 openrage model …/a_m_y_hipster_01.ydd --render pose.png --anim "…/move_m@generic.ycd:walk@0.5"
+openrage model …/csb_bogdan.ydd --render pose.png --anim "…/cuts_sil.rpf/sil_int.cut:csb_bogdan_dual@75"   # cutscene pose
 openrage xml …/ufo.ymap [-o ufo.ymap.xml]      # metadata (.ymap/.ytyp/.ymt/.ymf/.cut/.pso) → XML
 openrage xml …/ufo.ymap --tree                 # the readable structure, as in the GUI
 openrage text …/american_rel.rpf/iap.gxt2 [-o iap.oxt]   # text table → OpenIV .oxt text
