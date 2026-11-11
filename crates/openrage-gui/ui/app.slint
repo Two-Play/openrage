@@ -1022,6 +1022,8 @@ export component AppWindow inherits Window {
     property <bool> can-edit: root.edit-mode && !root.busy && !root.textures-locked;
     // The open texture list belongs to a particle dictionary and cannot be changed.
     in property <bool> textures-locked;
+    // The open texture list is a Red Dead Redemption 2 dictionary (read-only).
+    in property <bool> textures-rdr2;
 
     function apply-theme() {
         Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
@@ -1643,8 +1645,8 @@ export component AppWindow inherits Window {
                     }
                 }
                 if root.texture-mode && root.textures-locked: ContextBar {
-                    title: @tr("Particle textures");
-                    description: @tr("The textures inside a particle dictionary: view and extract them (changing them is not supported yet).");
+                    title: root.textures-rdr2 ? @tr("Red Dead Redemption 2 textures") : @tr("Particle textures");
+                    description: root.textures-rdr2 ? @tr("View and extract them as DDS or PNG (changing them is not supported yet).") : @tr("The textures inside a particle dictionary: view and extract them (changing them is not supported yet).");
                     Button {
                         text: @tr("Save PNG…");
                         icon: @image-url("icons/image.svg");

@@ -168,6 +168,9 @@ enum Command {
         /// List the entries of archives whose table is not encrypted.
         #[arg(long)]
         list: bool,
+        /// Instead of only reading files, parse every texture dictionary and decode every texture.
+        #[arg(long)]
+        textures: bool,
     },
     /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
     Media {
@@ -357,8 +360,8 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if let Command::Rpf8 { path, list } = &cli.command {
-        return cmd_rpf8(path, *list);
+    if let Command::Rpf8 { path, list, textures } = &cli.command {
+        return cmd_rpf8(path, *list, *textures);
     }
     if let Command::Rdr2Names { game, import } = &cli.command {
         return cmd_rdr2_names(game, import.as_deref());
@@ -695,11 +698,14 @@ fn cmd_repack(
 }
 
 fn load_ytd(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<rage_formats::ytd::TextureDictionary> {
-    let Node::ArchiveFile(rpf, id) = vfs::resolve(game_dir, path, keys)? else {
-        bail!("{path} is not a file inside an archive")
-    };
-    let res = rpf.read_resource(id)?;
-    Ok(rage_formats::ytd::parse(&res)?)
+    match vfs::resolve(game_dir, path, keys)? {
+        Node::ArchiveFile(rpf, id) => Ok(rage_formats::ytd::parse(&rpf.read_resource(id)?)?),
+        Node::Rpf8File(rpf, i) => {
+            let entry = &rpf.entries().context("no entries")?[i];
+            Ok(rage_formats::ytd::parse_rdr2(&rpf.read_resource(entry)?)?)
+        }
+        _ => bail!("{path} is not a file inside an archive"),
+    }
 }
 
 fn cmd_textures(
@@ -838,7 +844,9 @@ fn cmd_verify_textures(game_dir: &Path, within: &str, rebuild: bool, keys: Optio
                                 // Structures must match byte for byte, apart from pointers.
                                 let pointers: &[(usize, usize)] = match dict.layout {
                                     rage_formats::ytd::Layout::Legacy => &[(0x28, 0x30), (0x70, 0x78)],
-                                    rage_formats::ytd::Layout::Enhanced => &[(0x28, 0x40)],
+                                    rage_formats::ytd::Layout::Enhanced | rage_formats::ytd::Layout::Rdr2 => {
+                                        &[(0x28, 0x40)]
+                                    }
                                 };
                                 let masked = |t: &[u8]| {
                                     let mut t = t.to_vec();
@@ -2353,7 +2361,7 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
+fn cmd_rpf8(path: &Path, list: bool, textures: bool) -> Result<()> {
     use rage_rpf::rpf8::{Compression, Rpf8};
     let keys = rdr2_keys()?;
     let names = rdr2_game_folder(path)
@@ -2386,9 +2394,28 @@ fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
         readable: usize,
         entries: usize,
         failed: usize,
+        textures: usize,
         lines: Vec<String>,
     }
-    fn walk(rpf: &Rpf8, depth: usize, list: bool, t: &mut Tally) {
+    /// Parses a texture dictionary and decodes all its textures; returns how many.
+    fn check_textures(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
+        let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
+        let dict = rage_formats::ytd::parse_rdr2(&res).map_err(|err| err.to_string())?;
+        if let Some(err) = dict.errors.first() {
+            return Err(format!(
+                "{} of {} textures unreadable, e.g. {err}",
+                dict.errors.len(),
+                dict.errors.len() + dict.textures.len()
+            ));
+        }
+        for t in &dict.textures {
+            if t.to_rgba().is_none() {
+                return Err(format!("{}: cannot decode {}", t.name, t.format.name()));
+            }
+        }
+        Ok(dict.textures.len())
+    }
+    fn walk(rpf: &Rpf8, depth: usize, list: bool, textures: bool, t: &mut Tally) {
         let h = rpf.header();
         let Some(entries) = rpf.entries() else { return };
         t.readable += 1;
@@ -2410,11 +2437,21 @@ fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
                 match rpf.open_child(e) {
                     Ok(child) => {
                         t.nested += 1;
-                        walk(&child, depth + 1, list, t);
+                        walk(&child, depth + 1, list, textures, t);
                     }
                     Err(err) => {
                         t.failed += 1;
                         t.lines.push(format!("{indent}{name}: {err}"));
+                    }
+                }
+            } else if textures {
+                if e.ext_id == 5 && e.is_resource {
+                    match check_textures(rpf, e) {
+                        Ok(n) => t.textures += n,
+                        Err(err) => {
+                            t.failed += 1;
+                            t.lines.push(format!("{indent}{name}: {err}"));
+                        }
                     }
                 }
             } else if let Err(err) = rpf.read(e) {
@@ -2458,7 +2495,7 @@ fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
                             h.platform,
                             rpf.size()
                         ));
-                        walk(&rpf, 0, list, &mut t);
+                        walk(&rpf, 0, list, textures, &mut t);
                     }
                     Err(e) => {
                         t.failed += 1;
@@ -2470,6 +2507,7 @@ fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
             .collect()
     };
     let (mut ok, mut nested, mut plain, mut entries_total, mut failed, mut empty) = (0, 0, 0, 0usize, 0, 0);
+    let mut textures_total = 0;
     for (_, t) in &tallies {
         for l in &t.lines {
             outln!("{l}");
@@ -2482,6 +2520,10 @@ fn cmd_rpf8(path: &Path, list: bool) -> Result<()> {
         plain += t.readable;
         entries_total += t.entries;
         failed += t.failed;
+        textures_total += t.textures;
+    }
+    if textures {
+        outln!("\n{textures_total} textures decoded");
     }
     outln!(
         "\n{ok} archives read ({nested} more nested in them), {empty} empty, {failed} failed; {plain} with a readable table ({entries_total} entries).{}",
