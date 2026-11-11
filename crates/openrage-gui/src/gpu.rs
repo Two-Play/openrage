@@ -6,6 +6,7 @@
 //! If no GPU is available, callers fall back to the software renderer.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use openrage_app::models::{LoadedModel, Look};
@@ -28,6 +29,9 @@ struct Globals {
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var samp: sampler;
+// Overlay drawn over the base colour with its alpha, on the second UV set
+// (vehicle liveries and signs); transparent when there is none.
+@group(1) @binding(2) var overlay: texture_2d<f32>;
 // Material colour, multiplied with the texture.
 @group(2) @binding(0) var<uniform> tint: vec4<f32>;
 // Skinning matrices per skeleton bone (identity when not animated).
@@ -39,11 +43,13 @@ struct VsIn {
     @location(2) uv: vec2<f32>,
     @location(3) weights: vec4<f32>,
     @location(4) joints: vec4<u32>,
+    @location(5) uv1: vec2<f32>,
 };
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) uv: vec2<f32>,
+    @location(2) uv1: vec2<f32>,
 };
 
 @vertex
@@ -61,6 +67,7 @@ fn vs_main(v: VsIn) -> VsOut {
     o.clip = globals.view_proj * pos;
     o.normal = normal;
     o.uv = v.uv;
+    o.uv1 = v.uv1;
     return o;
 }
 
@@ -77,7 +84,9 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
     n = normalize(n);
     // Headlight plus a little sky light; double-sided.
     let light = 0.25 + 0.65 * abs(dot(n, globals.forward.xyz)) + 0.1 * max(n.z, 0.0);
-    return vec4<f32>(base.rgb * tint.rgb * light, 1.0);
+    let layer = textureSample(overlay, samp, i.uv1);
+    let colour = mix(base.rgb * tint.rgb, layer.rgb, layer.a);
+    return vec4<f32>(colour * light, 1.0);
 }
 "#;
 
@@ -89,6 +98,7 @@ struct Vertex {
     uv: [f32; 2],
     weights: [f32; 4],
     joints: [u32; 4],
+    uv1: [f32; 2],
 }
 
 #[repr(C)]
@@ -110,7 +120,9 @@ struct Gpu {
     tint_stride: u64,
     sampler: wgpu::Sampler,
     /// White 1×1 texture for untextured meshes (their colour is the tint).
-    plain: wgpu::BindGroup,
+    white: wgpu::TextureView,
+    /// Transparent 1×1 texture for meshes without an overlay.
+    clear: wgpu::TextureView,
 }
 
 struct Draw {
@@ -127,7 +139,8 @@ struct Draw {
 struct GpuModel {
     owner: Weak<crate::ModelPreview>,
     draws: Vec<Draw>,
-    /// Bind groups: 0 is the plain texture, then one per decoded image.
+    /// Bind groups: 0 is the plain texture, then one per pair of decoded
+    /// images (base colour, overlay).
     textures: Vec<wgpu::BindGroup>,
 }
 
@@ -205,6 +218,16 @@ fn init() -> Option<Gpu> {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     });
     let tint_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -249,7 +272,7 @@ fn init() -> Option<Gpu> {
             buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<Vertex>() as u64,
                 step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Uint32x4],
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Uint32x4, 5 => Float32x2],
             })],
         },
         primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
@@ -281,7 +304,8 @@ fn init() -> Option<Gpu> {
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
-    let plain = texture_bind_group_raw(&device, &queue, &texture_layout, &sampler, 1, 1, &[255, 255, 255, 255]);
+    let white = upload_texture(&device, &queue, 1, 1, &[255, 255, 255, 255]);
+    let clear = upload_texture(&device, &queue, 1, 1, &[0, 0, 0, 0]);
     Some(Gpu {
         device,
         queue,
@@ -292,19 +316,13 @@ fn init() -> Option<Gpu> {
         skin_layout,
         tint_stride,
         sampler,
-        plain,
+        white,
+        clear,
     })
 }
 
-fn texture_bind_group_raw(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    layout: &wgpu::BindGroupLayout,
-    sampler: &wgpu::Sampler,
-    w: u32,
-    h: u32,
-    rgba: &[u8],
-) -> wgpu::BindGroup {
+/// Uploads RGBA pixels as a texture.
+fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, rgba: &[u8]) -> wgpu::TextureView {
     let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
@@ -328,21 +346,29 @@ fn texture_bind_group_raw(
         wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
         size,
     );
-    let view = texture.create_view(&Default::default());
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
+    texture.create_view(&Default::default())
+}
+
+/// A material's textures: base colour and overlay.
+fn texture_bind_group(gpu: &Gpu, base: &wgpu::TextureView, overlay: &wgpu::TextureView) -> wgpu::BindGroup {
+    gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
-        layout,
+        layout: &gpu.texture_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(base) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&gpu.sampler) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(overlay) },
         ],
     })
 }
 
 /// Uploads every part of the model (placements baked into the vertices).
 fn upload(gpu: &Gpu, model: &LoadedModel, materials: &Materials) -> (Vec<Draw>, Vec<wgpu::BindGroup>) {
-    let mut textures = vec![gpu.plain.clone()];
-    let mut texture_of: Vec<(usize, usize)> = Vec::new(); // material image index → bind group
+    let mut textures = vec![texture_bind_group(gpu, &gpu.white, &gpu.clear)];
+    // Material image index → uploaded texture; (base, overlay) image indices → bind group.
+    let mut views: HashMap<usize, wgpu::TextureView> = HashMap::new();
+    let mut texture_of: HashMap<(Option<usize>, Option<usize>), usize> = HashMap::new();
+    texture_of.insert((None, None), 0);
     let mut draws = Vec::new();
     for (part_index, part) in model.parts.iter().enumerate() {
         let Some((_, d)) = model.drawables.get(part.drawable) else { continue };
@@ -352,6 +378,7 @@ fn upload(gpu: &Gpu, model: &LoadedModel, materials: &Materials) -> (Vec<Draw>, 
             }
             let has_n = mesh.normals.len() == mesh.positions.len();
             let has_uv = mesh.uvs.len() == mesh.positions.len();
+            let has_uv1 = mesh.uvs1.len() == mesh.positions.len();
             let skinned = mesh.bone_weights.len() == mesh.positions.len();
             let bone = part.bone.map(|b| b as u32);
             let vertices: Vec<Vertex> = (0..mesh.positions.len())
@@ -370,27 +397,24 @@ fn upload(gpu: &Gpu, model: &LoadedModel, materials: &Materials) -> (Vec<Draw>, 
                         None if skinned => mesh.bone_indices[i].map(u32::from),
                         None => [0; 4],
                     },
+                    uv1: if has_uv1 { mesh.uvs1[i] } else { [0.0; 2] },
                 })
                 .collect();
-            let texture = match materials.texture(part.drawable, mesh.shader) {
-                Some((image, w, h, rgba)) if has_uv => match texture_of.iter().find(|(i, _)| *i == image) {
-                    Some((_, bg)) => *bg,
-                    None => {
-                        textures.push(texture_bind_group_raw(
-                            &gpu.device,
-                            &gpu.queue,
-                            &gpu.texture_layout,
-                            &gpu.sampler,
-                            w as u32,
-                            h as u32,
-                            rgba,
-                        ));
-                        texture_of.push((image, textures.len() - 1));
-                        textures.len() - 1
-                    }
-                },
-                _ => 0,
+            let base = materials.texture(part.drawable, mesh.shader).filter(|_| has_uv);
+            let overlay = materials.overlay(part.drawable, mesh.shader).filter(|_| has_uv1);
+            let mut view = |image: Option<(usize, usize, usize, &[u8])>| {
+                image.map(|(i, w, h, rgba)| {
+                    views.entry(i).or_insert_with(|| upload_texture(&gpu.device, &gpu.queue, w as u32, h as u32, rgba));
+                    i
+                })
             };
+            let key = (view(base), view(overlay));
+            let texture = *texture_of.entry(key).or_insert_with(|| {
+                let base = key.0.map_or(&gpu.white, |i| &views[&i]);
+                let overlay = key.1.map_or(&gpu.clear, |i| &views[&i]);
+                textures.push(texture_bind_group(gpu, base, overlay));
+                textures.len() - 1
+            });
             draws.push(Draw {
                 part: part_index,
                 drawable: part.drawable,
@@ -650,4 +674,17 @@ pub fn render(
 /// thread-local state is gone once thread-locals are destroyed.
 pub fn shutdown() {
     let _ = STATE.try_with(|state| state.take());
+}
+
+#[cfg(test)]
+mod tests {
+    use wgpu::naga;
+
+    #[test]
+    fn shader_is_valid_wgsl() {
+        let module = naga::front::wgsl::parse_str(super::SHADER).expect("WGSL parses");
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+            .validate(&module)
+            .expect("WGSL validates");
+    }
 }

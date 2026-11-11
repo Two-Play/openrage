@@ -464,7 +464,19 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         win.set_anim_results(ModelRc::new(VecModel::from(rows)));
         state.borrow_mut().results = vec![ycd];
         win.invoke_anim_open(0);
-        win.invoke_anim_select(0);
+        // The clip that moves most of this model's bones (in a cutscene: its own).
+        let best = {
+            let st = state.borrow();
+            let skeleton = st.model().and_then(|m| m.loaded.skeleton.as_ref());
+            match (st.anim.as_ref(), skeleton) {
+                (Some(a), Some(sk)) => {
+                    let tags: std::collections::HashSet<u16> = sk.bones.iter().map(|b| b.tag).collect();
+                    openrage_app::suggest::best_clip(&openrage_app::suggest::clip_tags(&a.dict), &tags, &win.get_path())
+                }
+                _ => 0,
+            }
+        };
+        win.invoke_anim_select(best as i32);
         win.set_panel_tab(3);
     } else if has_skeleton {
         // Suggest the generic movement clips for peds.
