@@ -153,10 +153,16 @@ component IconButton inherits Rectangle {
     }
 }
 
+// A vertical divider for toolbars: fills the row's height (layouts override
+// `y`), with a 20px line centered in it.
 component VSeparator inherits Rectangle {
     width: 1px;
-    height: 20px;
-    background: Theme.border;
+    Rectangle {
+        y: (parent.height - self.height) / 2;
+        width: 1px;
+        height: min(20px, parent.height);
+        background: Theme.border;
+    }
 }
 
 component Splitter inherits Rectangle {
@@ -250,8 +256,12 @@ component TreeItem inherits Rectangle {
 
 component FileItem inherits Rectangle {
     in property <FileRow> item;
-    // Search results show a stretching location column instead of the fixed type column.
+    // Search results show a location column instead of the type column.
     in property <bool> wide-kind;
+    // Column widths, set by dragging the header's dividers.
+    in property <length> kind-width: 110px;
+    in property <length> size-width: 72px;
+    in property <length> info-width: 96px;
     in property <bool> selected;
     in property <bool> focused;
     in property <bool> odd;
@@ -399,11 +409,8 @@ component FileItem inherits Rectangle {
                 }
             }
             Rectangle {
-                // Fixed type column, or a stretching location column for search results.
-                horizontal-stretch: root.wide-kind ? 2 : 0;
-                min-width: root.wide-kind ? 60px : 100px;
-                preferred-width: 100px;
-                max-width: root.wide-kind ? 100000px : 100px;
+                // Type column, or the location column for search results.
+                width: root.kind-width;
                 Text {
                     width: 100%;
                     text: item.kind;
@@ -413,14 +420,14 @@ component FileItem inherits Rectangle {
                 }
             }
             Text {
-                width: 72px;
+                width: root.size-width;
                 text: item.size;
                 vertical-alignment: center;
                 horizontal-alignment: right;
                 color: root.fg;
             }
             Text {
-                width: 96px;
+                width: root.info-width;
                 text: item.info;
                 vertical-alignment: center;
                 overflow: elide;
@@ -435,12 +442,35 @@ component HeaderCell inherits Rectangle {
     in property <bool> active;
     in property <bool> descending;
     in property <TextHorizontalAlignment> align: left;
+    // A divider on the left edge widens (drag left) or narrows the column.
+    in property <bool> resizable;
     callback clicked();
+    callback resized(length);
     accessible-role: button;
     accessible-label: root.label;
     accessible-action-default => { root.clicked(); }
     ta := TouchArea {
         clicked => { root.clicked(); }
+    }
+    if root.resizable: Rectangle {
+        x: -Theme.space-s / 2 - 3px;
+        width: 6px;
+        background: grip.has-hover || grip.pressed ? Theme.accent : transparent;
+        Rectangle {
+            x: (parent.width - 1px) / 2;
+            y: 4px;
+            width: 1px;
+            height: parent.height - 8px;
+            background: Theme.border;
+        }
+        grip := TouchArea {
+            mouse-cursor: col-resize;
+            moved => {
+                if (self.pressed) {
+                    root.resized(self.pressed-x - self.mouse-x);
+                }
+            }
+        }
     }
     Text {
         width: 100%;
@@ -919,6 +949,11 @@ export component AppWindow inherits Window {
     init => { root.apply-theme(); }
 
     property <length> tree-width: 260px;
+    // File list columns (the name column takes the rest); resizable in the header.
+    property <length> col-kind-width: 110px;
+    property <length> col-location-width: 320px;
+    property <length> col-size-width: 72px;
+    property <length> col-info-width: 96px;
     property <length> preview-width: 460px;
     property <bool> has-selection: root.file-selected >= 0;
     property <bool> can-view: (root.model-mode || (root.has-image && root.image-viewable)) && !root.audio-mode;
@@ -943,12 +978,25 @@ export component AppWindow inherits Window {
 
     public function select-row(i: int) {
         root.file-select(i);
-        // Keep the selected row in view.
-        if (i * Theme.row-height < -list.content-y) {
-            list.content-y = -i * Theme.row-height;
-        } else if ((i + 1) * Theme.row-height > list.visible-height - list.content-y) {
-            list.content-y = list.visible-height - (i + 1) * Theme.row-height;
+        root.reveal-row(i);
+    }
+
+    // Scrolls the file list just enough to show row `i`.
+    function reveal-row(i: int) {
+        if (i < 0) {
+            return;
         }
+        // One row of context stays visible above and below the selection.
+        if (max(0, i - 1) * Theme.row-height < -list.content-y) {
+            list.content-y = -max(0, i - 1) * Theme.row-height;
+        } else if ((i + 2) * Theme.row-height > list.visible-height - list.content-y) {
+            list.content-y = min(0, list.visible-height - min(i + 2, root.files.length) * Theme.row-height);
+        }
+    }
+
+    // Selections made by the app (opening a path, Back, sorting, …) are kept in view too.
+    changed file-selected => {
+        root.reveal-row(root.file-selected);
     }
 
     function move-selection(delta: int) {
@@ -1306,9 +1354,7 @@ export component AppWindow inherits Window {
                     accessible-label: @tr("Search");
                     accepted(text) => { root.search(text); }
                 }
-                VSeparator {
-                    y: (parent.height - self.height) / 2;
-                }
+                VSeparator { }
                 if root.mods-available: Button {
                     text: @tr("Mods");
                     checkable: true;
@@ -1331,9 +1377,7 @@ export component AppWindow inherits Window {
                     colorize-icon: true;
                     clicked => { root.show-history(); }
                 }
-                VSeparator {
-                    y: (parent.height - self.height) / 2;
-                }
+                VSeparator { }
                 Button {
                     text: root.edit-mode ? @tr("Editing") : @tr("Read-only");
                     icon: root.edit-mode ? @image-url("icons/unlock.svg") : @image-url("icons/lock.svg");
@@ -1514,9 +1558,7 @@ export component AppWindow inherits Window {
                         enabled: root.entry-selected && root.can-edit;
                         clicked => { root.archive-rename(); }
                     }
-                    if root.edit-mode: VSeparator {
-                        y: (parent.height - self.height) / 2;
-                    }
+                    if root.edit-mode: VSeparator { }
                     if root.edit-mode: IconButton {
                         y: (parent.height - self.height) / 2;
                         icon: @image-url("icons/trash.svg");
@@ -1560,9 +1602,7 @@ export component AppWindow inherits Window {
                         enabled: root.texture-selected && root.can-edit;
                         clicked => { root.texture-replace(); }
                     }
-                    if root.edit-mode: VSeparator {
-                        y: (parent.height - self.height) / 2;
-                    }
+                    if root.edit-mode: VSeparator { }
                     if root.edit-mode: IconButton {
                         y: (parent.height - self.height) / 2;
                         icon: @image-url("icons/trash.svg");
@@ -1619,17 +1659,24 @@ export component AppWindow inherits Window {
                                     clicked => { root.sort-by(0); }
                                 }
                                 HeaderCell {
-                                    horizontal-stretch: root.search-mode ? 2 : 0;
-                                    min-width: root.search-mode ? 60px : 100px;
-                                    preferred-width: 100px;
-                                    max-width: root.search-mode ? 100000px : 100px;
+                                    width: root.search-mode ? root.col-location-width : root.col-kind-width;
+                                    resizable: true;
+                                    resized(d) => {
+                                        if (root.search-mode) {
+                                            root.col-location-width = max(60px, min(900px, root.col-location-width + d));
+                                        } else {
+                                            root.col-kind-width = max(60px, min(400px, root.col-kind-width + d));
+                                        }
+                                    }
                                     label: root.search-mode ? @tr("Location") : @tr("Type");
                                     active: !root.search-mode && root.sort-column == 1;
                                     descending: root.sort-descending;
                                     clicked => { root.sort-by(1); }
                                 }
                                 HeaderCell {
-                                    width: 72px;
+                                    width: root.col-size-width;
+                                    resizable: true;
+                                    resized(d) => { root.col-size-width = max(48px, min(200px, root.col-size-width + d)); }
                                     align: right;
                                     label: @tr("Size");
                                     active: root.sort-column == 2;
@@ -1637,7 +1684,9 @@ export component AppWindow inherits Window {
                                     clicked => { root.sort-by(2); }
                                 }
                                 HeaderCell {
-                                    width: 96px;
+                                    width: root.col-info-width;
+                                    resizable: true;
+                                    resized(d) => { root.col-info-width = max(48px, min(400px, root.col-info-width + d)); }
                                     label: @tr("Info");
                                     active: root.sort-column == 3;
                                     descending: root.sort-descending;
@@ -1712,6 +1761,9 @@ export component AppWindow inherits Window {
                                     for row[i] in root.files: FileItem {
                                         item: row;
                                         wide-kind: root.search-mode;
+                                        kind-width: root.search-mode ? root.col-location-width : root.col-kind-width;
+                                        size-width: root.col-size-width;
+                                        info-width: root.col-info-width;
                                         odd: Math.mod(i, 2) == 1;
                                         selected: i == root.file-selected;
                                         focused: list-scope.has-focus;
@@ -3245,6 +3297,13 @@ export component EditorWindow inherits Window {
 
     init => {
         root.apply-theme();
+        editor.focus();
+    }
+
+    // Puts the cursor at the start and scrolls back to the top left; the text
+    // field scrolls to the cursor while it is still being laid out.
+    public function reset-view() {
+        editor.set-selection-offsets(0, 0);
         editor.focus();
     }
 }
