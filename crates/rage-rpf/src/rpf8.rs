@@ -303,6 +303,22 @@ impl Rpf8 {
         Ok(rpf)
     }
 
+    /// Reads a resource entry as a [`rage_resource::Resource`]: virtual
+    /// pages, then physical pages, sized by the entry's flags.
+    pub fn read_resource(&self, entry: &Entry) -> Result<rage_resource::Resource, RpfError> {
+        let name = format!("{}/{}", self.display, entry.display_name(self.header.platform));
+        let Some(version) = entry.resource_version() else {
+            return Err(RpfError::NotFound(format!("{name} is not a resource")));
+        };
+        let mut pages = self.read(entry)?;
+        let virtual_len = (entry.size_or_flags & 0xFFFF_FFF0) as usize;
+        if pages.len() < virtual_len {
+            return Err(RpfError::BadResource { path: name, reason: "shorter than its virtual pages".into() });
+        }
+        let graphics = pages.split_off(virtual_len);
+        Ok(rage_resource::Resource { version, system: pages, graphics })
+    }
+
     /// Whether a file starts with the RPF8 magic.
     pub fn file_is_rpf8(path: &Path) -> bool {
         let mut head = [0u8; HEADER_LEN as usize];

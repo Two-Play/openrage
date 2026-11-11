@@ -1120,6 +1120,10 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
     ui.set_textures_locked(with_app(|a| {
         matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { read_only: true, .. }))
     }));
+    ui.set_textures_rdr2(with_app(|a| {
+        matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { .. }))
+            && a.game_dir.as_deref().is_some_and(is_rdr2_dir)
+    }));
     ui.set_texture_selected(texture_mode && selected_row.is_some());
     let history_mode = with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::History)));
     ui.set_history_mode(history_mode);

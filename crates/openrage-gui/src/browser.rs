@@ -245,6 +245,9 @@ pub fn list(
         }
         Node::ArchiveDir(rpf, dir) => Ok((list_archive(vpath, rpf, dir, origin), None)),
         Node::Rpf8Dir(rpf, dir) => Ok((list_rpf8(vpath, rpf, dir, origin), None)),
+        Node::Rpf8File(rpf, i) if is_texture_dict(&rpf.entry_name(i)) => {
+            Ok((list_rpf8_textures(vpath, rpf, i, origin)?, None))
+        }
         Node::ArchiveFile(..) | Node::PlainFile(_) | Node::Rpf8File(..) => {
             let name = last_segment(&vpath);
             let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys, overlay)?;
@@ -316,6 +319,29 @@ fn list_textures(vpath: String, rpf: Arc<Rpf7>, id: EntryId, origin: Origin) -> 
         })
         .collect();
     Ok(Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict), read_only }, items })
+}
+
+/// The textures of a Red Dead Redemption 2 texture dictionary (read-only).
+fn list_rpf8_textures(vpath: String, rpf: Arc<rage_rpf::Rpf8>, i: usize, origin: Origin) -> Result<Listing, RpfError> {
+    let entry = rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| RpfError::NotFound(vpath.clone()))?;
+    let res = rpf.read_resource(entry)?;
+    let dict = rage_formats::ytd::parse_rdr2(&res)
+        .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
+    let items = dict
+        .textures
+        .iter()
+        .map(|t| Item {
+            name: t.name.clone(),
+            kind: ItemKind::Texture,
+            size: t.data.len() as u64,
+            info: format!("{}×{} {}", t.width, t.height, t.format.name()),
+            entry: None,
+            vpath: None,
+            mark: None,
+            detail: None,
+        })
+        .collect();
+    Ok(Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict), read_only: true }, items })
 }
 
 fn list_audio(

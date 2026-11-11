@@ -259,6 +259,28 @@ impl Texture {
             return Some(out);
         }
         let (row, _) = self.format.pitch(self.width, self.height)?;
+        // Single-channel floats (heights, densities) are scaled from their own range to grey.
+        if matches!(self.format.0, 41 | 54) {
+            let mut values = Vec::with_capacity(w * h);
+            for y in 0..h {
+                let line = &src[y * row..];
+                for x in 0..w {
+                    values.push(if self.format.0 == 41 {
+                        f32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?)
+                    } else {
+                        half(u16::from_le_bytes([line[x * 2], line[x * 2 + 1]]))
+                    });
+                }
+            }
+            let finite = values.iter().copied().filter(|v| v.is_finite());
+            let (lo, hi) = finite.fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+            let span = if hi > lo { hi - lo } else { 1.0 };
+            for (o, v) in out.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+                let g = unit((v - lo) / span);
+                o.copy_from_slice(&[g, g, g, 255]);
+            }
+            return Some(out);
+        }
         for y in 0..h {
             let line = &src[y * row..];
             for x in 0..w {
@@ -274,6 +296,45 @@ impl Texture {
                         [p[2], p[1], p[0], 255]
                     }
                     61 => [line[x], line[x], line[x], 255],
+                    // Floating-point formats: shown with values clamped to 0..1
+                    // (single-channel heights are scaled to their range below).
+                    41 => {
+                        let v = f32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?);
+                        let g = unit(v);
+                        [g, g, g, 255]
+                    }
+                    54 => {
+                        let v = half(u16::from_le_bytes([line[x * 2], line[x * 2 + 1]]));
+                        let g = unit(v);
+                        [g, g, g, 255]
+                    }
+                    10 => {
+                        let c =
+                            |i: usize| unit(half(u16::from_le_bytes([line[x * 8 + i * 2], line[x * 8 + i * 2 + 1]])));
+                        [c(0), c(1), c(2), c(3)]
+                    }
+                    2 => {
+                        let c = |i: usize| {
+                            unit(f32::from_le_bytes(
+                                line[x * 16 + i * 4..x * 16 + i * 4 + 4].try_into().unwrap_or_default(),
+                            ))
+                        };
+                        [c(0), c(1), c(2), c(3)]
+                    }
+                    26 => {
+                        let v = u32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?);
+                        [
+                            unit(small_float(v & 0x7FF, 6)),
+                            unit(small_float((v >> 11) & 0x7FF, 6)),
+                            unit(small_float(v >> 22, 5)),
+                            255,
+                        ]
+                    }
+                    24 => {
+                        let v = u32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?);
+                        let c = |s: u32| ((v >> s & 0x3FF) * 255 / 0x3FF) as u8;
+                        [c(0), c(10), c(20), ((v >> 30) * 85) as u8]
+                    }
                     65 => [255, 255, 255, line[x]],
                     49 => [line[x * 2], line[x * 2 + 1], 0, 255],
                     56 => {
@@ -298,6 +359,34 @@ impl Texture {
             }
         }
         Some(out)
+    }
+}
+
+/// A value clamped to 0..1 as an 8-bit channel.
+fn unit(v: f32) -> u8 {
+    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+/// IEEE half-precision float.
+fn half(h: u16) -> f32 {
+    let sign = if h >> 15 == 1 { -1.0 } else { 1.0 };
+    let exp = (h >> 10) & 0x1F;
+    let man = (h & 0x3FF) as f32;
+    sign * match exp {
+        0 => man * 2f32.powi(-24),
+        31 => f32::INFINITY,
+        e => (1.0 + man / 1024.0) * 2f32.powi(e as i32 - 15),
+    }
+}
+
+/// An unsigned small float (R11G11B10): 5-bit exponent, `man_bits` mantissa bits.
+fn small_float(v: u32, man_bits: u32) -> f32 {
+    let exp = (v >> man_bits) & 0x1F;
+    let man = (v & ((1 << man_bits) - 1)) as f32 / (1u32 << man_bits) as f32;
+    match exp {
+        0 => man * 2f32.powi(-14),
+        31 => f32::INFINITY,
+        e => (1.0 + man) * 2f32.powi(e as i32 - 15),
     }
 }
 
