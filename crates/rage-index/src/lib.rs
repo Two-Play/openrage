@@ -88,6 +88,22 @@ impl Index {
         &self.path
     }
 
+    /// Every file whose name ends with one of `extensions` (lowercase, with
+    /// the dot): (name, virtual path).
+    pub fn files_with_extensions(&self, extensions: &[&str]) -> Result<Vec<(String, String)>, IndexError> {
+        let mut out = Vec::new();
+        let mut stmt = self.conn.prepare("SELECT name, vpath FROM entries")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (name, vpath) = row?;
+            let lower = name.to_ascii_lowercase();
+            if extensions.iter().any(|e| lower.ends_with(e)) {
+                out.push((lower, vpath));
+            }
+        }
+        Ok(out)
+    }
+
     /// Every name the index knows: file names without their extension and the
     /// strings of the hash dictionary; used to turn hashes back into names.
     pub fn known_names(&self) -> Result<Vec<String>, IndexError> {

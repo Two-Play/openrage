@@ -73,10 +73,29 @@ pub struct Actor {
     pub type_file: Option<String>,
 }
 
+/// A light of the cutscene, in scene coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Light {
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+    /// Reach in metres.
+    pub range: f32,
+    /// Full cone angle in degrees (spot lights).
+    pub cone: f32,
+    pub spot: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Cutscene {
+    /// The cutscene's lights.
+    pub lights: Vec<Light>,
     /// Length in seconds.
     pub duration: f32,
+    /// Where the scene's origin is in the world, and its rotation about Z (degrees).
+    pub offset: [f32; 3],
+    pub rotation: f32,
     pub actors: Vec<Actor>,
 }
 
@@ -169,7 +188,36 @@ pub fn from_xml(xml: &str) -> Result<Cutscene> {
             actors.push(Actor { kind, name: name.to_owned(), object_type, type_file });
         }
     }
-    Ok(Cutscene { duration: duration.unwrap_or(0.0), actors })
+    let offset = child(root, "vOffset")
+        .and_then(|n| {
+            Some([n.attribute("x")?.parse().ok()?, n.attribute("y")?.parse().ok()?, n.attribute("z")?.parse().ok()?])
+        })
+        .unwrap_or([0.0; 3]);
+    let rotation = child(root, "fRotation").and_then(|n| n.attribute("value")?.parse().ok()).unwrap_or(0.0);
+    let mut lights = Vec::new();
+    if let Some(objects) = child(root, "pCutsceneObjects") {
+        let v3 = |n: roxmltree::Node, name: &str| -> Option<[f32; 3]> {
+            let c = child(n, name)?;
+            Some([c.attribute("x")?.parse().ok()?, c.attribute("y")?.parse().ok()?, c.attribute("z")?.parse().ok()?])
+        };
+        let f = |n: roxmltree::Node, name: &str| -> Option<f32> { child(n, name)?.attribute("value")?.parse().ok() };
+        for item in objects.children().filter(|c| c.has_tag_name("Item")) {
+            if Kind::of(item.attribute("type").unwrap_or_default()) != Kind::Light {
+                continue;
+            }
+            let Some(position) = v3(item, "vPosition") else { continue };
+            lights.push(Light {
+                position,
+                direction: v3(item, "vDirection").unwrap_or([0.0, 0.0, -1.0]),
+                color: v3(item, "vColour").unwrap_or([1.0; 3]),
+                intensity: f(item, "fIntensity").unwrap_or(1.0),
+                range: f(item, "fFallOff").unwrap_or(5.0).max(0.1),
+                cone: f(item, "fConeAngle").unwrap_or(60.0),
+                spot: f(item, "iLightType").is_some_and(|t| t == 2.0),
+            });
+        }
+    }
+    Ok(Cutscene { duration: duration.unwrap_or(0.0), offset, rotation, actors, lights })
 }
 
 /// The clip of every actor in a joined cutscene animation: the k-th actor

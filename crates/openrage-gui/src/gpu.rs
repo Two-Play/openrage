@@ -23,10 +23,19 @@ const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 const SHADER: &str = r#"
+struct Light {
+    // xyz: position, w: range
+    position: vec4<f32>,
+    // rgb: colour × strength, a: 1 for a spot light
+    color: vec4<f32>,
+    // xyz: direction, w: cosine of half the cone angle
+    direction: vec4<f32>,
+};
 struct Globals {
     view_proj: mat4x4<f32>,
-    // xyz: viewing direction (headlight)
+    // xyz: viewing direction (headlight), w: number of lights
     forward: vec4<f32>,
+    lights: array<Light, 16>,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var tex: texture_2d<f32>;
@@ -57,6 +66,7 @@ struct VsOut {
     @location(0) normal: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) uv1: vec2<f32>,
+    @location(3) world: vec3<f32>,
 };
 
 @vertex
@@ -71,7 +81,9 @@ fn vs_main(v: VsIn) -> VsOut {
         pos = m * pos;
         normal = (m * vec4<f32>(normal, 0.0)).xyz;
     }
-    o.clip = globals.view_proj * draw.model * pos;
+    let world = draw.model * pos;
+    o.clip = globals.view_proj * world;
+    o.world = world.xyz;
     o.normal = (draw.model * vec4<f32>(normal, 0.0)).xyz;
     o.uv = v.uv;
     o.uv1 = v.uv1;
@@ -90,7 +102,28 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
     }
     n = normalize(n);
     // Headlight plus a little sky light; double-sided.
-    let light = 0.25 + 0.65 * abs(dot(n, globals.forward.xyz)) + 0.1 * max(n.z, 0.0);
+    var light = vec3<f32>(0.25 + 0.65 * abs(dot(n, globals.forward.xyz)) + 0.1 * max(n.z, 0.0));
+    let count = u32(globals.forward.w);
+    if (count > 0u) {
+        // With scene lights the headlight is dimmer and the lights add up.
+        light = vec3<f32>(0.22 + 0.3 * abs(dot(n, globals.forward.xyz)) + 0.05 * max(n.z, 0.0));
+        for (var k = 0u; k < min(count, 16u); k = k + 1u) {
+            let l = globals.lights[k];
+            let to = l.position.xyz - i.world;
+            let d = length(to);
+            if (d >= l.position.w || d < 1e-4) {
+                continue;
+            }
+            let dir = to / d;
+            let fall = 1.0 - d / l.position.w;
+            var amount = fall * fall * abs(dot(n, dir));
+            if (l.color.a > 0.5) {
+                let c = dot(-dir, normalize(l.direction.xyz));
+                amount = amount * smoothstep(l.direction.w, mix(l.direction.w, 1.0, 0.3), c);
+            }
+            light = light + l.color.rgb * amount;
+        }
+    }
     let layer = textureSample(overlay, samp, i.uv1);
     let colour = mix(base.rgb * draw.tint.rgb, layer.rgb, layer.a);
     return vec4<f32>(colour * light, 1.0);
@@ -110,9 +143,31 @@ struct Vertex {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuLight {
+    position: [f32; 4],
+    color: [f32; 4],
+    direction: [f32; 4],
+}
+
+/// The most lights a scene uses at once.
+pub const MAX_LIGHTS: usize = 16;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Globals {
     view_proj: [f32; 16],
     forward: [f32; 4],
+    lights: [GpuLight; MAX_LIGHTS],
+}
+
+/// A light of a scene: position, colour × strength, reach, and for spot
+/// lights the direction and full cone angle.
+#[derive(Debug, Clone, Copy)]
+pub struct SceneLight {
+    pub position: [f32; 3],
+    pub color: [f32; 3],
+    pub range: f32,
+    pub spot: Option<([f32; 3], f32)>,
 }
 
 struct Gpu {
@@ -523,7 +578,7 @@ pub fn render(
     w: u32,
     h: u32,
 ) -> Option<slint::Image> {
-    render_scene(&[SceneItem { preview, look, model: math::IDENTITY, skin }], camera, w, h)
+    render_scene(&[SceneItem { preview, look, model: math::IDENTITY, skin }], &[], camera, w, h)
 }
 
 /// One model of a scene: what is shown, where it stands and its pose.
@@ -537,7 +592,13 @@ pub struct SceneItem<'a> {
 
 /// Renders several models (each with its own placement and pose) from
 /// `camera`, e.g. all actors of a cutscene.
-pub fn render_scene(items: &[SceneItem], camera: &Camera, w: u32, h: u32) -> Option<slint::Image> {
+pub fn render_scene(
+    items: &[SceneItem],
+    lights: &[SceneLight],
+    camera: &Camera,
+    w: u32,
+    h: u32,
+) -> Option<slint::Image> {
     STATE.with(|state| {
         let mut st = state.borrow_mut();
         let st = &mut *st;
@@ -563,9 +624,22 @@ pub fn render_scene(items: &[SceneItem], camera: &Camera, w: u32, h: u32) -> Opt
 
         let near = (camera.distance * 0.01).max(0.001);
         let far = camera.distance + camera.radius * 4.0 + 1.0;
+        let mut gpu_lights = [<GpuLight as bytemuck::Zeroable>::zeroed(); MAX_LIGHTS];
+        for (slot, l) in gpu_lights.iter_mut().zip(lights) {
+            let (dir, cos) = match l.spot {
+                Some((d, cone)) => (d, (cone.to_radians() / 2.0).cos()),
+                None => ([0.0, 0.0, -1.0], -1.0),
+            };
+            *slot = GpuLight {
+                position: [l.position[0], l.position[1], l.position[2], l.range],
+                color: [l.color[0], l.color[1], l.color[2], if l.spot.is_some() { 1.0 } else { 0.0 }],
+                direction: [dir[0], dir[1], dir[2], cos],
+            };
+        }
         let globals = Globals {
             view_proj: view_projection(camera, w, h, near, far),
-            forward: [camera.forward[0], camera.forward[1], camera.forward[2], 0.0],
+            forward: [camera.forward[0], camera.forward[1], camera.forward[2], lights.len().min(MAX_LIGHTS) as f32],
+            lights: gpu_lights,
         };
         let globals_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("globals"),

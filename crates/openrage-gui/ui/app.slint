@@ -487,12 +487,13 @@ component HeaderCell inherits Rectangle {
     ta := TouchArea {
         clicked => { root.clicked(); }
     }
+    // Inside the cell: Slint only delivers pointer events within the parent.
     if root.resizable: Rectangle {
-        x: -Theme.space-s / 2 - 3px;
+        x: 0;
         width: 6px;
         background: grip.has-hover || grip.pressed ? Theme.accent : transparent;
         Rectangle {
-            x: (parent.width - 1px) / 2;
+            x: 0;
             y: 4px;
             width: 1px;
             height: parent.height - 8px;
@@ -987,7 +988,7 @@ export component AppWindow inherits Window {
 
     property <length> tree-width: 260px;
     // File list columns (the name column takes the rest); resizable in the header.
-    property <length> col-kind-width: 110px;
+    out property <length> col-kind-width: 110px;
     property <length> col-location-width: 320px;
     property <length> col-size-width: 72px;
     property <length> col-info-width: 96px;
@@ -3720,6 +3721,12 @@ export component SceneWindow inherits Window {
     in property <bool> cut-camera: true;
     in property <bool> has-camera;
     in property <string> status;
+    // The map around the scene: 0 not loaded yet, 1 shown, 2 hidden.
+    in property <int> surroundings;
+    callback toggle-surroundings();
+    in property <bool> has-lights;
+    in property <bool> lights-on;
+    callback toggle-lights();
     out property <length> area-width: area.width;
     out property <length> area-height: area.height;
 
@@ -3769,6 +3776,14 @@ export component SceneWindow inherits Window {
                         overflow: elide;
                         color: Theme.text-muted;
                     }
+                }
+                if root.has-lights: Button {
+                    text: root.lights-on ? @tr("Lights off") : @tr("Lights on");
+                    clicked => { root.toggle-lights(); }
+                }
+                if root.surroundings > 0: Button {
+                    text: root.surroundings == 1 ? @tr("Hide surroundings") : @tr("Show surroundings");
+                    clicked => { root.toggle-surroundings(); }
                 }
                 if root.has-camera: Button {
                     text: root.cut-camera ? @tr("Free camera") : @tr("Cutscene camera");
