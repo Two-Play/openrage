@@ -282,7 +282,12 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
 
 pub fn is_model(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n.ends_with(".ydr") || n.ends_with(".yft") || n.ends_with(".ydd") || n.ends_with(".ypt") || n.ends_with(".ybn")
+    n.ends_with(".ydr")
+        || n.ends_with(".yft")
+        || n.ends_with(".ydd")
+        || n.ends_with(".ypt")
+        || n.ends_with(".ybn")
+        || rage_formats::paths::is_path_file(&n)
 }
 
 /// Colour of a collision material, by what it is made of.
@@ -347,7 +352,19 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
     let lower = name.to_ascii_lowercase();
     let stem = name.split('.').next().unwrap_or(&name).to_owned();
     let mut external = Vec::new();
-    let (drawables, parts) = if lower.ends_with(".ybn") {
+    let (drawables, parts) = if rage_formats::paths::is_path_file(&lower) {
+        let ext = lower.rsplit('.').next().unwrap_or_default();
+        let (path, _) = rage_formats::paths::parse(&res, ext)?;
+        let part = Part {
+            name: stem.clone(),
+            group: String::new(),
+            drawable: 0,
+            transform: math::IDENTITY,
+            visible: true,
+            bone: None,
+        };
+        (vec![(stem.clone(), path)], vec![part])
+    } else if lower.ends_with(".ybn") {
         let (collision, stats) = rage_formats::ybn::parse(&res)?;
         let names = collision_material_names(game_dir, keys.clone());
         for &m in &stats.materials {
@@ -441,7 +458,7 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
         };
         (vec![(stem.clone(), drawable::parse_ydr(&res)?)], vec![part])
     } else {
-        bail!("{name} is not a model (.ydr, .yft, .ydd, .ypt, .ybn)");
+        bail!("{name} is not a model (.ydr, .yft, .ydd, .ypt, .ybn, .ynd, .yvr, .ywr)");
     };
 
     // Textures usually live next to the model: adder.yft → adder.ytd (+ vehshare.ytd for vehicles).

@@ -101,6 +101,9 @@ enum Command {
         /// Instead of archives, read every collision file (.ybn) and build its meshes.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles"])]
         collisions: bool,
+        /// Instead of archives, read every path file (.ynd nodes, .yvr and .ywr recordings).
+        #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions"])]
+        paths: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
         #[arg(long, requires = "textures")]
         rebuild: bool,
@@ -300,6 +303,7 @@ fn run() -> Result<()> {
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
+        Command::Verify { path, paths: true, .. } => cmd_verify_paths(&game_dir, &path, keys),
         Command::Verify { path, collisions: true, .. } => cmd_verify_collisions(&game_dir, &path, keys),
         Command::Verify { path, particles: true, .. } => cmd_verify_particles(&game_dir, &path, keys),
         Command::Verify { path, text: true, .. } => cmd_verify_text(&game_dir, &path, keys),
@@ -1152,6 +1156,78 @@ fn cmd_particles(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Re
     }
     for e in &p.effects {
         outln!("  effect  {e}");
+    }
+    Ok(())
+}
+
+fn cmd_verify_paths(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    use rage_formats::paths;
+    let starts = archive_roots(game_dir, within, keys)?;
+    let started = Instant::now();
+    type Counts = (usize, usize, usize, usize, f32, usize);
+    let all: Vec<(Counts, Vec<String>)> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let mut c: Counts = (0, 0, 0, 0, 0.0, 0);
+            let (mut errors, mut nested) = (Vec::new(), Vec::new());
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    let name = a.entry(id).name.to_ascii_lowercase();
+                    if !paths::is_path_file(&name) {
+                        return;
+                    }
+                    c.0 += 1;
+                    let ext = name.rsplit('.').next().unwrap_or_default().to_owned();
+                    match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| Ok(paths::parse(&r, &ext)?)) {
+                        Ok((d, s)) => {
+                            c.1 += s.nodes;
+                            c.2 += s.links;
+                            c.3 += s.points;
+                            c.4 += s.duration;
+                            c.5 += s.skipped;
+                            let bad = d
+                                .meshes
+                                .iter()
+                                .flat_map(|m| &m.positions)
+                                .any(|p| p.iter().any(|v| !v.is_finite() || v.abs() > 20000.0));
+                            if bad {
+                                errors.push(format!("{p}: positions out of the map"));
+                            }
+                        }
+                        Err(e) => errors.push(format!("{p}: {e:#}")),
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (c, errors)
+        })
+        .collect();
+    let mut t: Counts = (0, 0, 0, 0, 0.0, 0);
+    for (c, _) in &all {
+        t = (t.0 + c.0, t.1 + c.1, t.2 + c.2, t.3 + c.3, t.4 + c.4, t.5 + c.5);
+    }
+    let errors: Vec<&String> = all.iter().flat_map(|x| &x.1).collect();
+    for e in errors.iter().take(30) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} path files, {} nodes, {} links, {} recorded points ({:.1} h of vehicle recordings, {} implausible points skipped); {} errors ({:.1}s)",
+        t.0,
+        t.1,
+        t.2,
+        t.3,
+        t.4 / 3600.0,
+        t.5,
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() {
+        bail!("{} errors", errors.len());
     }
     Ok(())
 }
