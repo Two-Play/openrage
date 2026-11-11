@@ -368,6 +368,12 @@ fn run() -> Result<()> {
     }
 
     let game_dir = game_dir.context("no game directory configured; run `openrage --game <DIR> keys` first")?;
+    if game_dir.join("RDR2.exe").is_file() {
+        let names = rage_rpf::rpf8_names::NameIndex::default_path(&game_dir)
+            .and_then(|p| rage_rpf::rpf8_names::NameIndex::load(&p).ok().flatten())
+            .map(Arc::new);
+        rage_rpf::rpf8::set_defaults(rdr2_keys()?, names);
+    }
     let keys = openrage_app::load_keys().unwrap_or_else(|e| {
         eprintln!("warning: {e}");
         None
@@ -500,6 +506,17 @@ fn cmd_ls(game_dir: &Path, path: &str, recursive: bool, keys: Option<Arc<GtaVKey
         }
         Node::PlainFile(p) => outln!("file     {:>8}       {}", human(fs::metadata(&p)?.len()), p.display()),
         Node::ArchiveFile(rpf, id) => print_entry(&rpf, id, &rpf.path_of(id)),
+        Node::Rpf8File(rpf, i) => print_rpf8_entry(&rpf, i, &rpf.entry_name(i)),
+        Node::Rpf8Dir(rpf, dir) => {
+            let (dirs, files) = rpf.list_dir(&dir);
+            for d in dirs {
+                outln!("{:<8} {:>8}       {d}/", "dir", "");
+            }
+            for i in files {
+                let name = rpf.entry_name(i);
+                print_rpf8_entry(&rpf, i, name.rsplit('/').next().unwrap_or(&name));
+            }
+        }
         Node::ArchiveDir(rpf, dir) => {
             if recursive {
                 vfs::walk(&rpf, dir, "", true, &mut |a, id, p| print_entry(a, id, p), &mut |e| {
@@ -545,14 +562,63 @@ fn cmd_info(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
                 outln!("Resource version: {v}");
             }
         }
+        Node::Rpf8Dir(rpf, dir) => {
+            let h = rpf.header();
+            outln!("Archive:     {}", rpf.display_name());
+            outln!("Format:      RPF8 (Red Dead Redemption 2)");
+            outln!("Size:        {} ({} bytes)", human(rpf.size()), rpf.size());
+            outln!(
+                "Table:       {}",
+                if h.is_encrypted() { format!("encrypted (key {})", h.decryption_tag) } else { "plaintext".into() }
+            );
+            outln!("Entries:     {}", h.entry_count);
+            if !dir.is_empty() {
+                outln!("Folder:      {dir}");
+            }
+        }
+        Node::Rpf8File(rpf, i) => {
+            let e = &rpf.entries().expect("entries")[i];
+            outln!("Path:        {}/{}", rpf.display_name(), rpf.entry_name(i));
+            outln!("Kind:        {}", if e.is_resource { "resource" } else { "file" });
+            outln!("Size:        {} ({} on disk)", human(e.size()), human(e.size_on_disk));
+            outln!("Compression: {:?}", e.compression);
+            outln!("Encrypted:   {}", if e.is_encrypted() { format!("yes (key {})", e.key_id) } else { "no".into() });
+            if let Some(v) = e.resource_version() {
+                outln!("Resource version: {v}");
+            }
+        }
         Node::Dir(p) | Node::PlainFile(p) => outln!("{} is not inside an archive", p.display()),
     }
     Ok(())
 }
 
+fn report_rpf8_extract(rpf: &rage_rpf::Rpf8, dir: &str, file: Option<usize>, out: &Path) -> Result<()> {
+    let s = openrage_app::extract::extract_rpf8(rpf, dir, file, out, &AtomicBool::new(false), &mut |_, _| {})?;
+    for f in &s.failures {
+        eprintln!("warning: {f}");
+    }
+    outln!("{} file(s) ({}) extracted to {}, {} failed", s.files, human(s.bytes), out.display(), s.failures.len());
+    Ok(())
+}
+
+fn print_rpf8_entry(rpf: &rage_rpf::Rpf8, i: usize, name: &str) {
+    let e = &rpf.entries().expect("entries")[i];
+    let (kind, slash) = if e.ext_id == 0 {
+        ("rpf", "/")
+    } else if e.is_resource {
+        ("resource", "")
+    } else {
+        ("file", "")
+    };
+    let version = e.resource_version().map(|v| format!("v{v}")).unwrap_or_default();
+    outln!("{kind:<8} {:>8} {version:>4}  {name}{slash}", human(e.size()));
+}
+
 fn cmd_extract(game_dir: &Path, path: &str, out: &Path, expand: bool, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     let (rpf, id) = match vfs::resolve(game_dir, path, keys)? {
         Node::ArchiveFile(rpf, id) | Node::ArchiveDir(rpf, id) => (rpf, id),
+        Node::Rpf8File(rpf, i) => return report_rpf8_extract(&rpf, "", Some(i), out),
+        Node::Rpf8Dir(rpf, dir) => return report_rpf8_extract(&rpf, &dir, None, out),
         Node::Dir(_) | Node::PlainFile(_) => bail!("{path} is not inside an archive"),
     };
     let summary = extract_entry(&rpf, id, out, expand, &AtomicBool::new(false), &mut |_, _| {})?;
@@ -2177,7 +2243,8 @@ type Start = (String, Arc<Rpf7>, EntryId);
 fn archive_roots(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<Vec<Start>> {
     Ok(match vfs::resolve(game_dir, within, keys.clone())? {
         Node::ArchiveDir(rpf, dir) => vec![(within.trim_end_matches('/').to_owned(), rpf, dir)],
-        Node::ArchiveFile(..) | Node::PlainFile(_) => bail!("{within} is not a directory"),
+        Node::ArchiveFile(..) | Node::PlainFile(_) | Node::Rpf8File(..) => bail!("{within} is not a directory"),
+        Node::Rpf8Dir(..) => bail!("{within}: for Red Dead Redemption 2 archives use `openrage rpf8` for now"),
         Node::Dir(dir) => {
             let mut found = Vec::new();
             collect_rpfs(&dir, &mut found);
@@ -2521,6 +2588,8 @@ fn cmd_rdr2_names(game: &Path, import: Option<&Path>) -> Result<()> {
             });
             eprintln!();
             for (h, n) in found.names {
+                let files = found.files.get(&h).copied().unwrap_or(1);
+                index.files.entry(h).or_insert(files);
                 index.names.entry(h).or_insert(n);
             }
         }
@@ -2528,9 +2597,9 @@ fn cmd_rdr2_names(game: &Path, import: Option<&Path>) -> Result<()> {
     index.save(&path)?;
     outln!(
         "{} of {} entry names known ({:.1} %); stored in {} ({:.0} s)",
-        index.names.len(),
+        index.trusted_count(),
         wanted.len(),
-        index.names.len() as f64 * 100.0 / wanted.len().max(1) as f64,
+        index.trusted_count() as f64 * 100.0 / wanted.len().max(1) as f64,
         path.display(),
         started.elapsed().as_secs_f32()
     );

@@ -243,6 +243,28 @@ pub fn plausible_table(table: &[u8], archive_size: u64) -> bool {
         })
 }
 
+/// Keys and names used when archives are opened without passing them, e.g.
+/// through the virtual file system. Set once at start-up by the application.
+/// The registered keys and names.
+type Defaults = (Option<Arc<Rdr2Keys>>, Option<Arc<crate::rpf8_names::NameIndex>>);
+
+fn defaults() -> &'static std::sync::RwLock<Defaults> {
+    static DEFAULTS: std::sync::OnceLock<std::sync::RwLock<Defaults>> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(Default::default)
+}
+
+/// Registers the keys and names [`Rpf8::open_default`] uses.
+pub fn set_defaults(keys: Option<Arc<Rdr2Keys>>, names: Option<Arc<crate::rpf8_names::NameIndex>>) {
+    if let Ok(mut d) = defaults().write() {
+        *d = (keys, names);
+    }
+}
+
+/// Whether keys were registered with [`set_defaults`].
+pub fn has_default_keys() -> bool {
+    defaults().read().is_ok_and(|d| d.0.is_some())
+}
+
 /// An opened RPF8 archive.
 #[derive(Debug)]
 pub struct Rpf8 {
@@ -269,6 +291,66 @@ impl Rpf8 {
     /// Opens an archive. Encrypted entry tables are left unread.
     pub fn open(path: &Path) -> Result<Rpf8, RpfError> {
         Self::open_with_keys(path, None)
+    }
+
+    /// Opens an archive with the keys and names registered by [`set_defaults`].
+    pub fn open_default(path: &Path) -> Result<Rpf8, RpfError> {
+        let (keys, names) = defaults().read().map(|d| d.clone()).unwrap_or_default();
+        let mut rpf = Self::open_with_keys(path, keys)?;
+        if let Some(n) = names {
+            rpf.set_names(n);
+        }
+        Ok(rpf)
+    }
+
+    /// Whether a file starts with the RPF8 magic.
+    pub fn file_is_rpf8(path: &Path) -> bool {
+        let mut head = [0u8; HEADER_LEN as usize];
+        File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && Header::parse(&head).is_some()
+    }
+
+    /// The display name of entry `i`: its path when known, else `hash/XXXXXXXX.ext`.
+    pub fn entry_name(&self, i: usize) -> String {
+        self.entries.as_ref().map(|e| e[i].display_name(self.header.platform)).unwrap_or_default()
+    }
+
+    /// The entry at a path (case-insensitive).
+    pub fn find(&self, path: &str) -> Option<usize> {
+        let entries = self.entries.as_ref()?;
+        (0..entries.len()).find(|&i| self.entry_name(i).eq_ignore_ascii_case(path))
+    }
+
+    /// Whether `dir` is a folder: some entry's path starts with it. RPF8 has no
+    /// directories of its own; they come from the entries' paths.
+    pub fn is_dir(&self, dir: &str) -> bool {
+        let prefix = format!("{}/", dir.to_ascii_lowercase());
+        dir.is_empty()
+            || (0..self.entries.as_ref().map_or(0, Vec::len))
+                .any(|i| self.entry_name(i).to_ascii_lowercase().starts_with(&prefix))
+    }
+
+    /// The folders and files directly in `dir` ("" for the top): folder names,
+    /// and entry indices of the files.
+    pub fn list_dir(&self, dir: &str) -> (Vec<String>, Vec<usize>) {
+        let prefix = if dir.is_empty() { String::new() } else { format!("{}/", dir.to_ascii_lowercase()) };
+        let mut dirs: Vec<String> = Vec::new();
+        let mut files = Vec::new();
+        for i in 0..self.entries.as_ref().map_or(0, Vec::len) {
+            let name = self.entry_name(i);
+            let Some(rest) = name.to_ascii_lowercase().strip_prefix(&prefix).map(str::to_owned) else { continue };
+            match rest.split_once('/') {
+                Some((first, _)) => {
+                    let first = name[prefix.len()..prefix.len() + first.len()].to_owned();
+                    if !dirs.iter().any(|d| d.eq_ignore_ascii_case(&first)) {
+                        dirs.push(first);
+                    }
+                }
+                None => files.push(i),
+            }
+        }
+        dirs.sort();
+        files.sort_by_key(|&i| self.entry_name(i).to_ascii_lowercase());
+        (dirs, files)
     }
 
     /// Opens an archive, decrypting its entry table when the keys have the one it needs.
