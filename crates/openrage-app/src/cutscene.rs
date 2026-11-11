@@ -69,6 +69,8 @@ pub struct Actor {
     pub name: String,
     /// The C++ type, e.g. `rage__cutfPedModelObject`.
     pub object_type: String,
+    /// For props: the archetype file (`.ytyp`) that defines the model.
+    pub type_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -95,6 +97,53 @@ pub fn animation(rpf: &Rpf7, cut: EntryId) -> Result<ClipDictionary> {
     Ok(rage_formats::clip::join_sections(sections))
 }
 
+/// The virtual path of a file by its exact name, through the search index
+/// (the base game first, then updates and DLC).
+pub fn find_file(game_dir: &std::path::Path, name: &str) -> Option<String> {
+    let path = crate::index_path(game_dir).filter(|p| p.exists())?;
+    let index = rage_index::Index::open(&path).ok()?;
+    let results = index.search(name, 200, None).ok()?;
+    let mut hits: Vec<String> =
+        results.hits.into_iter().filter(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.vpath).collect();
+    hits.sort_by_key(|v| (v.starts_with("update"), v.len()));
+    hits.into_iter().next()
+}
+
+/// A prop's textures: its archetype in the cutscene's archetype file names
+/// the texture dictionary.
+pub fn prop_textures(
+    game_dir: &std::path::Path,
+    keys: Option<std::sync::Arc<rage_crypto::GtaVKeys>>,
+    type_file: &str,
+    archetype: &str,
+) -> Option<(String, rage_formats::ytd::TextureDictionary)> {
+    let ytyp = find_file(game_dir, &format!("{type_file}.ytyp"))?;
+    let xml = crate::metadata::load(game_dir, keys.clone(), &ytyp).ok()?;
+    let doc = roxmltree::Document::parse_with_options(
+        &xml.text,
+        roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: u32::MAX, ..Default::default() },
+    )
+    .ok()?;
+    let txd = doc
+        .descendants()
+        .filter(|n| n.has_tag_name("Item"))
+        .find(|item| {
+            item.children()
+                .any(|c| c.has_tag_name("name") && c.text().is_some_and(|t| t.eq_ignore_ascii_case(archetype)))
+        })?
+        .children()
+        .find(|c| c.has_tag_name("textureDictionary"))?
+        .text()?
+        .trim()
+        .to_owned();
+    let ytd_name = format!("{txd}.ytd");
+    let vpath = find_file(game_dir, &ytd_name)?;
+    let (node, _) = rage_mods::resolve(game_dir, &vpath, keys).ok()?;
+    let rage_rpf::vfs::Node::ArchiveFile(rpf, id) = node else { return None };
+    let dict = rage_formats::ytd::parse(&rpf.read_resource(id).ok()?).ok()?;
+    Some((ytd_name, dict))
+}
+
 /// Reads the cast and length from a cutscene's XML.
 pub fn from_xml(xml: &str) -> Result<Cutscene> {
     let doc = roxmltree::Document::parse_with_options(
@@ -116,7 +165,8 @@ pub fn from_xml(xml: &str) -> Result<Cutscene> {
             if matches!(kind, Kind::Other) {
                 continue;
             }
-            actors.push(Actor { kind, name: name.to_owned(), object_type });
+            let type_file = text("typeFile").map(str::to_owned);
+            actors.push(Actor { kind, name: name.to_owned(), object_type, type_file });
         }
     }
     Ok(Cutscene { duration: duration.unwrap_or(0.0), actors })
@@ -219,7 +269,8 @@ mod tests {
             ],
             animations: Vec::new(),
         };
-        let actor = |name: &str| Actor { kind: Kind::Ped, name: name.into(), object_type: String::new() };
+        let actor =
+            |name: &str| Actor { kind: Kind::Ped, name: name.into(), object_type: String::new(), type_file: None };
         let actors = [actor("mp_m_freemode_01"), actor("mp_m_freemode_01"), actor("prop_x"), actor("missing")];
         assert_eq!(actor_clips(&actors, &dict), vec![Some(1), Some(0), Some(3), None]);
     }

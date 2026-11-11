@@ -196,6 +196,22 @@ pub fn render_camera(
     width: usize,
     height: usize,
 ) -> Vec<u8> {
+    render_scene(&[SceneItem { model, look, materials, transform: math::IDENTITY, skin }], camera, width, height)
+}
+
+/// One model of a scene: what is shown, where it stands and its pose.
+pub struct SceneItem<'a> {
+    pub model: &'a LoadedModel,
+    pub look: &'a Look,
+    pub materials: &'a Materials,
+    /// Placement in the scene.
+    pub transform: math::Mat4,
+    pub skin: Option<&'a [math::Mat4]>,
+}
+
+/// Renders several models into one RGBA image (software; for previews and
+/// when there is no GPU).
+pub fn render_scene(items: &[SceneItem], camera: &Camera, width: usize, height: usize) -> Vec<u8> {
     let (w, h) = (width.max(1), height.max(1));
     // Transparent background: the UI (or the PNG viewer) shows through.
     let mut color = vec![0u8; w * h * 4];
@@ -212,115 +228,124 @@ pub fn render_camera(
         (w as f32 / 2.0 + dot(r, right) * focal / z, h as f32 / 2.0 - dot(r, up) * focal / z, z)
     };
 
-    for (part, d) in model.shown(&look.parts) {
-        for mesh in &d.meshes {
-            let Some(tint) = model.tint(look, part.drawable, mesh.shader) else { continue };
-            let img = materials.image(part.drawable, mesh.shader);
-            let has_uv = mesh.uvs.len() == mesh.positions.len();
-            let overlay =
-                materials.overlay_image(part.drawable, mesh.shader).filter(|_| mesh.uvs1.len() == mesh.positions.len());
-            let has_n = mesh.normals.len() == mesh.positions.len();
-            // Skinning acts in model space: after the part's placement. Parts
-            // attached to a bone follow that bone; others use the mesh weights.
-            let weights = |i: usize| -> Option<([u16; 4], [f32; 4])> {
-                match part.bone {
-                    Some(b) => Some(([b as u16, 0, 0, 0], [1.0, 0.0, 0.0, 0.0])),
-                    None => Some((*mesh.bone_indices.get(i)?, *mesh.bone_weights.get(i)?)),
-                }
-            };
-            let deform = |i: usize, v: [f32; 3], direction: bool| -> [f32; 3] {
-                let placed = if direction {
-                    math::transform_dir(&part.transform, v)
-                } else {
-                    math::transform_point(&part.transform, v)
+    for &SceneItem { model, look, materials, transform: placement, skin } in items {
+        for (part, d) in model.shown(&look.parts) {
+            for mesh in &d.meshes {
+                let Some(tint) = model.tint(look, part.drawable, mesh.shader) else { continue };
+                let img = materials.image(part.drawable, mesh.shader);
+                let has_uv = mesh.uvs.len() == mesh.positions.len();
+                let overlay = materials
+                    .overlay_image(part.drawable, mesh.shader)
+                    .filter(|_| mesh.uvs1.len() == mesh.positions.len());
+                let has_n = mesh.normals.len() == mesh.positions.len();
+                // Skinning acts in model space: after the part's placement. Parts
+                // attached to a bone follow that bone; others use the mesh weights.
+                let weights = |i: usize| -> Option<([u16; 4], [f32; 4])> {
+                    match part.bone {
+                        Some(b) => Some(([b as u16, 0, 0, 0], [1.0, 0.0, 0.0, 0.0])),
+                        None => Some((*mesh.bone_indices.get(i)?, *mesh.bone_weights.get(i)?)),
+                    }
                 };
-                match (skin, weights(i)) {
-                    (Some(s), Some((idx, w))) => crate::anim::skin_point(s, idx, w, placed, direction),
-                    _ => placed,
-                }
-            };
-            let positions: Vec<[f32; 3]> =
-                mesh.positions.iter().enumerate().map(|(i, p)| deform(i, *p, false)).collect();
-            let normals: Vec<[f32; 3]> = mesh.normals.iter().enumerate().map(|(i, n)| deform(i, *n, true)).collect();
-            let pts: Vec<(f32, f32, f32)> = positions.iter().map(|p| project(*p)).collect();
-            for tri in mesh.indices.as_chunks::<3>().0 {
-                let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
-                let (pa, pb, pc) = (pts[a], pts[b], pts[c]);
-                if pa.2 < near || pb.2 < near || pc.2 < near {
-                    continue;
-                }
-                let area = (pb.0 - pa.0) * (pc.1 - pa.1) - (pb.1 - pa.1) * (pc.0 - pa.0);
-                if area.abs() < 1e-9 {
-                    continue;
-                }
-                // Face normal for shading when vertex normals are missing.
-                let face_n = norm(cross(sub(positions[b], positions[a]), sub(positions[c], positions[a])));
-                let minx = pa.0.min(pb.0).min(pc.0).floor().max(0.0) as usize;
-                let maxx = pa.0.max(pb.0).max(pc.0).ceil().min(w as f32 - 1.0);
-                let miny = pa.1.min(pb.1).min(pc.1).floor().max(0.0) as usize;
-                let maxy = pa.1.max(pb.1).max(pc.1).ceil().min(h as f32 - 1.0);
-                if maxx < 0.0 || maxy < 0.0 {
-                    continue;
-                }
-                let (iza, izb, izc) = (1.0 / pa.2, 1.0 / pb.2, 1.0 / pc.2);
-                for y in miny..=maxy as usize {
-                    for x in minx..=maxx as usize {
-                        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                        let w0 = ((pb.0 - px) * (pc.1 - py) - (pb.1 - py) * (pc.0 - px)) / area;
-                        let w1 = ((pc.0 - px) * (pa.1 - py) - (pc.1 - py) * (pa.0 - px)) / area;
-                        let w2 = 1.0 - w0 - w1;
-                        if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                            continue;
-                        }
-                        let iz = w0 * iza + w1 * izb + w2 * izc;
-                        let z = 1.0 / iz;
-                        let di = y * w + x;
-                        if z >= depth[di] {
-                            continue;
-                        }
-                        // Perspective-correct weights.
-                        let (q0, q1, q2) = (w0 * iza * z, w1 * izb * z, w2 * izc * z);
-                        let mut base = [1.0f32; 4];
-                        if let (Some(img), true) = (img, has_uv) {
-                            let u = q0 * mesh.uvs[a][0] + q1 * mesh.uvs[b][0] + q2 * mesh.uvs[c][0];
-                            let v = q0 * mesh.uvs[a][1] + q1 * mesh.uvs[b][1] + q2 * mesh.uvs[c][1];
-                            let t = img.sample(u, v);
-                            if t[3] < 77 {
-                                continue; // alpha cut-out
+                let deform = |i: usize, v: [f32; 3], direction: bool| -> [f32; 3] {
+                    let placed = if direction {
+                        math::transform_dir(&part.transform, v)
+                    } else {
+                        math::transform_point(&part.transform, v)
+                    };
+                    let posed = match (skin, weights(i)) {
+                        (Some(s), Some((idx, w))) => crate::anim::skin_point(s, idx, w, placed, direction),
+                        _ => placed,
+                    };
+                    if direction {
+                        math::transform_dir(&placement, posed)
+                    } else {
+                        math::transform_point(&placement, posed)
+                    }
+                };
+                let positions: Vec<[f32; 3]> =
+                    mesh.positions.iter().enumerate().map(|(i, p)| deform(i, *p, false)).collect();
+                let normals: Vec<[f32; 3]> =
+                    mesh.normals.iter().enumerate().map(|(i, n)| deform(i, *n, true)).collect();
+                let pts: Vec<(f32, f32, f32)> = positions.iter().map(|p| project(*p)).collect();
+                for tri in mesh.indices.as_chunks::<3>().0 {
+                    let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+                    let (pa, pb, pc) = (pts[a], pts[b], pts[c]);
+                    if pa.2 < near || pb.2 < near || pc.2 < near {
+                        continue;
+                    }
+                    let area = (pb.0 - pa.0) * (pc.1 - pa.1) - (pb.1 - pa.1) * (pc.0 - pa.0);
+                    if area.abs() < 1e-9 {
+                        continue;
+                    }
+                    // Face normal for shading when vertex normals are missing.
+                    let face_n = norm(cross(sub(positions[b], positions[a]), sub(positions[c], positions[a])));
+                    let minx = pa.0.min(pb.0).min(pc.0).floor().max(0.0) as usize;
+                    let maxx = pa.0.max(pb.0).max(pc.0).ceil().min(w as f32 - 1.0);
+                    let miny = pa.1.min(pb.1).min(pc.1).floor().max(0.0) as usize;
+                    let maxy = pa.1.max(pb.1).max(pc.1).ceil().min(h as f32 - 1.0);
+                    if maxx < 0.0 || maxy < 0.0 {
+                        continue;
+                    }
+                    let (iza, izb, izc) = (1.0 / pa.2, 1.0 / pb.2, 1.0 / pc.2);
+                    for y in miny..=maxy as usize {
+                        for x in minx..=maxx as usize {
+                            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                            let w0 = ((pb.0 - px) * (pc.1 - py) - (pb.1 - py) * (pc.0 - px)) / area;
+                            let w1 = ((pc.0 - px) * (pa.1 - py) - (pc.1 - py) * (pa.0 - px)) / area;
+                            let w2 = 1.0 - w0 - w1;
+                            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                                continue;
                             }
-                            base = [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0];
-                        }
-                        for k in 0..3 {
-                            base[k] *= tint[k];
-                        }
-                        if let Some(img) = overlay {
-                            let uv = &mesh.uvs1;
-                            let u = q0 * uv[a][0] + q1 * uv[b][0] + q2 * uv[c][0];
-                            let v = q0 * uv[a][1] + q1 * uv[b][1] + q2 * uv[c][1];
-                            let t = img.sample(u, v);
-                            let alpha = t[3] as f32 / 255.0;
+                            let iz = w0 * iza + w1 * izb + w2 * izc;
+                            let z = 1.0 / iz;
+                            let di = y * w + x;
+                            if z >= depth[di] {
+                                continue;
+                            }
+                            // Perspective-correct weights.
+                            let (q0, q1, q2) = (w0 * iza * z, w1 * izb * z, w2 * izc * z);
+                            let mut base = [1.0f32; 4];
+                            if let (Some(img), true) = (img, has_uv) {
+                                let u = q0 * mesh.uvs[a][0] + q1 * mesh.uvs[b][0] + q2 * mesh.uvs[c][0];
+                                let v = q0 * mesh.uvs[a][1] + q1 * mesh.uvs[b][1] + q2 * mesh.uvs[c][1];
+                                let t = img.sample(u, v);
+                                if t[3] < 77 {
+                                    continue; // alpha cut-out
+                                }
+                                base = [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0];
+                            }
                             for k in 0..3 {
-                                base[k] += (t[k] as f32 / 255.0 - base[k]) * alpha;
+                                base[k] *= tint[k];
                             }
+                            if let Some(img) = overlay {
+                                let uv = &mesh.uvs1;
+                                let u = q0 * uv[a][0] + q1 * uv[b][0] + q2 * uv[c][0];
+                                let v = q0 * uv[a][1] + q1 * uv[b][1] + q2 * uv[c][1];
+                                let t = img.sample(u, v);
+                                let alpha = t[3] as f32 / 255.0;
+                                for k in 0..3 {
+                                    base[k] += (t[k] as f32 / 255.0 - base[k]) * alpha;
+                                }
+                            }
+                            let n = if has_n {
+                                let (na, nb, nc) = (normals[a], normals[b], normals[c]);
+                                norm([
+                                    q0 * na[0] + q1 * nb[0] + q2 * nc[0],
+                                    q0 * na[1] + q1 * nb[1] + q2 * nc[1],
+                                    q0 * na[2] + q1 * nb[2] + q2 * nc[2],
+                                ])
+                            } else {
+                                face_n
+                            };
+                            // Headlight plus a little sky light; double-sided.
+                            let light = 0.25 + 0.65 * dot(n, forward).abs() + 0.1 * n[2].max(0.0);
+                            depth[di] = z;
+                            let o = &mut color[di * 4..di * 4 + 4];
+                            for k in 0..3 {
+                                o[k] = (base[k] * light * 255.0).clamp(0.0, 255.0) as u8;
+                            }
+                            o[3] = 255;
                         }
-                        let n = if has_n {
-                            let (na, nb, nc) = (normals[a], normals[b], normals[c]);
-                            norm([
-                                q0 * na[0] + q1 * nb[0] + q2 * nc[0],
-                                q0 * na[1] + q1 * nb[1] + q2 * nc[1],
-                                q0 * na[2] + q1 * nb[2] + q2 * nc[2],
-                            ])
-                        } else {
-                            face_n
-                        };
-                        // Headlight plus a little sky light; double-sided.
-                        let light = 0.25 + 0.65 * dot(n, forward).abs() + 0.1 * n[2].max(0.0);
-                        depth[di] = z;
-                        let o = &mut color[di * 4..di * 4 + 4];
-                        for k in 0..3 {
-                            o[k] = (base[k] * light * 255.0).clamp(0.0, 255.0) as u8;
-                        }
-                        o[3] = 255;
                     }
                 }
             }

@@ -3608,6 +3608,7 @@ dependencies = [
  "rage-core",
  "rage-crypto",
  "rage-formats",
+ "rage-index",
  "rage-mods",
  "rage-resource",
  "rage-rpf",

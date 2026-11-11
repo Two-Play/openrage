@@ -121,6 +121,13 @@ impl LoadedModel {
         }
     }
 
+    /// Adds a texture dictionary the model uses (found elsewhere, e.g. through
+    /// its archetype) and sorts the materials again.
+    pub fn add_textures(&mut self, name: String, dict: TextureDictionary) {
+        self.external.push((name, dict));
+        self.collect_materials();
+    }
+
     /// Groups materials of all drawables by shader name.
     fn collect_materials(&mut self) {
         let mut materials: Vec<MaterialSlot> = Vec::new();
@@ -218,6 +225,55 @@ fn default_visibility(names: &[String]) -> Vec<bool> {
 /// Places a fragment's children on their bones. Wheels exist once per axle
 /// side in the file and are copied to every wheel bone (turned around on the
 /// right side).
+/// Component groups of a streamed ped worth showing by default (accessories,
+/// tasks and decals are left out).
+const STREAMED_GROUPS: &[&str] = &["head", "berd", "hair", "uppr", "lowr", "hand", "feet", "teef", "jbib"];
+
+type StreamedPed = (Vec<(String, Drawable)>, Vec<Part>, Vec<(String, TextureDictionary)>);
+
+/// The first variant of every component in a streamed ped's folder
+/// (`head_000_r.ydd`, `uppr_000_u.ydd`, …) and its first texture variant
+/// (`head_diff_000_a_whi.ytd`).
+fn streamed_ped(rpf: &rage_rpf::Rpf7, folder: rage_rpf::EntryId) -> Result<StreamedPed> {
+    let files: Vec<(String, rage_rpf::EntryId)> =
+        rpf.children(folder).map(|c| (rpf.entry(c).name.to_ascii_lowercase(), c)).collect();
+    let (mut drawables, mut parts, mut textures) = (Vec::new(), Vec::new(), Vec::new());
+    for group in STREAMED_GROUPS {
+        let mut candidates: Vec<&(String, rage_rpf::EntryId)> =
+            files.iter().filter(|(n, _)| n.starts_with(&format!("{group}_")) && n.ends_with(".ydd")).collect();
+        candidates.sort();
+        let Some((name, id)) = candidates.first() else { continue };
+        let Ok(res) = rpf.read_resource(*id) else { continue };
+        let Some((_, d)) = drawable::parse_ydd(&res).ok().and_then(|v| v.into_iter().next()) else { continue };
+        let stem = name.trim_end_matches(".ydd").to_owned();
+        // `head_000_r` → textures `head_diff_000_a_*.ytd`.
+        let variant = stem.split('_').nth(1).unwrap_or("000");
+        let prefix = format!("{group}_diff_{variant}_a");
+        let mut ytds: Vec<&(String, rage_rpf::EntryId)> =
+            files.iter().filter(|(n, _)| n.starts_with(&prefix) && n.ends_with(".ytd")).collect();
+        ytds.sort();
+        if let Some((tname, tid)) = ytds.first()
+            && let Ok(dict) =
+                rpf.read_resource(*tid).map_err(anyhow::Error::from).and_then(|r| Ok(rage_formats::ytd::parse(&r)?))
+        {
+            textures.push((tname.clone(), dict));
+        }
+        parts.push(Part {
+            name: stem.clone(),
+            group: ped_group(&stem),
+            drawable: drawables.len(),
+            transform: math::IDENTITY,
+            visible: true,
+            bone: None,
+        });
+        drawables.push((stem, d));
+    }
+    if drawables.is_empty() {
+        anyhow::bail!("no components in the ped's folder");
+    }
+    Ok((drawables, parts, textures))
+}
+
 fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Drawable)>, Vec<Part>) {
     let drawable::Fragment { drawable: body, children } = fragment;
     let skeleton = body.skeleton.clone().unwrap_or_default();
@@ -445,6 +501,20 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
             })
             .collect();
         (drawables, parts)
+    } else if lower.ends_with(".yft")
+        && let Some(folder) = rpf
+            .find_child(rpf.entry(id).parent.unwrap_or(rage_rpf::Rpf7::ROOT), &stem)
+            .filter(|&f| rpf.entry(f).is_dir())
+    {
+        // A streamed ped (online characters, story characters): the fragment
+        // holds the skeleton, the folder next to it the components.
+        let skeleton = drawable::parse_fragment(&res)?.drawable.skeleton;
+        let (drawables, parts, textures) = streamed_ped(&rpf, folder)?;
+        external.extend(textures);
+        let mut model =
+            LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
+        model.collect_materials();
+        return Ok(model);
     } else if lower.ends_with(".yft") {
         fragment_parts(drawable::parse_fragment(&res)?, &stem)
     } else if lower.ends_with(".ydr") {
