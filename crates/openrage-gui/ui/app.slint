@@ -49,6 +49,16 @@ export struct InfoRow {
     value: string,
 }
 
+// A value in an info table: selectable and copyable (Ctrl+C), and wrapped
+// anywhere so long names without spaces stay inside the table.
+component InfoValue inherits TextInput {
+    read-only: true;
+    single-line: false;
+    wrap: char-wrap;
+    selection-background-color: Theme.accent.with-alpha(0.35);
+    selection-foreground-color: self.color;
+}
+
 export struct PartRow {
     name: string,
     visible: bool,
@@ -1927,10 +1937,9 @@ export component AppWindow inherits Window {
                                 overflow: elide;
                                 vertical-alignment: top;
                             }
-                            Text {
+                            InfoValue {
                                 horizontal-stretch: 1;
                                 text: r.value;
-                                wrap: word-wrap;
                                 color: r.key == "" ? Theme.text-muted : r.key == "Error" ? Theme.danger : Theme.text;
                                 font-size: r.key == "" ? Theme.font-small : Theme.font-body;
                             }
@@ -2792,10 +2801,9 @@ export component ViewerWindow inherits Window {
                                         color: Theme.text-muted;
                                         overflow: elide;
                                     }
-                                    Text {
+                                    InfoValue {
                                         horizontal-stretch: 1;
                                         text: r.value;
-                                        wrap: word-wrap;
                                         color: r.key == "" ? Theme.text-muted : Theme.text;
                                         font-size: r.key == "" ? Theme.font-small : Theme.font-body;
                                     }
@@ -3572,11 +3580,10 @@ export component XmlWindow inherits Window {
                                         overflow: elide;
                                         color: Theme.text-muted;
                                     }
-                                    value-text := Text {
+                                    value-text := InfoValue {
                                         horizontal-stretch: 1;
                                         text: f.value;
                                         vertical-alignment: center;
-                                        wrap: word-wrap;
                                         color: Theme.text;
                                     }
                                 }
