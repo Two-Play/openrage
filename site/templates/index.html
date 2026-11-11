@@ -45,7 +45,39 @@
     </div>
   </section>
 
-  <section id="screenshots" class="alt" aria-labelledby="screenshots-title">
+  <section id="why" class="alt" aria-labelledby="why-title">
+    <div class="wrap">
+      <h2 id="why-title">{{ x.why_title }}</h2>
+      <div class="section-intro">{{ x.why_intro | markdown | safe }}</div>
+      <ul class="features reasons">
+        {%- for r in x.reasons %}
+        <li class="reveal"><h3><span class="icon" aria-hidden="true">{{ r.icon }}</span>{{ r.title }}</h3><p>{{ r.text | markdown(inline=true) | safe }}</p></li>
+        {%- endfor %}
+      </ul>
+
+      <h3 class="compare-title" id="compare">{{ x.compare_title }}</h3>
+      <div class="table-scroll">
+        <table class="stack compare">
+          <thead>
+            <tr><th scope="col">Feature</th><th scope="col">OpenIV</th><th scope="col">OpenRAGE</th></tr>
+          </thead>
+          <tbody>
+            {%- for c in x.compare %}
+            {%- set edge = c?.edge or "" %}
+            <tr>
+              <th scope="row">{{ c.feature | markdown(inline=true) | safe }}</th>
+              <td data-label="OpenIV"{% if edge == "openiv" %} class="edge"{% endif %}>{{ c.openiv | markdown(inline=true) | safe }}{% if edge == "openiv" %}<span class="visually-hidden"> (ahead)</span>{% endif %}</td>
+              <td data-label="OpenRAGE"{% if edge == "openrage" %} class="edge"{% endif %}>{{ c.openrage | markdown(inline=true) | safe }}{% if edge == "openrage" %}<span class="visually-hidden"> (ahead)</span>{% endif %}</td>
+            </tr>
+            {%- endfor %}
+          </tbody>
+        </table>
+      </div>
+      <div class="compare-note">{{ x.compare_note | markdown | safe }}</div>
+    </div>
+  </section>
+
+  <section id="screenshots" aria-labelledby="screenshots-title">
     <div class="wrap">
       <h2 id="screenshots-title">{{ x.screenshots_title }}</h2>
       <p class="section-intro">{{ x.screenshots_intro | markdown(inline=true) | safe }}</p>
@@ -67,7 +99,7 @@
     </div>
   </section>
 
-  <section id="status" aria-labelledby="status-title">
+  <section id="status" class="alt" aria-labelledby="status-title">
     <div class="wrap">
       <h2 id="status-title">{{ x.games_title }}</h2>
       <p class="section-intro">{{ x.games_intro | markdown(inline=true) | safe }}</p>
@@ -98,7 +130,7 @@
     </div>
   </section>
 
-  <section id="download" class="alt" aria-labelledby="download-title">
+  <section id="download" aria-labelledby="download-title">
     <div class="wrap">
       <h2 id="download-title">Download</h2>
       <p class="section-intro">{{ x.download_intro | markdown(inline=true) | safe }}</p>
