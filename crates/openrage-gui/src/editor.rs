@@ -27,6 +27,8 @@ pub struct Document {
     pub tab_mark: bool,
     /// Why the file cannot be saved (empty: it can).
     pub locked_reason: String,
+    /// Converted from this binary format for viewing (e.g. "PSO").
+    pub converted: Option<String>,
 }
 
 impl Document {
@@ -46,7 +48,7 @@ impl Document {
                 if tab_mark {
                     text = text.replace('\t', &TAB_HIDDEN.to_string());
                 }
-                Some(Self { vpath, name, text, crlf, bom, tab_mark, locked_reason: String::new() })
+                Some(Self { vpath, name, text, crlf, bom, tab_mark, locked_reason: String::new(), converted: None })
             }
             _ => {
                 // Other encodings are shown but not saved (it would change the file's encoding).
@@ -60,8 +62,27 @@ impl Document {
                     tab_mark: false,
                     locked_reason: "This file is not UTF-8 text; it is shown read-only so its encoding stays intact."
                         .into(),
+                    converted: None,
                 })
             }
+        }
+    }
+
+    /// A read-only view of text converted from a binary file (e.g. metadata as XML).
+    pub fn converted(vpath: String, text: String, format: &str) -> Self {
+        let name = format!("{} (XML)", vpath.rsplit('/').next().unwrap_or(&vpath));
+        let locked_reason = format!(
+            "Converted from {format} for viewing; it cannot be saved back yet. Use Export XML… to keep a copy."
+        );
+        Self {
+            vpath,
+            name,
+            text,
+            crlf: false,
+            bom: false,
+            tab_mark: false,
+            locked_reason,
+            converted: Some(format.to_owned()),
         }
     }
 
@@ -155,8 +176,16 @@ pub fn open(ui: &AppWindow, doc: Document) {
     let (w, d, main) = (win.as_weak(), Rc::clone(&doc), ui.as_weak());
     win.on_reload(move || {
         let (Some(win), Some(ui)) = (w.upgrade(), main.upgrade()) else { return };
-        let vpath = d.borrow().vpath.clone();
-        match crate::read_file(&ui, &vpath).map(|data| Document::from_bytes(vpath, &data)) {
+        let (vpath, converted) = {
+            let doc = d.borrow();
+            (doc.vpath.clone(), doc.converted.is_some())
+        };
+        let new = if converted {
+            crate::read_xml(&ui, &vpath).map(|x| Some(Document::converted(vpath, x.text, x.encoding.name())))
+        } else {
+            crate::read_file(&ui, &vpath).map(|data| Document::from_bytes(vpath, &data))
+        };
+        match new {
             Ok(Some(new)) => {
                 win.set_text(show_tabs(&new.text, win.get_tabs_shown()).into());
                 win.set_has_tabs(new.tab_mark);
@@ -205,6 +234,9 @@ fn status_line(doc: &Document) -> String {
     let lines = doc.text.lines().count();
     let endings = if doc.crlf { "CRLF" } else { "LF" };
     let tabs = if doc.tab_mark { " · contains tabs" } else { "" };
+    if let Some(format) = &doc.converted {
+        return format!("{lines} lines · XML converted from {format}");
+    }
     let encoding = if !doc.locked_reason.is_empty() {
         "other encoding"
     } else if doc.bom {

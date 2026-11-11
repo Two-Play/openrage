@@ -234,6 +234,9 @@ fn debug_snapshot(ui: &AppWindow) {
         if let Ok(path) = std::env::var("OPENRAGE_EDITOR") {
             open_editor(&ui, path);
         }
+        if let Ok(path) = std::env::var("OPENRAGE_XML") {
+            open_xml_view(&ui, path);
+        }
         if std::env::var("OPENRAGE_UNLOCK").is_ok() {
             ui.set_unlock_visible(true);
         }
@@ -361,6 +364,16 @@ fn wire_callbacks(ui: &AppWindow) {
             });
             if let Some(vpath) = text {
                 open_editor(ui, vpath);
+                return;
+            }
+            let meta = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(i as usize)?];
+                is_meta_file(item)
+                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = meta {
+                open_xml_view(ui, vpath);
                 return;
             }
             let is_ycd = with_app(|a| {
@@ -683,6 +696,20 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
                 }
             }
         }
+        "xml-view" | "xml" => {
+            let vpath = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(row)?];
+                Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = vpath {
+                if action == "xml" {
+                    export_xml(ui, vpath);
+                } else {
+                    open_xml_view(ui, vpath);
+                }
+            }
+        }
         "extract" => ui.invoke_extract_selected(),
         "gltf" => {
             if with_app(|a| a.model.is_some()) {
@@ -971,6 +998,13 @@ fn is_text_file(item: &Item) -> bool {
     matches!(item.kind, ItemKind::File) && item.mark != Some(Mark::Removed) && TEXT.contains(&ext.as_str())
 }
 
+/// Binary metadata files, shown as XML.
+fn is_meta_file(item: &Item) -> bool {
+    matches!(item.kind, ItemKind::File | ItemKind::Resource)
+        && item.mark != Some(Mark::Removed)
+        && openrage_app::metadata::is_metadata(&item.name)
+}
+
 /// Double-click navigates into it (or, for search hits and changes, to it).
 fn is_openable(item: &Item) -> bool {
     item.vpath.is_some()
@@ -996,6 +1030,7 @@ fn file_row(item: &Item) -> FileRow {
         can_view: is_viewable(item),
         is_model: is_model_item(item),
         can_edit_text: is_text_file(item),
+        is_meta: is_meta_file(item),
         kind: match &item.vpath {
             Some(_) if item.detail.is_some() => item.detail.clone().unwrap_or_default().into(),
             Some(vpath) => browser::short_location(&browser::parent(vpath).unwrap_or_default(), 40).into(),
@@ -1476,6 +1511,15 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
             Err(e) => (vec![kv("Error", e)], String::new()),
         },
         PreviewSource::Texture(..) => (Meta::new(), String::new()),
+        PreviewSource::DiskFile(path)
+            if openrage_app::metadata::is_metadata(&path.file_name().unwrap_or_default().to_string_lossy()) =>
+        {
+            match std::fs::read(&path).map_err(anyhow::Error::from).and_then(|d| openrage_app::metadata::from_bytes(&d))
+            {
+                Ok(xml) => metadata_lines(xml),
+                Err(e) => (vec![kv("Error", e)], String::new()),
+            }
+        }
         PreviewSource::DiskFile(path) => {
             let mut data = Vec::new();
             match File::open(&path).and_then(|f| f.take(1 << 20).read_to_end(&mut data)) {
@@ -1494,6 +1538,11 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
                     Ok(child) => (archive_info(&child), String::new()),
                     Err(e) => (vec![kv("Error", e)], String::new()),
                 };
+            }
+            if openrage_app::metadata::is_metadata(&entry.name)
+                && let Some(preview) = metadata_preview(&rpf, id)
+            {
+                return preview;
             }
             match entry.kind {
                 EntryKind::Resource { size, .. } => {
@@ -1532,6 +1581,34 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
             }
         }
     }
+}
+
+/// Metadata shown as XML in the preview (the start of it for big files).
+fn metadata_preview(rpf: &Rpf7, id: EntryId) -> Option<(Meta, String)> {
+    let xml = rpf.read(id).ok().and_then(|d| openrage_app::metadata::from_bytes(&d).ok())?;
+    Some(metadata_lines(xml))
+}
+
+fn metadata_lines(xml: openrage_app::metadata::Xml) -> (Meta, String) {
+    const LIMIT: usize = 256 * 1024;
+    let mut meta = vec![kv("Format", xml.encoding.name())];
+    if let Some(root) = &xml.root {
+        meta.push(kv("Content", root));
+    }
+    meta.push(kv("XML", human_size(xml.text.len() as u64)));
+    if !xml.errors.is_empty() {
+        meta.push(kv("Unreadable parts", xml.errors.len()));
+    }
+    let mut text = xml.text;
+    if text.len() > LIMIT {
+        let cut = (0..=LIMIT).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+        text.truncate(cut);
+        text.push_str("\n…\n");
+        meta.push(note("Showing the start; double-click to see all of it."));
+    } else {
+        meta.push(note("Double-click to open it as XML."));
+    }
+    (meta, text)
 }
 
 fn archive_info(rpf: &Rpf7) -> Meta {
@@ -1583,6 +1660,10 @@ fn start_index_update(ui: &AppWindow) {
                     status(format!("Indexing {}/{} archives…", p.archives_done, p.archives_total));
                 }
             })?;
+            // Names of models, textures, … so hashes in metadata read as names.
+            if let Ok(names) = index.known_names() {
+                rage_formats::names::register(names);
+            }
             index.stats()
         })();
         let text = match result {
@@ -2602,6 +2683,48 @@ fn open_editor(ui: &AppWindow, vpath: String) {
         },
         Err(e) => ui.set_status(format!("Cannot open {vpath}: {e:#}").into()),
     }
+}
+
+/// Reads a metadata file and converts it to XML.
+fn read_xml(ui: &AppWindow, vpath: &str) -> anyhow::Result<openrage_app::metadata::Xml> {
+    openrage_app::metadata::from_bytes(&read_file(ui, vpath)?)
+}
+
+/// Shows a metadata file as XML in a read-only editor window.
+fn open_xml_view(ui: &AppWindow, vpath: String) {
+    ui.set_status(format!("Converting {vpath} to XML …").into());
+    match read_xml(ui, &vpath) {
+        Ok(xml) => {
+            editor::open(ui, editor::Document::converted(vpath, xml.text, xml.encoding.name()));
+            ui.set_status(SharedString::new());
+        }
+        Err(e) => ui.set_status(format!("Cannot convert {vpath}: {e:#}").into()),
+    }
+}
+
+/// Asks for a file name and writes a metadata file as XML (`name.ymap.xml`, like CodeWalker).
+fn export_xml(ui: &AppWindow, vpath: String) {
+    let xml = match read_xml(ui, &vpath) {
+        Ok(x) => x,
+        Err(e) => return ui.set_status(format!("Cannot convert {vpath}: {e:#}").into()),
+    };
+    let name = vpath.rsplit('/').next().unwrap_or(&vpath).to_owned();
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export XML")
+            .set_file_name(format!("{name}.xml"))
+            .add_filter("XML", &["xml"])
+            .save_file()
+        else {
+            return;
+        };
+        let msg = match std::fs::write(&path, &xml.text) {
+            Ok(()) => format!("Exported {}", path.display()),
+            Err(e) => format!("Export failed: {e}"),
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+    });
 }
 
 /// Saves a file into the mods folder (inside an archive or as a loose file),

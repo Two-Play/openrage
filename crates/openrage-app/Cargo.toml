@@ -11,6 +11,7 @@ rage-crypto.workspace = true
 rage-rpf.workspace = true
 rage-mods.workspace = true
 rage-formats.workspace = true
+rage-resource.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 roxmltree.workspace = true

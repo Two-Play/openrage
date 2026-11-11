@@ -3609,6 +3609,7 @@ dependencies = [
  "rage-crypto",
  "rage-formats",
  "rage-mods",
+ "rage-resource",
  "rage-rpf",
  "roxmltree",
  "zip",

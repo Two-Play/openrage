@@ -12,7 +12,7 @@ An open-source explorer and modding toolkit for games built on Rockstar's RAGE e
 | GTA IV | planned (RPF3) | – |
 | Red Dead Redemption 2 | planned (RPF8) | – |
 
-Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF, complete vehicles and peds, GPU viewer) (done) → audio (`.awc` playback, WAV export) (done) → animations (`.ycd` clips on skinned models) (done) → **6** GTA IV → **7** RDR2.
+Roadmap: **1** archive reading + CLI (done) → **2** Slint GUI explorer (done: explorer, search, mods overlay) → **3** textures (YTD) (done) → **4** editing archives and `.oiv` packages (done) → **5** models (YDR/YFT → glTF, complete vehicles and peds, GPU viewer) (done) → audio (`.awc` playback, WAV export) (done) → animations (`.ycd` clips on skinned models) (done) → metadata as XML (`.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.cut`) (done) → **6** GTA IV → **7** RDR2.
 
 ## Build
 
@@ -119,6 +119,10 @@ Inside an archive, **Import…** (or dropping files onto the list, where the pla
 
 Every change is recorded in `mods/.openrage/journal` and can be reverted with **Undo**, step by step, back to the original files (OpenIV has no undo).
 
+### Metadata (XML)
+
+Map placements (`.ymap`), archetypes (`.ytyp`), `.ymt`, manifests (`.ymf`), cutscenes (`.cut`) and `.pso` files are shown as XML, formatted like CodeWalker's export: the preview shows the start, double-click (or **Show as XML**) opens all of it in a read-only window, **Export XML…** saves `name.ymap.xml`. All three binary encodings are read: RSC meta resources, PSO and RBF. Hashes are shown as names where the name is known: field and type names from a built-in list, model, texture and other asset names from the search index; unknown ones as `hash_XXXXXXXX`. Saving XML back into the game files will come later.
+
 ### OpenIV packages (`.oiv`)
 
 **Install .oiv…** (or `openrage-gui package.oiv`) shows the package — name, author, description — and exactly what installing it would change, before anything is written. Packages of format 2.x are supported: files added to or deleted from the game and from archives (also nested ones), new archives and DLC packs (`createIfNotExist`), text edits (`add`, `insert`, `replace`, `delete` with Equal/StartWith/Mask) and XML edits by XPath (`add` First/Last/Before/After, `replace`, `remove`) that keep the file's formatting. Changes go to the `mods` folder; loose files that are new (such as `.asi` plugins) go to the game folder, as loaders expect them there.
@@ -173,6 +177,8 @@ openrage verify --audio                        # decode every sound of the game
 openrage clips x64c.rpf/anim/ingame/clip_move_.rpf/move_m@generic.ycd     # clips of a .ycd
 openrage model …/a_m_y_hipster_01.ydd --render pose.png --anim "…/move_m@generic.ycd:walk@0.5"
 openrage verify --animations                   # parse every clip dictionary, evaluate all frames
+openrage xml …/ufo.ymap [-o ufo.ymap.xml]      # metadata (.ymap/.ytyp/.ymt/.ymf/.cut/.pso) → XML
+openrage verify --meta                         # convert every metadata file of the game
 openrage mods                                  # files in the OpenIV mods folder
 openrage mods --changes [--deep]               # every added/removed/modified entry
 ```
@@ -186,7 +192,7 @@ openrage mods --changes [--deep]               # every added/removed/modified en
 | `rage-rpf` | RPF7 reader and OpenIV-style writer, virtual file system over nested archives |
 | `rage-index` | SQLite search index: names, hash dictionary, FTS5 full text, incremental updates |
 | `rage-resource` | RSC7 resources: page layout, virtual pointers into system/graphics memory |
-| `rage-formats` | game formats: texture dictionaries (YTD), BC1–BC7 decoding, DDS and PNG export |
+| `rage-formats` | game formats: textures, models, audio, animations, metadata (meta/PSO/RBF → XML) |
 | `rage-mods` | OpenIV `mods` folder: overlay resolution, folder comparison, change lists |
 | `openrage-app` | settings, key setup, game detection and extraction shared by CLI and GUI |
 | `openrage-cli` | the `openrage` command-line tool |
