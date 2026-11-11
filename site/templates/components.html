@@ -3,7 +3,7 @@
 {#- Download buttons for the latest release. In Markdown: {{ <downloads /> }} -#}
 {% component downloads(releases: string = "https://github.com/Two-Play/openrage/releases") %}
 <p>
-  <a class="btn btn-primary" data-release="linux" href="{{ releases }}/latest">Linux (.tar.gz)<span data-size></span></a>
-  <a class="btn btn-primary" data-release="windows" href="{{ releases }}/latest">Windows (.zip)<span data-size></span></a>
+  <a class="btn btn-primary" data-release="linux" href="{{ releases }}/latest"><span>Linux (.tar.gz)<span class="size" data-size></span></span></a>
+  <a class="btn btn-primary" data-release="windows" href="{{ releases }}/latest"><span>Windows (.zip)<span class="size" data-size></span></span></a>
 </p>
 {% endcomponent downloads %}
