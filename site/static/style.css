@@ -541,3 +541,30 @@ a.zoom { display: block; cursor: zoom-in; color: inherit; }
   .doc-grid .toc { position: sticky; top: 84px; }
 }
 .prose h2, .prose h3, section[id] { scroll-margin-top: 80px; }
+
+/* Why OpenRAGE and the comparison with OpenIV */
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+.reasons { margin-bottom: 2.5rem; }
+.compare-title { font-size: 1.25rem; margin: 0 0 1rem; }
+table.compare th[scope="row"] { font-weight: 600; white-space: nowrap; }
+table.compare thead th:last-child { color: var(--accent); }
+table.compare td.edge { font-weight: 600; color: var(--text); }
+table.compare td.edge::after {
+  content: "✓";
+  display: inline-block;
+  margin-left: 0.45rem;
+  color: var(--ok);
+  font-weight: 700;
+}
+.compare-note { color: var(--text-muted); font-size: 0.95rem; max-width: 70ch; margin-top: 1rem; }
+.compare-note p { margin: 0; }
+@media (min-width: 641px) {
+  table.compare th[scope="row"] { width: 22%; }
+  table.compare td { width: 39%; }
+}
+@media (max-width: 640px) {
+  table.compare th[scope="row"] { white-space: normal; padding-top: 0.6rem; }
+}

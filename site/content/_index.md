@@ -26,6 +26,17 @@ games_title = "Supported games"
 games_intro = "GTA V comes first; Red Dead Redemption 2 archives can be read, GTA IV is planned."
 details_summary = "Checked against the whole game"
 download_intro = "Unpack the archive and run `openrage-gui` (or `openrage` for the command line). On first start the GUI detects your game and sets up the keys."
+why_title = "Why OpenRAGE"
+why_intro = """
+OpenIV has been the standard tool for RAGE games for years, and OpenRAGE keeps what it got right:
+the same `mods` folder, the same `.oiv` packages, the same export formats. This is what it adds.
+"""
+compare_title = "OpenRAGE and OpenIV side by side"
+compare_note = """
+OpenIV is a mature tool with wider game support and model import. You can use both:
+they share the same `mods` folder. Compared with OpenIV's public releases;
+if something is out of date, please [open an issue](https://github.com/Two-Play/openrage/issues).
+"""
 
 [extra.hero]
 light = "explorer-light.png"
@@ -161,6 +172,119 @@ name = "GTA IV"
 archives_status = "planned"
 archives = "RPF3"
 formats_status = "none"
+
+# ------------------------------------------------------------- Why OpenRAGE
+
+[[extra.reasons]]
+icon = "🔓"
+title = "Open source"
+text = "GPL-3.0. Read the code, check what it does with your files, fix it or fork it. The tool cannot vanish with a single team."
+
+[[extra.reasons]]
+icon = "🐧"
+title = "Native on Linux and Windows"
+text = "One code base, native builds for both. Works with Steam and Proton installs; no Wine needed for the tool itself."
+
+[[extra.reasons]]
+icon = "↩️"
+title = "Undo everything"
+text = "Every change is journaled and can be undone step by step, back to the original files. Installed `.oiv` packages can be uninstalled."
+
+[[extra.reasons]]
+icon = "👀"
+title = "See before you install"
+text = "An `.oiv` package shows exactly which files and lines it would change before anything is written."
+
+[[extra.reasons]]
+icon = "🔎"
+title = "Search the whole game"
+text = "Names, hashes (`0xB779A091` → `adder`) and full text of every archive, in milliseconds."
+
+[[extra.reasons]]
+icon = "🎬"
+title = "More than a file browser"
+text = "Play whole cutscenes in one scene, view collisions, road networks and nav meshes in 3D, disassemble scripts, export models as glTF for Blender."
+
+[[extra.reasons]]
+icon = "✅"
+title = "Tested on the whole game"
+text = "Every format is checked against every file of the game: hundreds of thousands of textures, models, sounds and clips."
+
+[[extra.reasons]]
+icon = "🔁"
+title = "No lock-in"
+text = "Same `mods` layout, `.oiv` format and DDS/WAV output as OpenIV. Switch back and forth whenever you like."
+
+# Comparison table. `edge` marks the cell that is ahead: openrage, openiv or empty.
+
+[[extra.compare]]
+feature = "Price"
+openiv = "Free"
+openrage = "Free"
+
+[[extra.compare]]
+feature = "Source code"
+openiv = "Closed"
+openrage = "Open, GPL-3.0"
+edge = "openrage"
+
+[[extra.compare]]
+feature = "Operating systems"
+openiv = "Windows"
+openrage = "Linux and Windows, native"
+edge = "openrage"
+
+[[extra.compare]]
+feature = "Games"
+openiv = "GTA IV, EFLC, GTA V, Max Payne 3"
+openrage = "GTA V; RDR2 archives; GTA IV planned"
+edge = "openiv"
+
+[[extra.compare]]
+feature = "OpenIV `mods` folder"
+openiv = "Yes"
+openrage = "Yes, same layout"
+
+[[extra.compare]]
+feature = "`.oiv` packages"
+openiv = "Install"
+openrage = "Install with a preview of every change, uninstall"
+edge = "openrage"
+
+[[extra.compare]]
+feature = "Undo"
+openiv = "No"
+openrage = "Every change, step by step"
+edge = "openrage"
+
+[[extra.compare]]
+feature = "Search"
+openiv = "File names"
+openrage = "Names, hashes and full text of the whole game"
+edge = "openrage"
+
+[[extra.compare]]
+feature = "Model export"
+openiv = "openFormats"
+openrage = "glTF (Blender and most 3D tools)"
+
+[[extra.compare]]
+feature = "Model import"
+openiv = "Yes, from openFormats"
+openrage = "Not yet"
+edge = "openiv"
+
+[[extra.compare]]
+feature = "Cutscenes"
+openiv = "As files"
+openrage = "Play the whole scene with every actor and the cutscene camera"
+edge = "openrage"
+
+[[extra.compare]]
+feature = "Command line"
+openiv = "No"
+openrage = "Yes, for scripts and automation"
+edge = "openrage"
 
 +++
 
