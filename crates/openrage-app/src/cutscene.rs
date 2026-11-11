@@ -2,6 +2,8 @@
 //! cutscene's XML (see [`crate::metadata`]).
 
 use anyhow::{Result, bail};
+use rage_formats::clip::{Clip, ClipDictionary};
+use rage_formats::math::{self, Mat4};
 use rage_rpf::{EntryId, Rpf7};
 
 /// Kinds of cutscene objects worth listing.
@@ -78,7 +80,7 @@ pub struct Cutscene {
 
 /// A cutscene's animation: its sections (`name-0.ycd`, `name-1.ycd`, … next
 /// to the `.cut`) joined into one clip per actor.
-pub fn animation(rpf: &Rpf7, cut: EntryId) -> Result<rage_formats::clip::ClipDictionary> {
+pub fn animation(rpf: &Rpf7, cut: EntryId) -> Result<ClipDictionary> {
     let name = rpf.entry(cut).name.clone();
     let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_owned();
     let dir = rpf.entry(cut).parent.unwrap_or(Rpf7::ROOT);
@@ -120,6 +122,61 @@ pub fn from_xml(xml: &str) -> Result<Cutscene> {
     Ok(Cutscene { duration: duration.unwrap_or(0.0), actors })
 }
 
+/// The clip of every actor in a joined cutscene animation: the k-th actor
+/// with a model name plays `name^k` (`name` for the first), with or without
+/// the `_dual` suffix.
+pub fn actor_clips(actors: &[Actor], dict: &ClipDictionary) -> Vec<Option<usize>> {
+    let split = |clip: &str| -> (String, usize) {
+        let lower = clip.to_ascii_lowercase();
+        let base = lower.strip_suffix("_dual").unwrap_or(&lower);
+        match base.rsplit_once('^') {
+            Some((name, n)) if n.chars().all(|c| c.is_ascii_digit()) => (name.to_owned(), n.parse().unwrap_or(0)),
+            _ => (base.to_owned(), 0),
+        }
+    };
+    let clips: Vec<(String, usize)> = dict.clips.iter().map(|c| split(&c.name)).collect();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    actors
+        .iter()
+        .map(|a| {
+            let name = a.name.to_ascii_lowercase();
+            let k = seen.entry(name.clone()).or_insert(0);
+            let found = clips.iter().position(|(n, i)| *n == name && *i == *k);
+            *k += 1;
+            found
+        })
+        .collect()
+}
+
+/// A track's value on bone `bone` at `time` seconds into a clip.
+pub fn track_at(dict: &ClipDictionary, clip: &Clip, bone: u16, track: u8, time: f32) -> Option<[f32; 4]> {
+    let (_, part, at) = clip.part_at(time)?;
+    let anim = dict.animations.get(part.animation)?;
+    let t = anim.tracks.iter().position(|tr| tr.bone == bone && tr.track == track)?;
+    anim.value(t, anim.frame_at(at))
+}
+
+/// Where an actor stands in the scene: its mover (root motion) tracks.
+pub fn mover(dict: &ClipDictionary, clip: &Clip, time: f32) -> Mat4 {
+    let t = track_at(dict, clip, 0, 5, time).unwrap_or([0.0; 4]);
+    let r = track_at(dict, clip, 0, 6, time).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    math::from_trs([t[0], t[1], t[2]], r, [1.0; 3])
+}
+
+/// The cutscene camera at a time: position, rotation (looking along its +Y,
+/// Z up) and vertical field of view in degrees.
+pub fn camera(dict: &ClipDictionary, clip: &Clip, time: f32) -> Option<([f32; 3], [f32; 4], f32)> {
+    let t = track_at(dict, clip, 0, 7, time)?;
+    let r = track_at(dict, clip, 0, 8, time)?;
+    let fov = track_at(dict, clip, 0, 27, time).map_or(45.0, |f| f[0]);
+    Some(([t[0], t[1], t[2]], r, if fov > 1.0 && fov < 170.0 { fov } else { 45.0 }))
+}
+
+/// The camera clip of a joined cutscene animation.
+pub fn camera_clip(dict: &ClipDictionary) -> Option<usize> {
+    dict.clips.iter().position(|c| c.name.eq_ignore_ascii_case("exportcamera"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +200,27 @@ mod tests {
             cast,
             vec![(Kind::Camera, "exportcamera"), (Kind::Ped, "csb_bogdan"), (Kind::Prop, "xm_prop_x17_lectern_01")]
         );
+    }
+
+    #[test]
+    fn assigns_clips_to_actors() {
+        use rage_formats::clip::ClipPart;
+        let clip = |name: &str| Clip {
+            name: name.into(),
+            parts: vec![ClipPart { animation: 0, start: 0.0, end: 1.0, rate: 1.0 }],
+            sequential: true,
+        };
+        let dict = ClipDictionary {
+            clips: vec![
+                clip("mp_m_freemode_01^1_dual"),
+                clip("mp_m_freemode_01_dual"),
+                clip("prop_x^1"),
+                clip("prop_x"),
+            ],
+            animations: Vec::new(),
+        };
+        let actor = |name: &str| Actor { kind: Kind::Ped, name: name.into(), object_type: String::new() };
+        let actors = [actor("mp_m_freemode_01"), actor("mp_m_freemode_01"), actor("prop_x"), actor("missing")];
+        assert_eq!(actor_clips(&actors, &dict), vec![Some(1), Some(0), Some(3), None]);
     }
 }

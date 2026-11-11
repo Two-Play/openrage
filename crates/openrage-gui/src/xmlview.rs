@@ -293,18 +293,24 @@ fn show_cast(win: &XmlWindow, ui: &AppWindow, vpath: &str, cut: openrage_app::cu
         .collect();
     win.set_cast(ModelRc::new(VecModel::from(rows)));
     win.set_tab(2);
+    {
+        let (main, cut_path, cut) = (ui.as_weak(), vpath.to_owned(), cut.clone());
+        let w = win.as_weak();
+        win.on_play_scene(move || {
+            let (Some(ui), Some(win)) = (main.upgrade(), w.upgrade()) else { return };
+            win.set_status("Finding the actors' models …".into());
+            let models: Vec<Option<String>> = cut.actors.iter().map(|a| find_model(&a.name, a.kind)).collect();
+            crate::scene::open(&ui, cut_path.clone(), cut.clone(), models);
+            win.set_status(SharedString::new());
+        });
+    }
     let (main, cut_path, actors) = (ui.as_weak(), vpath.to_owned(), cut.actors);
     let w = win.as_weak();
     win.on_play_actor(move |i| {
         let (Some(ui), Some(win)) = (main.upgrade(), w.upgrade()) else { return };
         let Some(actor) = actors.get(i as usize) else { return };
         let name = actor.name.to_ascii_lowercase();
-        let model = actor.kind.model_extensions().iter().find_map(|ext| {
-            crate::find_files(&format!("{name}{ext}"), ext, 20)
-                .into_iter()
-                .find(|v| v.rsplit('/').next().is_some_and(|f| f.eq_ignore_ascii_case(&format!("{name}{ext}"))))
-        });
-        match model {
+        match find_model(&name, actor.kind) {
             Some(model) => {
                 win.set_status(format!("Opening {model} with the cutscene's animation …").into());
                 crate::open_model_with_animation(&ui, model, cut_path.clone());
@@ -316,12 +322,23 @@ fn show_cast(win: &XmlWindow, ui: &AppWindow, vpath: &str, cut: openrage_app::cu
     });
 }
 
+/// The model file of a cutscene actor, found through the search index.
+fn find_model(name: &str, kind: openrage_app::cutscene::Kind) -> Option<String> {
+    let name = name.to_ascii_lowercase();
+    kind.model_extensions().iter().find_map(|ext| {
+        crate::find_files(&format!("{name}{ext}"), ext, 20)
+            .into_iter()
+            .find(|v| v.rsplit('/').next().is_some_and(|f| f.eq_ignore_ascii_case(&format!("{name}{ext}"))))
+    })
+}
+
 thread_local! {
     static OPEN: RefCell<Vec<(u64, XmlWindow)>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The most recently opened XML window (for debug snapshots).
+#[cfg(debug_assertions)]
 pub fn newest() -> Option<XmlWindow> {
     OPEN.with(|o| o.borrow().last().map(|(_, w)| w.clone_strong()))
 }

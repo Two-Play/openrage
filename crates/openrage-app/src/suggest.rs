@@ -452,8 +452,15 @@ pub fn best_clip(clips: &[(String, HashSet<u16>)], skeleton: &HashSet<u16>, mode
         .enumerate()
         .max_by_key(|(i, (name, tags))| {
             let hits = tags.iter().filter(|t| skeleton.contains(t)).count();
-            let named = clip_model(name).is_some_and(|m| m == model);
-            (hits, named, std::cmp::Reverse(*i))
+            // A cutscene section (`csb_bogdan_dual-3`) or a whole joined
+            // cutscene clip (`csb_bogdan_dual`, `prop^1`) named after the model.
+            let joined = || {
+                let n = name.split('^').next().unwrap_or(name);
+                n.strip_suffix("_dual").unwrap_or(n).to_ascii_lowercase()
+            };
+            let named = clip_model(name).unwrap_or_else(joined) == model;
+            // The model's own clip wins as long as it moves some of its bones.
+            (named && hits > 0, hits, std::cmp::Reverse(*i))
         })
         .map_or(0, |(i, _)| i)
 }
