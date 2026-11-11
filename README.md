@@ -138,8 +138,10 @@ Every format is checked against the complete game (GTA V Enhanced):
 
 **Red Dead Redemption 2:** `openrage rpf8 <game folder>` reads every archive. Most archives encrypt their tables and many files with keys that, unlike GTA V's, are not stored in the game's executable on disk but exist only while the game runs, so OpenRAGE takes them from your own game and never ships them:
 
-- **Key file:** `openrage rdr2-keys --file secrets.bin <game folder>` reads a file of length-prefixed blocks (such as the `secrets.bin` Swage writes). OpenRAGE works out which block is what by decrypting your archives' tables with them — it carries no keys or fingerprints — and stores the result in its config folder (`rdr2.keys`).
-- **Memory dump of your running game:** planned next.
+- **Key file:** `openrage rdr2-keys --file secrets.bin <game folder>` takes the keys from a file of length-prefixed blocks (such as the `secrets.bin` Swage writes). The result is stored in OpenRAGE's config folder (`rdr2.keys`).
+- **Memory dump of your running game:** start RDR2 in story mode (not Red Dead Online), wait for the main menu or load a save, and dump the process: on Windows, Task Manager → Details → right-click `RDR2.exe` → *Create dump file*; under Proton/Linux, `gcore <pid of RDR2.exe>` (from gdb). Then run `openrage rdr2-keys --dump <dump file> <game folder>`. The dump is several gigabytes and holds everything the game had in memory, including login data — delete it afterwards.
+
+In both cases the cipher tables and the IV come from your `RDR2.exe`: OpenRAGE finds their 565 pieces by SHA-256 fingerprints (checksums only). All archive keys start with the same 32 bytes; every place in the dump or key file that starts that way is tried on your archives, and the keys that open them are kept. Only the Steam version of 2 April 2024 is known so far; other versions report which pieces are missing.
 
 Compressed files use Oodle, for which an open-source decoder is still to be added.
 
@@ -361,7 +363,8 @@ openrage particles …/ptfx.rpf/core.ypt         # effects, emitters, textures a
 openrage script …/script_rel.rpf/omega2.ysc [-o omega2.txt] [--strings]   # disassemble a script
 openrage media …/scaleform_generic.rpf/hud.gfx [--swf hud.swf]   # Scaleform movie or Bink video facts
 openrage natives natives.json                  # native names for script disassembly
-openrage rdr2-keys --file secrets.bin <RDR2>   # RDR2 archive keys from a key file
+openrage rdr2-keys --dump RDR2.dmp <RDR2>      # RDR2 archive keys from a memory dump of the running game
+openrage rdr2-keys --file secrets.bin <RDR2>   # … or from a key file
 openrage rpf8 --list <RDR2>/common_0.rpf       # RDR2 archive contents
 openrage world --radius 40 -- 350 4870 -60     # map objects near a point (builds the world cache)
 ```

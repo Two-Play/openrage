@@ -8,6 +8,7 @@ pub mod editor;
 mod error;
 mod rpf7;
 pub mod rpf8;
+pub mod rpf8_exe;
 pub mod rpf8_keys;
 mod toc;
 pub mod vfs;
