@@ -95,6 +95,9 @@ enum Command {
         /// checking that the result is identical.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta"])]
         text: bool,
+        /// Instead of archives, parse every particle dictionary (.ypt): effects, textures and models.
+        #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text"])]
+        particles: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
         #[arg(long, requires = "textures")]
         rebuild: bool,
@@ -109,6 +112,11 @@ enum Command {
         /// Print the readable structure (as in the GUI) instead of the XML.
         #[arg(long, conflicts_with = "out")]
         tree: bool,
+    },
+    /// Show what a particle dictionary (.ypt) contains: effects, emitters, textures, models.
+    Particles {
+        /// Virtual path of the .ypt.
+        path: String,
     },
     /// Show a text table (.gxt2 as OpenIV .oxt text, .nametable one name per line).
     Text {
@@ -289,6 +297,7 @@ fn run() -> Result<()> {
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
+        Command::Verify { path, particles: true, .. } => cmd_verify_particles(&game_dir, &path, keys),
         Command::Verify { path, text: true, .. } => cmd_verify_text(&game_dir, &path, keys),
         Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
@@ -303,6 +312,7 @@ fn run() -> Result<()> {
             cmd_model(&game_dir, &path, export.as_deref(), render.as_deref(), yaw, anim.as_deref(), keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
+        Command::Particles { path } => cmd_particles(&game_dir, &path, keys),
         Command::Text { path, out } => cmd_text(&game_dir, &path, out.as_deref(), keys),
         Command::Xml { path, out, tree } => cmd_xml(&game_dir, &path, out.as_deref(), tree, keys),
         Command::Audio { path, export } => cmd_audio(&game_dir, &path, export.as_deref(), keys),
@@ -1112,6 +1122,99 @@ fn cmd_xml(game_dir: &Path, path: &str, out: Option<&Path>, tree: bool, keys: Op
             );
         }
         None => print!("{}", xml.text),
+    }
+    Ok(())
+}
+
+fn cmd_particles(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
+    let Node::ArchiveFile(rpf, id) = node else { bail!("{path} is not a file inside an archive") };
+    let p = rage_formats::ypt::parse(&rpf.read_resource(id)?)?;
+    outln!(
+        "{}: {} effects, {} emitters, {} particle rules",
+        p.name,
+        p.effects.len(),
+        p.emitters.len(),
+        p.particles.len()
+    );
+    match &p.textures {
+        Some(t) => outln!("{} textures", t.textures.len()),
+        None => outln!("no textures"),
+    }
+    let tris: usize = p.drawables.iter().map(|(_, d)| d.triangle_count()).sum();
+    outln!("{} models ({tris} triangles)", p.drawables.len());
+    for e in &p.errors {
+        outln!("problem: {e}");
+    }
+    for e in &p.effects {
+        outln!("  effect  {e}");
+    }
+    Ok(())
+}
+
+fn cmd_verify_particles(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let starts = archive_roots(game_dir, within, keys)?;
+    let started = Instant::now();
+    type Counts = (usize, usize, usize, usize, usize);
+    let all: Vec<(Counts, Vec<String>)> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let mut c: Counts = (0, 0, 0, 0, 0);
+            let (mut errors, mut nested) = (Vec::new(), Vec::new());
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    if !a.entry(id).name.to_ascii_lowercase().ends_with(".ypt") {
+                        return;
+                    }
+                    c.0 += 1;
+                    match a
+                        .read_resource(id)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|r| Ok(rage_formats::ypt::parse(&r)?))
+                    {
+                        Ok(d) => {
+                            c.1 += d.effects.len();
+                            c.2 += d.textures.as_ref().map_or(0, |t| t.textures.len());
+                            c.3 += d.drawables.len();
+                            c.4 += d.drawables.iter().map(|(_, m)| m.triangle_count()).sum::<usize>();
+                            let bad_tex = d.textures.as_ref().map_or(0, |t| t.errors.len());
+                            if !d.errors.is_empty() || bad_tex > 0 {
+                                errors.push(format!("{p}: {} {bad_tex} texture errors", d.errors.join("; ")));
+                            }
+                        }
+                        Err(e) => errors.push(format!("{p}: {e:#}")),
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (c, errors)
+        })
+        .collect();
+    let mut t: Counts = (0, 0, 0, 0, 0);
+    for (c, _) in &all {
+        t = (t.0 + c.0, t.1 + c.1, t.2 + c.2, t.3 + c.3, t.4 + c.4);
+    }
+    let errors: Vec<&String> = all.iter().flat_map(|x| &x.1).collect();
+    for e in errors.iter().take(30) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} particle dictionaries, {} effects, {} textures, {} models ({} triangles); {} errors ({:.1}s)",
+        t.0,
+        t.1,
+        t.2,
+        t.3,
+        t.4,
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() {
+        bail!("{} errors", errors.len());
     }
     Ok(())
 }

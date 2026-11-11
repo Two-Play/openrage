@@ -91,6 +91,8 @@ pub enum Location {
     /// An opened texture dictionary (`.ytd`); items are its textures in order.
     Textures {
         dict: Arc<rage_formats::ytd::TextureDictionary>,
+        /// The textures of a particle dictionary (`.ypt`): shown and exported, not changed.
+        read_only: bool,
     },
     /// An opened audio container (`.awc`); items are its sounds (or its one
     /// multi-channel stream).
@@ -106,7 +108,13 @@ pub fn is_audio(name: &str) -> bool {
 
 /// Whether a file name is a texture dictionary that can be opened like a folder.
 pub fn is_texture_dict(name: &str) -> bool {
-    name.to_ascii_lowercase().ends_with(".ytd")
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".ytd") || lower.ends_with(".ypt")
+}
+
+/// Particle dictionaries open like texture dictionaries, read-only.
+pub fn is_particles(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".ypt")
 }
 
 /// The virtual path of the mod change list.
@@ -275,8 +283,21 @@ fn merge_mods_inner(game_dir: &Path, listing: &mut Listing) {
 
 fn list_textures(vpath: String, rpf: Arc<Rpf7>, id: EntryId, origin: Origin) -> Result<Listing, RpfError> {
     let res = rpf.read_resource(id)?;
-    let dict = rage_formats::ytd::parse(&res)
-        .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
+    let bad = |reason: String| RpfError::BadResource { path: vpath.clone(), reason };
+    let read_only = is_particles(&rpf.entry(id).name);
+    let dict = if read_only {
+        let ptfx = rage_formats::ypt::parse(&res).map_err(|e| bad(e.to_string()))?;
+        ptfx.textures.unwrap_or_else(|| rage_formats::ytd::TextureDictionary {
+            textures: Vec::new(),
+            errors: Vec::new(),
+            layout: rage_formats::ytd::Layout::Enhanced,
+            version: res.version,
+            root: Vec::new(),
+            stored: Vec::new(),
+        })
+    } else {
+        rage_formats::ytd::parse(&res).map_err(|e| bad(e.to_string()))?
+    };
     let items = dict
         .textures
         .iter()
@@ -291,7 +312,7 @@ fn list_textures(vpath: String, rpf: Arc<Rpf7>, id: EntryId, origin: Origin) -> 
             detail: None,
         })
         .collect();
-    Ok(Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict) }, items })
+    Ok(Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict), read_only }, items })
 }
 
 fn list_audio(

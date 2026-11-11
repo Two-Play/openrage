@@ -59,6 +59,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 | 🔊 **Audio** | Plays every sound and radio track of the game, with waveform, seeking and WAV export. |
 | 🏃 **Animations** | Clip dictionaries play on skinned models; fitting models are suggested from the bones a clip moves. |
 | 📄 **Metadata** | `.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.cut` and `.pso` as XML (RSC meta, PSO and RBF), compatible with CodeWalker. |
+| ✨ **Particles** | `.ypt` effect dictionaries: effect, emitter and particle rule names, their textures and models. |
 | 🌐 **Game text** | Edit `.gxt2` text tables in OpenIV's `.oxt` form and save them back losslessly. |
 | 🧩 **Mods, safely** | Changes go to OpenIV's `mods` folder, never into your game files; every change and every `.oiv` package can be undone. |
 
@@ -101,6 +102,7 @@ Every format is checked against the complete game (GTA V Enhanced):
 | Animations (`.ycd`) | 25,961 dictionaries, 332,771 clips | all evaluate |
 | Metadata (`.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.cut`, `.pso`) | 30,280 files | all convert to XML |
 | Text tables (`.gxt2`, `.nametable`) | 19,858 files, 9.16 million strings | text → binary is byte-identical |
+| Particles (`.ypt`) | 1,544 dictionaries, 12,987 effects | all read, incl. 1,694 textures and 1,223 models |
 
 **Roadmap**
 
@@ -113,7 +115,9 @@ Every format is checked against the complete game (GTA V Enhanced):
 - [x] Animations (`.ycd` clips on skinned models)
 - [x] Metadata as XML
 - [x] Text tables (`.gxt2`, `.nametable`, `.ugc`)
-- [ ] Particles (`.ypt`), collisions and paths in 3D, scripts (`.ysc`), cutscene viewer, `.gfx`/`.bik` info
+- [x] Readable metadata view (structure tree, highlighted XML)
+- [x] Particles (`.ypt`): effects, textures, models
+- [ ] Collisions and paths in 3D, scripts (`.ysc`), cutscene viewer, `.gfx`/`.bik` info
 - [ ] GTA IV
 - [ ] Red Dead Redemption 2
 
@@ -240,6 +244,10 @@ Map placements (`.ymap`), archetypes (`.ytyp`), `.ymt`, manifests (`.ymf`), cuts
 
 **Export XML…** saves `name.ymap.xml`. All three binary encodings are read: RSC meta resources, PSO and RBF. Hashes are shown as names where the name is known: field and type names from a built-in list, model, texture and other asset names from the search index; unknown ones as `hash_XXXXXXXX`. Saving XML back into the game files will come later.
 
+### Particles
+
+Particle dictionaries (`.ypt`) list their effects (the names the game and scripts use, e.g. `bul_gravel_heli`), emitter and particle rules in the info panel. Their models — debris, shells, bottles, sparks — are shown side by side at the same size and open in the viewer; double-click the file to browse its textures like a texture dictionary (view, Save PNG, Extract; changing them is not supported yet).
+
 ### Text tables
 
 Game text (`.gxt2`) opens in the text editor in OpenIV's `.oxt` form, one `0xHASH = text` line per string (label names are used where the search index knows them). Audio name tables (`.nametable`) show one name per line, and `.ugc` files open as the JSON they are. After **Unlock editing**, saving converts the text back to `.gxt2` or `.nametable` and writes it into the mods folder; the conversion is lossless for every text table of the game. **Export as text…** writes `.oxt` or `.txt`.
@@ -304,6 +312,7 @@ openrage model …/a_m_y_hipster_01.ydd --render pose.png --anim "…/move_m@gen
 openrage xml …/ufo.ymap [-o ufo.ymap.xml]      # metadata (.ymap/.ytyp/.ymt/.ymf/.cut/.pso) → XML
 openrage xml …/ufo.ymap --tree                 # the readable structure, as in the GUI
 openrage text …/american_rel.rpf/iap.gxt2 [-o iap.oxt]   # text table → OpenIV .oxt text
+openrage particles …/ptfx.rpf/core.ypt         # effects, emitters, textures and models of a .ypt
 ```
 
 </details>
@@ -338,6 +347,7 @@ openrage verify --audio                        # decode every sound of the game
 openrage verify --animations                   # parse every clip dictionary, evaluate all frames
 openrage verify --meta                         # convert every metadata file of the game
 openrage verify --text                         # every .gxt2/.nametable → text → back, identical
+openrage verify --particles                    # parse every particle dictionary
 ```
 
 </details>

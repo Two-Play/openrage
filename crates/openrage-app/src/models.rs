@@ -275,7 +275,7 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
 
 pub fn is_model(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n.ends_with(".ydr") || n.ends_with(".yft") || n.ends_with(".ydd")
+    n.ends_with(".ydr") || n.ends_with(".yft") || n.ends_with(".ydd") || n.ends_with(".ypt")
 }
 
 /// Loads a model as the game sees it (mods included).
@@ -286,7 +286,42 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
     let res = rpf.read_resource(id)?;
     let lower = name.to_ascii_lowercase();
     let stem = name.split('.').next().unwrap_or(&name).to_owned();
-    let (drawables, parts) = if lower.ends_with(".ydd") {
+    let mut external = Vec::new();
+    let (drawables, parts) = if lower.ends_with(".ypt") {
+        // Particle models (debris, sparks, …) side by side, textured from the
+        // dictionary inside the file.
+        let ptfx = rage_formats::ypt::parse(&res)?;
+        if ptfx.drawables.is_empty() {
+            bail!("{name} contains no models");
+        }
+        let drawables: Vec<(String, Drawable)> = ptfx
+            .drawables
+            .into_iter()
+            .enumerate()
+            .map(|(i, (hash, d))| {
+                let label = rage_formats::names::value(hash);
+                let label = if hash == 0 || label.starts_with("hash_") { format!("{stem}#{i}") } else { label };
+                (label, d)
+            })
+            .collect();
+        let layout = thumbnail_layout(&drawables);
+        let parts = drawables
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| Part {
+                name: n.clone(),
+                group: String::new(),
+                drawable: i,
+                transform: layout[i],
+                visible: true,
+                bone: None,
+            })
+            .collect();
+        if let Some(t) = ptfx.textures {
+            external.push((format!("{stem}.ypt textures"), t));
+        }
+        (drawables, parts)
+    } else if lower.ends_with(".ydd") {
         let drawables: Vec<(String, Drawable)> = drawable::parse_ydd(&res)?
             .into_iter()
             .enumerate()
@@ -329,11 +364,10 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
         };
         (vec![(stem.clone(), drawable::parse_ydr(&res)?)], vec![part])
     } else {
-        bail!("{name} is not a model (.ydr, .yft, .ydd)");
+        bail!("{name} is not a model (.ydr, .yft, .ydd, .ypt)");
     };
 
     // Textures usually live next to the model: adder.yft → adder.ytd (+ vehshare.ytd for vehicles).
-    let mut external = Vec::new();
     let dir = rpf.entry(id).parent.unwrap_or(rage_rpf::Rpf7::ROOT);
     let mut candidates = vec![format!("{stem}.ytd"), format!("{stem}+hi.ytd")];
     if lower.ends_with(".yft") {
@@ -358,6 +392,41 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
         LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
     model.collect_materials();
     Ok(model)
+}
+
+/// Like [`grid_layout`], but every drawable is scaled to the same size: for
+/// particle models, where a spark sits next to a large hoop and real sizes
+/// would leave most of them invisible.
+fn thumbnail_layout(drawables: &[(String, Drawable)]) -> Vec<Mat4> {
+    let columns = (drawables.len().min(SHOWN_AT_FIRST) as f32).sqrt().ceil().max(1.0) as usize;
+    drawables
+        .iter()
+        .enumerate()
+        .map(|(i, (_, d))| {
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in d.meshes.iter().flat_map(|m| &m.positions) {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            if lo[0] > hi[0] {
+                (lo, hi) = ([0.0; 3], [0.0; 3]);
+            }
+            let extent = (0..3).map(|k| hi[k] - lo[k]).fold(0.0f32, f32::max).max(1e-3);
+            let s = 1.0 / extent;
+            let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, lo[2]];
+            let (col, row) = ((i % SHOWN_AT_FIRST) % columns, (i % SHOWN_AT_FIRST) / columns);
+            let mut m = math::IDENTITY;
+            m[0] = s;
+            m[5] = s;
+            m[10] = s;
+            m[12] = col as f32 * 1.3 - centre[0] * s;
+            m[13] = -(row as f32) * 1.3 - centre[1] * s;
+            m[14] = -centre[2] * s;
+            m
+        })
+        .collect()
 }
 
 /// Places drawables side by side in rows (centred on their bounds), so a
