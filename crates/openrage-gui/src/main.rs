@@ -23,7 +23,7 @@ use openrage_app::config::Config;
 use openrage_app::extract::{extract_entry, human_size};
 use openrage_app::install::{self, Op};
 use openrage_app::setup::{self, KeyBlobRequired, KeySource};
-use openrage_app::{detect, game_language_from_locale, index_path, load_keys};
+use openrage_app::{detect, game_language_from_locale, index_path, load_keys, suggest};
 use rage_crypto::GtaVKeys;
 use rage_index::{EntryTag, HitReason, Index, LANGUAGES};
 use rage_rpf::vfs::{self, Node};
@@ -90,6 +90,8 @@ struct App {
     suggestions: Vec<String>,
     suggest_ycd: String,
     suggest_awc: String,
+    /// Models for `suggest_ycd` are still being looked for.
+    suggest_pending: bool,
     index_running: bool,
 }
 
@@ -140,6 +142,7 @@ fn main() -> anyhow::Result<()> {
             suggestions: Vec::new(),
             suggest_ycd: String::new(),
             suggest_awc: String::new(),
+            suggest_pending: false,
             index_running: false,
         })
     });
@@ -225,36 +228,54 @@ fn debug_snapshot(ui: &AppWindow) {
                 select_row(&ui, row);
             }
         }
-        if let Ok(i) = std::env::var("OPENRAGE_SUGGEST") {
-            ui.invoke_suggestion_open(i.parse().unwrap_or(0));
-        }
-        if std::env::var("OPENRAGE_HISTORY").is_ok() {
-            history::open(&ui);
-        }
-        if let Ok(path) = std::env::var("OPENRAGE_EDITOR") {
-            open_editor(&ui, path);
-        }
-        if std::env::var("OPENRAGE_UNLOCK").is_ok() {
-            ui.set_unlock_visible(true);
-        }
-        let weak = ui.as_weak();
-        slint::Timer::single_shot(Duration::from_secs(2), move || {
-            let Some(ui) = weak.upgrade() else { return };
-            let snap = match (viewer::newest(), editor::newest(), history::window()) {
-                (Some(v), ..) => v.window().take_snapshot(),
-                (None, Some(e), _) => e.window().take_snapshot(),
-                (None, None, Some(h)) => h.window().take_snapshot(),
-                (None, None, None) => ui.window().take_snapshot(),
-            };
-            match snap {
-                Ok(img) => {
-                    let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
-                        .map(|png| std::fs::write(&path, png));
-                }
-                Err(e) => eprintln!("snapshot failed: {e}"),
+        // Wait (up to a minute) until the models for a clip dictionary are found.
+        let waiting = std::rc::Rc::new(slint::Timer::default());
+        let started = Instant::now();
+        let (weak, timer) = (ui.as_weak(), std::rc::Rc::clone(&waiting));
+        waiting.start(slint::TimerMode::Repeated, Duration::from_millis(250), move || {
+            if with_app(|a| a.suggest_pending) && started.elapsed() < Duration::from_secs(60) {
+                return;
             }
-            let _ = slint::quit_event_loop();
+            timer.stop();
+            if let Some(ui) = weak.upgrade() {
+                debug_snapshot_rest(&ui, path.clone());
+            }
         });
+    });
+}
+
+/// The part of [`debug_snapshot`] after selecting a file.
+#[cfg(debug_assertions)]
+fn debug_snapshot_rest(ui: &AppWindow, path: String) {
+    if let Ok(i) = std::env::var("OPENRAGE_SUGGEST") {
+        ui.invoke_suggestion_open(i.parse().unwrap_or(0));
+    }
+    if std::env::var("OPENRAGE_HISTORY").is_ok() {
+        history::open(ui);
+    }
+    if let Ok(path) = std::env::var("OPENRAGE_EDITOR") {
+        open_editor(ui, path);
+    }
+    if std::env::var("OPENRAGE_UNLOCK").is_ok() {
+        ui.set_unlock_visible(true);
+    }
+    let weak = ui.as_weak();
+    slint::Timer::single_shot(Duration::from_secs(2), move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let snap = match (viewer::newest(), editor::newest(), history::window()) {
+            (Some(v), ..) => v.window().take_snapshot(),
+            (None, Some(e), _) => e.window().take_snapshot(),
+            (None, None, Some(h)) => h.window().take_snapshot(),
+            (None, None, None) => ui.window().take_snapshot(),
+        };
+        match snap {
+            Ok(img) => {
+                let _ =
+                    rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(&path, png));
+            }
+            Err(e) => eprintln!("snapshot failed: {e}"),
+        }
+        let _ = slint::quit_event_loop();
     });
 }
 
@@ -1280,6 +1301,7 @@ fn select_row(ui: &AppWindow, row: usize) {
         a.suggestions.clear();
         a.suggest_ycd.clear();
         a.suggest_awc.clear();
+        a.suggest_pending = false;
     });
     if item.name.to_ascii_lowercase().ends_with(".ycd") && item.mark != Some(Mark::Removed) {
         show_clip_dictionary(ui, vpath.clone(), info);
@@ -2258,57 +2280,103 @@ fn open_model_with_animation(ui: &AppWindow, model: String, ycd: String) {
     });
 }
 
-/// What a clip dictionary animates and the models that fit, best first.
-fn suggest_models(ycd: &str, dict: &rage_formats::clip::ClipDictionary) -> (String, Vec<String>) {
-    let name = ycd.rsplit('/').next().unwrap_or(ycd).trim_end_matches(".ycd").to_ascii_lowercase();
-    let tags: std::collections::HashSet<u16> =
-        dict.animations.iter().flat_map(|a| a.tracks.iter().map(|t| t.bone)).collect();
-    // Pelvis, thighs, calves and feet of the human skeleton.
-    const HUMAN: [u16; 6] = [0x2E28, 0xE39F, 0xF9BB, 0x3779, 0x9000, 0x3FCF];
-    let human = HUMAN.iter().filter(|t| tags.contains(t)).count() >= 2
-        || name.starts_with("facials@")
-        || name.contains("@facial")
-        || name.starts_with("mood_");
-    if let Some(vehicle) = name.strip_prefix("va_") {
-        let found = find_files(vehicle, ".yft", 40);
-        let exact: Vec<String> = found
-            .iter()
-            .filter(|v| v.rsplit('/').next().is_some_and(|n| n.eq_ignore_ascii_case(&format!("{vehicle}.yft"))))
-            .cloned()
-            .collect();
-        return (format!("Vehicle animation for {vehicle}"), exact);
+/// Models a clip dictionary can be played on, best first (slow: runs off the
+/// UI thread). Candidates come from the names the dictionary and its clips
+/// hint at, all peds for human animations and all vehicles for vehicle
+/// animations without a named vehicle; they are ranked by how many of the
+/// animated bones their skeletons have.
+fn suggest_models(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, profile: &suggest::Profile) -> Vec<String> {
+    let Some(index) = index_path(game_dir).filter(|p| p.exists()).and_then(|p| Index::open(&p).ok()) else {
+        return Vec::new();
+    };
+    let search = |query: &str, limit: usize| -> Vec<String> {
+        index.search(query, limit, None).map(|r| r.hits.into_iter().map(|h| h.vpath).collect()).unwrap_or_default()
+    };
+    let is_model = |v: &str| {
+        let n = v.to_ascii_lowercase();
+        (n.ends_with(".ydd") || n.ends_with(".yft") || n.ends_with(".ydr")) && !n.ends_with("_hi.yft")
+    };
+    // Models named exactly like a hint; peds as their drawable dictionary.
+    let mut named: Vec<String> = Vec::new();
+    for hint in profile.hints.iter().take(80) {
+        let hits: Vec<String> =
+            search(hint, 100).into_iter().filter(|v| is_model(v) && suggest::model_stem(v) == *hint).collect();
+        let has_ydd = hits.iter().any(|v| v.ends_with(".ydd"));
+        named.extend(hits.into_iter().filter(|v| !has_ydd || v.ends_with(".ydd")));
     }
-    if let Some(rest) = name.split("creatures@").nth(1) {
-        let animal = rest.split('@').next().unwrap_or(rest);
-        let found: Vec<String> = find_files(&format!("a_c_{animal}"), ".ydd", 40);
-        return (format!("Animal animation ({animal})"), found);
-    }
-    if human {
+    let mut candidates: Vec<suggest::Candidate> = Vec::new();
+    let mut load: Vec<String> = named.clone();
+    if let Some(animal) = &profile.animal {
+        load.extend(search(&format!("a_c_{animal}"), 160).into_iter().filter(|v| v.ends_with(".ydd")));
+    } else if profile.kinds.contains(&suggest::Kind::Ped) {
+        // All peds share one skeleton: no need to load each.
         const PREFIXES: [&str; 13] =
             ["a_m_", "a_f_", "s_m_", "s_f_", "g_m_", "g_f_", "u_m_", "u_f_", "ig_", "cs_", "csb_", "mp_", "player_"];
-        let mut peds: Vec<String> = find_files(".ydd", ".ydd", 6000)
+        let mut peds: Vec<String> = search(".ydd", 24000)
             .into_iter()
             .filter(|v| {
                 let n = v.rsplit('/').next().unwrap_or(v).to_ascii_lowercase();
-                PREFIXES.iter().any(|p| n.starts_with(p)) && !n.contains("_p.ydd") && v.contains("peds")
+                n.ends_with(".ydd")
+                    && PREFIXES.iter().any(|p| n.starts_with(p))
+                    && !n.contains("_p.ydd")
+                    && v.contains("peds")
             })
             .collect();
         // Female clips suggest female peds first.
-        let female = name.contains("_f@") || name.contains("female") || name.starts_with("move_f");
         peds.sort_by_key(|v| {
-            let n = v.rsplit('/').next().unwrap_or(v).to_ascii_lowercase();
+            let n = suggest::model_stem(v);
             let is_female = n.contains("_f_") || n.starts_with("a_f") || n.starts_with("s_f");
-            (is_female != female, v.starts_with("update"), n)
+            (is_female != profile.female, v.starts_with("update"), n)
         });
-        peds.dedup_by(|a, b| a.rsplit('/').next() == b.rsplit('/').next());
+        peds.dedup_by(|a, b| suggest::model_stem(a) == suggest::model_stem(b));
         peds.truncate(150);
-        return ("Human animation — fits all peds".into(), peds);
+        let skeleton = suggest::ped_skeleton();
+        candidates.extend(peds.into_iter().map(|vpath| suggest::Candidate { vpath, tags: Some(skeleton.clone()) }));
     }
-    // Otherwise: models sharing the dictionary's leading name part.
-    let stem = name.split(['@', '_']).find(|p| p.len() > 2).unwrap_or(&name).to_owned();
-    let mut found = find_files(&stem, ".ydr", 40);
-    found.extend(find_files(&stem, ".yft", 40));
-    (format!("Animation ({} bones) — possible models", tags.len()), found)
+    if profile.kinds.contains(&suggest::Kind::Vehicle) && !named.iter().any(|v| v.contains("/vehicles")) {
+        // No vehicle named: try them all (their skeletons are cached).
+        let mut vehicles: Vec<String> = search(".yft", 200_000)
+            .into_iter()
+            .filter(|v| is_model(v) && v.contains("/vehicles") && !v.contains("vehiclemods"))
+            .collect();
+        vehicles.sort_by_key(|v| (suggest::model_stem(v), v.starts_with("update"), v.len()));
+        vehicles.dedup_by(|a, b| suggest::model_stem(a) == suggest::model_stem(b));
+        load.extend(vehicles);
+    }
+    if profile.kinds.contains(&suggest::Kind::Prop) && named.is_empty() {
+        // Objects sharing a word of the dictionary name.
+        if let Some(word) = profile.hints.iter().filter(|h| !h.contains('@')).max_by_key(|h| h.len()) {
+            load.extend(search(word, 400).into_iter().filter(|v| is_model(v)).take(80));
+        }
+    }
+    load.sort();
+    load.dedup();
+    // Read the skeletons in parallel.
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+    let chunk = load.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = load
+            .chunks(chunk)
+            .map(|paths| {
+                let keys = keys.clone();
+                scope.spawn(move || {
+                    paths
+                        .iter()
+                        .map(|v| suggest::Candidate {
+                            vpath: v.clone(),
+                            tags: suggest::skeleton_tags(game_dir, keys.clone(), v),
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for job in jobs {
+            candidates.extend(job.join().unwrap_or_default());
+        }
+    });
+    let mut ranked = suggest::rank(profile, candidates);
+    ranked.truncate(200);
+    ranked
 }
 
 /// Renders a model into an image of `w × h` pixels: on the GPU if there is
@@ -2507,39 +2575,59 @@ fn show_audio_container(ui: &AppWindow, vpath: String, mut info: Meta) {
     }
 }
 
-/// Selecting a `.ycd`: its clips and the models it fits.
+/// Selecting a `.ycd`: its clips and (found in the background) the models it fits.
 fn show_clip_dictionary(ui: &AppWindow, vpath: String, mut info: Meta) {
     match load_clip_dictionary(&vpath) {
         Ok(dict) => {
-            let (kind, models) = suggest_models(&vpath, &dict);
+            let profile = suggest::Profile::new(&vpath, &dict);
             info.push(kv("Clips", dict.clips.len()));
             info.push(kv("Animations", dict.animations.len()));
-            info.push(kv("Kind", &kind));
+            info.push(kv("Kind", profile.describe()));
             let names: Vec<&str> = dict.clips.iter().take(12).map(|c| c.name.as_str()).collect();
             let more = if dict.clips.len() > 12 { ", …" } else { "" };
             info.push(kv("Clips", format!("{}{more}", names.join(", "))));
             info.push(note("Pick a model to play the animation on it; double-click the file opens the first."));
             set_meta(ui, &info);
-            let rows: Vec<ClipRow> = models
-                .iter()
-                .map(|m| {
-                    let (dir, name) = m.rsplit_once('/').unwrap_or(("", m));
-                    ClipRow { name: name.into(), info: dir.into() }
-                })
-                .collect();
-            ui.set_suggest_title(
-                if rows.is_empty() {
-                    "No fitting models found (the search index may still be building).".to_owned()
-                } else {
-                    format!("{} fitting models — click one to play the animation", rows.len())
-                }
-                .into(),
-            );
+            ui.set_suggest_title("Looking for fitting models…".into());
             ui.set_suggest_icon("model".into());
-            ui.set_suggestions(ModelRc::new(VecModel::from(rows)));
-            with_app(|a| {
-                a.suggestions = models;
-                a.suggest_ycd = vpath;
+            ui.set_suggestions(ModelRc::default());
+            let Some((game_dir, keys)) = with_app(|a| {
+                a.suggestions.clear();
+                a.suggest_ycd = vpath.clone();
+                a.suggest_pending = true;
+                a.game_dir.clone().map(|d| (d, a.keys.clone()))
+            }) else {
+                return;
+            };
+            let weak = ui.as_weak();
+            std::thread::spawn(move || {
+                let models = suggest_models(&game_dir, keys, &profile);
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    // Another file may have been selected meanwhile.
+                    if !with_app(|a| a.suggest_ycd == vpath) {
+                        return;
+                    }
+                    let rows: Vec<ClipRow> = models
+                        .iter()
+                        .map(|m| {
+                            let (dir, name) = m.rsplit_once('/').unwrap_or(("", m));
+                            ClipRow { name: name.into(), info: dir.into() }
+                        })
+                        .collect();
+                    ui.set_suggest_title(
+                        if rows.is_empty() {
+                            "No fitting models found (the search index may still be building).".to_owned()
+                        } else {
+                            format!("{} fitting models, best first — click one to play the animation", rows.len())
+                        }
+                        .into(),
+                    );
+                    ui.set_suggestions(ModelRc::new(VecModel::from(rows)));
+                    with_app(|a| {
+                        a.suggestions = models;
+                        a.suggest_pending = false;
+                    });
+                });
             });
         }
         Err(e) => {
