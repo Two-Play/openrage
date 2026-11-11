@@ -15,6 +15,27 @@ export struct TreeRow {
     tint: color,
 }
 
+export struct XmlNodeRow {
+    id: int,
+    label: string,
+    depth: int,
+    expandable: bool,
+    expanded: bool,
+    // Matches the filter (shown in bold while filtering).
+    hit: bool,
+}
+
+export struct XmlSpan {
+    text: string,
+    // 0 punctuation, 1 tag, 2 attribute, 3 value, 4 text
+    kind: int,
+}
+
+export struct XmlLine {
+    number: int,
+    spans: [XmlSpan],
+}
+
 export struct InfoRow {
     // Empty key: a note spanning the whole row.
     key: string,
@@ -3305,6 +3326,274 @@ export component EditorWindow inherits Window {
     public function reset-view() {
         editor.set-selection-offsets(0, 0);
         editor.focus();
+    }
+}
+
+// Metadata (.ymap, .ytyp, .ymt, …) in a readable form: a structure tree with
+// the selected node's fields, and the XML with syntax colors.
+export component XmlWindow inherits Window {
+    title: root.heading + " — OpenRAGE";
+    icon: @image-url("icon.png");
+    preferred-width: 1100px;
+    preferred-height: 720px;
+    min-width: 600px;
+    min-height: 360px;
+    background: Theme.background;
+    default-font-size: Theme.font-body;
+
+    in-out property <int> theme-mode;
+    in property <string> mono-font: "monospace";
+    in property <string> heading;
+    in property <string> path;
+    in property <string> summary;
+    in-out property <int> tab;
+    in property <[XmlNodeRow]> nodes;
+    in-out property <int> selected-node: -1;
+    in property <string> node-title;
+    in property <[InfoRow]> fields;
+    in property <[XmlLine]> lines;
+    in property <string> status;
+    in-out property <string> filter;
+    property <length> tree-width: 380px;
+
+    callback toggle(int);
+    callback select(int);
+    callback filter-edited(string);
+    callback export-xml();
+    callback open-text();
+    callback expand-all(bool);
+
+    changed theme-mode => { root.apply-theme(); }
+    init => { root.apply-theme(); }
+
+    function apply-theme() {
+        Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+
+    function span-color(kind: int) -> color {
+        if (kind == 1) { return Theme.syntax-tag; }
+        if (kind == 2) { return Theme.syntax-attribute; }
+        if (kind == 3) { return Theme.syntax-value; }
+        if (kind == 0) { return Theme.text-faint; }
+        return Theme.text;
+    }
+
+    VerticalLayout {
+        Rectangle {
+            background: Theme.surface;
+            HorizontalLayout {
+                padding: Theme.space-m;
+                padding-left: Theme.space-l;
+                spacing: Theme.space-s;
+                Image {
+                    y: (parent.height - self.height) / 2;
+                    width: 20px;
+                    height: 20px;
+                    source: @image-url("icons/data.svg");
+                    colorize: Theme.success;
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    Text {
+                        text: root.heading;
+                        font-size: Theme.font-title;
+                        font-weight: 600;
+                        overflow: elide;
+                        color: Theme.text;
+                    }
+                    Text {
+                        text: root.summary;
+                        font-size: Theme.font-small;
+                        overflow: elide;
+                        color: Theme.text-muted;
+                    }
+                }
+                Button {
+                    text: @tr("Open as text");
+                    icon: @image-url("icons/text.svg");
+                    colorize-icon: true;
+                    clicked => { root.open-text(); }
+                }
+                Button {
+                    text: @tr("Export XML…");
+                    icon: @image-url("icons/export.svg");
+                    colorize-icon: true;
+                    clicked => { root.export-xml(); }
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+        TabWidget {
+            vertical-stretch: 1;
+            current-index <=> root.tab;
+            Tab {
+                title: @tr("Structure");
+                HorizontalLayout {
+                    // Tree
+                    VerticalLayout {
+                        width: root.tree-width;
+                        padding: Theme.space-s;
+                        spacing: Theme.space-s;
+                        HorizontalLayout {
+                            spacing: Theme.space-xs;
+                            LineEdit {
+                                horizontal-stretch: 1;
+                                placeholder-text: @tr("Filter names and values");
+                                text <=> root.filter;
+                                edited(t) => { root.filter-edited(t); }
+                            }
+                            Button {
+                                text: @tr("Expand all");
+                                clicked => { root.expand-all(true); }
+                            }
+                            Button {
+                                text: @tr("Collapse");
+                                clicked => { root.expand-all(false); }
+                            }
+                        }
+                        ListView {
+                            vertical-stretch: 1;
+                            for n[i] in root.nodes: Rectangle {
+                                height: Theme.row-height;
+                                border-radius: Theme.radius-s;
+                                background: i == root.selected-node ? Theme.selection : row-ta.has-hover ? Theme.hover : transparent;
+                                row-ta := TouchArea {
+                                    clicked => { root.select(i); }
+                                    double-clicked => {
+                                        if (n.expandable) {
+                                            root.toggle(i);
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    padding-left: Theme.space-s + n.depth * 16px;
+                                    padding-right: Theme.space-s;
+                                    spacing: Theme.space-xs;
+                                    Rectangle {
+                                        width: 16px;
+                                        Text {
+                                            text: n.expandable ? (n.expanded ? "▾" : "▸") : "";
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                            color: i == root.selected-node ? Theme.selection-text : Theme.text-muted;
+                                        }
+                                        TouchArea {
+                                            clicked => { root.toggle(i); }
+                                        }
+                                    }
+                                    Text {
+                                        text: n.label;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        font-weight: n.hit ? 600 : 400;
+                                        color: i == root.selected-node ? Theme.selection-text : Theme.text;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Splitter {
+                        dragged(d) => { root.tree-width = max(200px, min(root.width - 300px, root.tree-width + d)); }
+                    }
+                    // Fields of the selected node
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        padding: Theme.space-l;
+                        spacing: Theme.space-s;
+                        Text {
+                            text: root.node-title;
+                            font-size: Theme.font-title;
+                            font-weight: 600;
+                            overflow: elide;
+                            color: Theme.text;
+                        }
+                        if root.fields.length == 0: Text {
+                            text: @tr("No values of its own — open it in the tree to see what it contains.");
+                            color: Theme.text-muted;
+                            wrap: word-wrap;
+                        }
+                        ListView {
+                            vertical-stretch: 1;
+                            for f[i] in root.fields: Rectangle {
+                                height: max(Theme.row-height, value-text.preferred-height + 8px);
+                                background: Math.mod(i, 2) == 1 ? Theme.stripe : transparent;
+                                HorizontalLayout {
+                                    padding-left: Theme.space-s;
+                                    padding-right: Theme.space-s;
+                                    spacing: Theme.space-m;
+                                    Text {
+                                        width: 200px;
+                                        text: f.key;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        color: Theme.text-muted;
+                                    }
+                                    value-text := Text {
+                                        horizontal-stretch: 1;
+                                        text: f.value;
+                                        vertical-alignment: center;
+                                        wrap: word-wrap;
+                                        color: Theme.text;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Tab {
+                title: @tr("XML");
+                ListView {
+                    for l in root.lines: HorizontalLayout {
+                        height: 18px;
+                        spacing: Theme.space-m;
+                        Text {
+                            width: 56px;
+                            text: l.number;
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                            font-family: root.mono-font;
+                            font-size: 12px;
+                            color: Theme.text-faint;
+                        }
+                        HorizontalLayout {
+                            horizontal-stretch: 1;
+                            alignment: start;
+                            for s in l.spans: Text {
+                                text: s.text;
+                                vertical-alignment: center;
+                                font-family: root.mono-font;
+                                font-size: 12px;
+                                color: root.span-color(s.kind);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+        Rectangle {
+            background: Theme.surface;
+            HorizontalLayout {
+                padding-left: Theme.space-l;
+                padding-right: Theme.space-l;
+                height: 28px;
+                Text {
+                    text: root.status;
+                    vertical-alignment: center;
+                    font-size: Theme.font-small;
+                    overflow: elide;
+                    color: Theme.text-muted;
+                }
+            }
+        }
     }
 }
 

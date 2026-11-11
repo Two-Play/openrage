@@ -10,6 +10,7 @@ mod gpu;
 mod history;
 mod preview;
 mod viewer;
+mod xmlview;
 
 use std::cell::RefCell;
 use std::fs::File;
@@ -266,6 +267,16 @@ fn debug_snapshot_rest(ui: &AppWindow, path: String) {
     slint::Timer::single_shot(Duration::from_secs(2), move || {
         let Some(ui) = weak.upgrade() else { return };
         let snap = match (viewer::newest(), editor::newest(), history::window()) {
+            _ if let Some(x) = xmlview::newest() => {
+                if let Ok(tab) = std::env::var("OPENRAGE_TAB") {
+                    x.set_tab(tab.parse().unwrap_or(0));
+                }
+                if let Ok(filter) = std::env::var("OPENRAGE_FILTER") {
+                    x.set_filter(filter.clone().into());
+                    x.invoke_filter_edited(filter.into());
+                }
+                x.window().take_snapshot()
+            }
             (Some(v), ..) => v.window().take_snapshot(),
             (None, Some(e), _) => e.window().take_snapshot(),
             (None, None, Some(h)) => h.window().take_snapshot(),
@@ -557,6 +568,7 @@ fn wire_callbacks(ui: &AppWindow) {
         });
         viewer::set_theme(mode);
         editor::set_theme(mode);
+        xmlview::set_theme(mode);
         history::set_theme(mode);
     });
     let w = ui.as_weak();
@@ -2838,7 +2850,7 @@ fn open_xml_view(ui: &AppWindow, vpath: String) {
     ui.set_status(format!("Converting {vpath} to XML …").into());
     match read_xml(ui, &vpath) {
         Ok(xml) => {
-            editor::open(ui, editor::Document::converted(vpath, xml.text, xml.encoding.name()));
+            xmlview::open(ui, vpath, xml);
             ui.set_status(SharedString::new());
         }
         Err(e) => ui.set_status(format!("Cannot convert {vpath}: {e:#}").into()),

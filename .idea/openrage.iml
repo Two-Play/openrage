@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="EMPTY_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/crates/openrage-app/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/openrage-app/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/openrage-cli/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/openrage-gui/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rage-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rage-crypto/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rage-formats/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rage-index/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rage-mods/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rage-mods/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rage-resource/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rage-rpf/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/rage-rpf/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

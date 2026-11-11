@@ -233,7 +233,12 @@ Supported: PCM and IMA ADPCM (GTA V Legacy), MPEG audio (GTA V Enhanced), single
 
 ### Metadata (XML)
 
-Map placements (`.ymap`), archetypes (`.ytyp`), `.ymt`, manifests (`.ymf`), cutscenes (`.cut`) and `.pso` files are shown as XML, formatted like CodeWalker's export: the preview shows the start, double-click (or **Show as XML**) opens all of it in a read-only window, **Export XML…** saves `name.ymap.xml`. All three binary encodings are read: RSC meta resources, PSO and RBF. Hashes are shown as names where the name is known: field and type names from a built-in list, model, texture and other asset names from the search index; unknown ones as `hash_XXXXXXXX`. Saving XML back into the game files will come later.
+Map placements (`.ymap`), archetypes (`.ytyp`), `.ymt`, manifests (`.ymf`), cutscenes (`.cut`) and `.pso` files are shown as XML, formatted like CodeWalker's export: the preview shows the start; double-click (or **Show as XML**) opens a window with two views:
+
+- **Structure:** the file as a tree — entities, archetypes, cutscene objects, … labelled with their type and name (`CEntityDef #3 · dt1_tc_ufocore`) — and the selected node's values as a table with readable names (`fTotalDuration` → *Total duration*), vectors as `x, y, z` and flags with their hex value. A filter finds names and values anywhere in the file.
+- **XML:** the XML with syntax colors and line numbers; **Open as text** shows it in the text editor for copying.
+
+**Export XML…** saves `name.ymap.xml`. All three binary encodings are read: RSC meta resources, PSO and RBF. Hashes are shown as names where the name is known: field and type names from a built-in list, model, texture and other asset names from the search index; unknown ones as `hash_XXXXXXXX`. Saving XML back into the game files will come later.
 
 ### Text tables
 
@@ -297,6 +302,7 @@ openrage audio x64/audio/sfx/RADIO_02_POP.rpf/alright.awc --export out/   # soun
 openrage clips x64c.rpf/anim/ingame/clip_move_.rpf/move_m@generic.ycd     # clips of a .ycd
 openrage model …/a_m_y_hipster_01.ydd --render pose.png --anim "…/move_m@generic.ycd:walk@0.5"
 openrage xml …/ufo.ymap [-o ufo.ymap.xml]      # metadata (.ymap/.ytyp/.ymt/.ymf/.cut/.pso) → XML
+openrage xml …/ufo.ymap --tree                 # the readable structure, as in the GUI
 openrage text …/american_rel.rpf/iap.gxt2 [-o iap.oxt]   # text table → OpenIV .oxt text
 ```
 
