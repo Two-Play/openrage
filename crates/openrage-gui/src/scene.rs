@@ -110,9 +110,21 @@ fn load(
         let handles: Vec<_> = models
             .iter()
             .zip(actors)
-            .map(|(m, _)| {
+            .map(|(m, actor)| {
                 let (game_dir, keys) = (&game_dir, keys.clone());
-                s.spawn(move || m.as_ref().and_then(|v| crate::load_model_preview(game_dir, keys, v).ok()))
+                s.spawn(move || {
+                    let mut loaded = openrage_app::models::load(game_dir, keys.clone(), m.as_ref()?).ok()?;
+                    // Props whose textures live in the dictionary their archetype names.
+                    if let Some(type_file) = &actor.type_file
+                        && let Some(extra) = cutscene::prop_textures(game_dir, keys, type_file, &actor.name)
+                    {
+                        loaded.add_textures(extra.0, extra.1);
+                    }
+                    let materials = render::Materials::new(&loaded);
+                    let name = loaded.drawables.first().map(|(n, _)| n.clone()).unwrap_or_default();
+                    let look = std::sync::RwLock::new(loaded.default_look());
+                    Some(ModelPreview { loaded, look, materials, name })
+                })
             })
             .collect();
         handles.into_iter().map(|h| h.join().ok().flatten()).collect()
@@ -194,7 +206,7 @@ fn start(
         playing: true,
         last: Instant::now(),
         cut_camera: camera_clip.is_some(),
-        view: View::default(),
+        view: View { zoom: 2.2, ..View::default() },
         bounds: (lo, hi),
         timer: slint::Timer::default(),
     });
@@ -292,9 +304,32 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         .collect();
     let camera = if st.cut_camera { cut_camera(st) } else { None }
         .unwrap_or_else(|| render::orbit_camera(st.bounds.0, st.bounds.1, st.view));
-    match crate::gpu::render_scene(&items, &camera, width, height) {
+    let gpu = if std::env::var_os("OPENRAGE_SOFTWARE_RENDERER").is_none() {
+        crate::gpu::render_scene(&items, &camera, width, height)
+    } else {
+        None
+    };
+    match gpu {
         Some(img) => win.set_frame(img),
-        None => win.set_status("Showing a whole cutscene needs a GPU (Vulkan, DirectX 12, Metal or OpenGL).".into()),
+        None => {
+            // No GPU: the software renderer, at a smaller size to stay responsive.
+            let (sw, sh) = ((width / 2).max(64) as usize, (height / 2).max(64) as usize);
+            let soft: Vec<render::SceneItem> = st
+                .actors
+                .iter()
+                .zip(&poses)
+                .map(|(a, (model, skin))| render::SceneItem {
+                    model: &a.preview.loaded,
+                    look: &a.look,
+                    materials: &a.preview.materials,
+                    transform: *model,
+                    skin: skin.as_deref(),
+                })
+                .collect();
+            let rgba = render::render_scene(&soft, &camera, sw, sh);
+            let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, sw as u32, sh as u32);
+            win.set_frame(slint::Image::from_rgba8_premultiplied(buffer));
+        }
     }
     win.set_time(st.time);
     win.set_time_text(format!("{:.1} / {:.1} s", st.time, st.duration).into());
