@@ -5,11 +5,11 @@
 <main id="main" class="doc">
   <div class="wrap prose">
     <h1>{{ page.title }}</h1>
-    {%- if page.extra.lead %}
+    {%- if page.extra?.lead %}
     <p class="lead">{{ page.extra.lead | markdown(inline=true) | safe }}</p>
     {%- endif %}
 
-    {%- if page.extra.toc and page.toc %}
+    {%- if page.extra?.toc and page.toc %}
     <nav class="toc" aria-label="On this page">
       <strong>On this page</strong>
       <ol>

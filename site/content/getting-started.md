@@ -7,14 +7,14 @@ lead = "Install OpenRAGE, point it at your game and let it take the archive keys
 toc = true
 +++
 
-## 1. Download a release {#download}
+## Download a release
 
 Ready-made builds for **Linux** (x86-64, glibc 2.35 or newer) and **Windows** (x86-64) are on the
 [releases page](https://github.com/Two-Play/openrage/releases/latest).
 Unpack the archive and run `openrage-gui`, or `openrage` for the command line.
 `SHA256SUMS.txt` lists the checksums of the archives.
 
-{{ downloads() }}
+{{ <downloads /> }}
 
 To check a download on Linux:
 
@@ -22,7 +22,7 @@ To check a download on Linux:
 sha256sum --check --ignore-missing SHA256SUMS.txt
 ```
 
-## 2. Build from source {#build}
+## Build from source
 
 You need a recent stable [Rust toolchain](https://rustup.rs); the exact version is pinned in
 `rust-toolchain.toml` and rustup picks it up automatically.
@@ -47,7 +47,7 @@ cargo build --release
 For a reproducible environment there is a container image based on Fedora's toolbx image (`dev/Containerfile`);
 see [Reproducible build environment](https://github.com/Two-Play/openrage#reproducible-build-environment) in the README.
 
-## 3. Set up GTA V {#gtav}
+## Set up GTA V
 
 OpenRAGE needs the archive keys from *your own* game installation. On first start the GUI shows a setup dialog that
 detects Steam installations and derives the keys. On the command line:
@@ -68,7 +68,7 @@ The keys are extracted once and cached at `~/.config/openrage/gtav.keys` (Linux)
 > [!WARNING]
 > **Never share the key cache.** It contains keys taken from your copy of the game.
 
-## 4. Set up Red Dead Redemption 2 {#rdr2}
+## Set up Red Dead Redemption 2
 
 Reading RDR2 archives works on the command line. Unlike GTA V's, most RDR2 archive keys are not stored in the executable on disk;
 they exist only while the game runs. OpenRAGE takes them from your own game and never ships them. There are two ways:
@@ -101,7 +101,7 @@ openrage rpf8 --list "/path/to/Red Dead Redemption 2/common_0.rpf"
 Only the Steam version of 2 April 2024 is known so far; other versions report which pieces are missing.
 Browsing RDR2 in the GUI and its file formats follow.
 
-## 5. Next steps {#next}
+## Next steps
 
 Start the explorer, or try a few commands. Paths are virtual: archives, including archives inside archives, behave like folders.
 

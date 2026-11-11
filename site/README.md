@@ -11,7 +11,7 @@ Source of <https://two-play.github.io/openrage/>, built with [Zola](https://www.
 | CSS, theme toggle, release links | `static/` |
 | Screenshots | `../docs/images/` (copied to `static/images/` at build time, not committed here) |
 
-Markdown supports GitHub-style alerts (`> [!NOTE]`, `> [!WARNING]`) and `{{ downloads() }}` for the
+Markdown supports GitHub-style alerts (`> [!NOTE]`, `> [!WARNING]`) and `{{ <downloads /> }}` for the
 download buttons of the latest release.
 
 ## Preview locally

@@ -49,9 +49,9 @@
       <div class="gallery">
         {%- for s in x.screenshots %}
         <figure>
-          {%- if s.dark %}
+          {%- if s?.dark %}
           <img class="light-only" src="{{ get_url(path='images/' ~ s.image) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s.alt }}">
-          <img class="dark-only" src="{{ get_url(path='images/' ~ s.dark) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s.dark_alt | default(value=s.alt) }}">
+          <img class="dark-only" src="{{ get_url(path='images/' ~ s.dark) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s?.dark_alt or s.alt }}">
           {%- else %}
           <img src="{{ get_url(path='images/' ~ s.image) }}" width="{{ s.width }}" height="{{ s.height }}" loading="lazy" alt="{{ s.alt }}">
           {%- endif %}
@@ -75,9 +75,9 @@
           <tbody>
             {%- for g in x.games %}
             <tr>
-              <th scope="row">{{ g.name }}{% if g.variant %} <span class="muted">({{ g.variant }})</span>{% endif %}</th>
-              <td data-label="Archives"><span class="status {{ g.archives_status }}">{{ labels[g.archives_status] }}</span>{% if g.archives %}<br>{{ g.archives | markdown(inline=true) | safe }}{% endif %}</td>
-              <td data-label="Formats"><span class="status {{ g.formats_status }}">{{ labels[g.formats_status] }}</span>{% if g.formats %}<br>{{ g.formats | markdown(inline=true) | safe }}{% endif %}</td>
+              <th scope="row">{{ g.name }}{% if g?.variant %} <span class="muted">({{ g.variant }})</span>{% endif %}</th>
+              <td data-label="Archives"><span class="status {{ g.archives_status }}">{{ labels[g.archives_status] }}</span>{% if g?.archives %}<br>{{ g.archives | markdown(inline=true) | safe }}{% endif %}</td>
+              <td data-label="Formats"><span class="status {{ g.formats_status }}">{{ labels[g.formats_status] }}</span>{% if g?.formats %}<br>{{ g.formats | markdown(inline=true) | safe }}{% endif %}</td>
             </tr>
             {%- endfor %}
           </tbody>
@@ -111,7 +111,7 @@
         <div class="card">
           <h3>Build from source</h3>
           <p>Rust toolchain plus a few system libraries on Linux.</p>
-          <a class="btn btn-secondary" href="{{ get_url(path='@/getting-started.md') }}#build">Build instructions</a>
+          <a class="btn btn-secondary" href="{{ get_url(path='@/getting-started.md') }}#build-from-source">Build instructions</a>
         </div>
       </div>
       <p>
