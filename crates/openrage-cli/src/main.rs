@@ -977,14 +977,24 @@ fn cmd_model(
                 };
                 let (node, _) = rage_mods::resolve(game_dir, ycd, keys)?;
                 let vfs::Node::ArchiveFile(rpf, id) = node else { bail!("{ycd} is not a file") };
-                let dict = rage_formats::clip::parse_ycd(&rpf.read_resource(id)?)?;
+                // A cutscene (.cut) plays its sections joined into one clip per actor.
+                let dict = if ycd.to_ascii_lowercase().ends_with(".cut") {
+                    openrage_app::cutscene::animation(&rpf, id)?
+                } else {
+                    rage_formats::clip::parse_ycd(&rpf.read_resource(id)?)?
+                };
                 let c = dict.clips.iter().find(|c| c.name.eq_ignore_ascii_case(clip)).context("no such clip")?;
-                let part = c.parts.first().context("clip without animation")?;
+                let (_, part, at) = c.part_at(secs).context("clip without animation")?;
                 let a = &dict.animations[part.animation];
                 let skel = model.skeleton.as_ref().context("the model has no skeleton")?;
                 let binding = openrage_app::anim::Binding::new(skel, a);
-                outln!("animating {} of {} bones", binding.animated_bones(), skel.bones.len());
-                Some(binding.skin(skel, a, a.frame_at(part.start + secs * part.rate)))
+                outln!(
+                    "animating {} of {} bones ({:.1} s clip)",
+                    binding.animated_bones(),
+                    skel.bones.len(),
+                    c.duration()
+                );
+                Some(binding.skin(skel, a, a.frame_at(at)))
             }
             None => None,
         };

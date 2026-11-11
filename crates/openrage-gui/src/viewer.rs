@@ -21,7 +21,9 @@ use rage_formats::math::Mat4;
 pub struct AnimState {
     dict: Arc<ClipDictionary>,
     clip: Option<usize>,
-    binding: Option<Binding>,
+    /// Bone binding per part of the clip (one for most clips; one per section
+    /// of a joined cutscene).
+    bindings: Vec<Option<Binding>>,
     /// Seconds into the clip.
     time: f32,
     playing: bool,
@@ -37,11 +39,10 @@ impl AnimState {
     /// Skinning matrices for the current time.
     pub fn skin(&self, m: &ModelPreview) -> Option<Vec<Mat4>> {
         let clip = self.dict.clips.get(self.clip?)?;
-        let part = clip.parts.first()?;
+        let (index, part, at) = clip.part_at(self.time)?;
         let anim = self.dict.animations.get(part.animation)?;
         let skeleton = m.loaded.skeleton.as_ref()?;
-        let at = part.start + self.time * part.rate;
-        Some(self.binding.as_ref()?.skin(skeleton, anim, anim.frame_at(at)))
+        Some(self.bindings.get(index)?.as_ref()?.skin(skeleton, anim, anim.frame_at(at)))
     }
 }
 
@@ -372,7 +373,7 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
                 s.borrow_mut().anim = Some(AnimState {
                     dict: Arc::new(dict),
                     clip: None,
-                    binding: None,
+                    bindings: Vec::new(),
                     time: 0.0,
                     playing: false,
                     speed: 1.0,
@@ -389,12 +390,13 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
             let skeleton = st.model().and_then(|m| m.loaded.skeleton.clone());
             let Some(a) = st.anim.as_mut() else { return };
             let Some(clip) = a.dict.clips.get(i as usize) else { return };
-            let binding = skeleton
-                .as_ref()
-                .zip(clip.parts.first())
-                .map(|(sk, p)| Binding::new(sk, &a.dict.animations[p.animation]));
-            let moved = binding.as_ref().map_or(0, Binding::animated_bones);
-            a.binding = binding;
+            let bindings: Vec<Option<Binding>> = clip
+                .parts
+                .iter()
+                .map(|p| skeleton.as_ref().map(|sk| Binding::new(sk, &a.dict.animations[p.animation])))
+                .collect();
+            let moved = bindings.first().and_then(Option::as_ref).map_or(0, Binding::animated_bones);
+            a.bindings = bindings;
             a.clip = Some(i as usize);
             a.time = 0.0;
             a.playing = true;

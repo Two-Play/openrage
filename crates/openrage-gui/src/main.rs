@@ -2863,6 +2863,9 @@ fn load_clip_dictionary(vpath: &str) -> anyhow::Result<rage_formats::clip::ClipD
     let game_dir = game_dir.ok_or_else(|| anyhow::anyhow!("no game folder"))?;
     let (node, _) = rage_mods::resolve(&game_dir, vpath, keys)?;
     let Node::ArchiveFile(rpf, id) = node else { anyhow::bail!("{vpath} is not a file inside an archive") };
+    if vpath.to_ascii_lowercase().ends_with(".cut") {
+        return openrage_app::cutscene::animation(&rpf, id);
+    }
     Ok(rage_formats::clip::parse_ycd(&rpf.read_resource(id)?)?)
 }
 

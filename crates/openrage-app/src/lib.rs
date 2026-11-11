@@ -4,6 +4,7 @@
 pub mod anim;
 pub mod audio;
 pub mod config;
+pub mod cutscene;
 pub mod detect;
 pub mod extract;
 pub mod install;

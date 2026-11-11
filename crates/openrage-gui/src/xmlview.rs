@@ -9,7 +9,7 @@ use openrage_app::metadata::Xml;
 use openrage_app::xmltree::{self, Node, SpanKind};
 use slint::{ComponentHandle, Model, ModelRc, ModelTracker, SharedString, VecModel};
 
-use crate::{AppWindow, InfoRow, XmlLine, XmlNodeRow, XmlSpan, XmlWindow};
+use crate::{AppWindow, CastRow, InfoRow, XmlLine, XmlNodeRow, XmlSpan, XmlWindow};
 
 /// A node of the tree in a flat arena (`id` = index).
 struct Entry {
@@ -145,6 +145,15 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
     let line_count = xml.text.lines().count();
     let nodes = tree.count();
     win.set_status(format!("{nodes} structures · {line_count} lines of XML").into());
+    win.set_cutscene_summary(
+        format!(
+            "{} · stored as {} · {nodes} structures · {line_count} lines of XML{}",
+            xml.root.as_deref().unwrap_or("Metadata"),
+            xml.encoding.name(),
+            if xml.errors.is_empty() { String::new() } else { format!(" · {} unreadable parts", xml.errors.len()) }
+        )
+        .into(),
+    );
 
     let mut entries = Vec::with_capacity(nodes);
     flatten(&tree, 0, &mut entries);
@@ -155,6 +164,11 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
     }
     let state = Rc::new(RefCell::new(State { entries, expanded, shown: Vec::new(), filter: String::new() }));
 
+    if vpath.to_ascii_lowercase().ends_with(".cut")
+        && let Ok(cut) = openrage_app::cutscene::from_xml(&xml.text)
+    {
+        show_cast(&win, ui, &vpath, cut);
+    }
     let lines: Vec<String> = xml.text.lines().map(|l| l.replace('\t', "    ")).collect();
     win.set_lines(ModelRc::new(Lines { lines }));
 
@@ -250,6 +264,56 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
     if win.show().is_ok() {
         OPEN.with(|o| o.borrow_mut().push((id, win)));
     }
+}
+
+/// Fills the cutscene tab: the cast, and playing an actor with its part of
+/// the cutscene's animation.
+fn show_cast(win: &XmlWindow, ui: &AppWindow, vpath: &str, cut: openrage_app::cutscene::Cutscene) {
+    use openrage_app::cutscene::Kind;
+    let people = cut.actors.iter().filter(|a| a.kind == Kind::Ped).count();
+    let vehicles = cut.actors.iter().filter(|a| a.kind == Kind::Vehicle).count();
+    let props = cut.actors.iter().filter(|a| a.kind == Kind::Prop).count();
+    win.set_is_cutscene(true);
+    win.set_cutscene_summary(
+        format!(
+            "{:.1} seconds · {people} people, {vehicles} vehicles, {props} props. \
+             Play animation opens the model in the viewer with its animation over the whole cutscene.",
+            cut.duration
+        )
+        .into(),
+    );
+    let rows: Vec<CastRow> = cut
+        .actors
+        .iter()
+        .map(|a| CastRow {
+            kind: a.kind.label().into(),
+            name: a.name.clone().into(),
+            playable: !a.kind.model_extensions().is_empty(),
+        })
+        .collect();
+    win.set_cast(ModelRc::new(VecModel::from(rows)));
+    win.set_tab(2);
+    let (main, cut_path, actors) = (ui.as_weak(), vpath.to_owned(), cut.actors);
+    let w = win.as_weak();
+    win.on_play_actor(move |i| {
+        let (Some(ui), Some(win)) = (main.upgrade(), w.upgrade()) else { return };
+        let Some(actor) = actors.get(i as usize) else { return };
+        let name = actor.name.to_ascii_lowercase();
+        let model = actor.kind.model_extensions().iter().find_map(|ext| {
+            crate::find_files(&format!("{name}{ext}"), ext, 20)
+                .into_iter()
+                .find(|v| v.rsplit('/').next().is_some_and(|f| f.eq_ignore_ascii_case(&format!("{name}{ext}"))))
+        });
+        match model {
+            Some(model) => {
+                win.set_status(format!("Opening {model} with the cutscene's animation …").into());
+                crate::open_model_with_animation(&ui, model, cut_path.clone());
+            }
+            None => {
+                win.set_status(format!("No model named {name} found (the search index may still be building).").into())
+            }
+        }
+    });
 }
 
 thread_local! {

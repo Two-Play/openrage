@@ -63,13 +63,70 @@ pub struct ClipPart {
 pub struct Clip {
     pub name: String,
     pub parts: Vec<ClipPart>,
+    /// The parts play one after another (a cutscene's sections joined by
+    /// [`join_sections`]); otherwise the first part is the clip.
+    pub sequential: bool,
+}
+
+impl ClipPart {
+    fn duration(&self) -> f32 {
+        (self.end - self.start).max(0.0) / self.rate.max(0.001)
+    }
 }
 
 impl Clip {
-    /// Length in seconds (the longest part).
+    /// Length in seconds (the longest part, or all parts in a row).
     pub fn duration(&self) -> f32 {
-        self.parts.iter().map(|p| (p.end - p.start).max(0.0) / p.rate.max(0.001)).fold(0.0, f32::max)
+        let parts = self.parts.iter().map(ClipPart::duration);
+        if self.sequential { parts.sum() } else { parts.fold(0.0, f32::max) }
     }
+
+    /// The part playing at `time` seconds into the clip, its index and the
+    /// time in the part's animation.
+    pub fn part_at(&self, time: f32) -> Option<(usize, &ClipPart, f32)> {
+        if !self.sequential {
+            let p = self.parts.first()?;
+            return Some((0, p, p.start + time * p.rate));
+        }
+        let mut t = time.max(0.0);
+        for (i, p) in self.parts.iter().enumerate() {
+            let d = p.duration();
+            if t < d || i + 1 == self.parts.len() {
+                return Some((i, p, p.start + t.min(d) * p.rate));
+            }
+            t -= d;
+        }
+        None
+    }
+}
+
+/// Joins a cutscene's sections (`name-0.ycd`, `name-1.ycd`, …, in order) into
+/// one dictionary: one clip per actor (`csb_bogdan_dual-3` → `csb_bogdan_dual`)
+/// whose parts are its clips of every section, played in a row. Sections an
+/// actor is missing from are left out.
+pub fn join_sections(sections: Vec<ClipDictionary>) -> ClipDictionary {
+    let mut out = ClipDictionary::default();
+    let mut names: Vec<String> = Vec::new();
+    for section in sections {
+        let base = out.animations.len();
+        out.animations.extend(section.animations);
+        for clip in section.clips {
+            let name = match clip.name.rsplit_once('-') {
+                Some((stem, n)) if n.chars().all(|c| c.is_ascii_digit()) => stem.to_owned(),
+                _ => clip.name.clone(),
+            };
+            let Some(first) = clip.parts.into_iter().next() else { continue };
+            let part = ClipPart { animation: first.animation + base, ..first };
+            match names.iter().position(|n| *n == name) {
+                Some(i) => out.clips[i].parts.push(part),
+                None => {
+                    names.push(name.clone());
+                    out.clips.push(Clip { name, parts: vec![part], sequential: true });
+                }
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Default)]
@@ -521,7 +578,7 @@ pub fn parse_ycd(res: &Resource) -> Result<ClipDictionary, ResourceError> {
                     }
                     _ => {}
                 }
-                clips.push(Clip { name, parts });
+                clips.push(Clip { name, parts, sequential: false });
             }
             entry = res.u64(entry + 0x10)?;
             guard += 1;
@@ -534,6 +591,33 @@ pub fn parse_ycd(res: &Resource) -> Result<ClipDictionary, ResourceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joins_cutscene_sections() {
+        let section = |n: usize| ClipDictionary {
+            clips: vec![
+                Clip {
+                    name: format!("actor_dual-{n}"),
+                    parts: vec![ClipPart { animation: 0, start: 0.0, end: 4.0, rate: 1.0 }],
+                    sequential: false,
+                },
+                Clip {
+                    name: format!("prop-{n}"),
+                    parts: vec![ClipPart { animation: 1, start: 0.0, end: 4.0, rate: 1.0 }],
+                    sequential: false,
+                },
+            ],
+            animations: Vec::new(),
+        };
+        let joined = join_sections(vec![section(0), section(1), section(2)]);
+        assert_eq!(joined.clips.len(), 2);
+        let actor = &joined.clips[0];
+        assert_eq!(actor.name, "actor_dual");
+        assert_eq!(actor.duration(), 12.0);
+        let (i, part, at) = actor.part_at(9.0).unwrap();
+        assert_eq!((i, part.animation, at), (2, 0, 1.0));
+        assert_eq!(actor.part_at(20.0).unwrap().0, 2);
+    }
 
     #[test]
     fn bit_reader() {
