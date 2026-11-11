@@ -1184,7 +1184,7 @@ fn cmd_verify_paths(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) 
                     let ext = name.rsplit('.').next().unwrap_or_default().to_owned();
                     match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| Ok(paths::parse(&r, &ext)?)) {
                         Ok((d, s)) => {
-                            c.1 += s.nodes;
+                            c.1 += s.nodes + s.polygons;
                             c.2 += s.links;
                             c.3 += s.points;
                             c.4 += s.duration;
@@ -1216,7 +1216,7 @@ fn cmd_verify_paths(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) 
         outln!("FAIL {e}");
     }
     outln!(
-        "{} path files, {} nodes, {} links, {} recorded points ({:.1} h of vehicle recordings, {} implausible points skipped); {} errors ({:.1}s)",
+        "{} path and nav mesh files, {} nodes and polygons, {} links, {} recorded points ({:.1} h of vehicle recordings, {} implausible points skipped); {} errors ({:.1}s)",
         t.0,
         t.1,
         t.2,
