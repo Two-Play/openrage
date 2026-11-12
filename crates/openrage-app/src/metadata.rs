@@ -56,6 +56,15 @@ pub struct Xml {
 
 /// Converts the bytes of a metadata file (as stored in the archive: RSC7, PSO or text).
 pub fn from_bytes(data: &[u8]) -> Result<Xml> {
+    from_bytes_for(data, false)
+}
+
+/// Like [`from_bytes`] for a file from Red Dead Redemption 2 (its PSO pointers differ).
+pub fn from_bytes_rdr2(data: &[u8]) -> Result<Xml> {
+    from_bytes_for(data, true)
+}
+
+fn from_bytes_for(data: &[u8], rdr2: bool) -> Result<Xml> {
     if data.starts_with(b"RSC7") {
         let res = Resource::from_rsc7(data)?;
         if !rage_formats::meta::is_meta(res.version) {
@@ -64,7 +73,7 @@ pub fn from_bytes(data: &[u8]) -> Result<Xml> {
         return from_resource(&res);
     }
     if rage_formats::pso::is_pso(data) {
-        let pso = rage_formats::pso::parse(data)?;
+        let pso = if rdr2 { rage_formats::pso::parse_rdr2(data)? } else { rage_formats::pso::parse(data)? };
         let (text, errors) = pso.to_xml();
         return Ok(Xml { text, encoding: Encoding::Pso, root: pso.root_type(), errors });
     }
@@ -87,12 +96,26 @@ pub fn from_resource(res: &Resource) -> Result<Xml> {
     Ok(Xml { text, encoding: Encoding::Meta, root: meta.root_type(), errors })
 }
 
+/// Converts a metadata file in an RDR2 archive (resource or PSO/RBF) to XML.
+pub fn from_rpf8(rpf: &rage_rpf::Rpf8, i: usize) -> Result<Xml> {
+    let entry = rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| anyhow::anyhow!("archive table not readable"))?;
+    if entry.is_resource {
+        let res = rpf.read_resource(entry)?;
+        if !rage_formats::meta::is_meta(res.version) {
+            bail!("resource version {} is not a meta file", res.version);
+        }
+        return from_resource(&res);
+    }
+    from_bytes_rdr2(&rpf.read(entry)?)
+}
+
 /// Reads a metadata file (mods included) and converts it to XML.
 pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result<Xml> {
     let (node, _) = rage_mods::resolve(game_dir, vpath, keys)?;
     let data = match node {
         Node::ArchiveFile(rpf, id) => rpf.read(id)?,
         Node::PlainFile(p) => std::fs::read(p)?,
+        Node::Rpf8File(rpf, i) => return from_rpf8(&rpf, i),
         _ => bail!("{vpath} is not a file"),
     };
     from_bytes(&data)

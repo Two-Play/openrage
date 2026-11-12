@@ -51,6 +51,7 @@ openrage rdr2-keys --file secrets.bin <RDR2>   # … or from a key file
 openrage rdr2-names <RDR2>                     # find RDR2 file names in the game's files (cached)
 openrage rpf8 --list <RDR2>/common_0.rpf       # RDR2 archive contents
 openrage rpf8 --text <RDR2>                    # read every RDR2 text table (.yldb)
+openrage rpf8 --meta <RDR2>                    # convert all RDR2 metadata (.ymap, .ytyp, .ymt, .ymf) to XML
 openrage world --radius 40 -- 350 4870 -60     # map objects near a point (builds the world cache)
 ```
 

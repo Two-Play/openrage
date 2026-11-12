@@ -2055,6 +2055,19 @@ fn rpf8_preview(rpf: &rage_rpf::Rpf8, i: usize) -> (Meta, String) {
         meta.extend(table);
         return (meta, text);
     }
+    if e.ext_id != 0 && openrage_app::metadata::is_metadata(&rpf.entry_name(i)) && e.size() <= 64 << 20 {
+        return match openrage_app::metadata::from_rpf8(rpf, i) {
+            Ok(xml) => {
+                let (more, text) = metadata_lines(xml);
+                meta.extend(more);
+                (meta, text)
+            }
+            Err(err) => {
+                meta.push(kv("Error", format!("{err:#}")));
+                (meta, String::new())
+            }
+        };
+    }
     if e.ext_id == 0 || e.is_resource || e.size() > 4 << 20 {
         return (meta, String::new());
     }
@@ -3346,6 +3359,13 @@ fn script_preview(rpf: &Rpf7, id: EntryId) -> Option<(Meta, String)> {
 
 /// Reads a metadata file and converts it to XML.
 fn read_xml(ui: &AppWindow, vpath: &str) -> anyhow::Result<openrage_app::metadata::Xml> {
+    // RDR2 keeps much of its metadata as resources, which the game's own
+    // resolution reads; GTA V files are read like any other file.
+    if let Some((dir, keys)) = with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone())))
+        && is_rdr2_dir(&dir)
+    {
+        return openrage_app::metadata::load(&dir, keys, vpath);
+    }
     openrage_app::metadata::from_bytes(&read_file(ui, vpath)?)
 }
 
@@ -4242,6 +4262,9 @@ fn register_rdr2(game_dir: &Path) -> bool {
         .map(Arc::new);
     let names = NameIndex::default_path(game_dir).and_then(|p| NameIndex::load(&p).ok().flatten()).map(Arc::new);
     let ok = keys.is_some();
+    if let Some(n) = &names {
+        openrage_app::rdr2::register_names(n);
+    }
     rage_rpf::rpf8::set_defaults(keys, names);
     ok
 }

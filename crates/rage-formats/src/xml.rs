@@ -25,11 +25,18 @@ pub fn float(v: f32) -> String {
     format!("{v}")
 }
 
+/// The most text a writer produces. A damaged or misread file can nest
+/// arrays inside arrays and grow without bound (one 475 KB RDR2 file asked
+/// for over 5 GB); past this the writer stops and records why.
+pub const MAX_OUTPUT: usize = 64 << 20;
+
 #[derive(Default)]
 pub struct Writer {
     pub out: String,
     /// Things that could not be read; also written as `<error>` elements.
     pub errors: Vec<String>,
+    /// The output reached [`MAX_OUTPUT`]; nothing more is written.
+    truncated: bool,
 }
 
 impl Writer {
@@ -40,6 +47,28 @@ impl Writer {
         w
     }
 
+    /// Whether the output is full; callers walking nested data stop then.
+    pub fn full(&self) -> bool {
+        self.truncated
+    }
+
+    /// Whether there is room for more output; at the limit, notes the truncation once.
+    fn room(&mut self) -> bool {
+        if self.truncated {
+            return false;
+        }
+        if self.out.len() > MAX_OUTPUT {
+            self.truncated = true;
+            let msg = format!("output truncated at {} MB: the data nests too much to show in full", MAX_OUTPUT >> 20);
+            self.out.push_str("<error>");
+            self.out.push_str(&msg);
+            self.out.push_str("</error>\n");
+            self.errors.push(msg);
+            return false;
+        }
+        true
+    }
+
     fn indent(&mut self, level: usize) {
         for _ in 0..level {
             self.out.push(' ');
@@ -48,6 +77,9 @@ impl Writer {
 
     /// `<tag>` (the tag may include attributes) followed by a newline.
     pub fn open(&mut self, level: usize, tag: &str) {
+        if !self.room() {
+            return;
+        }
         self.indent(level);
         self.out.push('<');
         self.out.push_str(tag);
@@ -55,6 +87,9 @@ impl Writer {
     }
 
     pub fn close(&mut self, level: usize, name: &str) {
+        if !self.room() {
+            return;
+        }
         self.indent(level);
         self.out.push_str("</");
         self.out.push_str(name);
@@ -63,6 +98,9 @@ impl Writer {
 
     /// `<name value="v" />`
     pub fn value(&mut self, level: usize, name: &str, v: &str) {
+        if !self.room() {
+            return;
+        }
         self.indent(level);
         self.out.push('<');
         self.out.push_str(name);
@@ -73,6 +111,9 @@ impl Writer {
 
     /// `<content />`
     pub fn empty(&mut self, level: usize, content: &str) {
+        if !self.room() {
+            return;
+        }
         self.indent(level);
         self.out.push('<');
         self.out.push_str(content);
@@ -81,6 +122,9 @@ impl Writer {
 
     /// `<name>text</name>`, text escaped; `name` may carry attributes.
     pub fn text(&mut self, level: usize, name: &str, text: &str) {
+        if !self.room() {
+            return;
+        }
         self.indent(level);
         self.out.push('<');
         self.out.push_str(name);
@@ -97,6 +141,9 @@ impl Writer {
     }
 
     pub fn error(&mut self, level: usize, msg: String) {
+        if !self.room() {
+            return;
+        }
         self.indent(level);
         self.out.push_str("<error>");
         self.out.push_str(&escape(&msg));
@@ -106,6 +153,9 @@ impl Writer {
 
     /// Values separated by spaces, `per_row` to a line.
     pub fn raw_array(&mut self, level: usize, name: &str, items: &[String], per_row: usize) {
+        if !self.room() {
+            return;
+        }
         if items.is_empty() {
             return self.empty(level, name);
         }
@@ -132,6 +182,9 @@ impl Writer {
 
     /// One value per line (element content).
     pub fn raw_array_lines(&mut self, level: usize, items: &[String]) {
+        if !self.room() {
+            return;
+        }
         for item in items {
             self.indent(level);
             self.out.push_str(item);
@@ -141,6 +194,9 @@ impl Writer {
 
     /// `<Item>value</Item>` per item.
     pub fn item_array(&mut self, level: usize, name: &str, items: &[String]) {
+        if !self.room() {
+            return;
+        }
         if items.is_empty() {
             return self.empty(level, name);
         }
@@ -159,6 +215,19 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_stops_at_the_cap() {
+        let mut w = Writer::default();
+        let long = "x".repeat(1 << 20);
+        for _ in 0..100 {
+            w.value(0, "V", &long);
+        }
+        assert!(w.full());
+        let (text, errors) = w.finish();
+        assert!(text.len() < MAX_OUTPUT + (2 << 20));
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
 
     #[test]
     fn formatting() {

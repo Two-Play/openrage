@@ -177,6 +177,9 @@ enum Command {
         /// Instead of only reading files, read every text table (.yldb) and count its strings.
         #[arg(long, conflicts_with_all = ["textures", "models"])]
         text: bool,
+        /// Instead of only reading files, convert all metadata (.ymap, .ytyp, .ymt, .ymf) to XML.
+        #[arg(long, conflicts_with_all = ["textures", "models", "text"])]
+        meta: bool,
     },
     /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
     Media {
@@ -366,8 +369,8 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if let Command::Rpf8 { path, list, textures, models, text } = &cli.command {
-        return cmd_rpf8(path, *list, *textures, *models, *text);
+    if let Command::Rpf8 { path, list, textures, models, text, meta } = &cli.command {
+        return cmd_rpf8(path, *list, *textures, *models, *text, *meta);
     }
     if let Command::Rdr2Names { game, import } = &cli.command {
         return cmd_rdr2_names(game, import.as_deref());
@@ -381,6 +384,9 @@ fn run() -> Result<()> {
         let names = rage_rpf::rpf8_names::NameIndex::default_path(&game_dir)
             .and_then(|p| rage_rpf::rpf8_names::NameIndex::load(&p).ok().flatten())
             .map(Arc::new);
+        if let Some(n) = &names {
+            openrage_app::rdr2::register_names(n);
+        }
         rage_rpf::rpf8::set_defaults(rdr2_keys()?, names);
     }
     let keys = openrage_app::load_keys().unwrap_or_else(|e| {
@@ -2372,7 +2378,7 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool) -> Result<()> {
+fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool, meta: bool) -> Result<()> {
     use rage_rpf::rpf8::{Compression, Rpf8};
     let keys = rdr2_keys()?;
     let names = rdr2_game_folder(path)
@@ -2451,6 +2457,20 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool) -
         }
         Ok(triangles)
     }
+    /// Converts a metadata file to XML; returns how many problems it had.
+    fn check_meta(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
+        let xml = if e.is_resource {
+            let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
+            if !rage_formats::meta::is_meta(res.version) {
+                return Err(format!("resource version {} is not a meta file", res.version));
+            }
+            openrage_app::metadata::from_resource(&res).map_err(|err| err.to_string())?
+        } else {
+            openrage_app::metadata::from_bytes_rdr2(&rpf.read(e).map_err(|err| err.to_string())?)
+                .map_err(|err| err.to_string())?
+        };
+        Ok(xml.errors.len())
+    }
     /// Reads a text table; returns its string count.
     fn check_texts(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
         let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
@@ -2462,9 +2482,10 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool) -
         textures: bool,
         models: bool,
         texts: bool,
+        meta: bool,
     }
     fn walk(rpf: &Rpf8, depth: usize, list: bool, checks: Checks, t: &mut Tally) {
-        let Checks { textures, models, texts } = checks;
+        let Checks { textures, models, texts, meta } = checks;
         let h = rpf.header();
         let Some(entries) = rpf.entries() else { return };
         t.readable += 1;
@@ -2491,6 +2512,23 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool) -
                     Err(err) => {
                         t.failed += 1;
                         t.lines.push(format!("{indent}{name}: {err}"));
+                    }
+                }
+            } else if meta {
+                // .ymap 73, .ytyp 74, .ymt 11, .ymf 1
+                if matches!(e.ext_id, 1 | 11 | 73 | 74) {
+                    match check_meta(rpf, e) {
+                        Ok(problems) => {
+                            t.textures += 1;
+                            t.triangles += problems;
+                            if problems > 0 {
+                                t.lines.push(format!("{indent}{name}: {problems} parts not read"));
+                            }
+                        }
+                        Err(err) => {
+                            t.failed += 1;
+                            t.lines.push(format!("{indent}{name}: {err}"));
+                        }
                     }
                 }
             } else if models {
@@ -2571,7 +2609,7 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool) -
                             h.platform,
                             rpf.size()
                         ));
-                        walk(&rpf, 0, list, Checks { textures, models, texts: text }, &mut t);
+                        walk(&rpf, 0, list, Checks { textures, models, texts: text, meta }, &mut t);
                     }
                     Err(e) => {
                         t.failed += 1;
@@ -2608,6 +2646,9 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool) -
     }
     if text {
         outln!("\n{textures_total} text tables read ({triangles_total} strings)");
+    }
+    if meta {
+        outln!("\n{textures_total} metadata files converted ({triangles_total} parts not read)");
     }
     outln!(
         "\n{ok} archives read ({nested} more nested in them), {empty} empty, {failed} failed; {plain} with a readable table ({entries_total} entries).{}",

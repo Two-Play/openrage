@@ -27,6 +27,10 @@ use crate::xml::{self, Writer};
 
 /// Resource version of meta files.
 pub const VERSION: u32 = 2;
+/// Resource version of Red Dead Redemption 2's meta files (`.ymap`, `.ytyp`):
+/// the same format with the header fields from `0x1C` moved 8 bytes on (root
+/// block `0x20` (4 bytes on), lists `0x28`/`0x30`/`0x38` and name `0x40` (8 on)).
+pub const VERSION_RDR2: u32 = 3;
 
 const ARRAYINFO: u32 = 0x100;
 
@@ -41,6 +45,20 @@ pub enum MetaError {
 /// Data types of structure entries.
 mod ty {
     pub const BOOLEAN: u8 = 0x01;
+    /// 64-bit unsigned integer (RDR2, e.g. entity ids).
+    pub const ULONG: u8 = 0x08;
+    /// RDR2: another 64-bit integer (guids).
+    pub const ULONG2: u8 = 0x17;
+    /// RDR2: half-precision float.
+    pub const HALF: u8 = 0x20;
+    /// RDR2: a 3D vector in 16 bytes.
+    pub const VEC3_PADDED: u8 = 0x31;
+    /// RDR2: 4×4 float matrix.
+    pub const MATRIX: u8 = 0x36;
+    /// RDR2: a 32-byte value of unknown layout (shown as bytes).
+    pub const OPAQUE32: u8 = 0x53;
+    /// RDR2: a map; the entry's key holds the key and value type indices.
+    pub const MAP: u8 = 0x71;
     pub const STRUCTURE: u8 = 0x05;
     pub const STRUCTURE_POINTER: u8 = 0x07;
     pub const SBYTE: u8 = 0x10;
@@ -94,11 +112,13 @@ pub struct Meta {
     structs: HashMap<u32, StructInfo>,
     enums: HashMap<u32, Vec<(u32, i32)>>,
     blocks: Vec<Block>,
+    /// Bit where the offset of a packed pointer starts (12, or 20 in RDR2).
+    offset_shift: u32,
 }
 
 /// Whether a resource with this version is a meta file.
 pub fn is_meta(version: u32) -> bool {
-    version == VERSION
+    version == VERSION || version == VERSION_RDR2
 }
 
 pub fn parse(res: &Resource) -> Result<Meta, MetaError> {
@@ -108,12 +128,13 @@ pub fn parse(res: &Resource) -> Result<Meta, MetaError> {
     if block_count == 0 || block_count > 0x10000 || struct_count > 0x10000 || enum_count > 0x10000 {
         return Err(MetaError::Invalid(format!("{block_count} blocks, {struct_count} structures")));
     }
-    let root_block = res.u32(root + 0x1C)? as usize;
-    let name_ptr = res.u64(root + 0x38)?;
+    let shift = if res.version == VERSION_RDR2 { 8 } else { 0 };
+    let root_block = res.u32(root + if res.version == VERSION_RDR2 { 0x20 } else { 0x1C })? as usize;
+    let name_ptr = res.u64(root + 0x38 + shift)?;
     let name = if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() };
 
     let mut structs = HashMap::new();
-    let infos = res.u64(root + 0x20)?;
+    let infos = res.u64(root + 0x20 + shift)?;
     for i in 0..struct_count as u64 {
         let at = infos + i * 32;
         let entries_ptr = res.u64(at + 0x10)?;
@@ -133,21 +154,27 @@ pub fn parse(res: &Resource) -> Result<Meta, MetaError> {
     }
 
     let mut enums = HashMap::new();
-    let infos = res.u64(root + 0x28)?;
+    let infos = res.u64(root + 0x28 + shift)?;
     for i in 0..enum_count as u64 {
         let at = infos + i * 24;
         let entries_ptr = res.u64(at + 8)?;
         let count = res.u32(at + 0x10)? as u64;
         let mut entries = Vec::with_capacity(count as usize);
         for e in 0..count.min(0x10000) {
-            let p = entries_ptr + e * 8;
-            entries.push((res.u32(p)?, res.u32(p + 4)? as i32));
+            // GTA V: (name, value), 8 bytes; RDR2: (value, name), 16 bytes.
+            if res.version == VERSION_RDR2 {
+                let p = entries_ptr + e * 16;
+                entries.push((res.u32(p + 8)?, res.u32(p)? as i32));
+            } else {
+                let p = entries_ptr + e * 8;
+                entries.push((res.u32(p)?, res.u32(p + 4)? as i32));
+            }
         }
         enums.insert(res.u32(at)?, entries);
     }
 
     let mut blocks = Vec::with_capacity(block_count);
-    let infos = res.u64(root + 0x30)?;
+    let infos = res.u64(root + 0x30 + shift)?;
     for i in 0..block_count as u64 {
         let at = infos + i * 16;
         let len = res.u32(at + 4)? as usize;
@@ -155,7 +182,8 @@ pub fn parse(res: &Resource) -> Result<Meta, MetaError> {
         let data = if len == 0 { Vec::new() } else { res.bytes(ptr, len)?.to_vec() };
         blocks.push(Block { name: res.u32(at)?, data });
     }
-    Ok(Meta { name, root_block, structs, enums, blocks })
+    let offset_shift = if res.version == VERSION_RDR2 { 20 } else { 12 };
+    Ok(Meta { name, root_block, structs, enums, blocks, offset_shift })
 }
 
 /// Parses a meta file and writes it as XML (see [`Meta::to_xml`]).
@@ -181,6 +209,18 @@ fn u64_at(d: &[u8], at: usize) -> Result<u64, String> {
     le::<8>(d, at).map(u64::from_le_bytes)
 }
 
+/// IEEE half-precision float.
+fn half(h: u16) -> f32 {
+    let sign = if h >> 15 == 1 { -1.0 } else { 1.0 };
+    let exp = i32::from((h >> 10) & 0x1F);
+    let man = f32::from(h & 0x3FF);
+    sign * match exp {
+        0 => man * 2f32.powi(-24),
+        31 => f32::INFINITY,
+        e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
+    }
+}
+
 fn f32_at(d: &[u8], at: usize) -> Result<f32, String> {
     le::<4>(d, at).map(f32::from_le_bytes)
 }
@@ -189,9 +229,10 @@ fn vector(d: &[u8], at: usize, n: usize) -> Result<Vec<f32>, String> {
     (0..n).map(|i| f32_at(d, at + i * 4)).collect()
 }
 
-/// Splits a packed pointer into (1-based block, offset).
-fn unpack(ptr: u64) -> (usize, usize) {
-    ((ptr & 0xFFF) as usize, ((ptr >> 12) & 0xFFFFF) as usize)
+/// Splits a packed pointer into (1-based block, offset): bits 0–11 and
+/// 12–31 in GTA V; RDR2 starts the offset at bit 20.
+fn unpack_with(ptr: u64, offset_shift: u32) -> (usize, usize) {
+    ((ptr & 0xFFF) as usize, ((ptr >> offset_shift) & 0xFFFFF) as usize)
 }
 
 /// `<tag x="…" y="…" …/>` contents for a vector.
@@ -212,6 +253,10 @@ enum Tag {
 }
 
 impl Meta {
+    fn unpack(&self, ptr: u64) -> (usize, usize) {
+        unpack_with(ptr, self.offset_shift)
+    }
+
     fn block(&self, id: usize) -> Option<&Block> {
         id.checked_sub(1).and_then(|i| self.blocks.get(i))
     }
@@ -224,7 +269,7 @@ impl Meta {
     /// Reads `count` items of `size` bytes starting at a packed pointer; long
     /// arrays continue in the following blocks.
     fn array(&self, ptr: u64, count: usize, size: usize) -> Result<Vec<u8>, String> {
-        let (mut id, mut off) = unpack(ptr);
+        let (mut id, mut off) = self.unpack(ptr);
         let mut out = Vec::with_capacity(count * size);
         for _ in 0..count {
             let mut block = self.block(id).ok_or_else(|| format!("array block {id} missing"))?;
@@ -271,6 +316,9 @@ impl Meta {
         struct_name: u32,
         depth: usize,
     ) {
+        if w.full() {
+            return;
+        }
         let Some(block) = self.block(block_id) else {
             return w.error(level, format!("block {block_id} not found"));
         };
@@ -302,9 +350,16 @@ impl Meta {
                 continue;
             }
             let ename = names::field(entry.name);
-            if let Err(e) =
-                self.entry(w, inner, block_id, &block.data, offset + entry.offset, entry, &array_info, &ename, depth)
-            {
+            if let Err(e) = self.entry(
+                w,
+                inner,
+                block_id,
+                &block.data,
+                offset + entry.offset,
+                (entry, &array_info, info),
+                &ename,
+                depth,
+            ) {
                 w.error(inner, format!("{ename}: {e}"));
             }
         }
@@ -321,14 +376,14 @@ impl Meta {
         block_id: usize,
         data: &[u8],
         at: usize,
-        entry: &Entry,
-        array_info: &Entry,
+        (entry, array_info, owner): (&Entry, &Entry, &StructInfo),
         ename: &str,
         depth: usize,
     ) -> Result<(), String> {
         let byte = |at: usize| data.get(at).copied().ok_or_else(|| format!("offset {at:#x} beyond block"));
         match entry.kind {
             ty::ARRAY => self.array_node(w, level, data, at, array_info, ename, depth)?,
+            ty::MAP => self.map_node(w, level, data, at, entry, owner, ename, depth)?,
             ty::ARRAY_OF_BYTES => {
                 let n = entry.key as usize;
                 let text = match array_info.kind {
@@ -371,7 +426,7 @@ impl Meta {
                 w.text(level, ename, &text);
             }
             ty::DATA_BLOCK_POINTER => {
-                let (id, _) = unpack(u64_at(data, at)?);
+                let (id, _) = self.unpack(u64_at(data, at)?);
                 let bytes: Vec<String> = match self.block(id) {
                     Some(b) => b.data.iter().map(|b| format!("{b:02X}")).collect(),
                     None => Vec::new(),
@@ -382,6 +437,10 @@ impl Meta {
             ty::FLOAT_XYZ => w.empty(level, &vector_attrs(ename, &vector(data, at, 3)?)),
             ty::FLOAT_XYZW => w.empty(level, &vector_attrs(ename, &vector(data, at, 4)?)),
             ty::HASH => w.string(level, ename, &names::value(u32_at(data, at)?)),
+            // RDR2's 0x63 flags are a single byte.
+            ty::INT_FLAGS1 if self.offset_shift == 20 => {
+                w.string(level, ename, &self.enum_string(entry, i32::from(byte(at)?)));
+            }
             ty::INT_ENUM | ty::INT_FLAGS1 | ty::INT_FLAGS2 => {
                 let v = u32_at(data, at)? as i32;
                 w.string(level, ename, &self.enum_string(entry, v));
@@ -389,6 +448,20 @@ impl Meta {
             ty::SHORT_FLAGS => {
                 let v = u16_at(data, at)? as i16 as i32;
                 w.string(level, ename, &self.enum_string(entry, v));
+            }
+            ty::ULONG | ty::ULONG2 => w.value(level, ename, &u64_at(data, at)?.to_string()),
+            ty::HALF => w.value(level, ename, &xml::float(half(u16_at(data, at)?))),
+            ty::VEC3_PADDED => w.empty(level, &vector_attrs(ename, &vector(data, at, 3)?)),
+            ty::MATRIX => {
+                let m = vector(data, at, 16)?;
+                let rows: Vec<String> =
+                    m.chunks(4).map(|r| r.iter().map(|v| xml::float(*v)).collect::<Vec<_>>().join(" ")).collect();
+                w.raw_array(level, ename, &rows, 1);
+            }
+            ty::OPAQUE32 => {
+                let b: Vec<String> =
+                    (0..32).map(|i| byte(at + i).map(|v| format!("{v:02X}"))).collect::<Result<_, _>>()?;
+                w.raw_array(level, ename, &b, 16);
             }
             ty::SINT => w.value(level, ename, &(u32_at(data, at)? as i32).to_string()),
             ty::SSHORT => w.value(level, ename, &(u16_at(data, at)? as i16).to_string()),
@@ -405,7 +478,7 @@ impl Meta {
             }
             ty::STRUCTURE_POINTER => {
                 let ptr = u64_at(data, at)?;
-                let (id, off) = unpack(ptr);
+                let (id, off) = self.unpack(ptr);
                 match self.block(id) {
                     Some(b) if ptr != 0 => {
                         w.open(level, &format!("{ename} type=\"{}\"", names::field(b.name)));
@@ -421,11 +494,80 @@ impl Meta {
     }
 
     fn string(&self, ptr: u64, len: usize) -> Result<String, String> {
-        let (id, off) = unpack(ptr);
+        let (id, off) = self.unpack(ptr);
         let block = self.block(id).ok_or_else(|| format!("string block {id} missing"))?;
         let bytes = block.data.get(off..(off + len).min(block.data.len())).ok_or("string beyond block")?;
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
+    }
+
+    /// An RDR2 map: `1`, pointer at +8, count at +16. Each pair is the key
+    /// (4 bytes, padded to 8) and the value; the entry's key names the
+    /// owner's type entries for key (high 16 bits) and value (low 16 bits).
+    #[allow(clippy::too_many_arguments)]
+    fn map_node(
+        &self,
+        w: &mut Writer,
+        level: usize,
+        data: &[u8],
+        at: usize,
+        entry: &Entry,
+        owner: &StructInfo,
+        ename: &str,
+        depth: usize,
+    ) -> Result<(), String> {
+        let ptr = u64_at(data, at + 8)?;
+        let count = u16_at(data, at + 16)? as usize;
+        if count == 0 {
+            w.empty(level, ename);
+            return Ok(());
+        }
+        let (ki, vi) = ((entry.key >> 16) as usize, (entry.key & 0xFFFF) as usize);
+        let key_entry = *owner.entries.get(ki).ok_or("map key type not found")?;
+        let value_entry = *owner.entries.get(vi).ok_or("map value type not found")?;
+        // An array value's item type is the type entry before it.
+        let value_info = vi.checked_sub(1).and_then(|i| owner.entries.get(i)).copied().unwrap_or_default();
+        let value_size = match value_entry.kind {
+            ty::ARRAY => 16,
+            ty::STRUCTURE => self.structs.get(&value_entry.key).map_or(8, |s| s.size),
+            ty::INT_FLAGS1 if self.offset_shift == 20 => 1,
+            ty::HASH | ty::UINT | ty::SINT | ty::FLOAT | ty::INT_ENUM | ty::INT_FLAGS1 | ty::INT_FLAGS2 => 4,
+            ty::BOOLEAN | ty::UBYTE | ty::SBYTE | ty::BYTE_ENUM => 1,
+            ty::USHORT | ty::SSHORT | ty::SHORT_FLAGS => 2,
+            ty::FLOAT_XYZ | ty::FLOAT_XYZW => 16,
+            _ => 8,
+        };
+        let stride = (8 + value_size).next_multiple_of(8);
+        let (id, off) = self.unpack(ptr);
+        let block = self.block(id).ok_or_else(|| format!("map block {id} not found"))?;
+        w.open(level, ename);
+        for i in 0..count {
+            let pair = off + i * stride;
+            if pair + stride > block.data.len() {
+                w.error(level + 1, format!("map pair {i} beyond its block"));
+                break;
+            }
+            let key = match key_entry.kind {
+                ty::HASH | ty::UINT | ty::INT_ENUM => names::value(u32_at(&block.data, pair)?),
+                _ => u32_at(&block.data, pair)?.to_string(),
+            };
+            w.open(level + 1, &format!("Item key=\"{}\"", xml::escape(&key)));
+            if let Err(e) = self.entry(
+                w,
+                level + 2,
+                id,
+                &block.data,
+                pair + 8,
+                (&value_entry, &value_info, owner),
+                "Value",
+                depth + 1,
+            ) {
+                w.error(level + 2, format!("map value: {e}"));
+            }
+            w.close(level + 1, "Item");
+        }
+        w.close(level, ename);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -452,7 +594,7 @@ impl Meta {
                     return Ok(());
                 }
                 let info = self.structs.get(&item.key).ok_or("array item structure not found")?;
-                let (mut id, mut off) = unpack(ptr);
+                let (mut id, mut off) = self.unpack(ptr);
                 w.open(level, &tag);
                 for n in 0..count {
                     self.node(w, level + 1, id, off, Tag::Item, item.key, depth + 1);
@@ -473,7 +615,7 @@ impl Meta {
                 w.open(level, ename);
                 for p in ptrs.as_chunks::<8>().0 {
                     let p = u64::from_le_bytes(*p);
-                    let (id, off) = unpack(p);
+                    let (id, off) = self.unpack(p);
                     if p == 0 {
                         w.empty(level + 1, "Item");
                     } else {
