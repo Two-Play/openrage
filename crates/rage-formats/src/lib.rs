@@ -3,6 +3,7 @@
 //! * [`ytd`]: texture dictionaries (GTA V Legacy and Enhanced)
 //! * [`texture`]: pixel formats, decoding to RGBA
 //! * [`dds`], [`png`]: export, compatible with OpenIV/CodeWalker output
+//! * [`gxt2`], [`ldb`]: text tables (GTA V, RDR2)
 //! * [`meta`], [`pso`], [`rbf`]: metadata (`.ymap`, `.ytyp`, `.ymt`, `.cut`, …) as XML
 
 pub mod awc;
@@ -12,6 +13,7 @@ pub mod drawable;
 pub mod geometry;
 pub mod gltf;
 pub mod gxt2;
+pub mod ldb;
 pub mod math;
 pub mod media;
 pub mod meta;

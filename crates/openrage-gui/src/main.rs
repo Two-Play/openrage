@@ -1255,7 +1255,7 @@ fn is_viewable(item: &Item) -> bool {
 /// Files that open in the text editor (by extension; binary contents are
 /// detected when opening).
 fn is_text_file(item: &Item) -> bool {
-    const TEXT: [&str; 17] = [
+    const TEXT: [&str; 18] = [
         "xml",
         "meta",
         "txt",
@@ -1273,6 +1273,7 @@ fn is_text_file(item: &Item) -> bool {
         "ugc",
         "gxt2",
         "nametable",
+        "yldb",
     ];
     let ext = item.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
     matches!(item.kind, ItemKind::File) && item.mark != Some(Mark::Removed) && TEXT.contains(&ext.as_str())
@@ -1956,12 +1957,17 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
 
 /// A text table shown as text in the preview.
 fn text_table_preview(kind: openrage_app::texttable::Kind, data: &[u8]) -> (Meta, String) {
+    table_text_preview(kind.name(), openrage_app::texttable::to_text(kind, data))
+}
+
+/// A text table already converted to text (with its entry count) for the preview.
+fn table_text_preview(format: &str, converted: anyhow::Result<(String, usize)>) -> (Meta, String) {
     const LIMIT: usize = 256 * 1024;
-    match openrage_app::texttable::to_text(kind, data) {
+    match converted {
         Ok((text, count)) => {
             // The preview font has no tab glyph.
             let mut text = text.replace('\t', "    ");
-            let mut meta = vec![kv("Format", kind.name()), kv("Entries", count)];
+            let mut meta = vec![kv("Format", format), kv("Entries", count)];
             if text.len() > LIMIT {
                 let cut = (0..=LIMIT).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
                 text.truncate(cut);
@@ -2025,6 +2031,11 @@ fn rpf8_preview(rpf: &rage_rpf::Rpf8, i: usize) -> (Meta, String) {
         meta.push(kv("Resource version", v));
     }
     meta.push(kv("Hash", format!("0x{:08X}", e.hash)));
+    if e.is_resource && openrage_app::texttable::is_rdr2_text_table(&rpf.entry_name(i)) {
+        let (table, text) = table_text_preview("RDR2 text table", openrage_app::texttable::rdr2_entry_to_text(rpf, i));
+        meta.extend(table);
+        return (meta, text);
+    }
     if e.ext_id == 0 || e.is_resource || e.size() > 4 << 20 {
         return (meta, String::new());
     }
@@ -3210,9 +3221,30 @@ fn read_file(ui: &AppWindow, vpath: &str) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+/// Reads a Red Dead Redemption 2 text table (`.yldb`) as text.
+fn read_rdr2_text_table(vpath: &str) -> anyhow::Result<String> {
+    let (game_dir, keys) = with_app(|a| (a.game_dir.clone(), a.keys.clone()));
+    let game_dir = game_dir.ok_or_else(|| anyhow::anyhow!("no game folder"))?;
+    match rage_mods::resolve(&game_dir, vpath, keys)?.0 {
+        Node::Rpf8File(rpf, i) => Ok(openrage_app::texttable::rdr2_entry_to_text(&rpf, i)?.0),
+        _ => anyhow::bail!("{vpath} is not a file in a Red Dead Redemption 2 archive"),
+    }
+}
+
 fn open_editor(ui: &AppWindow, vpath: String) {
     if vpath.to_ascii_lowercase().ends_with(".ysc") {
         return open_script_view(ui, vpath);
+    }
+    if openrage_app::texttable::is_rdr2_text_table(&vpath) {
+        ui.set_status(format!("Reading {vpath} …").into());
+        match read_rdr2_text_table(&vpath) {
+            Ok(text) => {
+                editor::open(ui, editor::Document::rdr2_text_table(vpath, text));
+                ui.set_status(SharedString::new());
+            }
+            Err(e) => ui.set_status(format!("Cannot read {vpath}: {e:#}").into()),
+        }
+        return;
     }
     ui.set_status(format!("Opening {vpath} …").into());
     match read_file(ui, &vpath) {
