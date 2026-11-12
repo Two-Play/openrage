@@ -20,7 +20,7 @@ const HEADER: &str = "openrage-rdr2-textures 1";
 
 /// Where a texture dictionary is: archive file (relative to the game folder)
 /// and the hashes of the entries leading to it (nested archives, then the dictionary).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Location {
     pub archive: String,
     pub chain: Vec<u32>,
@@ -31,6 +31,8 @@ pub struct Location {
 pub struct TextureIndex {
     pub textures: HashMap<String, usize>,
     pub dictionaries: Vec<Location>,
+    /// Name and dictionary by the hash of the name (built on first use).
+    by_hash: OnceLock<HashMap<u32, (String, usize)>>,
 }
 
 impl TextureIndex {
@@ -99,6 +101,22 @@ impl TextureIndex {
     /// The dictionary that holds a texture.
     pub fn find(&self, texture: &str) -> Option<&Location> {
         self.dictionaries.get(*self.textures.get(&texture.to_ascii_lowercase())?)
+    }
+
+    /// The dictionary that holds the texture whose name has this hash
+    /// (metadata often stores texture names as hashes).
+    pub fn find_hash(&self, hash: u32) -> Option<&Location> {
+        self.dictionaries.get(self.hashed().get(&hash)?.1)
+    }
+
+    /// The (lower case) name of the texture whose name has this hash.
+    pub fn name_of(&self, hash: u32) -> Option<&str> {
+        Some(self.hashed().get(&hash)?.0.as_str())
+    }
+
+    fn hashed(&self) -> &HashMap<u32, (String, usize)> {
+        self.by_hash
+            .get_or_init(|| self.textures.iter().map(|(n, d)| (rage_core::hash::joaat(n), (n.clone(), *d))).collect())
     }
 }
 
@@ -232,5 +250,8 @@ mod tests {
         let back = TextureIndex::from_text(&idx.to_text()).unwrap();
         assert_eq!(back.dictionaries, idx.dictionaries);
         assert_eq!(back.find("NBX_Ground_Paving14_ab"), Some(&idx.dictionaries[0]));
+        let hash = rage_core::hash::joaat("nbx_ground_paving14_ab");
+        assert_eq!(back.find_hash(hash), Some(&idx.dictionaries[0]));
+        assert_eq!(back.name_of(hash), Some("nbx_ground_paving14_ab"));
     }
 }

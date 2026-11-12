@@ -20300,3 +20300,14 @@ AllowPlayerIgnoreSpawnRestrictions 34fdc530
 CheckForObstructionEvenInClusters 285735f7
 IgnoreShockingPlayerRunOverEvent ebb1eee6
 ForceWantedLevelWhenKilled d960413b
+# RDR2 metapeds (outfit assets)
+drawable
+albedo
+material
+palette
+tint0
+tint1
+tint2
+outfits
+assets
+value

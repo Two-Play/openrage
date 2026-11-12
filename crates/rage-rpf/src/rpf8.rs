@@ -260,6 +260,11 @@ pub fn set_defaults(keys: Option<Arc<Rdr2Keys>>, names: Option<Arc<crate::rpf8_n
     }
 }
 
+/// The keys registered with [`set_defaults`].
+pub fn default_keys() -> Option<Arc<Rdr2Keys>> {
+    defaults().read().ok()?.0.clone()
+}
+
 /// Whether keys were registered with [`set_defaults`].
 pub fn has_default_keys() -> bool {
     defaults().read().is_ok_and(|d| d.0.is_some())
@@ -476,6 +481,11 @@ impl Rpf8 {
 
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// The platform letter of the archive (`y` for PC); it fills in extensions such as `#dd`.
+    pub fn platform(&self) -> char {
+        self.header.platform
     }
 
     pub fn path(&self) -> &Path {

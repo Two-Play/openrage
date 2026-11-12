@@ -162,6 +162,17 @@ enum Command {
         #[arg(long)]
         import: Option<PathBuf>,
     },
+    /// Show a Red Dead Redemption 2 ped (people and animals): its outfits and the files of their parts.
+    Rdr2Ped {
+        /// The ped, e.g. `cs_johnmarston` (none: list all peds).
+        name: Option<String>,
+        /// Show only this outfit (counted from 0).
+        #[arg(long)]
+        outfit: Option<usize>,
+        /// Check every outfit of every ped: all parts must be found in the game.
+        #[arg(long, conflicts_with_all = ["name", "outfit"])]
+        check: bool,
+    },
     /// Inspect Red Dead Redemption 2 archives (RPF8): a file or every .rpf in a folder.
     Rpf8 {
         path: PathBuf,
@@ -421,6 +432,7 @@ fn run() -> Result<()> {
         Command::Verify { path, particles: true, .. } => cmd_verify_particles(&game_dir, &path, keys),
         Command::Verify { path, text: true, .. } => cmd_verify_text(&game_dir, &path, keys),
         Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
+        Command::Rdr2Ped { name, outfit, check } => cmd_rdr2_ped(&game_dir, name.as_deref(), outfit, check),
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
         Command::Verify { path, textures: true, rebuild, .. } => cmd_verify_textures(&game_dir, &path, rebuild, keys),
@@ -2799,6 +2811,169 @@ fn cmd_rdr2_keys(game: &Path, dump: Option<&Path>, file: Option<&Path>) -> Resul
 fn rdr2_game_folder(path: &Path) -> Option<PathBuf> {
     let start = if path.is_dir() { path } else { path.parent()? };
     start.ancestors().find(|d| d.join("RDR2.exe").is_file()).map(Path::to_path_buf)
+}
+
+fn cmd_rdr2_ped(game: &Path, name: Option<&str>, outfit: Option<usize>, check: bool) -> Result<()> {
+    use openrage_app::metaped;
+    if !game.join("RDR2.exe").is_file() {
+        bail!("{} is not a Red Dead Redemption 2 folder", game.display());
+    }
+    let started = Instant::now();
+    let peds = metaped::ped_list(game)?;
+    let name = match name {
+        Some(n) if !check => n,
+        _ if check => return check_rdr2_peds(game, &peds, started),
+        _ => {
+            for p in &peds {
+                outln!("{:<40} {}", p.name, p.base);
+            }
+            outln!("{} peds", peds.len());
+            return Ok(());
+        }
+    };
+    let finder = PedFinder::new(game)?;
+    match peds.iter().find(|p| p.name.eq_ignore_ascii_case(name)) {
+        Some(p) => outln!("{}: base skeleton {}", p.name, metaped::base_fragment(p)),
+        None => outln!("{name}: not in the ped list"),
+    }
+    let outfits = metaped::load_outfits(game, &finder.index, name)?;
+    outln!("{} outfits", outfits.len());
+    for (k, o) in outfits.iter().enumerate().filter(|(k, _)| outfit.is_none_or(|n| n == *k)) {
+        outln!("outfit {k}: {} parts, {} face shape values", o.assets.len(), o.expressions.len());
+        for a in &o.assets {
+            outln!("  {}", finder.model(a.drawable));
+            outln!(
+                "    albedo {}  normal {}  material {}",
+                finder.texture(a.albedo),
+                finder.texture(a.normal),
+                rage_formats::names::value(a.material)
+            );
+            if a.palette != 0 {
+                outln!("    palette {}  tints {:?}", finder.palette(a.palette), a.tints);
+            }
+        }
+    }
+    eprintln!("{:.2} s", started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// Finds the files of a ped's parts, for showing and checking them.
+struct PedFinder {
+    index: Arc<openrage_app::metaped::AssetIndex>,
+    textures: Arc<openrage_app::rdr2::TextureIndex>,
+    palettes: Vec<(u32, String)>,
+}
+
+impl PedFinder {
+    fn new(game: &Path) -> Result<PedFinder> {
+        use openrage_app::metaped;
+        let textures = openrage_app::rdr2::texture_index(game)
+            .context("no texture index yet: run `openrage rdr2-names <game folder>` first")?;
+        let built = std::sync::atomic::AtomicBool::new(false);
+        let index = metaped::index(game, |done, total| {
+            built.store(true, std::sync::atomic::Ordering::Relaxed);
+            if done % 500 == 0 || done == total {
+                eprint!("\rindexing the peds' models: {done}/{total} dictionaries");
+            }
+        })
+        .context("no RDR2 keys yet: run `openrage rdr2-keys` first")?;
+        if built.into_inner() {
+            eprintln!();
+        }
+        let palettes = metaped::palettes(game)?;
+        Ok(PedFinder { index, textures, palettes })
+    }
+
+    /// The name of a hash (or the hash), and whether the file was found.
+    fn show(hash: u32, found: bool) -> String {
+        let name = rage_formats::names::value(hash);
+        if found { name } else { format!("{name} (missing)") }
+    }
+
+    fn model(&self, hash: u32) -> String {
+        match self.index.drawable(hash) {
+            Some(d) if hash != 0 => {
+                let file = d.file.chain.last().map(|h| rage_formats::names::value(*h)).unwrap_or_default();
+                format!("{} (in {file}.ydd #{})", rage_formats::names::value(hash), d.index)
+            }
+            _ => Self::show(hash, hash == 0),
+        }
+    }
+
+    fn texture(&self, hash: u32) -> String {
+        if hash == 0 {
+            return "-".into();
+        }
+        match self.textures.name_of(hash) {
+            Some(n) => n.to_owned(),
+            None => Self::show(hash, false),
+        }
+    }
+
+    fn palette(&self, hash: u32) -> String {
+        match self.palettes.iter().find(|(h, _)| *h == hash) {
+            Some((_, n)) => n.clone(),
+            None => Self::show(hash, false),
+        }
+    }
+}
+
+/// Checks every ped: its outfit file, every part's model and textures, its palette.
+fn check_rdr2_peds(game: &Path, peds: &[openrage_app::metaped::Ped], started: Instant) -> Result<()> {
+    use openrage_app::metaped;
+    use rage_formats::names::value;
+    use std::collections::BTreeMap;
+    let finder = PedFinder::new(game)?;
+    let (outfit_files, models) = finder.index.counts();
+    eprintln!("{outfit_files} outfit files, {models} models indexed ({:.1} s)", started.elapsed().as_secs_f64());
+    let (mut outfits, mut parts) = (0usize, 0usize);
+    // Problem → (count, example).
+    let mut missing: BTreeMap<&'static str, (usize, String)> = BTreeMap::new();
+    let mut note = |what: &'static str, example: String| {
+        missing.entry(what).or_insert((0, example)).0 += 1;
+    };
+    for (n, p) in peds.iter().enumerate() {
+        eprint!("\r{}/{} peds", n + 1, peds.len());
+        let list = match metaped::load_outfits(game, &finder.index, &p.name) {
+            Ok(l) => l,
+            Err(e) => {
+                note("outfit file", format!("{}: {e:#}", p.name));
+                continue;
+            }
+        };
+        if list.is_empty() {
+            note("ped without outfits", p.name.clone());
+        }
+        outfits += list.len();
+        for o in &list {
+            for a in &o.assets {
+                parts += 1;
+                if a.drawable == 0 {
+                    note("part without model", p.name.clone());
+                } else if finder.index.drawable(a.drawable).is_none() {
+                    note("model", format!("{} ({})", value(a.drawable), p.name));
+                }
+                for (hash, what) in [(a.albedo, "albedo texture"), (a.normal, "normal texture")] {
+                    if hash != 0 && finder.textures.find_hash(hash).is_none() {
+                        note(what, format!("{} ({})", value(hash), p.name));
+                    }
+                }
+                if a.palette != 0 && !finder.palettes.iter().any(|(h, _)| *h == a.palette) {
+                    note("palette", format!("{} ({})", value(a.palette), p.name));
+                }
+            }
+        }
+    }
+    eprintln!();
+    outln!("{} peds, {outfits} outfits, {parts} parts", peds.len());
+    if missing.is_empty() {
+        outln!("all parts found");
+    }
+    for (what, (count, example)) in &missing {
+        outln!("missing {what}: {count} (e.g. {example})");
+    }
+    eprintln!("{:.1} s", started.elapsed().as_secs_f64());
+    Ok(())
 }
 
 fn cmd_rdr2_names(game: &Path, import: Option<&Path>) -> Result<()> {
