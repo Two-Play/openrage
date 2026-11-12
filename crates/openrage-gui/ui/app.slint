@@ -4105,6 +4105,10 @@ export component SceneWindow inherits Window {
     in property <string> path;
     in property <image> frame;
     in property <bool> loading: true;
+    // What is loading (cast while `loading`, then the surroundings) and how
+    // far: 0..1, or below 0 when the amount is not known.
+    in property <string> load-text;
+    in property <float> load-progress: -1;
     in property <bool> playing;
     in property <float> duration: 1;
     in-out property <float> time;
@@ -4192,9 +4196,51 @@ export component SceneWindow inherits Window {
                 source: root.frame;
                 image-fit: contain;
             }
-            if root.loading: Text {
-                text: @tr("Loading the cast …");
-                color: #ffffff;
+            if root.loading: VerticalLayout {
+                alignment: center;
+                spacing: Theme.space-s;
+                HorizontalLayout {
+                    alignment: center;
+                    Spinner {
+                        width: 40px;
+                        height: 40px;
+                        indeterminate: root.load-progress < 0;
+                        progress: max(root.load-progress, 0);
+                    }
+                }
+                Text {
+                    horizontal-alignment: center;
+                    text: root.load-text != "" ? root.load-text : @tr("Loading the cast …");
+                    color: #ffffff;
+                }
+            }
+            // The surroundings load while the scene already plays.
+            if !root.loading && root.load-text != "": Rectangle {
+                x: Theme.space-m;
+                y: parent.height - self.height - Theme.space-m;
+                width: row.preferred-width + 2 * Theme.space-s;
+                height: row.preferred-height + 2 * Theme.space-xs;
+                border-radius: 6px;
+                background: #000000b0;
+                row := HorizontalLayout {
+                    padding-left: Theme.space-s;
+                    padding-right: Theme.space-s;
+                    padding-top: Theme.space-xs;
+                    padding-bottom: Theme.space-xs;
+                    spacing: Theme.space-s;
+                    Spinner {
+                        width: 18px;
+                        height: 18px;
+                        indeterminate: root.load-progress < 0;
+                        progress: max(root.load-progress, 0);
+                    }
+                    Text {
+                        vertical-alignment: center;
+                        text: root.load-text;
+                        color: #ffffff;
+                        font-size: Theme.font-small;
+                    }
+                }
             }
             ta := TouchArea {
                 property <length> last-x;

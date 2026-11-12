@@ -195,6 +195,8 @@ struct Draw {
     indices: wgpu::Buffer,
     count: u32,
     texture: usize,
+    /// Bounding sphere (centre, radius) in the model's space, for culling.
+    sphere: ([f32; 3], f32),
 }
 
 /// A model uploaded to the GPU.
@@ -222,6 +224,8 @@ struct State {
     gpu: Option<Option<Gpu>>,
     models: Vec<GpuModel>,
     targets: Option<Targets>,
+    /// Bone palette of items without a skin (all identity), shared by them.
+    rest_pose: Option<wgpu::BindGroup>,
 }
 
 thread_local! {
@@ -478,7 +482,17 @@ fn upload(gpu: &Gpu, model: &LoadedModel, materials: &Materials) -> (Vec<Draw>, 
                 textures.push(texture_bind_group(gpu, base, overlay));
                 textures.len() - 1
             });
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for v in &vertices {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(v.pos[k]);
+                    hi[k] = hi[k].max(v.pos[k]);
+                }
+            }
+            let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+            let radius = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt() / 2.0;
             draws.push(Draw {
+                sphere: (centre, radius),
                 part: part_index,
                 drawable: part.drawable,
                 shader: mesh.shader,
@@ -536,6 +550,30 @@ fn targets(gpu: &Gpu, w: u32, h: u32) -> Targets {
 }
 
 /// Column-major view-projection matrix for a camera (Z-up world).
+/// The six planes (a, b, c, d; inside where a·x + b·y + c·z + d ≥ 0) of a
+/// view-projection matrix with depth 0..1.
+fn frustum_planes(m: &[f32; 16]) -> [[f32; 4]; 6] {
+    let row = |i: usize| [m[i], m[4 + i], m[8 + i], m[12 + i]];
+    let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
+    let add = |a: [f32; 4], b: [f32; 4], s: f32| std::array::from_fn(|k| a[k] + s * b[k]);
+    let mut planes = [add(r3, r0, 1.0), add(r3, r0, -1.0), add(r3, r1, 1.0), add(r3, r1, -1.0), r2, add(r3, r2, -1.0)];
+    for p in &mut planes {
+        let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-12);
+        *p = p.map(|v| v / len);
+    }
+    planes
+}
+
+/// Whether a bounding sphere in model space, placed by `model`, touches the view.
+fn sphere_visible(planes: &[[f32; 4]; 6], model: &math::Mat4, (centre, radius): ([f32; 3], f32)) -> bool {
+    let c = math::transform_point(model, centre);
+    let scale = (0..3)
+        .map(|k| (model[k * 4].powi(2) + model[k * 4 + 1].powi(2) + model[k * 4 + 2].powi(2)).sqrt())
+        .fold(0.0f32, f32::max);
+    let r = radius * scale;
+    planes.iter().all(|p| p[0] * c[0] + p[1] * c[1] + p[2] * c[2] + p[3] >= -r)
+}
+
 fn view_projection(cam: &Camera, w: u32, h: u32, near: f32, far: f32) -> [f32; 16] {
     let (f, r, u, e) = (cam.forward, cam.right, cam.up, cam.eye);
     let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -652,12 +690,19 @@ pub fn render_scene(
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals_buffer.as_entire_binding() }],
         });
 
-        // Shown draws of every item with their colours (hidden parts and materials left out).
+        // Shown draws of every item with their colours (hidden parts and
+        // materials left out, and unskinned ones outside the view).
+        let model_of: HashMap<*const crate::ModelPreview, usize> =
+            st.models.iter().enumerate().map(|(i, m)| (m.owner.as_ptr(), i)).collect();
+        let planes = frustum_planes(&globals.view_proj);
         let mut shown: Vec<(usize, &GpuModel, &Draw, [f32; 4])> = Vec::new();
         for (index, item) in items.iter().enumerate() {
-            let model = st.models.iter().find(|m| std::ptr::eq(m.owner.as_ptr(), Arc::as_ptr(item.preview)))?;
+            let model = &st.models[*model_of.get(&Arc::as_ptr(item.preview))?];
             for d in &model.draws {
                 if !item.look.parts.get(d.part).copied().unwrap_or(false) {
+                    continue;
+                }
+                if item.skin.is_none() && !sphere_visible(&planes, &item.model, d.sphere) {
                     continue;
                 }
                 if let Some(tint) = item.preview.loaded.tint(item.look, d.drawable, d.shader) {
@@ -689,28 +734,26 @@ pub fn render_scene(
             }],
         });
 
-        // One bone palette per item.
-        let skin_groups: Vec<wgpu::BindGroup> = items
-            .iter()
-            .map(|item| {
-                let mut palette = vec![math::IDENTITY; MAX_BONES];
-                if let Some(skin) = item.skin {
-                    for (slot, m) in palette.iter_mut().zip(skin) {
-                        *slot = *m;
-                    }
-                }
-                let buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("skin"),
-                    contents: bytemuck::cast_slice(&palette),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-                gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &gpu.skin_layout,
-                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
-                })
+        // A bone palette per skinned item; the others share the rest pose.
+        let palette_group = |skin: Option<&[math::Mat4]>| {
+            let mut palette = vec![math::IDENTITY; MAX_BONES];
+            for (slot, m) in palette.iter_mut().zip(skin.unwrap_or_default()) {
+                *slot = *m;
+            }
+            let buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("skin"),
+                contents: bytemuck::cast_slice(&palette),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &gpu.skin_layout,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
             })
-            .collect();
+        };
+        let rest_pose = &*st.rest_pose.get_or_insert_with(|| palette_group(None));
+        let skin_groups: Vec<Option<wgpu::BindGroup>> =
+            items.iter().map(|item| item.skin.map(|s| palette_group(Some(s)))).collect();
 
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         {
@@ -737,7 +780,7 @@ pub fn render_scene(
             pass.set_pipeline(&gpu.pipeline);
             pass.set_bind_group(0, &globals_group, &[]);
             for (i, (index, model, d, _)) in shown.iter().enumerate() {
-                pass.set_bind_group(3, &skin_groups[*index], &[]);
+                pass.set_bind_group(3, skin_groups[*index].as_ref().unwrap_or(rest_pose), &[]);
                 pass.set_bind_group(1, &model.textures[d.texture], &[]);
                 pass.set_bind_group(2, &tint_group, &[(i * stride) as u32]);
                 pass.set_vertex_buffer(0, d.vertices.slice(..));
@@ -790,6 +833,27 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use wgpu::naga;
+
+    #[test]
+    fn culls_what_is_behind_or_beside_the_camera() {
+        let camera = openrage_app::render::Camera {
+            eye: [0.0; 3],
+            forward: [0.0, 1.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 0.0, 1.0],
+            distance: 5.0,
+            radius: 50.0,
+            fov: 60f32.to_radians(),
+        };
+        let planes = super::frustum_planes(&super::view_projection(&camera, 800, 600, 0.05, 300.0));
+        let at = |p: [f32; 3]| rage_formats::math::from_trs(p, [0.0, 0.0, 0.0, 1.0], [1.0; 3]);
+        let unit = ([0.0; 3], 1.0);
+        assert!(super::sphere_visible(&planes, &at([0.0, 10.0, 0.0]), unit));
+        assert!(!super::sphere_visible(&planes, &at([0.0, -10.0, 0.0]), unit));
+        assert!(!super::sphere_visible(&planes, &at([40.0, 10.0, 0.0]), unit));
+        // A large sphere beside the view still reaches into it.
+        assert!(super::sphere_visible(&planes, &at([40.0, 10.0, 0.0]), ([0.0; 3], 40.0)));
+    }
 
     #[test]
     fn shader_is_valid_wgsl() {

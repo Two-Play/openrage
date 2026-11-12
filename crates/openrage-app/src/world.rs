@@ -371,6 +371,7 @@ pub fn load_models(
     game_dir: &Path,
     keys: Option<Arc<GtaVKeys>>,
     placed: &[Placed],
+    progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Vec<(String, crate::models::LoadedModel, Vec<Mat4>)> {
     let mut by_archetype: HashMap<&str, Vec<Mat4>> = HashMap::new();
     for p in placed {
@@ -380,8 +381,12 @@ pub fn load_models(
         by_archetype.entry(p.archetype.as_str()).or_default().push(p.transform);
     }
     let list: Vec<(&str, Vec<Mat4>)> = by_archetype.into_iter().collect();
+    let (total, done) = (list.len(), std::sync::atomic::AtomicUsize::new(0));
+    progress(0, total);
     list.into_par_iter()
         .filter_map(|(name, transforms)| {
+            let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            progress(finished, total);
             let vpath = files.models.get(name)?;
             let mut model = crate::models::load(game_dir, keys.clone(), vpath).ok()?;
             if let Some(txd) = world.archetypes.get(name).and_then(|a| a.textures.as_ref())
