@@ -86,6 +86,8 @@ impl Program {
     ) -> usize {
         let mut stack: Vec<[f32; 4]> = Vec::with_capacity(32);
         let mut variables = vec![[0.0f32; 4]; self.variables];
+        // RDR2: values stored for register blends.
+        let mut registers: Vec<f32> = Vec::new();
         let mut pc = 0;
         let mut steps = 0;
         let pop = |stack: &mut Vec<[f32; 4]>| stack.pop().unwrap_or([0.0; 4]);
@@ -119,6 +121,8 @@ impl Program {
                     let jump = match kind {
                         0x2C => top == 0.0,
                         0x2D => top != 0.0,
+                        // RDR2: takes the condition off the stack, jumps when it is false.
+                        0x70 => pop(&mut stack)[0] == 0.0,
                         _ => true,
                     };
                     if jump {
@@ -193,6 +197,39 @@ impl Program {
                     stack.push(if *quaternion { from_euler([out[0], out[1], out[2]]) } else { out });
                 }
                 Op::Simple(code) => simple(*code, &mut stack, frame),
+                Op::Store(index) => {
+                    let v = pop(&mut stack);
+                    let i = *index as usize;
+                    if i < 4096 {
+                        if registers.len() <= i {
+                            registers.resize(i + 1, 0.0);
+                        }
+                        registers[i] = v[0];
+                    }
+                }
+                Op::LinearBlend { offset, groups, registers: lanes } => {
+                    let mut out = *offset;
+                    for (g, weights) in groups.iter().enumerate() {
+                        for lane in 0..4 {
+                            let r = lanes
+                                .get(g * 4 + lane)
+                                .map_or(0.0, |&i| registers.get(i as usize).copied().unwrap_or(0.0));
+                            for (axis, w) in weights.iter().enumerate() {
+                                out[axis] += w[lane] * r;
+                            }
+                        }
+                    }
+                    stack.push(out);
+                }
+                Op::Unknown { pops, pushes, .. } => {
+                    for _ in 0..*pops {
+                        stack.pop();
+                    }
+                    // What these give is not known: NaN, which is never written to a bone.
+                    for _ in 0..*pushes {
+                        stack.push([f32::NAN; 4]);
+                    }
+                }
             }
         }
         stack.len()
@@ -480,6 +517,54 @@ mod tests {
         for i in 0..3 {
             assert!((back[i] - e[i]).abs() < 1e-5, "{back:?}");
         }
+    }
+
+    #[test]
+    fn rdr2_registers_jumps_and_unknown_values() {
+        use rage_formats::expression::{Expression, Track};
+        let skeleton = Skeleton {
+            bones: vec![rage_formats::drawable::Bone {
+                tag: 7,
+                parent: -1,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+                scale: [1.0; 3],
+                ..Default::default()
+            }],
+        };
+        let set = |track| Op::Track { kind: 0x26, track, component: 0, defaults: false };
+        let ops = vec![
+            // Face value 0.5 into register 1; x = 0.1 + 2 · r1.
+            Op::Track { kind: 0x06, track: 1, component: 0, defaults: false },
+            Op::Store(1),
+            Op::LinearBlend {
+                offset: [0.1, 0.0, 0.0, 0.0],
+                groups: vec![[[0.0, 2.0, 0.0, 0.0], [0.0; 4], [0.0; 4]]],
+                registers: vec![0, 1, 0, 0, 0, 0, 0, 0],
+            },
+            set(0),
+            // A false condition jumps over the next operation.
+            Op::Push([0.0; 4]),
+            Op::Jump { kind: 0x70, target: 1 },
+            Op::Push([9.0; 4]),
+            // Unknown values are never written.
+            Op::Unknown { code: 0x71, pops: 0, pushes: 1 },
+            set(0),
+        ];
+        let e = Expression {
+            name: "test".into(),
+            tracks: vec![Track { bone: 7, track: 0, format: 0 }, Track { bone: 42, track: 64, format: 2 }],
+            streams: vec![rage_formats::expression::Stream { name: 0, ops }],
+            variables: 0,
+        };
+        let still = Animation::empty();
+        let program = Program::new(&e, &skeleton, &still);
+        let rest = vec![Local { translation: [0.0; 3], rotation: [0.0, 0.0, 0.0, 1.0], scale: [1.0; 3] }];
+        let mut pose = rest.clone();
+        let mut controls = Controls::new();
+        controls.insert((42, 64), [0.5; 4]);
+        let left = program.run(&mut pose, &rest, &[None], &still, 0.0, &mut controls);
+        assert_eq!(left, 0, "the jump took the condition and skipped the push");
+        assert!((pose[0].translation[0] - 1.1).abs() < 1e-6, "{:?}", pose[0].translation);
     }
 
     #[test]

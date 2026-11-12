@@ -1199,13 +1199,31 @@ fn load_rdr2_ped_inner(game: &Path, ped: &str, outfit: usize) -> Result<LoadedMo
     }
     // The base skeleton: as the ped list names it, else guessed from the name.
     crate::progress::set("Reading the skeleton", 0, 0);
-    let base = metaped::peds(game)
+    let fragment = metaped::peds(game)
         .ok()
-        .and_then(|peds| peds.iter().find(|p| p.name.eq_ignore_ascii_case(ped)).map(metaped::base_fragment))
-        .and_then(|frag| rdr2_skeleton_named(game, &frag))
+        .and_then(|peds| peds.iter().find(|p| p.name.eq_ignore_ascii_case(ped)).map(metaped::base_fragment));
+    let base = fragment
+        .as_deref()
+        .and_then(|frag| rdr2_skeleton_named(game, frag))
         .or_else(|| rdr2_base_skeleton_in(game, ped));
+    // Human heads name face bones the base skeletons lack: add them from
+    // the one face rig the game has.
+    let base = base.map(|mut sk| {
+        if let Some(rig) = rdr2_face_rig(game) {
+            let wanted = |t: u16| drawables.iter().any(|(_, d)| d.meshes.iter().any(|m| m.bone_tags.contains(&t)));
+            add_face_rig(&mut sk, &rig, wanted);
+        }
+        sk
+    });
     if let Some(sk) = &base {
         fit_to_skeleton(&mut drawables, sk);
+        let shapes = &outfits[chosen].expressions;
+        if let Some(frag) = &fragment
+            && !shapes.is_empty()
+        {
+            crate::progress::set("Shaping the face and body", 0, 0);
+            shape_rdr2_ped(game, frag, sk, &mut drawables, shapes);
+        }
     }
     let parts = drawables
         .iter()
@@ -1301,6 +1319,116 @@ fn tint_parts(
     dict.errors.clear();
     dict.textures = baked;
     external.push(("tinted (palettes)".to_owned(), dict));
+}
+
+/// The face rig of human heads: the base skeletons lack the face bones that
+/// heads are bound to and that face shapes move. Only one model in the game
+/// carries them in its own skeleton (53 of the 93 bones a head names; the
+/// others have no definition and follow the head).
+const RDR2_FACE_RIG: &str = "packs_1.rpf/packs/base/models/metapeds_cutscene_a_f.rpf/cs_creoledoctor_ms1_merge_2.ydd";
+
+/// The face rig skeleton (read once).
+fn rdr2_face_rig(game: &Path) -> Option<drawable::Skeleton> {
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, Option<drawable::Skeleton>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(r) = cache.lock().ok().and_then(|c| c.get(game).cloned()) {
+        return r;
+    }
+    let rig = (|| {
+        let (Node::Rpf8File(rpf, i), _) = rage_mods::resolve(game, RDR2_FACE_RIG, None).ok()? else { return None };
+        let res = rpf.read_resource(rpf.entries()?.get(i)?).ok()?;
+        let skeletons = drawable::parse_ydd_rdr2(&res).ok()?.into_iter().filter_map(|(_, d)| d.skeleton);
+        skeletons.filter(|s| s.find_name("FACIAL_C_FacialRoot").is_some()).max_by_key(|s| s.bones.len())
+    })();
+    if let Ok(mut c) = cache.lock() {
+        c.insert(game.to_path_buf(), rig.clone());
+    }
+    rig
+}
+
+/// Adds the bones of a face rig the skeleton lacks (when the parts use one
+/// of them): the rig's root hangs from the head, the rest keep their parents.
+fn add_face_rig(skeleton: &mut drawable::Skeleton, rig: &drawable::Skeleton, used: impl Fn(u16) -> bool) {
+    let Some(head) = skeleton.find_name("SKEL_Head") else { return };
+    if !rig.bones.iter().any(|b| skeleton.find_tag(b.tag).is_none() && used(b.tag)) {
+        return;
+    }
+    let mut placed: Vec<Option<usize>> = vec![None; rig.bones.len()];
+    for (i, b) in rig.bones.iter().enumerate() {
+        if let Some(existing) = skeleton.find_tag(b.tag) {
+            placed[i] = Some(existing);
+            continue;
+        }
+        let parent = match usize::try_from(b.parent).ok().filter(|&p| p < i) {
+            Some(p) => placed[p].unwrap_or(head),
+            None => head,
+        };
+        placed[i] = Some(skeleton.bones.len());
+        skeleton.bones.push(drawable::Bone { parent: parent as i16, ..b.clone() });
+    }
+}
+
+/// Where RDR2 keeps the expression dictionaries (`<base skeleton>.yed`).
+const RDR2_EXPRESSIONS: &str = "anim_0.rpf/anim/expressions.rpf";
+
+/// The expressions of a base skeleton that shape a ped's face and body from
+/// its outfit's values (face features, body build, muscles).
+const RDR2_SHAPING: [&str; 3] = ["pack:/bcustom.expr", "pack:/meta_cust.expr", "pack:/muscles.expr"];
+
+/// Shapes a ped's face and body: its outfit's values (by id) are the
+/// control values (track type 64) the base skeleton's shaping expressions
+/// read; the bone poses they give are baked into the parts' vertices.
+/// Returns how many expressions ran.
+fn shape_rdr2_ped(
+    game: &Path,
+    fragment: &str,
+    skeleton: &drawable::Skeleton,
+    drawables: &mut [(String, Drawable)],
+    values: &[(u32, f32)],
+) -> usize {
+    let stem = fragment.trim_end_matches(".yft");
+    let Ok((Node::Rpf8File(rpf, i), _)) = rage_mods::resolve(game, &format!("{RDR2_EXPRESSIONS}/{stem}.yed"), None)
+    else {
+        return 0;
+    };
+    let Some(dict) = rpf
+        .entries()
+        .and_then(|e| e.get(i))
+        .and_then(|e| rpf.read_resource(e).ok())
+        .and_then(|res| rage_formats::expression::parse_rdr2(&res).ok())
+    else {
+        return 0;
+    };
+    let expressions: Vec<_> = RDR2_SHAPING
+        .iter()
+        .filter_map(|n| dict.expressions.iter().find(|e| e.name.eq_ignore_ascii_case(n)).cloned())
+        .collect();
+    if expressions.is_empty() {
+        return 0;
+    }
+    let still = rage_formats::clip::Animation::empty();
+    let binding = crate::anim::Binding::new(skeleton, &still).with_expressions(skeleton, &still, &expressions);
+    let controls: crate::expr::Controls =
+        values.iter().filter(|(id, _)| *id <= 0xFFFF).map(|(id, v)| ((*id as u16, 64u8), [*v; 4])).collect();
+    let skin = binding.skin_with(skeleton, &still, 0.0, controls);
+    for (_, d) in drawables.iter_mut() {
+        for mesh in &mut d.meshes {
+            if mesh.bone_indices.len() != mesh.positions.len() || mesh.bone_weights.len() != mesh.positions.len() {
+                continue;
+            }
+            for (k, p) in mesh.positions.iter_mut().enumerate() {
+                *p = crate::anim::skin_point(&skin, mesh.bone_indices[k], mesh.bone_weights[k], *p, false);
+            }
+            if mesh.normals.len() == mesh.bone_indices.len() {
+                for (k, n) in mesh.normals.iter_mut().enumerate() {
+                    let v = crate::anim::skin_point(&skin, mesh.bone_indices[k], mesh.bone_weights[k], *n, true);
+                    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                    *n = if len > 1e-6 { [v[0] / len, v[1] / len, v[2] / len] } else { *n };
+                }
+            }
+        }
+    }
+    expressions.len()
 }
 
 /// The part of a texture name before its variation (`pant_mf1_061_c3_000_ab`
@@ -1406,6 +1534,34 @@ mod tests {
         // No piece of that name: every colour texture changes.
         replace_texture(&mut d, "_nm", "other_c0_000_nm");
         assert!(d.shaders.iter().all(|s| s.textures[1] == "other_c0_000_nm"));
+    }
+
+    #[test]
+    fn face_rig_hangs_from_the_head() {
+        let bone = |name: &str, tag: u16, parent: i16| drawable::Bone {
+            name: name.into(),
+            tag,
+            parent,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+            ..Default::default()
+        };
+        let mut base = drawable::Skeleton { bones: vec![bone("SKEL_ROOT", 0, -1), bone("SKEL_Head", 31086, 0)] };
+        let rig = drawable::Skeleton {
+            bones: vec![
+                bone("FACIAL_C_FacialRoot", 3280, -1),
+                bone("FACIAL_C_Skull", 4956, 0),
+                bone("FACIAL_L_Temple", 13658, 0),
+            ],
+        };
+        // Not used by any part: nothing added.
+        add_face_rig(&mut base, &rig, |_| false);
+        assert_eq!(base.bones.len(), 2);
+        add_face_rig(&mut base, &rig, |t| t == 4956);
+        assert_eq!(base.bones.len(), 5);
+        assert_eq!(base.bones[2].parent, 1, "the rig's root hangs from the head");
+        assert_eq!(base.bones[3].parent, 2);
+        assert_eq!(base.find_tag(13658), Some(4));
     }
 
     #[test]

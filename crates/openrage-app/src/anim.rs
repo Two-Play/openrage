@@ -76,6 +76,18 @@ impl Binding {
 
     /// Skinning matrices (posed world × inverse bind) at a fractional frame.
     pub fn skin(&self, skeleton: &Skeleton, animation: &Animation, frame: f32) -> Vec<Mat4> {
+        self.skin_with(skeleton, animation, frame, crate::expr::Controls::new())
+    }
+
+    /// Like [`Binding::skin`], with control values the expressions start
+    /// from (RDR2 face shapes).
+    pub fn skin_with(
+        &self,
+        skeleton: &Skeleton,
+        animation: &Animation,
+        frame: f32,
+        mut controls: crate::expr::Controls,
+    ) -> Vec<Mat4> {
         let rest: Vec<Local> = skeleton
             .bones
             .iter()
@@ -95,7 +107,6 @@ impl Binding {
             })
             .collect();
         if !self.programs.is_empty() {
-            let mut controls = crate::expr::Controls::new();
             for p in &self.programs {
                 p.run(&mut pose, &rest, &self.parents, animation, frame, &mut controls);
             }
