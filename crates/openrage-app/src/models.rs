@@ -402,6 +402,9 @@ fn collision_material_names(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> &'s
 /// Loads a model as the game sees it (mods included).
 pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result<LoadedModel> {
     let (node, _) = rage_mods::resolve(game_dir, vpath, keys.clone())?;
+    if let Node::Rpf8File(rpf, i) = node {
+        return load_rdr2(&rpf, i);
+    }
     let Node::ArchiveFile(rpf, id) = node else { bail!("{vpath} is not a file inside an archive") };
     let name = rpf.entry(id).name.clone();
     let res = rpf.read_resource(id)?;
@@ -668,4 +671,113 @@ pub fn to_glb(model: &LoadedModel, name: &str, look: &Look) -> Option<Vec<u8>> {
         &|d, t| model.texture(&model.drawables[d].1, t),
         &|d, s| model.tint(look, d, s as u16),
     ))
+}
+
+/// Loads a Red Dead Redemption 2 model (`.ydr`, `.ydd`). Map objects take
+/// their textures from shared dictionaries in the same archive folder, so
+/// those are loaded too (the largest few by name match first).
+fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
+    let entries = rpf.entries().context("archive table not readable")?;
+    let entry = &entries[i];
+    let full = rpf.entry_name(i);
+    let name = full.rsplit('/').next().unwrap_or(&full).to_owned();
+    let lower = name.to_ascii_lowercase();
+    let stem = name.split('.').next().unwrap_or(&name).to_owned();
+    let res = rpf.read_resource(entry)?;
+    let drawables: Vec<(String, Drawable)> = if lower.ends_with(".ydr") {
+        vec![(stem.clone(), drawable::parse_ydr_rdr2(&res)?)]
+    } else if lower.ends_with(".ydd") {
+        drawable::parse_ydd_rdr2(&res)?
+            .into_iter()
+            .enumerate()
+            .map(|(k, (hash, d))| {
+                let label = rage_formats::names::value(hash);
+                let label = if hash == 0 || label.starts_with("hash_") { format!("{stem}#{k}") } else { label };
+                (label, d)
+            })
+            .collect()
+    } else if lower.ends_with(".yft") {
+        vec![(stem.clone(), drawable::parse_fragment_rdr2(&res)?.drawable)]
+    } else {
+        bail!("{name}: only .ydr, .ydd and .yft models of Red Dead Redemption 2 can be shown so far");
+    };
+    let layout = if drawables.len() > 1 { grid_layout(&drawables) } else { vec![math::IDENTITY] };
+    let parts = drawables
+        .iter()
+        .enumerate()
+        .map(|(k, (n, _))| Part {
+            name: n.clone(),
+            group: String::new(),
+            drawable: k,
+            transform: layout[k],
+            visible: true,
+            bone: None,
+        })
+        .collect();
+    // Texture dictionaries in the same folder: `<stem>.ytd` first, then those
+    // whose name shares the model's prefix, then the rest; at most eight.
+    let dir = full.rsplit_once('/').map_or("", |(d, _)| d).to_owned();
+    let (_, files) = rpf.list_dir(&dir);
+    let prefix: String = stem.chars().take_while(|c| *c != '_').collect();
+    let mut ytds: Vec<(i32, usize, String)> = files
+        .into_iter()
+        .filter_map(|k| {
+            let n = rpf.entry_name(k);
+            let base = n.rsplit('/').next().unwrap_or(&n).to_owned();
+            let lb = base.to_ascii_lowercase();
+            if !lb.ends_with(".ytd") {
+                return None;
+            }
+            let rank = if lb == format!("{}.ytd", stem.to_ascii_lowercase()) {
+                0
+            } else if !prefix.is_empty() && lb.starts_with(&prefix.to_ascii_lowercase()) {
+                1
+            } else {
+                2
+            };
+            Some((rank, k, base))
+        })
+        .collect();
+    ytds.sort();
+    let mut external = Vec::new();
+    for (_, k, base) in ytds.into_iter().take(8) {
+        if let Ok(dict) = rpf
+            .read_resource(&entries[k])
+            .map_err(anyhow::Error::from)
+            .and_then(|r| rage_formats::ytd::parse_rdr2(&r).context("texture dictionary"))
+        {
+            external.push((base, dict));
+        }
+    }
+    // The rest from shared dictionaries elsewhere, through the texture index.
+    if let Some(game) = crate::rdr2::game_folder(rpf.path())
+        && let Some(index) = crate::rdr2::texture_index(&game)
+    {
+        let have = |n: &str, ext: &[(String, TextureDictionary)]| {
+            drawables.iter().any(|(_, d)| {
+                d.textures.as_ref().is_some_and(|t| t.textures.iter().any(|x| x.name.eq_ignore_ascii_case(n)))
+            }) || ext.iter().any(|(_, t)| t.textures.iter().any(|x| x.name.eq_ignore_ascii_case(n)))
+        };
+        let wanted: Vec<String> =
+            drawables.iter().flat_map(|(_, d)| d.shaders.iter().flat_map(|s| s.textures.iter().cloned())).collect();
+        let mut opened: Vec<crate::rdr2::Location> = Vec::new();
+        for name in wanted {
+            if opened.len() >= 32 || have(&name, &external) {
+                continue;
+            }
+            let Some(loc) = index.find(&name) else { continue };
+            if opened.contains(loc) {
+                continue;
+            }
+            opened.push(loc.clone());
+            if let Some(dict) = crate::rdr2::open_dictionary(&game, loc) {
+                external.push((format!("{name} (shared)"), dict));
+            }
+        }
+    }
+    let skeleton = drawables.iter().find_map(|(_, d)| d.skeleton.clone());
+    let mut model =
+        LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
+    model.collect_materials();
+    Ok(model)
 }

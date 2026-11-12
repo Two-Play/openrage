@@ -230,6 +230,25 @@ impl Drawable {
     }
 }
 
+/// Which game's drawable layout a resource uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gen {
+    /// GTA V Legacy (`grm` structures, D3D9-era vertex declarations).
+    Legacy,
+    /// GTA V Enhanced (`rage::sga`, interleaved vertices).
+    Enhanced,
+    /// Red Dead Redemption 2 (`rage::sga`; geometry with the vertex buffer at
+    /// `0x08` and the index buffer at `0x10`; vertex attributes stored as
+    /// separate streams, one after another).
+    Rdr2,
+}
+
+impl Gen {
+    fn sga(self) -> bool {
+        self != Gen::Legacy
+    }
+}
+
 fn bad(msg: impl Into<String>) -> ResourceError {
     ResourceError::Format(msg.into())
 }
@@ -274,6 +293,8 @@ enum Encoding {
     Uint8x4,
     /// 10:10:10:2, signed normalized (Enhanced normals).
     R10G10B10A2,
+    /// 10:10:10:2, unsigned normalized and mapped to −1..1 (RDR2 normals).
+    R10G10B10A2Unorm,
 }
 
 impl Encoding {
@@ -297,6 +318,11 @@ impl Encoding {
                 };
                 [s10(v), s10(v >> 10), s10(v >> 20), ((v >> 30) & 3) as f32 / 3.0]
             }
+            Encoding::R10G10B10A2Unorm => {
+                let v = u32::from_le_bytes(d[0..4].try_into().unwrap());
+                let u10 = |x: u32| (x & 0x3FF) as f32 / 1023.0 * 2.0 - 1.0;
+                [u10(v), u10(v >> 10), u10(v >> 20), ((v >> 30) & 3) as f32 / 3.0]
+            }
         }
     }
 
@@ -305,7 +331,12 @@ impl Encoding {
             Encoding::Float2 | Encoding::Half4 => 8,
             Encoding::Float3 => 12,
             Encoding::Float4 => 16,
-            Encoding::Half2 | Encoding::Unorm8x4 | Encoding::Snorm8x4 | Encoding::Uint8x4 | Encoding::R10G10B10A2 => 4,
+            Encoding::Half2
+            | Encoding::Unorm8x4
+            | Encoding::Snorm8x4
+            | Encoding::Uint8x4
+            | Encoding::R10G10B10A2
+            | Encoding::R10G10B10A2Unorm => 4,
         }
     }
 }
@@ -314,6 +345,9 @@ impl Encoding {
 #[derive(Debug, Default)]
 struct VertexLayout {
     stride: usize,
+    /// Attributes are stored as separate streams (RDR2): attribute `a` of
+    /// vertex `i` is at `offset + i × size` instead of `i × stride + offset`.
+    streamed: bool,
     position: Option<(usize, Encoding)>,
     normal: Option<(usize, Encoding)>,
     uv: Option<(usize, Encoding)>,
@@ -406,10 +440,13 @@ fn gen9_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayout,
     Ok(layout)
 }
 
-fn read_geometry(res: &Resource, g: u64, enhanced: bool) -> Result<Mesh, ResourceError> {
-    let vb = res.u64(g + 0x18)?;
-    let ib = res.u64(g + 0x38)?;
-    let (count, stride, data, layout) = if enhanced {
+fn read_geometry(res: &Resource, g: u64, layout_gen: Gen) -> Result<Mesh, ResourceError> {
+    let (vb, ib) = if layout_gen == Gen::Rdr2 {
+        (res.u64(g + 0x08)?, res.u64(g + 0x10)?)
+    } else {
+        (res.u64(g + 0x18)?, res.u64(g + 0x38)?)
+    };
+    let (count, stride, data, mut layout) = if layout_gen.sga() {
         let count = res.u32(vb + 0x08)? as usize;
         let stride = res.u16(vb + 0x0C)? as usize;
         let data = res.u64(vb + 0x18)?;
@@ -423,17 +460,28 @@ fn read_geometry(res: &Resource, g: u64, enhanced: bool) -> Result<Mesh, Resourc
     if stride == 0 || count > 1 << 22 {
         return Err(bad("implausible vertex buffer"));
     }
+    layout.streamed = layout_gen == Gen::Rdr2;
+    if layout_gen == Gen::Rdr2
+        && let Some((o, Encoding::R10G10B10A2)) = layout.normal
+    {
+        layout.normal = Some((o, Encoding::R10G10B10A2Unorm));
+    }
     let bytes = res.bytes(data, count * stride)?;
     let (pos_off, pos_enc) = layout.position.ok_or_else(|| bad("vertices without positions"))?;
-    let attr = |slot: Option<(usize, Encoding)>, i: usize| {
-        slot.filter(|(o, e)| o + e.size() <= layout.stride).map(|(o, e)| e.decode(&bytes[i * stride + o..]))
+    // Where attribute (offset, encoding) of vertex i starts, if inside the buffer.
+    let at = |(o, e): (usize, Encoding), i: usize| -> Option<usize> {
+        if layout.streamed {
+            let start = o + i * e.size();
+            (o + count * e.size() <= bytes.len()).then_some(start)
+        } else {
+            (o + e.size() <= layout.stride).then_some(i * layout.stride + o)
+        }
     };
+    let attr = |slot: Option<(usize, Encoding)>, i: usize| slot.and_then(|s| Some(s.1.decode(&bytes[at(s, i)?..])));
     let mut mesh = Mesh::default();
     for i in 0..count {
-        if pos_off + pos_enc.size() > stride {
-            return Err(bad("position outside vertex"));
-        }
-        let p = pos_enc.decode(&bytes[i * stride + pos_off..]);
+        let Some(p_at) = at((pos_off, pos_enc), i) else { return Err(bad("position outside vertex")) };
+        let p = pos_enc.decode(&bytes[p_at..]);
         mesh.positions.push([p[0], p[1], p[2]]);
         if let Some(n) = attr(layout.normal, i) {
             mesh.normals.push([n[0], n[1], n[2]]);
@@ -453,7 +501,18 @@ fn read_geometry(res: &Resource, g: u64, enhanced: bool) -> Result<Mesh, Resourc
         }
     }
     // Blend indices point into the geometry's bone table (skeleton indices).
-    if !mesh.bone_indices.is_empty() {
+    // RDR2 keeps the table at 0x18 without a count: look up just the entries used.
+    if !mesh.bone_indices.is_empty() && layout_gen == Gen::Rdr2 {
+        let table = res.u64(g + 0x18)?;
+        if (0x5000_0000..0x7000_0000).contains(&table) {
+            let used = mesh.bone_indices.iter().flatten().copied().max().unwrap_or(0) as u64 + 1;
+            if let Ok(ids) = (0..used).map(|i| res.u16(table + i * 2)).collect::<Result<Vec<u16>, _>>() {
+                for b in &mut mesh.bone_indices {
+                    *b = b.map(|i| ids.get(i as usize).copied().unwrap_or(0));
+                }
+            }
+        }
+    } else if !mesh.bone_indices.is_empty() {
         let table = res.u64(g + 0x68)?;
         let count = res.u16(g + 0x72)? as u64;
         if table != 0 && count > 0 && count <= 1024 {
@@ -465,8 +524,11 @@ fn read_geometry(res: &Resource, g: u64, enhanced: bool) -> Result<Mesh, Resourc
     }
 
     let index_count = res.u32(ib + 0x08)? as usize;
-    let (index_ptr, index_size) =
-        if enhanced { (res.u64(ib + 0x18)?, res.u16(ib + 0x0C)?.max(2) as usize) } else { (res.u64(ib + 0x10)?, 2) };
+    let (index_ptr, index_size) = if layout_gen.sga() {
+        (res.u64(ib + 0x18)?, res.u16(ib + 0x0C)?.max(2) as usize)
+    } else {
+        (res.u64(ib + 0x10)?, 2)
+    };
     let ib_bytes = res.bytes(index_ptr, index_count * index_size)?;
     mesh.indices = if index_size == 4 {
         ib_bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect()
@@ -485,7 +547,7 @@ fn read_geometry(res: &Resource, g: u64, enhanced: bool) -> Result<Mesh, Resourc
 fn read_models(
     res: &Resource,
     list: u64,
-    enhanced: bool,
+    layout_gen: Gen,
     out: &mut Vec<(Mesh, Option<usize>)>,
 ) -> Result<(), ResourceError> {
     let ptr = res.u64(list)?;
@@ -502,7 +564,7 @@ fn read_models(
         let skinned = (binding >> 8) & 0xFF != 0;
         let bone = (!skinned && binding >> 24 != 0).then_some((binding >> 24) as usize);
         for i in 0..gcount {
-            let mut mesh = read_geometry(res, res.u64(geoms + i * 8)?, enhanced)?;
+            let mut mesh = read_geometry(res, res.u64(geoms + i * 8)?, layout_gen)?;
             mesh.shader = if mapping != 0 { res.u16(mapping + i * 2)? } else { 0 };
             out.push((mesh, bone));
         }
@@ -516,7 +578,7 @@ fn texture_name(res: &Resource, tex: u64) -> Option<String> {
     (!name.is_empty() && name.len() < 128 && name.chars().all(|c| c.is_ascii_graphic())).then_some(name)
 }
 
-fn read_shaders(res: &Resource, group: u64, enhanced: bool) -> Result<Vec<Shader>, ResourceError> {
+fn read_shaders(res: &Resource, group: u64, layout_gen: Gen) -> Result<Vec<Shader>, ResourceError> {
     let list = res.u64(group + 0x10)?;
     let count = res.u16(group + 0x18)? as u64;
     let mut shaders = Vec::new();
@@ -525,7 +587,7 @@ fn read_shaders(res: &Resource, group: u64, enhanced: bool) -> Result<Vec<Shader
         let mut shader = Shader::default();
         // (parameter hash or 0, texture structure) per texture reference.
         let mut refs: Vec<(u32, u64)> = Vec::new();
-        if enhanced {
+        if layout_gen.sga() {
             shader.name_hash = res.u32(s)?;
             // Texture references: a pointer array at 0x10. The parameter info
             // block (0x20) has the number of textures at 1, the number of
@@ -615,6 +677,11 @@ fn read_skeleton(res: &Resource, ptr: u64) -> Result<Skeleton, ResourceError> {
 /// Reads the drawable structure at `ptr`. Meshes rigidly attached to a bone
 /// are moved to their place in model space.
 pub fn read_drawable(res: &Resource, ptr: u64, enhanced: bool) -> Result<Drawable, ResourceError> {
+    read_drawable_gen(res, ptr, if enhanced { Gen::Enhanced } else { Gen::Legacy })
+}
+
+/// Reads the drawable structure at `ptr` in the layout of `gen`.
+pub fn read_drawable_gen(res: &Resource, ptr: u64, layout_gen: Gen) -> Result<Drawable, ResourceError> {
     let mut d =
         Drawable { bounds_min: vec3(res, ptr + 0x30)?, bounds_max: vec3(res, ptr + 0x40)?, ..Default::default() };
     let skel = res.u64(ptr + 0x18)?;
@@ -626,7 +693,7 @@ pub fn read_drawable(res: &Resource, ptr: u64, enhanced: bool) -> Result<Drawabl
         let list = res.u64(ptr + 0x50 + lod * 8)?;
         if list != 0 {
             let mut meshes = Vec::new();
-            read_models(res, list, enhanced, &mut meshes)?;
+            read_models(res, list, layout_gen, &mut meshes)?;
             for (mut mesh, bone) in meshes {
                 if let Some((b, m)) = bone.and_then(|b| Some((b, world.get(b)?))) {
                     mesh.positions.iter_mut().for_each(|p| *p = math::transform_point(m, *p));
@@ -644,10 +711,14 @@ pub fn read_drawable(res: &Resource, ptr: u64, enhanced: bool) -> Result<Drawabl
     }
     let group = res.u64(ptr + 0x10)?;
     if group != 0 {
-        d.shaders = read_shaders(res, group, enhanced).unwrap_or_default();
+        d.shaders = read_shaders(res, group, layout_gen).unwrap_or_default();
         let txd = res.u64(group + 0x08)?;
         if txd != 0 {
-            d.textures = ytd::parse_at(res, txd, enhanced).ok();
+            d.textures = if layout_gen == Gen::Rdr2 {
+                ytd::parse_rdr2_at(res, txd).ok()
+            } else {
+                ytd::parse_at(res, txd, layout_gen.sga()).ok()
+            };
         }
     }
     Ok(d)
@@ -672,6 +743,26 @@ pub fn parse_yft(res: &Resource) -> Result<Drawable, ResourceError> {
 }
 
 /// A `.yft` file with the child drawables (wheels and other parts).
+/// A Red Dead Redemption 2 `.yft`: its main drawable (at `0x20` of the
+/// fragment; found among the root's pointers if not). Children are not read yet.
+pub fn parse_fragment_rdr2(res: &Resource) -> Result<Fragment, ResourceError> {
+    let root = Resource::ROOT;
+    let looks_like_drawable = |p: u64| -> bool {
+        let ok = |q: u64| (0x5000_0000..0x6000_0000).contains(&q);
+        ok(p)
+            && res.u64(p + 0x10).is_ok_and(ok)
+            && res.u64(p + 0x50).is_ok_and(|lod| {
+                ok(lod) && res.u64(lod).is_ok_and(ok) && res.u16(lod + 8).is_ok_and(|n| n > 0 && n < 64)
+            })
+    };
+    let candidates = std::iter::once(0x20).chain((0..0xC0).step_by(8));
+    let drawable = candidates
+        .filter_map(|o| res.u64(root + o).ok())
+        .find(|&p| looks_like_drawable(p))
+        .ok_or_else(|| bad("fragment without a drawable"))?;
+    Ok(Fragment { drawable: read_drawable_gen(res, drawable, Gen::Rdr2)?, children: Vec::new() })
+}
+
 pub fn parse_fragment(res: &Resource) -> Result<Fragment, ResourceError> {
     let enhanced = is_enhanced(res.version)?;
     let root = Resource::ROOT;
@@ -720,7 +811,21 @@ fn read_fragment_children(res: &Resource, enhanced: bool) -> Result<Vec<Fragment
 
 /// A `.ydd` file: all drawables with their name hashes.
 pub fn parse_ydd(res: &Resource) -> Result<Vec<(u32, Drawable)>, ResourceError> {
-    let enhanced = is_enhanced(res.version)?;
+    let layout_gen = if is_enhanced(res.version)? { Gen::Enhanced } else { Gen::Legacy };
+    parse_ydd_gen(res, layout_gen)
+}
+
+/// A Red Dead Redemption 2 `.ydr`.
+pub fn parse_ydr_rdr2(res: &Resource) -> Result<Drawable, ResourceError> {
+    read_drawable_gen(res, Resource::ROOT, Gen::Rdr2)
+}
+
+/// A Red Dead Redemption 2 `.ydd`.
+pub fn parse_ydd_rdr2(res: &Resource) -> Result<Vec<(u32, Drawable)>, ResourceError> {
+    parse_ydd_gen(res, Gen::Rdr2)
+}
+
+fn parse_ydd_gen(res: &Resource, layout_gen: Gen) -> Result<Vec<(u32, Drawable)>, ResourceError> {
     let root = Resource::ROOT;
     let hashes = res.u64(root + 0x20)?;
     let list = res.u64(root + 0x30)?;
@@ -728,7 +833,7 @@ pub fn parse_ydd(res: &Resource) -> Result<Vec<(u32, Drawable)>, ResourceError> 
     let mut out = Vec::new();
     for i in 0..count.min(4096) {
         let hash = if hashes != 0 { res.u32(hashes + i * 4)? } else { 0 };
-        out.push((hash, read_drawable(res, res.u64(list + i * 8)?, enhanced)?));
+        out.push((hash, read_drawable_gen(res, res.u64(list + i * 8)?, layout_gen)?));
     }
     Ok(out)
 }
