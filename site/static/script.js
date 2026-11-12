@@ -35,42 +35,82 @@
     });
   }
 
-  // Screenshots: click to enlarge in a dialog. Without JS the link opens the image.
+  // Screenshots: click to enlarge in a dialog; arrows browse a gallery.
+  // Without JS the link opens the image.
   var zooms = document.querySelectorAll("a.zoom");
   if (zooms.length && window.HTMLDialogElement) {
     var box = document.createElement("dialog");
     box.className = "lightbox";
     box.setAttribute("aria-label", "Enlarged screenshot");
+    var icon = function (d) {
+      return '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="' + d + '"/></svg>';
+    };
     box.innerHTML =
-      '<button type="button" class="lightbox-close" aria-label="Close">' +
-      '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>' +
-      "</button><figure><img alt=\"\"><figcaption></figcaption></figure>";
+      '<button type="button" class="lightbox-close" aria-label="Close">' + icon("M6 6l12 12M18 6 6 18") + "</button>" +
+      '<button type="button" class="lightbox-nav prev" aria-label="Previous screenshot">' + icon("M15 5l-7 7 7 7") + "</button>" +
+      '<button type="button" class="lightbox-nav next" aria-label="Next screenshot">' + icon("M9 5l7 7-7 7") + "</button>" +
+      '<figure><img alt=""><figcaption></figcaption></figure><p class="lightbox-count" aria-live="polite"></p>';
     document.body.appendChild(box);
     var boxImg = box.querySelector("img");
     var boxCaption = box.querySelector("figcaption");
+    var boxCount = box.querySelector(".lightbox-count");
+    var prevBtn = box.querySelector(".prev");
+    var nextBtn = box.querySelector(".next");
+    var group = [];
+    var current = 0;
+
+    var visibleImg = function (link) {
+      var imgs = link.querySelectorAll("img");
+      for (var i = 0; i < imgs.length; i++) {
+        if (imgs[i].offsetWidth > 0) return imgs[i];
+      }
+      return imgs[0];
+    };
+    var show = function (i) {
+      current = (i + group.length) % group.length;
+      var link = group[current];
+      var img = visibleImg(link);
+      boxImg.src = img.currentSrc || img.src;
+      boxImg.alt = img.alt;
+      var fig = link.closest("figure");
+      var cap = fig && fig.querySelector("figcaption");
+      if (cap) boxCaption.innerHTML = cap.innerHTML;
+      else boxCaption.textContent = link.getAttribute("data-caption") || "";
+      boxCaption.hidden = !boxCaption.textContent;
+      var many = group.length > 1;
+      prevBtn.hidden = nextBtn.hidden = boxCount.hidden = !many;
+      boxCount.textContent = many ? current + 1 + " / " + group.length : "";
+    };
 
     box.addEventListener("click", function (e) {
+      if (e.target.closest(".prev")) return show(current - 1);
+      if (e.target.closest(".next")) return show(current + 1);
       // Clicks on the backdrop, the image or the close button close it.
       if (e.target === box || e.target === boxImg || e.target.closest(".lightbox-close")) box.close();
+    });
+    box.addEventListener("keydown", function (e) {
+      if (group.length < 2) return;
+      if (e.key === "ArrowRight") { e.preventDefault(); show(current + 1); }
+      else if (e.key === "ArrowLeft") { e.preventDefault(); show(current - 1); }
+    });
+    // Swipe on touch screens.
+    var startX = null;
+    box.addEventListener("touchstart", function (e) { startX = e.touches[0].clientX; }, { passive: true });
+    box.addEventListener("touchend", function (e) {
+      if (startX === null || group.length < 2) return;
+      var dx = e.changedTouches[0].clientX - startX;
+      startX = null;
+      if (Math.abs(dx) > 50) show(current + (dx < 0 ? 1 : -1));
     });
 
     zooms.forEach(function (link) {
       link.setAttribute("aria-haspopup", "dialog");
       link.addEventListener("click", function (e) {
         if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey) return;
-        var imgs = link.querySelectorAll("img");
-        var img = imgs[0];
-        for (var i = 0; i < imgs.length; i++) {
-          if (imgs[i].offsetWidth > 0) { img = imgs[i]; break; }
-        }
         e.preventDefault();
-        boxImg.src = img.currentSrc || img.src;
-        boxImg.alt = img.alt;
-        var fig = link.closest("figure");
-        var cap = fig && fig.querySelector("figcaption");
-        if (cap) boxCaption.innerHTML = cap.innerHTML;
-        else boxCaption.textContent = link.getAttribute("data-caption") || "";
-        boxCaption.hidden = !boxCaption.textContent;
+        var gallery = link.closest(".gallery");
+        group = gallery ? Array.prototype.slice.call(gallery.querySelectorAll("a.zoom")) : [link];
+        show(group.indexOf(link));
         box.showModal();
       });
     });

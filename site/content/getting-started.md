@@ -19,7 +19,8 @@ Ready-made builds for **Linux** (x86-64, glibc 2.35 or newer) and **Windows** (x
 
 ### Linux
 
-Unpack the archive and start the GUI, or `openrage` for the command line:
+Unpack the archive and start the GUI, or `openrage` for the command line. The archive also holds `openrage.desktop`
+and `openrage.png` for a menu entry. Newer releases also come as an **AppImage**: make it executable and start it.
 
 ```
 tar -xzf openrage-*-linux-x86_64.tar.gz
@@ -63,7 +64,7 @@ your own copy of the game: check the game folder and click **Derive keys**. For 
   CodeWalker key blob (`magic.dat`) you obtained yourself under *Key blob*. It is decrypted with the key from *your*
   executable and checked against `common.rpf` before it is used.
 - The keys are cached once, at `~/.config/openrage/gtav.keys` (Linux) or `%APPDATA%\openrage\gtav.keys` (Windows),
-  and the game folder is remembered. To switch games or keys later: **Settings → Change game or keys…**
+  and the game folder is remembered. To add or switch games later: **File → Switch game…**
 
 > [!WARNING]
 > **Never share the key cache.** It contains keys taken from your copy of the game.
@@ -108,7 +109,7 @@ This finds about 44 % of all names, including nearly all models, clip sets and p
 
 ### Browse
 
-In the GUI, choose the RDR2 folder under **Settings → Change game or keys…**: archives open like folders, with file
+In the GUI, add the RDR2 folder as a game under **File → Switch game… → Add a game…**: archives open like folders, with file
 details, a text preview and *Extract…* for files and whole folders. **Textures** (`.ytd`) work as in GTA V: preview, viewer and export as DDS
 or PNG. On the command line:
 
@@ -130,7 +131,7 @@ The search index and the other format viewers (models, …) are GTA V only for n
 - **Install .oiv…** shows what a package changes before anything is written; installed packages can be uninstalled.
 - **F1** lists all keyboard shortcuts.
 
-The [README](https://github.com/Two-Play/openrage#using-the-gui) describes every part of the GUI.
+The [user guide](@/guide.md) describes every part of the GUI.
 
 ## Command line
 
@@ -157,7 +158,7 @@ openrage oiv install mod.oiv
 openrage undo                                  # revert the newest change
 ```
 
-The [README](https://github.com/Two-Play/openrage#command-line) lists every command.
+The [command line reference](@/cli.md) lists every command.
 
 ## Build from source
 
@@ -189,7 +190,7 @@ cargo build --release
 ```
 
 For a reproducible environment there is a container image based on Fedora's toolbx image (`dev/Containerfile`);
-see [Reproducible build environment](https://github.com/Two-Play/openrage#reproducible-build-environment) in the README.
+see [Development](@/development.md#reproducible-build-environment).
 
 </div>
 <div class="os-panel" data-os="windows">

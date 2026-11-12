@@ -19,7 +19,7 @@ It contains **no game files and no encryption keys**: keys are taken from your o
 features_title = "Highlights"
 features_intro = "What OpenRAGE can open, show and change today."
 screenshots_title = "Screenshots"
-screenshots_intro = "Click a picture to enlarge it. The screenshots show files from the author's own copy of the game."
+screenshots_intro = "Click a picture to enlarge it, arrow keys browse. The screenshots show files from the author's own copy of the game."
 games_title = "Supported games"
 games_intro = "GTA V comes first; Red Dead Redemption 2 archives and textures work, GTA IV is planned."
 details_summary = "Checked against the whole game"
@@ -34,11 +34,11 @@ Out of date? [Open an issue](https://github.com/Two-Play/openrage/issues).
 
 
 [extra.hero]
-light = "explorer-light.png"
-dark = "explorer-dark.png"
+light = "overview-light.png"
+dark = "overview-dark.png"
 width = 1512
 height = 945
-alt = "OpenRAGE explorer showing the vehicles archive of GTA V with a 3D preview of a car"
+alt = "OpenRAGE explorer showing a vehicles archive of GTA V with a 3D preview of a car"
 
 # ---------------------------------------------------------------- Highlights
 
@@ -91,52 +91,52 @@ text = "Disassembled scripts; particle effects with their textures and models."
 # `dark` (optional) is shown instead of `image` in dark mode.
 
 [[extra.screenshots]]
-image = "viewer.png"
+image = "model-viewer.png"
 width = 1155
 height = 798
-alt = "Viewer window with a car painted blue and its list of materials"
+alt = "A sports car painted orange in the model viewer, with its parts list"
 title = "Model viewer"
-caption = "materials, paint, parts, glTF export"
+caption = "paint, parts, materials, glTF export"
 
 [[extra.screenshots]]
-image = "animation.png"
+image = "ped-animation.png"
 width = 1155
 height = 798
-alt = "A pedestrian model playing a walking animation in the viewer"
+alt = "A pedestrian in a suit playing a walking animation"
 title = "Animations"
-caption = "clips play on skinned models"
+caption = "clips play on complete peds"
 
 [[extra.screenshots]]
-image = "collision.png"
+image = "nav-mesh.png"
 width = 1155
 height = 798
-alt = "Collision mesh of a downtown skyscraper, coloured by material"
-title = "Collisions"
-caption = "coloured by material, in 3D"
+alt = "A nav mesh shown in 3D, coloured by kind of ground"
+title = "Nav meshes"
+caption = "where peds walk, in 3D"
 
 [[extra.screenshots]]
-image = "search.png"
+image = "textures.png"
 width = 1512
 height = 945
-alt = "Search for the hash 0xB779A091 finding the Adder car files"
-title = "Search"
-caption = "names, hashes and text of the whole game"
+alt = "A texture dictionary with a preview of its textures"
+title = "Textures"
+caption = "preview, export, replace"
 
 [[extra.screenshots]]
-image = "metadata.png"
+image = "text-search.png"
+width = 1512
+height = 945
+alt = "Full-text search finding the Zentorno in the vehicle data"
+title = "Search"
+caption = "names, hashes and full text"
+
+[[extra.screenshots]]
+image = "xml-view.png"
 width = 1155
 height = 756
-alt = "Map placement file shown as a structure tree with its values"
+alt = "A map placement file as highlighted XML"
 title = "Metadata"
-caption = "maps, archetypes, cutscenes as XML"
-
-[[extra.screenshots]]
-image = "text-table.png"
-width = 1029
-height = 798
-alt = "Game text table shown as OpenIV oxt text in the editor"
-title = "Game text"
-caption = "`.gxt2` as editable `.oxt`"
+caption = "maps and archetypes as XML"
 
 # ---------------------------------------------------------- Supported games
 # Status: ok, partial, planned or none.
@@ -160,7 +160,7 @@ name = "Red Dead Redemption 2"
 archives_status = "ok"
 archives = "RPF8 read: decryption with keys from your own game, Oodle decompression, browsing and extracting in the GUI"
 formats_status = "partial"
-formats = "textures (preview, viewer, DDS/PNG export); models and other formats follow"
+formats = "textures, models (viewer, glTF export) and texts (read-only)"
 
 [[extra.games]]
 name = "GTA IV"
