@@ -510,6 +510,92 @@ pub fn index(game: &Path, progress: impl Fn(usize, usize) + Sync) -> Option<Arc<
     Some(index)
 }
 
+/// Where the colour textures of ped parts are described.
+pub const ALBEDOS: &str = "packs_0.rpf/packs/base/data/metapeds/assets_albedo.ymt";
+
+/// The colour textures (by name hash) that hold a shade and masks for a tint
+/// palette rather than colours (`useTintPalette` in [`ALBEDOS`]).
+#[derive(Debug, Default)]
+pub struct TintedAlbedos {
+    /// Name hash → uses a tint palette.
+    flags: HashMap<u32, bool>,
+}
+
+impl TintedAlbedos {
+    /// Reads the albedo entries of `assets_albedo.ymt` (as XML).
+    pub fn from_xml(xml: &str) -> TintedAlbedos {
+        // The flag has no known name.
+        const USE_TINT_PALETTE: &str = "hash_B03B6E39";
+        let mut flags = HashMap::new();
+        let mut guid: Option<u32> = None;
+        for line in xml.lines().map(str::trim) {
+            if let Some(g) = line.strip_prefix("<guid>").and_then(|l| l.strip_suffix("</guid>")) {
+                guid = Some(hash_of(g));
+            } else if line.starts_with(&format!("<{USE_TINT_PALETTE} "))
+                && let Some(g) = guid.take()
+            {
+                flags.insert(g, line.contains("\"true\""));
+            }
+        }
+        TintedAlbedos { flags }
+    }
+
+    /// Whether a colour texture is tinted: as its entry says, else (for
+    /// textures without one) when its variant number is 990–999 (`…_c3_999_ab`).
+    pub fn is_tinted(&self, hash: u32, name: Option<&str>) -> bool {
+        match self.flags.get(&hash) {
+            Some(f) => *f,
+            None => name.is_some_and(|n| {
+                let n = n.to_ascii_lowercase();
+                let stem = n.strip_suffix("_ab").unwrap_or(&n);
+                let variant = stem.rsplit('_').next().unwrap_or("");
+                variant.len() == 3 && variant.starts_with("99") && variant.chars().all(|c| c.is_ascii_digit())
+            }),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.flags.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.flags.is_empty()
+    }
+}
+
+/// The tint flags of a game folder, read once.
+pub fn tinted_albedos(game: &Path) -> Arc<TintedAlbedos> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<TintedAlbedos>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(t) = cache.lock().ok().and_then(|c| c.get(game).cloned()) {
+        return t;
+    }
+    let read = crate::metadata::load(game, None, ALBEDOS).map(|x| TintedAlbedos::from_xml(&x.text));
+    let tinted = Arc::new(read.unwrap_or_default());
+    if let Ok(mut c) = cache.lock() {
+        c.insert(game.to_path_buf(), tinted.clone());
+    }
+    tinted
+}
+
+/// The tint palettes ([`PALETTES`]), read once.
+pub fn palette_dictionary(game: &Path) -> Option<Arc<rage_formats::ytd::TextureDictionary>> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<rage_formats::ytd::TextureDictionary>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(d) = cache.lock().ok().and_then(|c| c.get(game).cloned()) {
+        return Some(d);
+    }
+    let (node, _) = rage_mods::resolve(game, PALETTES, None).ok()?;
+    let rage_rpf::vfs::Node::Rpf8File(rpf, i) = node else { return None };
+    let dict = Arc::new(rage_formats::ytd::parse_rdr2(&rpf.read_resource(rpf.entries()?.get(i)?).ok()?).ok()?);
+    if let Ok(mut c) = cache.lock() {
+        c.insert(game.to_path_buf(), dict.clone());
+    }
+    Some(dict)
+}
+
 /// The base skeleton fragment of a ped (`META_Base_Male` → `meta_base_male.yft`).
 pub fn base_fragment(ped: &Ped) -> String {
     format!("{}.yft", ped.base.to_ascii_lowercase())
@@ -529,6 +615,18 @@ mod tests {
         assert_eq!(peds.len(), 2);
         assert_eq!(peds[0], Ped { name: "CS_JohnMarston".into(), base: "META_Base_Male".into() });
         assert_eq!(base_fragment(&peds[1]), "meta_base_cow.yft");
+    }
+
+    #[test]
+    fn reads_tint_flags() {
+        let xml = "<a>\n <Item>\n  <guid>hair_gen_999_c0_999_ab</guid>\n  <hash_8E9261BB value=\"0xFF1B7E14\" />\n  <hash_B03B6E39 value=\"true\" />\n </Item>\n <Item>\n  <guid>hash_9240183C</guid>\n  <hash_B03B6E39 value=\"false\" />\n </Item>\n</a>";
+        let t = TintedAlbedos::from_xml(xml);
+        assert_eq!(t.len(), 2);
+        assert!(t.is_tinted(joaat("hair_gen_999_c0_999_ab"), None));
+        assert!(!t.is_tinted(0x9240_183C, Some("pant_mf1_061_c3_999_ab")), "the entry wins over the name");
+        assert!(t.is_tinted(1, Some("hat_fr1_011_c3_999_ab")));
+        assert!(t.is_tinted(1, Some("a_c_cow_uppr_000_c0_994_ab")));
+        assert!(!t.is_tinted(1, Some("head_fr1_sc08_rough_c0_008_ab")));
     }
 
     #[test]

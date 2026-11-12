@@ -24,6 +24,7 @@ pub mod setup;
 pub mod suggest;
 pub mod texttable;
 pub mod textures;
+pub mod tint;
 pub mod world;
 pub mod xmltree;
 
