@@ -53,6 +53,13 @@ pub struct Animation {
     blocks: Vec<Block>,
 }
 
+impl Animation {
+    /// An animation without tracks: every bone keeps its rest pose.
+    pub fn empty() -> Animation {
+        Animation { flags: 0, frames: 1, frames_per_block: 1, duration: 0.0, tracks: Vec::new(), blocks: Vec::new() }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClipPart {
     pub animation: usize,

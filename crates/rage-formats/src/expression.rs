@@ -54,6 +54,25 @@ pub enum Op {
     },
     /// Every other operation, with no operands (arithmetic, comparisons, …).
     Simple(u8),
+    /// RDR2: pops a value into a numbered register (read by [`Op::LinearBlend`]).
+    Store(u32),
+    /// RDR2: a weighted sum of registers per output axis, plus a constant:
+    /// `x = offset.x + Σ weights[g][0][lane] · register[registers[4g + lane]]`,
+    /// likewise y and z (w is the offset's).
+    LinearBlend {
+        offset: [f32; 4],
+        /// Per group of four lanes: the weights for x, y and z.
+        groups: Vec<[[f32; 4]; 3]>,
+        /// The register each lane reads (four per group).
+        registers: Vec<u16>,
+    },
+    /// RDR2: an operation whose meaning is not known, only how many values
+    /// it takes from the stack and gives back (those are unknown: NaN).
+    Unknown {
+        code: u8,
+        pops: u8,
+        pushes: u8,
+    },
 }
 
 /// One input of a blend: the track component it reads and how it maps the
@@ -241,16 +260,115 @@ fn read_ops(d1: &[u8], d2: &[u8], d3: &[u8]) -> Result<Vec<Op>, ResourceError> {
     Ok(ops)
 }
 
+/// RDR2 operations: (operand bytes in the vector data, in the other data,
+/// values popped, values pushed) for those not decoded on their own. Found by
+/// how every one of the game's 1,603 expression streams uses its data.
+fn rdr2_shape(code: u8) -> Option<(usize, usize, u8, u8)> {
+    Some(match code {
+        // Operations of one value whose meaning is not known.
+        0x0C | 0x0D | 0x0E | 0x14 => (0, 0, 1, 1),
+        0x24 => (0, 8, 1, 1),
+        0x3E => (0, 0, 3, 1),
+        0x4A | 0x4B | 0x4E | 0x54 | 0x6E => (0, 0, 0, 0),
+        0x4F => (0, 0, 2, 1),
+        // Values from elsewhere (ped state, other bones…).
+        0x45 | 0x57 | 0x67 | 0x6D | 0x71 | 0x72 => (0, 8, 0, 1),
+        0x46 | 0x56 => (0, 0, 0, 1),
+        0x60 | 0x61 => (0, 12, 0, 1),
+        0x62 => (80, 0, 0, 1),
+        0x65 => (0, 16, 0, 1),
+        0x59 | 0x5A => (0, 4, 1, 0),
+        0x5F => (0, 0, 1, 0),
+        0x5E => (0, 12, 0, 0),
+        0x5C | 0x5D => (32, 0, 4, 1),
+        _ => return None,
+    })
+}
+
+/// Reads the operations of a Red Dead Redemption 2 stream. Most keep their
+/// GTA V meaning; jumps differ (0x2B always, 0x70 when the popped condition
+/// is false), 0x67 also reads a variable, 0x52 stores into a register and
+/// 0x50 sums registers (see [`Op::LinearBlend`]).
+fn read_ops_rdr2(d1: &[u8], d2: &[u8], d3: &[u8]) -> Result<Vec<Op>, ResourceError> {
+    let (mut r1, mut r2) = (Reader { data: d1, at: 0 }, Reader { data: d2, at: 0 });
+    let mut ops = Vec::with_capacity(d3.len());
+    for &code in d3 {
+        let op = match code {
+            0x00 => Op::End,
+            0x01 => Op::Pop,
+            0x02 => Op::Dup,
+            0x03 => Op::Push([0.0; 4]),
+            0x04 => Op::Push([1.0; 4]),
+            0x05 => Op::Push([r2.f32()?; 4]),
+            0x0B => Op::Push(r1.vec4()?),
+            0x06..=0x0A | 0x20 | 0x23 | 0x26..=0x2A => {
+                let track = r2.u16()?;
+                let _bone = r2.u16()?;
+                let _track_type = r2.u8()?;
+                let _format = r2.u8()?;
+                let component = r2.u8()?;
+                let defaults = r2.u8()? != 0;
+                Op::Track { kind: code, track, component, defaults }
+            }
+            0x42 | 0x43 | 0x67 => {
+                let _hash = r2.u32()?;
+                let index = r2.u32()?;
+                if code == 0x43 { Op::SetVariable(index) } else { Op::GetVariable(index) }
+            }
+            0x2B | 0x2C | 0x2D | 0x70 => {
+                let _ = (r2.u32()?, r2.u32()?);
+                Op::Jump { kind: code, target: r2.u32()? as usize }
+            }
+            0x52 => Op::Store(r2.u32()?),
+            0x50 => {
+                let start = r1.at;
+                let length = r1.u32()? as usize;
+                let groups = r1.u32()? as usize;
+                let _ = (r1.u32()?, r1.u32()?);
+                if groups > 1024 || length != 32 + 48 * groups + 16 * groups.div_ceil(2) {
+                    return Err(ResourceError::Format("expression register blend of unexpected size".into()));
+                }
+                let offset = r1.vec4()?;
+                let groups_data = (0..groups)
+                    .map(|_| Ok([r1.vec4()?, r1.vec4()?, r1.vec4()?]))
+                    .collect::<Result<Vec<_>, ResourceError>>()?;
+                let registers =
+                    (0..groups.div_ceil(2) * 8).map(|_| r1.u16()).collect::<Result<Vec<_>, ResourceError>>()?;
+                debug_assert_eq!(r1.at - start, length);
+                Op::LinearBlend { offset, groups: groups_data, registers }
+            }
+            0x0F..=0x12 | 0x1B..=0x1F | 0x21 | 0x22 | 0x2E..=0x33 | 0x35..=0x3D | 0x40 | 0x48 | 0x49 => {
+                Op::Simple(code)
+            }
+            other => {
+                let Some((n1, n2, pops, pushes)) = rdr2_shape(other) else {
+                    return Err(ResourceError::Format(format!("unknown RDR2 expression operation {other:#04x}")));
+                };
+                r1.take(n1)?;
+                r2.take(n2)?;
+                Op::Unknown { code: other, pops, pushes }
+            }
+        };
+        ops.push(op);
+    }
+    Ok(ops)
+}
+
 /// (pointer, count) of a 64-bit resource list.
 fn list(res: &Resource, at: u64) -> Result<(u64, u64), ResourceError> {
     Ok((res.u64(at)?, u64::from(res.u16(at + 8)?)))
 }
 
 fn read_expression(res: &Resource, e: u64) -> Result<Expression, ResourceError> {
-    let (streams_ptr, stream_count) = list(res, e + 0x20)?;
-    let (tracks_ptr, track_count) = list(res, e + 0x30)?;
-    let (_, variables) = list(res, e + 0x50)?;
-    let name = res.string(res.u64(e + 0x60)?).unwrap_or_default();
+    read_expression_at(res, e, 0)
+}
+
+/// An expression; RDR2's fields sit `shift` (0x10) bytes further on.
+fn read_expression_at(res: &Resource, e: u64, shift: u64) -> Result<Expression, ResourceError> {
+    let (streams_ptr, stream_count) = list(res, e + 0x20 + shift)?;
+    let (tracks_ptr, track_count) = list(res, e + 0x30 + shift)?;
+    let (_, variables) = list(res, e + 0x50 + shift)?;
+    let name = res.string(res.u64(e + 0x60 + shift)?).unwrap_or_default();
     let tracks = (0..track_count)
         .map(|i| {
             let t = tracks_ptr + i * 4;
@@ -265,7 +383,8 @@ fn read_expression(res: &Resource, e: u64) -> Result<Expression, ResourceError> 
         let d1 = res.bytes(s + 16, l1)?;
         let d2 = res.bytes(s + 16 + l1 as u64, l2)?;
         let d3 = res.bytes(s + 16 + (l1 + l2) as u64, l3)?;
-        streams.push(Stream { name, ops: read_ops(d1, d2, d3)? });
+        let ops = if shift == 0 { read_ops(d1, d2, d3)? } else { read_ops_rdr2(d1, d2, d3)? };
+        streams.push(Stream { name, ops });
     }
     Ok(Expression { name, tracks, streams, variables: variables as usize })
 }
@@ -275,6 +394,31 @@ pub fn parse(res: &Resource) -> Result<ExpressionDictionary, ResourceError> {
     let (ptr, count) = list(res, Resource::ROOT + 0x30)?;
     let expressions =
         (0..count.min(4096)).map(|i| read_expression(res, res.u64(ptr + i * 8)?)).collect::<Result<_, _>>()?;
+    Ok(ExpressionDictionary { expressions })
+}
+
+/// Reads a Red Dead Redemption 2 expression dictionary (resource version
+/// 30): the expressions are in a hash map (buckets at 0x48, their count at
+/// 0x50; entries hold the name hash, the expression and the next entry), and
+/// each expression's fields sit 0x10 further on than in GTA V. Expressions
+/// with operations not understood yet (a few with variable-size operands)
+/// are left out.
+pub fn parse_rdr2(res: &Resource) -> Result<ExpressionDictionary, ResourceError> {
+    let buckets = res.u64(Resource::ROOT + 0x48)?;
+    let count = u64::from(res.u16(Resource::ROOT + 0x50)?);
+    let mut expressions = Vec::new();
+    for b in 0..count.min(4096) {
+        let mut entry = res.u64(buckets + b * 8)?;
+        let mut guard = 0;
+        while entry != 0 && guard < 4096 {
+            // Expressions with operations not understood yet are left out.
+            if let Ok(e) = read_expression_at(res, res.u64(entry + 8)?, 0x10) {
+                expressions.push(e);
+            }
+            entry = res.u64(entry + 0x10)?;
+            guard += 1;
+        }
+    }
     Ok(ExpressionDictionary { expressions })
 }
 
@@ -297,6 +441,37 @@ mod tests {
         assert_eq!(ops[2], Op::Track { kind: 0x06, track: 3, component: 0, defaults: false });
         assert_eq!(ops[3], Op::Simple(0x30));
         assert_eq!(ops[4], Op::End);
+    }
+
+    #[test]
+    fn decodes_rdr2_operations() {
+        // A register blend with one group: header, offset, x/y/z weights, lanes.
+        let mut d1 = Vec::new();
+        for w in [96u32, 1, 0, 0] {
+            d1.extend(w.to_le_bytes());
+        }
+        for v in [0.0f32, 0.0, 0.0, 0.0, -0.5, -0.5, 0.0, 0.0, 0.0, 0.0, 0.7, 0.7, 0.0, 0.0, 0.0, 0.0] {
+            d1.extend(v.to_le_bytes());
+        }
+        for lane in [1u16, 2, 3, 4, 0, 0, 0, 0] {
+            d1.extend(lane.to_le_bytes());
+        }
+        let mut d2 = Vec::new();
+        d2.extend(5u32.to_le_bytes()); // 0x52: register 5
+        d2.extend([0, 0, 0, 0, 20, 0, 0, 0, 2, 0, 0, 0]); // 0x70: skip two operations
+        d2.extend([0xBA, 0x16, 0x47, 0x4D, 0x10, 0, 0, 0]); // 0x67: variable 16
+        let ops = read_ops_rdr2(&d1, &d2, &[0x52, 0x50, 0x70, 0x67, 0x0C, 0x00]).unwrap();
+        assert_eq!(ops[0], Op::Store(5));
+        let Op::LinearBlend { offset, groups, registers } = &ops[1] else { panic!("{:?}", ops[1]) };
+        assert_eq!(*offset, [0.0; 4]);
+        assert_eq!(groups[0][0], [-0.5, -0.5, 0.0, 0.0]);
+        assert_eq!(groups[0][1], [0.0, 0.0, 0.7, 0.7]);
+        assert_eq!(&registers[..4], &[1, 2, 3, 4]);
+        assert_eq!(ops[2], Op::Jump { kind: 0x70, target: 2 });
+        assert_eq!(ops[3], Op::GetVariable(16));
+        assert_eq!(ops[4], Op::Unknown { code: 0x0C, pops: 1, pushes: 1 });
+        // An operation whose operands are not understood stops the stream.
+        assert!(read_ops_rdr2(&[], &[], &[0x74]).is_err());
     }
 
     #[test]
