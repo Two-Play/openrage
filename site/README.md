@@ -5,7 +5,7 @@ Source of <https://two-play.github.io/openrage/>, built with [Zola](https://www.
 | What | Where |
 |---|---|
 | Landing page text, highlights, screenshots, supported games | `content/_index.md` (front matter + Markdown) |
-| Getting started | `content/getting-started.md` |
+| Getting started, user guide, command line, development | `content/getting-started.md`, `guide.md`, `cli.md`, `development.md` (the user documentation lives here, not in the main README) |
 | New page | add `content/<name>.md` with `title` and `description` in the front matter |
 | Layout | `templates/` |
 | CSS, theme toggle, release links | `static/` |
