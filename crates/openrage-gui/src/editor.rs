@@ -18,6 +18,8 @@ pub const TAB_HIDDEN: char = '\u{a0}';
 
 /// `Document::converted` value of script disassemblies.
 const SCRIPT: &str = "script";
+/// `Document::converted` value of Red Dead Redemption 2 text tables.
+const RDR2_TEXT: &str = "RDR2 text table";
 
 /// A file loaded for editing.
 pub struct Document {
@@ -117,6 +119,25 @@ impl Document {
             tab_mark: false,
             locked_reason: "Disassembled from the compiled script for reading; scripts cannot be edited here.".into(),
             converted: Some(SCRIPT.into()),
+            table: None,
+        }
+    }
+
+    /// A read-only view of a Red Dead Redemption 2 text table (`.yldb`).
+    pub fn rdr2_text_table(vpath: String, text: String) -> Self {
+        let name = vpath.rsplit('/').next().unwrap_or(&vpath).to_owned();
+        // Read-only, so the indentation need not survive a round trip.
+        let text = text.replace('\t', "    ");
+        Self {
+            vpath,
+            name,
+            text,
+            crlf: false,
+            bom: false,
+            tab_mark: false,
+            locked_reason: "Red Dead Redemption 2 text tables are shown for reading; they cannot be saved back yet."
+                .into(),
+            converted: Some(RDR2_TEXT.into()),
             table: None,
         }
     }
@@ -256,7 +277,9 @@ pub fn open(ui: &AppWindow, doc: Document) {
             let doc = d.borrow();
             (doc.vpath.clone(), doc.converted.is_some())
         };
-        let new = if converted && vpath.to_ascii_lowercase().ends_with(".ysc") {
+        let new = if converted && openrage_app::texttable::is_rdr2_text_table(&vpath) {
+            crate::read_rdr2_text_table(&vpath).map(|text| Some(Document::rdr2_text_table(vpath, text)))
+        } else if converted && vpath.to_ascii_lowercase().ends_with(".ysc") {
             crate::read_script_listing(&ui, &vpath).map(|text| Some(Document::script(vpath, text)))
         } else if converted {
             crate::read_xml(&ui, &vpath).map(|x| Some(Document::converted(vpath, x.text, x.encoding.name())))
@@ -327,6 +350,9 @@ fn status_line(doc: &Document) -> String {
     if let Some(format) = &doc.converted {
         if format == SCRIPT {
             return format!("{lines} lines · script disassembly");
+        }
+        if format == RDR2_TEXT {
+            return format!("{lines} lines · {RDR2_TEXT}, read-only");
         }
         return format!("{lines} lines · XML converted from {format}");
     }

@@ -174,6 +174,9 @@ enum Command {
         /// Instead of only reading files, parse every model (.ydr, .yft, .ydd).
         #[arg(long)]
         models: bool,
+        /// Instead of only reading files, read every text table (.yldb) and count its strings.
+        #[arg(long, conflicts_with_all = ["textures", "models"])]
+        text: bool,
     },
     /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
     Media {
@@ -363,8 +366,8 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if let Command::Rpf8 { path, list, textures, models } = &cli.command {
-        return cmd_rpf8(path, *list, *textures, *models);
+    if let Command::Rpf8 { path, list, textures, models, text } = &cli.command {
+        return cmd_rpf8(path, *list, *textures, *models, *text);
     }
     if let Command::Rdr2Names { game, import } = &cli.command {
         return cmd_rdr2_names(game, import.as_deref());
@@ -2369,7 +2372,7 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool) -> Result<()> {
+fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool) -> Result<()> {
     use rage_rpf::rpf8::{Compression, Rpf8};
     let keys = rdr2_keys()?;
     let names = rdr2_game_folder(path)
@@ -2402,8 +2405,9 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool) -> Result<()>
         readable: usize,
         entries: usize,
         failed: usize,
-        /// Textures decoded or models parsed.
+        /// Textures decoded, models parsed or text tables read.
         textures: usize,
+        /// Triangles of the models, or strings of the text tables.
         triangles: usize,
         lines: Vec<String>,
     }
@@ -2447,7 +2451,20 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool) -> Result<()>
         }
         Ok(triangles)
     }
-    fn walk(rpf: &Rpf8, depth: usize, list: bool, textures: bool, models: bool, t: &mut Tally) {
+    /// Reads a text table; returns its string count.
+    fn check_texts(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
+        let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
+        Ok(rage_formats::ldb::parse(&res).map_err(|err| err.to_string())?.len())
+    }
+    /// Which files to parse instead of only reading them.
+    #[derive(Clone, Copy)]
+    struct Checks {
+        textures: bool,
+        models: bool,
+        texts: bool,
+    }
+    fn walk(rpf: &Rpf8, depth: usize, list: bool, checks: Checks, t: &mut Tally) {
+        let Checks { textures, models, texts } = checks;
         let h = rpf.header();
         let Some(entries) = rpf.entries() else { return };
         t.readable += 1;
@@ -2469,7 +2486,7 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool) -> Result<()>
                 match rpf.open_child(e) {
                     Ok(child) => {
                         t.nested += 1;
-                        walk(&child, depth + 1, list, textures, models, t);
+                        walk(&child, depth + 1, list, checks, t);
                     }
                     Err(err) => {
                         t.failed += 1;
@@ -2479,6 +2496,20 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool) -> Result<()>
             } else if models {
                 if matches!(e.ext_id, 2..=4) && e.is_resource {
                     match check_model(rpf, e) {
+                        Ok(n) => {
+                            t.textures += 1;
+                            t.triangles += n;
+                        }
+                        Err(err) => {
+                            t.failed += 1;
+                            t.lines.push(format!("{indent}{name}: {err}"));
+                        }
+                    }
+                }
+            } else if texts {
+                // Extension id 76 is `.#ldb` (`.yldb` on PC).
+                if e.ext_id == 76 && e.is_resource {
+                    match check_texts(rpf, e) {
                         Ok(n) => {
                             t.textures += 1;
                             t.triangles += n;
@@ -2540,7 +2571,7 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool) -> Result<()>
                             h.platform,
                             rpf.size()
                         ));
-                        walk(&rpf, 0, list, textures, models, &mut t);
+                        walk(&rpf, 0, list, Checks { textures, models, texts: text }, &mut t);
                     }
                     Err(e) => {
                         t.failed += 1;
@@ -2574,6 +2605,9 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool) -> Result<()>
     }
     if models {
         outln!("\n{textures_total} models parsed ({triangles_total} triangles)");
+    }
+    if text {
+        outln!("\n{textures_total} text tables read ({triangles_total} strings)");
     }
     outln!(
         "\n{ok} archives read ({nested} more nested in them), {empty} empty, {failed} failed; {plain} with a readable table ({entries_total} entries).{}",
