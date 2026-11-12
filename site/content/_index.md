@@ -2,16 +2,19 @@
 # Landing page. Edit the text here; the layout is in templates/index.html.
 # TOML note: plain keys must stay above the first [table] / [[list]] entry.
 # Strings are Markdown (links, `code`, **bold**). Images are file names in docs/images/.
-title = "OpenRAGE"
-description = "OpenRAGE is a free, open-source explorer and modding toolkit for Rockstar's RAGE engine games on Linux and Windows: archives, textures, models, audio, animations, metadata and OpenIV-compatible mods."
+title = "OpenRAGE – the open-source OpenIV successor"
+description = "OpenRAGE is the free, open-source successor to OpenIV: mod GTA V (Legacy and Enhanced) and explore Red Dead Redemption 2 on Linux and Windows, with OpenIV's mods folder and .oiv packages, plus undo."
 
 [extra]
+# Small line above the headline.
+eyebrow = "The open-source OpenIV successor"
 # **bold** parts are shown in the accent colour.
 headline = "The open modding toolkit for **RAGE engine** games"
 # One short line under the headline; the longer description belongs in features_intro.
-lead = "Browse every archive, preview every file and mod GTA V safely. Free, on Linux and Windows."
+lead = "OpenIV's last release was in 2022. OpenRAGE picks up where it left off: same `mods` folder and `.oiv` packages, now open source, on Linux and Windows, ready for GTA V Enhanced and RDR2."
 notice = """
 OpenRAGE is an independent community project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive.
+It is not made by or affiliated with the OpenIV team either.
 It contains **no game files and no encryption keys**: keys are taken from your own copy of the game at runtime.
 """
 
@@ -21,11 +24,11 @@ features_intro = "What OpenRAGE can open, show and change today."
 screenshots_title = "Screenshots"
 screenshots_intro = "Click a picture to enlarge it, arrow keys browse. The screenshots show files from the author's own copy of the game."
 games_title = "Supported games"
-games_intro = "GTA V comes first; Red Dead Redemption 2 archives and textures work, GTA IV is planned."
+games_intro = "GTA V comes first and Red Dead Redemption 2 can be explored. **GTA VI is next:** support follows as fast as possible once it comes to PC. GTA IV is planned."
 details_summary = "Checked against the whole game"
 download_intro = "Unpack the archive and run `openrage-gui` (or `openrage` for the command line). On first start the GUI detects your game and sets up the keys."
-why_title = "Why OpenRAGE"
-why_intro = "OpenRAGE keeps what OpenIV got right — the `mods` folder, `.oiv` packages, the export formats — and adds this."
+why_title = "Why switch from OpenIV"
+why_intro = "OpenRAGE keeps what OpenIV got right — the `mods` folder, `.oiv` packages, the export formats — so your mods keep working. Switching costs nothing, and you gain this:"
 compare_title = "OpenRAGE and OpenIV side by side"
 compare_note = """
 OpenIV supports more games and can import models; both tools share the same `mods` folder, so you can use them side by side.
@@ -163,6 +166,12 @@ formats_status = "partial"
 formats = "textures, models (viewer, glTF export) and texts (read-only)"
 
 [[extra.games]]
+name = "GTA VI"
+archives_status = "planned"
+archives = "as fast as possible once GTA VI comes to PC"
+formats_status = "none"
+
+[[extra.games]]
 name = "GTA IV"
 archives_status = "planned"
 archives = "RPF3"
@@ -183,7 +192,7 @@ text = "Native on both, Steam and Proton installs included."
 [[extra.reasons]]
 icon = "🛠️"
 title = "Actively developed"
-text = "Supports GTA V Enhanced. OpenIV's last release, 4.1, is from January 2022."
+text = "Supports GTA V Enhanced, GTA VI follows as fast as possible. OpenIV's last release, 4.1, is from January 2022."
 
 [[extra.reasons]]
 icon = "↩️"
@@ -234,7 +243,7 @@ edge = "openrage"
 [[extra.compare]]
 feature = "Other games"
 openiv = "GTA IV, EFLC, Max Payne 3"
-openrage = "RDR2 archives and textures; GTA IV planned"
+openrage = "RDR2 archives, textures, models and texts; GTA VI as soon as it is on PC; GTA IV planned"
 edge = "openiv"
 
 [[extra.compare]]

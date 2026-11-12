@@ -2,7 +2,7 @@
 # Content lives in content/ (Markdown), layout in templates/, CSS/JS in static/.
 base_url = "https://two-play.github.io/openrage"
 title = "OpenRAGE"
-description = "Free, open-source explorer and modding toolkit for Rockstar's RAGE engine games on Linux and Windows."
+description = "The free, open-source successor to OpenIV: mod GTA V and explore Red Dead Redemption 2 on Linux and Windows."
 default_language = "en"
 compile_sass = false
 build_search_index = false

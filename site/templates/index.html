@@ -6,6 +6,7 @@
 <main id="main">
   <div class="hero">
     <div class="wrap">
+      {%- if x?.eyebrow %}<p class="eyebrow">{{ x.eyebrow }}</p>{% endif %}
       <h1>{{ x.headline | markdown(inline=true) | safe }}</h1>
       <p class="lead">{{ x.lead | markdown(inline=true) | safe }}</p>
       <div class="actions">
@@ -19,6 +20,7 @@
         <li><span data-release="version">Latest release</span></li>
         <li>Linux &amp; Windows</li>
         <li>GTA V · RDR2 archives</li>
+        <li>GTA VI next</li>
         <li>GPL-3.0</li>
       </ul>
 
