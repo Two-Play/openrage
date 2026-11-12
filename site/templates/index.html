@@ -6,12 +6,12 @@
 <main id="main">
   <div class="hero">
     <div class="wrap">
-      <h1>{{ x.headline }}</h1>
+      <h1>{{ x.headline | markdown(inline=true) | safe }}</h1>
       <p class="lead">{{ x.lead | markdown(inline=true) | safe }}</p>
       <div class="actions">
-        <a class="btn btn-primary" href="{{ config.extra.releases }}/latest">
+        <a class="btn btn-primary" data-os-download href="{{ config.extra.releases }}/latest">
           <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
-          Download the latest release
+          <span data-os-label>Download the latest release</span>
         </a>
         <a class="btn btn-secondary" href="{{ get_url(path='@/getting-started.md') }}">Getting started</a>
       </div>
@@ -135,13 +135,13 @@
       <h2 id="download-title">Download</h2>
       <p class="section-intro">{{ x.download_intro | markdown(inline=true) | safe }}</p>
       <div class="downloads">
-        <div class="card reveal">
-          <h3>Linux</h3>
+        <div class="card reveal" data-os="linux">
+          <h3>Linux <span class="os-badge" hidden>Your system</span></h3>
           <p>x86-64, glibc 2.35 or newer (<code>.tar.gz</code>).</p>
           <a class="btn btn-primary" data-release="linux" href="{{ config.extra.releases }}/latest"><span>Download for Linux<span class="size" data-size></span></span></a>
         </div>
-        <div class="card reveal">
-          <h3>Windows</h3>
+        <div class="card reveal" data-os="windows">
+          <h3>Windows <span class="os-badge" hidden>Your system</span></h3>
           <p>x86-64 (<code>.zip</code>).</p>
           <a class="btn btn-primary" data-release="windows" href="{{ config.extra.releases }}/latest"><span>Download for Windows<span class="size" data-size></span></span></a>
         </div>

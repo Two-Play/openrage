@@ -213,9 +213,18 @@ h3 { font-size: 1.15rem; margin: 0 0 0.35rem; }
 /* Hero */
 .hero { padding: 3.5rem 0 2rem; text-align: center; }
 .hero h1 {
-  font-size: clamp(2rem, 5.5vw, 3.4rem);
+  font-size: clamp(2.1rem, 5.2vw, 3.5rem);
+  font-weight: 800;
+  line-height: 1.08;
+  letter-spacing: -0.025em;
   margin: 0 auto 1rem;
-  max-width: 18ch;
+  max-width: 16ch;
+  text-wrap: balance;
+}
+.hero h1 strong {
+  font-weight: inherit;
+  color: var(--accent);
+  white-space: nowrap;
 }
 .hero .lead {
   font-size: clamp(1.05rem, 2vw, 1.25rem);
@@ -568,3 +577,58 @@ table.compare td.edge::after {
 @media (max-width: 640px) {
   table.compare th[scope="row"] { white-space: normal; padding-top: 0.6rem; }
 }
+
+/* GitHub icon in the navigation */
+.site-nav .nav-icon { display: inline-flex; align-items: center; padding: 0.2rem; }
+.site-nav .nav-icon svg { width: 20px; height: 20px; }
+
+/* "Your system" marks and Linux / Windows tabs */
+.os-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+  font-size: 0.72rem;
+  font-weight: 600;
+  vertical-align: middle;
+  letter-spacing: 0.02em;
+}
+.os-badge[hidden] { display: none; }
+.os-tabs.tabbed {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  margin: 1.25rem 0;
+}
+.os-tablist {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.4rem 0.4rem 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+.os-tab {
+  font: inherit;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: none;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  padding: 0.5rem 1rem;
+  margin-bottom: -1px;
+  cursor: pointer;
+}
+.os-tab:hover { color: var(--text); }
+.os-tab[aria-selected="true"] {
+  color: var(--text);
+  background: var(--surface);
+  border-color: var(--border);
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.os-tab:focus-visible, .os-panel:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.os-tabs.tabbed .os-panel { padding: 0.25rem 1.1rem 0.6rem; }
+.os-tabs.tabbed .os-panel[hidden] { display: none; }

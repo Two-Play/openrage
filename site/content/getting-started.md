@@ -11,22 +11,56 @@ toc = true
 
 Ready-made builds for **Linux** (x86-64, glibc 2.35 or newer) and **Windows** (x86-64) are on the
 [releases page](https://github.com/Two-Play/openrage/releases/latest).
-Unpack the archive and run `openrage-gui`, or `openrage` for the command line.
-`SHA256SUMS.txt` lists the checksums of the archives.
 
 {{ <downloads /> }}
 
-To check a download on Linux:
+<div class="os-tabs">
+<div class="os-panel" data-os="linux">
+
+### Linux
+
+Unpack the archive and start the GUI, or `openrage` for the command line:
+
+```
+tar -xzf openrage-*-linux-x86_64.tar.gz
+cd openrage-*-linux-x86_64
+./openrage-gui
+```
+
+To check the download, put `SHA256SUMS.txt` next to it:
 
 ```
 sha256sum --check --ignore-missing SHA256SUMS.txt
 ```
 
+</div>
+<div class="os-panel" data-os="windows">
+
+### Windows
+
+Unzip the archive (right-click → *Extract All…*) and start `openrage-gui.exe`; `openrage.exe` is the command line.
+The program is not signed yet, so Windows SmartScreen may ask first: *More info* → *Run anyway*.
+
+To check the download, compare its hash in PowerShell with the line in `SHA256SUMS.txt`:
+
+```
+Get-FileHash .\openrage-*-windows-x86_64.zip -Algorithm SHA256
+```
+
+</div>
+</div>
+
 ## Build from source
 
-You need a recent stable [Rust toolchain](https://rustup.rs); the exact version is pinned in
-`rust-toolchain.toml` and rustup picks it up automatically.
-On Linux the GUI also needs the development packages of fontconfig, xkbcommon, Wayland and ALSA:
+You need a recent stable [Rust toolchain](https://rustup.rs) and [Git](https://git-scm.com/downloads).
+The exact Rust version is pinned in `rust-toolchain.toml`; rustup picks it up automatically.
+
+<div class="os-tabs">
+<div class="os-panel" data-os="linux">
+
+### Linux
+
+The GUI needs the development packages of fontconfig, xkbcommon, Wayland and ALSA:
 
 ```
 # Fedora
@@ -41,11 +75,30 @@ Then clone and build:
 git clone https://github.com/Two-Play/openrage.git
 cd openrage
 cargo build --release
-# binaries: target/release/openrage (CLI) and target/release/openrage-gui
+./target/release/openrage-gui
 ```
 
 For a reproducible environment there is a container image based on Fedora's toolbx image (`dev/Containerfile`);
 see [Reproducible build environment](https://github.com/Two-Play/openrage#reproducible-build-environment) in the README.
+
+</div>
+<div class="os-panel" data-os="windows">
+
+### Windows
+
+Rust on Windows needs the [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+with *Desktop development with C++*; `rustup-init.exe` offers to install them. No other libraries are needed.
+Then, in PowerShell:
+
+```
+git clone https://github.com/Two-Play/openrage.git
+cd openrage
+cargo build --release
+.\target\release\openrage-gui.exe
+```
+
+</div>
+</div>
 
 ## Set up GTA V
 
@@ -122,18 +175,32 @@ The search index and the other format viewers (models, …) are GTA V only for n
 
 ## Next steps
 
-Start the explorer, or try a few commands. Paths are virtual: archives, including archives inside archives, behave like folders.
+### In the GUI
+
+- Start `openrage-gui`. On first start it finds your Steam installation and sets up the keys.
+- Archives, even nested ones, open like folders. Double-click a model, texture or sound to open its viewer.
+- **Ctrl+F** searches names, hashes and the text of the whole game.
+- OpenRAGE starts read-only. Switch **Read-only → Editing** in the toolbar to change files: changes go to the `mods`
+  folder and can be undone with **Ctrl+Z** or from **History**.
+- **Install .oiv…** shows what a package changes before anything is written.
+- **F1** lists all keyboard shortcuts.
+
+### On the command line
+
+Paths are virtual: archives, including archives inside archives, behave like folders.
 
 ```
-openrage-gui
 openrage ls x64a.rpf/data
 openrage find adder.yft
 openrage search 0xB779A091                     # hash lookup
 openrage extract common.rpf/data/cargens.meta -o out/
 openrage model …/adder.yft --export adder.glb  # glTF for Blender
+openrage oiv info mod.oiv                      # what a package would change
+openrage oiv install mod.oiv
+openrage undo                                  # revert the newest change
 ```
 
-Edits never touch your game files: they go to OpenIV's `mods` folder and can be undone. The
+Edits never touch your game files: they go to OpenIV's `mods` folder. The
 [README](https://github.com/Two-Play/openrage#readme) documents every part of the GUI and the complete
 [command line](https://github.com/Two-Play/openrage#command-line).
 Found a bug or missing a format? [Open an issue](https://github.com/Two-Play/openrage/issues).

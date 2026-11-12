@@ -6,7 +6,8 @@ title = "OpenRAGE"
 description = "OpenRAGE is a free, open-source explorer and modding toolkit for Rockstar's RAGE engine games on Linux and Windows: archives, textures, models, audio, animations, metadata and OpenIV-compatible mods."
 
 [extra]
-headline = "Explore and mod RAGE engine games"
+# **bold** parts are shown in the accent colour.
+headline = "Explore and mod **GTA V** and **RDR2**"
 # One short line under the headline; the longer description belongs in features_intro.
 lead = "Free, open-source explorer and modding toolkit for Rockstar's RAGE engine games."
 notice = """
