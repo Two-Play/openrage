@@ -77,19 +77,27 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 <table>
   <tr>
     <td width="50%"><img alt="Viewer window with a car painted blue and its list of materials" src="docs/images/viewer.png"></td>
-    <td width="50%"><img alt="Archetype file of a map shown as XML in the preview" src="docs/images/metadata.png"></td>
+    <td width="50%"><img alt="A pedestrian model playing a walking animation in the viewer" src="docs/images/animation.png"></td>
   </tr>
   <tr>
-    <td align="center"><b>Model viewer</b> — materials, paint, parts and animations</td>
-    <td align="center"><b>Metadata as XML</b> — maps, archetypes, cutscenes, …</td>
+    <td align="center"><b>Model viewer</b> — materials, paint, parts, glTF export</td>
+    <td align="center"><b>Animations</b> — clips play on skinned models</td>
   </tr>
   <tr>
-    <td width="50%"><img alt="Game text table shown as OpenIV oxt text" src="docs/images/text-table.png"></td>
-    <td width="50%"><img alt="Explorer in light mode" src="docs/images/explorer-light.png"></td>
+    <td width="50%"><img alt="Collision mesh of a downtown skyscraper, coloured by material" src="docs/images/collision.png"></td>
+    <td width="50%"><img alt="Search for the hash 0xB779A091 finding the Adder car files" src="docs/images/search.png"></td>
   </tr>
   <tr>
+    <td align="center"><b>Collisions</b> — coloured by material, in 3D</td>
+    <td align="center"><b>Search</b> — names, hashes and text of the whole game</td>
+  </tr>
+  <tr>
+    <td width="50%"><img alt="Map placement file shown as a structure tree with its values" src="docs/images/metadata.png"></td>
+    <td width="50%"><img alt="Game text table shown as OpenIV oxt text in the editor" src="docs/images/text-table.png"></td>
+  </tr>
+  <tr>
+    <td align="center"><b>Metadata</b> — maps, archetypes, cutscenes as XML</td>
     <td align="center"><b>Game text</b> — <code>.gxt2</code> as editable <code>.oxt</code></td>
-    <td align="center"><b>Light mode</b> — follows the system or your choice</td>
   </tr>
 </table>
 
