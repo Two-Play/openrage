@@ -1165,7 +1165,7 @@ fn cmd_model(
                 let (_, part, at) = c.part_at(secs).context("clip without animation")?;
                 let a = &dict.animations[part.animation];
                 let skel = model.skeleton.as_ref().context("the model has no skeleton")?;
-                let binding = openrage_app::anim::Binding::new(skel, a);
+                let binding = openrage_app::anim::Binding::new(skel, a).with_expressions(skel, a, &model.expressions);
                 outln!(
                     "animating {} of {} bones ({:.1} s clip)",
                     binding.animated_bones(),

@@ -220,7 +220,11 @@ fn start(
             Some(sk) => dict.clips[clip]
                 .parts
                 .iter()
-                .map(|p| dict.animations.get(p.animation).map(|a| Binding::new(sk, a)))
+                .map(|p| {
+                    dict.animations
+                        .get(p.animation)
+                        .map(|a| Binding::new(sk, a).with_expressions(sk, a, &preview.loaded.expressions))
+                })
                 .collect(),
             None => Vec::new(),
         };

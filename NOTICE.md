@@ -4,7 +4,7 @@
 
 Format knowledge for RPF7 and the NG cipher, the audio container layout and
 Rockstar's XXTEA variant, the metadata formats (RSC meta, PSO, RBF) and their XML
-layout, the SHA-1 fingerprints in `crates/rage-crypto/src/key_hashes.rs`, and the
+layout, the layout of expression dictionaries (`.yed`), the SHA-1 fingerprints in `crates/rage-crypto/src/key_hashes.rs`, and the
 list of metadata names in `crates/rage-formats/src/meta_names.txt` (from
 CodeWalker's `MetaNames`) are derived from CodeWalker
 (https://github.com/dexyfex/CodeWalker), which is distributed under the MIT license:

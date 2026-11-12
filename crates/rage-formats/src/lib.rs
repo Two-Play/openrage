@@ -10,6 +10,7 @@ pub mod awc;
 pub mod clip;
 pub mod dds;
 pub mod drawable;
+pub mod expression;
 pub mod geometry;
 pub mod gltf;
 pub mod gxt2;
