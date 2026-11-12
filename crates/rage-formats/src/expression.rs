@@ -247,10 +247,15 @@ fn list(res: &Resource, at: u64) -> Result<(u64, u64), ResourceError> {
 }
 
 fn read_expression(res: &Resource, e: u64) -> Result<Expression, ResourceError> {
-    let (streams_ptr, stream_count) = list(res, e + 0x20)?;
-    let (tracks_ptr, track_count) = list(res, e + 0x30)?;
-    let (_, variables) = list(res, e + 0x50)?;
-    let name = res.string(res.u64(e + 0x60)?).unwrap_or_default();
+    read_expression_at(res, e, 0)
+}
+
+/// An expression; RDR2's fields sit `shift` (0x10) bytes further on.
+fn read_expression_at(res: &Resource, e: u64, shift: u64) -> Result<Expression, ResourceError> {
+    let (streams_ptr, stream_count) = list(res, e + 0x20 + shift)?;
+    let (tracks_ptr, track_count) = list(res, e + 0x30 + shift)?;
+    let (_, variables) = list(res, e + 0x50 + shift)?;
+    let name = res.string(res.u64(e + 0x60 + shift)?).unwrap_or_default();
     let tracks = (0..track_count)
         .map(|i| {
             let t = tracks_ptr + i * 4;
@@ -265,7 +270,20 @@ fn read_expression(res: &Resource, e: u64) -> Result<Expression, ResourceError> 
         let d1 = res.bytes(s + 16, l1)?;
         let d2 = res.bytes(s + 16 + l1 as u64, l2)?;
         let d3 = res.bytes(s + 16 + (l1 + l2) as u64, l3)?;
-        streams.push(Stream { name, ops: read_ops(d1, d2, d3)? });
+        let ops = match read_ops(d1, d2, d3) {
+            Ok(ops) => ops,
+            Err(e) if shift != 0 && std::env::var_os("PROBE_YED").is_some() => {
+                eprintln!("stream {i} ({l1}+{l2}+{l3}): {e}");
+                let mut hist = std::collections::BTreeMap::new();
+                for c in d3 { *hist.entry(*c).or_insert(0) += 1; }
+                eprintln!("  ops {:x?}", hist);
+                eprintln!("  first ops {:x?}", &d3[..d3.len().min(60)]);
+                eprintln!("  d1 {:02x?}", &d1[..d1.len().min(96)]);
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
+        streams.push(Stream { name, ops });
     }
     Ok(Expression { name, tracks, streams, variables: variables as usize })
 }
@@ -275,6 +293,26 @@ pub fn parse(res: &Resource) -> Result<ExpressionDictionary, ResourceError> {
     let (ptr, count) = list(res, Resource::ROOT + 0x30)?;
     let expressions =
         (0..count.min(4096)).map(|i| read_expression(res, res.u64(ptr + i * 8)?)).collect::<Result<_, _>>()?;
+    Ok(ExpressionDictionary { expressions })
+}
+
+/// Reads a Red Dead Redemption 2 expression dictionary (resource version
+/// 30): the expressions are in a hash map (buckets at 0x48, their count at
+/// 0x50; entries hold the name hash, the expression and the next entry), and
+/// each expression's fields sit 0x10 further on than in GTA V.
+pub fn parse_rdr2(res: &Resource) -> Result<ExpressionDictionary, ResourceError> {
+    let buckets = res.u64(Resource::ROOT + 0x48)?;
+    let count = u64::from(res.u16(Resource::ROOT + 0x50)?);
+    let mut expressions = Vec::new();
+    for b in 0..count.min(4096) {
+        let mut entry = res.u64(buckets + b * 8)?;
+        let mut guard = 0;
+        while entry != 0 && guard < 4096 {
+            expressions.push(read_expression_at(res, res.u64(entry + 8)?, 0x10)?);
+            entry = res.u64(entry + 0x10)?;
+            guard += 1;
+        }
+    }
     Ok(ExpressionDictionary { expressions })
 }
 
