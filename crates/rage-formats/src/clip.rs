@@ -307,9 +307,15 @@ fn read_channel(kind: u16, c: &mut Cursor, frames: usize) -> Result<Channel, Res
 /// Delta-coded values in chunks of 64 frames: per chunk a bit offset and a
 /// start value, then per frame a delta of the increment (`count3` low bits,
 /// unary high bits, sign bit).
-/// RDR2's kind-9 channels: the coding between chunk starts is not known
-/// yet, so the values are interpolated linearly between the exact values
-/// stored at the start of every 64-frame chunk (the last one is held).
+/// RDR2's kind-9 channels. Known: per 64-frame chunk a bit offset (`count1`
+/// bits) and the exact start value (`count2` bits), as in GTA V's linear
+/// floats; then per chunk a 16-bit mask with a 0 for every group of four
+/// frames that has a key (where the value changes), followed by one unary
+/// code per key (the offsets count these code bits); then `count3` blocks of
+/// 128 bits whose coding of the values is not known yet (they take four
+/// `code + 1`-bit values per key). So the values are interpolated between
+/// the exact chunk starts across the frames that have keys, and held
+/// elsewhere; without a readable key mask, across the whole chunk.
 fn chunk_starts(data: &[u8], base: usize, frames: usize, counts: u32, quantum: f32, offset: f32) -> Vec<f32> {
     const CHUNK: usize = 64;
     let (c1, c2) = (counts & 0xFF, (counts >> 8) & 0xFF);
@@ -317,9 +323,18 @@ fn chunk_starts(data: &[u8], base: usize, frames: usize, counts: u32, quantum: f
     let starts: Vec<f32> = (0..chunks)
         .map(|i| bits(data, base + chunks * c1 as usize + i * c2 as usize, c2.min(32)) as f32 * quantum + offset)
         .collect();
+    let spans = key_spans(data, base, frames, chunks, c1, c2);
     (0..frames)
         .map(|f| {
-            let (i, t) = (f / CHUNK, (f % CHUNK) as f32 / CHUNK as f32);
+            let (i, k) = (f / CHUNK, f % CHUNK);
+            let (start, end) = spans.as_ref().and_then(|s| s.get(i).copied().flatten()).unwrap_or((0, CHUNK));
+            let t = if k <= start {
+                0.0
+            } else if k >= end {
+                1.0
+            } else {
+                (k - start) as f32 / (end - start).max(1) as f32
+            };
             match (starts.get(i), starts.get(i + 1)) {
                 (Some(a), Some(b)) => a + (b - a) * t,
                 (Some(a), None) => *a,
@@ -327,6 +342,46 @@ fn chunk_starts(data: &[u8], base: usize, frames: usize, counts: u32, quantum: f
             }
         })
         .collect()
+}
+
+/// The frames of each chunk that have keys in a kind-9 channel: from the
+/// first keyed group of four frames to the end of the last (`None` for a
+/// chunk without keys). `None` when the key masks do not agree with the
+/// chunk offsets (an unexpected layout).
+fn key_spans(
+    data: &[u8],
+    base: usize,
+    frames: usize,
+    chunks: usize,
+    c1: u32,
+    c2: u32,
+) -> Option<Vec<Option<(usize, usize)>>> {
+    let groups = frames / 4;
+    let mut pos = base + chunks * (c1 + c2) as usize;
+    let end = data.len() * 8;
+    let mut code_bits = 0usize;
+    let mut spans = Vec::with_capacity(chunks);
+    for chunk in 0..chunks {
+        if bits(data, base + chunk * c1 as usize, c1.min(32)) as usize != code_bits {
+            return None;
+        }
+        let n = groups.saturating_sub(chunk * 16).min(16);
+        let keyed: Vec<usize> = (0..n).filter(|g| bits(data, pos + g, 1) == 0).collect();
+        pos += n;
+        for _ in &keyed {
+            let start = pos;
+            while pos < end && bits(data, pos, 1) == 0 {
+                pos += 1;
+            }
+            pos += 1;
+            code_bits += pos - start;
+        }
+        if pos > end {
+            return None;
+        }
+        spans.push(keyed.first().zip(keyed.last()).map(|(a, b)| (a * 4, (b + 1) * 4)));
+    }
+    Some(spans)
 }
 
 fn linear_float(data: &[u8], base: usize, frames: usize, counts: u32, quantum: f32, offset: f32) -> Vec<f32> {
@@ -773,6 +828,38 @@ mod tests {
         assert_eq!(values[0], 10.0);
         assert_eq!(values[32], 15.0);
         assert_eq!(values[64], 20.0);
+        assert_eq!(values[99], 20.0);
+    }
+
+    #[test]
+    fn rdr2_kind9_moves_only_where_keys_are() {
+        // Two chunks (100 frames, 25 groups of four): offsets 0 and 2 (two
+        // code bits in chunk 0), starts 10 and 20; chunk 0 has keys in groups
+        // 10 and 11 (frames 40..48), chunk 1 none.
+        let (c1, c2) = (4u32, 8u32);
+        let mut v: u128 = 0;
+        v |= 2 << c1;
+        v |= 10 << (2 * c1);
+        v |= 20 << (2 * c1 + c2);
+        let mut at = 2 * (c1 + c2);
+        for g in 0..16 {
+            if g != 10 && g != 11 {
+                v |= 1 << (at + g);
+            }
+        }
+        at += 16;
+        v |= 0b11 << at; // the two codes
+        at += 2;
+        for g in 0..9 {
+            v |= 1 << (at + g);
+        }
+        let data = v.to_le_bytes();
+        let values = chunk_starts(&data, 0, 100, c1 | c2 << 8, 1.0, 0.0);
+        assert_eq!(values[0], 10.0);
+        assert_eq!(values[40], 10.0);
+        assert_eq!(values[44], 15.0);
+        assert_eq!(values[48], 20.0);
+        assert_eq!(values[63], 20.0);
         assert_eq!(values[99], 20.0);
     }
 
