@@ -399,8 +399,16 @@ fn collision_material_names(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> &'s
     })
 }
 
-/// Loads a model as the game sees it (mods included).
+/// Loads a model as the game sees it (mods included). Reports its steps
+/// to [`crate::progress`].
 pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result<LoadedModel> {
+    crate::progress::set("Reading the model", 0, 0);
+    let result = load_inner(game_dir, keys, vpath);
+    crate::progress::clear();
+    result
+}
+
+fn load_inner(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result<LoadedModel> {
     let (node, _) = rage_mods::resolve(game_dir, vpath, keys.clone())?;
     if let Node::Rpf8File(rpf, i) = node {
         return load_rdr2(&rpf, i);
@@ -540,7 +548,9 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
     if lower.ends_with(".yft") {
         candidates.push("vehshare.ytd".into());
     }
-    for c in candidates {
+    let total = candidates.len() as u64;
+    for (k, c) in candidates.into_iter().enumerate() {
+        crate::progress::set("Loading textures", k as u64, total);
         if let Some(tid) = rpf.find_child(dir, &c)
             && let Ok(dict) = rpf
                 .read_resource(tid)
@@ -683,6 +693,7 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
     let name = full.rsplit('/').next().unwrap_or(&full).to_owned();
     let lower = name.to_ascii_lowercase();
     let stem = name.split('.').next().unwrap_or(&name).to_owned();
+    crate::progress::set("Reading the model", 0, 0);
     let res = rpf.read_resource(entry)?;
     let drawables: Vec<(String, Drawable)> = if lower.ends_with(".ydr") {
         vec![(stem.clone(), drawable::parse_ydr_rdr2(&res)?)]
@@ -740,7 +751,10 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
         .collect();
     ytds.sort();
     let mut external = Vec::new();
-    for (_, k, base) in ytds.into_iter().take(8) {
+    let folder: Vec<(i32, usize, String)> = ytds.into_iter().take(8).collect();
+    let folder_count = folder.len() as u64;
+    for (n, (_, k, base)) in folder.into_iter().enumerate() {
+        crate::progress::set("Loading textures", n as u64, folder_count);
         if let Ok(dict) = rpf
             .read_resource(&entries[k])
             .map_err(anyhow::Error::from)
@@ -760,17 +774,22 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
         };
         let wanted: Vec<String> =
             drawables.iter().flat_map(|(_, d)| d.shaders.iter().flat_map(|s| s.textures.iter().cloned())).collect();
-        let mut opened: Vec<crate::rdr2::Location> = Vec::new();
+        // Which shared dictionaries are needed (one per texture not found yet).
+        let mut needed: Vec<(String, crate::rdr2::Location)> = Vec::new();
         for name in wanted {
-            if opened.len() >= 32 || have(&name, &external) {
+            if needed.len() >= 32 || have(&name, &external) {
                 continue;
             }
             let Some(loc) = index.find(&name) else { continue };
-            if opened.contains(loc) {
+            if needed.iter().any(|(_, l)| l == loc) {
                 continue;
             }
-            opened.push(loc.clone());
-            if let Some(dict) = crate::rdr2::open_dictionary(&game, loc) {
+            needed.push((name, loc.clone()));
+        }
+        let total = needed.len() as u64;
+        for (k, (name, loc)) in needed.into_iter().enumerate() {
+            crate::progress::set("Loading shared textures", k as u64, total);
+            if let Some(dict) = crate::rdr2::open_dictionary(&game, &loc) {
                 external.push((format!("{name} (shared)"), dict));
             }
         }

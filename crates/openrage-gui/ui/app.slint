@@ -414,6 +414,17 @@ component FileItem inherits Rectangle {
                 activated => { root.action("uninstall"); }
             }
             MenuSeparator { }
+            if root.wide-kind: MenuItem {
+                title: @tr("Show in folder");
+                icon: @image-url("icons/menu/folder.svg");
+                activated => { root.action("show-in-folder"); }
+            }
+            if !root.history-mode: MenuItem {
+                title: @tr("Search for this name");
+                icon: @image-url("icons/menu/search.svg");
+                activated => { root.action("search-name"); }
+            }
+            MenuSeparator { }
             MenuItem {
                 title: @tr("Copy name");
                 icon: @image-url("icons/menu/copy.svg");
@@ -423,6 +434,11 @@ component FileItem inherits Rectangle {
                 title: @tr("Copy path");
                 icon: @image-url("icons/menu/copy.svg");
                 activated => { root.action("copy-path"); }
+            }
+            if !root.history-mode: MenuItem {
+                title: @tr("Copy hash");
+                icon: @image-url("icons/menu/copy.svg");
+                activated => { root.action("copy-hash"); }
             }
         }
 
@@ -923,6 +939,9 @@ export component AppWindow inherits Window {
     in-out property <string> prompt-value;
     in property <bool> texture-selected;
     in property <bool> preview-loading;
+    // Progress of the preview's load: 0..1, or below 0 when unknown; and the current step.
+    in property <float> preview-progress: -1;
+    in property <string> preview-progress-text;
     in-out property <bool> shortcuts-visible;
     // History opens in its own window (else in the file list).
     in-out property <bool> history-in-window: true;
@@ -2293,10 +2312,25 @@ export component AppWindow inherits Window {
                         // After a search without results, say what was looked for.
                         text: root.suggest-title != "" ? root.suggest-title : root.has-selection ? @tr("No preview for this file type") : @tr("Select a file to preview it");
                     }
-                    if root.preview-loading: Spinner {
-                        width: 32px;
-                        height: 32px;
-                        indeterminate: true;
+                    if root.preview-loading: VerticalLayout {
+                        alignment: center;
+                        spacing: Theme.space-s;
+                        HorizontalLayout {
+                            alignment: center;
+                            Spinner {
+                                width: 40px;
+                                height: 40px;
+                                // Known count: a ring that fills; otherwise endless.
+                                indeterminate: root.preview-progress < 0;
+                                progress: max(root.preview-progress, 0);
+                            }
+                        }
+                        if root.preview-progress-text != "": Text {
+                            horizontal-alignment: center;
+                            text: root.preview-progress-text;
+                            font-size: Theme.font-small;
+                            color: Theme.text-muted;
+                        }
                     }
                 }
             }
