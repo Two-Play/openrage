@@ -50,8 +50,118 @@ Get-FileHash .\openrage-*-windows-x86_64.zip -Algorithm SHA256
 </div>
 </div>
 
+## Set up GTA V
+
+<div class="callout">
+
+**On first start, OpenRAGE opens a setup dialog.** It finds your Steam installation and takes the archive keys from
+your own copy of the game: check the game folder and click **Derive keys**. For GTA V Legacy that is all.
+
+</div>
+
+- **GTA V Enhanced** (`GTA5_Enhanced.exe`) no longer stores all keys in the executable. In the setup dialog, choose a
+  CodeWalker key blob (`magic.dat`) you obtained yourself under *Key blob*. It is decrypted with the key from *your*
+  executable and checked against `common.rpf` before it is used.
+- The keys are cached once, at `~/.config/openrage/gtav.keys` (Linux) or `%APPDATA%\openrage\gtav.keys` (Windows),
+  and the game folder is remembered. To switch games or keys later: **Settings → Change game or keys…**
+
+> [!WARNING]
+> **Never share the key cache.** It contains keys taken from your copy of the game.
+
+## Set up Red Dead Redemption 2
+
+RDR2's keys are set up on the **command line** for now; after that you browse the game in the GUI.
+Unlike GTA V's, most RDR2 archive keys are not stored in the executable on disk: they exist only while the game runs.
+OpenRAGE takes them from your own game and never ships them. There are two ways:
+
+### From a key file
+
+```
+openrage rdr2-keys --file secrets.bin "/path/to/Red Dead Redemption 2"
+```
+
+The file holds length-prefixed key blocks, such as the `secrets.bin` Swage writes.
+
+### From a memory dump of your running game
+
+1. Start RDR2 in story mode (not Red Dead Online) and wait for the main menu, or load a save.
+2. Dump the process. On Windows: Task Manager → Details → right-click `RDR2.exe` → *Create dump file*.
+   Under Proton/Linux: `gcore <pid of RDR2.exe>` (from gdb).
+3. Run `openrage rdr2-keys --dump <dump file> "/path/to/Red Dead Redemption 2"`.
+
+> [!WARNING]
+> **Delete the dump afterwards.** It is several gigabytes and holds everything the game had in memory, including login data.
+
+The keys are stored in OpenRAGE's config folder (`rdr2.keys`).
+
+### File names
+
+RDR2 archives store only a hash of each file name. Let OpenRAGE search the game's own files for matching names once
+(about 7 minutes; the result is cached):
+
+```
+openrage rdr2-names "/path/to/Red Dead Redemption 2"
+```
+
+This finds about 44 % of all names, including nearly all models, clip sets and particle files; the rest show as
+`hash/XXXXXXXX.ext`. `--import <list>` adds names from a text file (one per line).
+
+### Browse
+
+In the GUI, choose the RDR2 folder under **Settings → Change game or keys…**: archives open like folders, with file
+details, a text preview and *Extract…* for files and whole folders. **Textures** (`.ytd`) work as in GTA V: preview, viewer and export as DDS
+or PNG. On the command line:
+
+```
+openrage rpf8 "/path/to/Red Dead Redemption 2"
+openrage --game "/path/to/Red Dead Redemption 2" ls levels_1.rpf/levels/rdr3
+openrage textures <path to .ytd> --export out/ --png
+```
+
+Only the Steam version of 2 April 2024 is known so far; other versions report which pieces are missing.
+The search index and the other format viewers (models, …) are GTA V only for now.
+
+## Using the GUI
+
+- Archives, even nested ones, open like folders. Double-click a model, texture or sound to open its viewer.
+- **Ctrl+F** searches names, hashes and the text of the whole game.
+- OpenRAGE starts read-only. Switch **Read-only → Editing** in the toolbar to change files: changes go to OpenIV's
+  `mods` folder, never into your game files, and can be undone with **Ctrl+Z** or from **History**.
+- **Install .oiv…** shows what a package changes before anything is written; installed packages can be uninstalled.
+- **F1** lists all keyboard shortcuts.
+
+The [README](https://github.com/Two-Play/openrage#using-the-gui) describes every part of the GUI.
+
+## Command line
+
+For scripts, automation and everyone who prefers a terminal. `openrage` comes in the same archive as the GUI.
+Paths are virtual: archives, including archives inside archives, behave like folders.
+
+### Keys
+
+```
+openrage --game "/path/to/Grand Theft Auto V" keys
+openrage keys --magic /path/to/magic.dat       # GTA V Enhanced: your own key blob
+```
+
+### Common commands
+
+```
+openrage ls x64a.rpf/data
+openrage find adder.yft
+openrage search 0xB779A091                     # hash lookup
+openrage extract common.rpf/data/cargens.meta -o out/
+openrage model …/adder.yft --export adder.glb  # glTF for Blender
+openrage oiv info mod.oiv                      # what a package would change
+openrage oiv install mod.oiv
+openrage undo                                  # revert the newest change
+```
+
+The [README](https://github.com/Two-Play/openrage#command-line) lists every command.
+
 ## Build from source
 
+For contributors and anyone who wants the newest code.
 You need a recent stable [Rust toolchain](https://rustup.rs) and [Git](https://git-scm.com/downloads).
 The exact Rust version is pinned in `rust-toolchain.toml`; rustup picks it up automatically.
 
@@ -100,107 +210,4 @@ cargo build --release
 </div>
 </div>
 
-## Set up GTA V
-
-OpenRAGE needs the archive keys from *your own* game installation. On first start the GUI shows a setup dialog that
-detects Steam installations and derives the keys. On the command line:
-
-```
-openrage --game "/path/to/Grand Theft Auto V" keys
-```
-
-The keys are extracted once and cached at `~/.config/openrage/gtav.keys` (Linux) or
-`%APPDATA%\openrage\gtav.keys` (Windows). The game directory is remembered after this step.
-
-- **GTA V Legacy** (`GTA5.exe`): all keys are found in the executable.
-- **GTA V Enhanced** (`GTA5_Enhanced.exe`): the executable only contains the AES key; the NG keys are no
-  longer stored in plain form. Pass a CodeWalker key blob you obtained yourself:
-  `openrage keys --magic /path/to/magic.dat`. The blob is decrypted with the AES key from your executable and verified
-  against `common.rpf` before it is cached.
-
-> [!WARNING]
-> **Never share the key cache.** It contains keys taken from your copy of the game.
-
-## Set up Red Dead Redemption 2
-
-RDR2 archives can be browsed in the GUI and on the command line. Unlike GTA V's, most RDR2 archive keys are not stored in the executable on disk;
-they exist only while the game runs. OpenRAGE takes them from your own game and never ships them. There are two ways:
-
-### From a key file
-
-```
-openrage rdr2-keys --file secrets.bin "/path/to/Red Dead Redemption 2"
-```
-
-The file holds length-prefixed key blocks, such as the `secrets.bin` Swage writes.
-
-### From a memory dump of your running game
-
-1. Start RDR2 in story mode (not Red Dead Online) and wait for the main menu, or load a save.
-2. Dump the process. On Windows: Task Manager → Details → right-click `RDR2.exe` → *Create dump file*.
-   Under Proton/Linux: `gcore <pid of RDR2.exe>` (from gdb).
-3. Run `openrage rdr2-keys --dump <dump file> "/path/to/Red Dead Redemption 2"`.
-
-> [!WARNING]
-> **Delete the dump afterwards.** It is several gigabytes and holds everything the game had in memory, including login data.
-
-The keys are stored in OpenRAGE's config folder (`rdr2.keys`).
-
-### File names
-
-RDR2 archives store only a hash of each file name. Let OpenRAGE search the game's own files for matching names once
-(about 7 minutes; the result is cached):
-
-```
-openrage rdr2-names "/path/to/Red Dead Redemption 2"
-```
-
-This finds about 44 % of all names, including nearly all models, clip sets and particle files; the rest show as
-`hash/XXXXXXXX.ext`. `--import <list>` adds names from a text file (one per line).
-
-### Browse
-
-In the GUI, choose the RDR2 folder as the game folder: archives open like folders, with file details, a text preview
-and *Extract…* for files and whole folders. **Textures** (`.ytd`) work as in GTA V: preview, viewer and export as DDS
-or PNG. On the command line:
-
-```
-openrage rpf8 "/path/to/Red Dead Redemption 2"
-openrage --game "/path/to/Red Dead Redemption 2" ls levels_1.rpf/levels/rdr3
-openrage textures <path to .ytd> --export out/ --png
-```
-
-Only the Steam version of 2 April 2024 is known so far; other versions report which pieces are missing.
-The search index and the other format viewers (models, …) are GTA V only for now.
-
-## Next steps
-
-### In the GUI
-
-- Start `openrage-gui`. On first start it finds your Steam installation and sets up the keys.
-- Archives, even nested ones, open like folders. Double-click a model, texture or sound to open its viewer.
-- **Ctrl+F** searches names, hashes and the text of the whole game.
-- OpenRAGE starts read-only. Switch **Read-only → Editing** in the toolbar to change files: changes go to the `mods`
-  folder and can be undone with **Ctrl+Z** or from **History**.
-- **Install .oiv…** shows what a package changes before anything is written.
-- **F1** lists all keyboard shortcuts.
-
-### On the command line
-
-Paths are virtual: archives, including archives inside archives, behave like folders.
-
-```
-openrage ls x64a.rpf/data
-openrage find adder.yft
-openrage search 0xB779A091                     # hash lookup
-openrage extract common.rpf/data/cargens.meta -o out/
-openrage model …/adder.yft --export adder.glb  # glTF for Blender
-openrage oiv info mod.oiv                      # what a package would change
-openrage oiv install mod.oiv
-openrage undo                                  # revert the newest change
-```
-
-Edits never touch your game files: they go to OpenIV's `mods` folder. The
-[README](https://github.com/Two-Play/openrage#readme) documents every part of the GUI and the complete
-[command line](https://github.com/Two-Play/openrage#command-line).
 Found a bug or missing a format? [Open an issue](https://github.com/Two-Play/openrage/issues).

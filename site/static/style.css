@@ -632,3 +632,16 @@ table.compare td.edge::after {
 .os-tab:focus-visible, .os-panel:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .os-tabs.tabbed .os-panel { padding: 0.25rem 1.1rem 0.6rem; }
 .os-tabs.tabbed .os-panel[hidden] { display: none; }
+
+/* Prominent hint in guides: <div class="callout"> … </div> */
+.prose .callout {
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-left: 4px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+  border-radius: var(--radius);
+  padding: 0.9rem 1.2rem;
+  margin: 1.25rem 0;
+  font-size: 1.05rem;
+}
+.prose .callout p { margin: 0; }
+.prose .callout strong:first-child { color: var(--accent); }
