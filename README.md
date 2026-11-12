@@ -156,7 +156,11 @@ With the keys, `openrage rpf8 <game folder>` opens all 89 archives and the 4,874
 
 ### Download
 
-Ready-made builds for Linux (x86-64, glibc 2.35 or newer) and Windows (x86-64) are on the [releases page](https://github.com/Two-Play/openrage/releases): unpack the archive and run `openrage-gui` (or `openrage` for the command line). `SHA256SUMS.txt` lists the checksums of the archives.
+Ready-made builds for Linux (x86-64, glibc 2.35 or newer) and Windows (x86-64) are on the [releases page](https://github.com/Two-Play/openrage/releases):
+
+- **Linux AppImage** (`openrage-<version>-x86_64.AppImage`): make it executable and start it — it opens the GUI; `./openrage-….AppImage --cli <command>` runs the command line. Tools such as Gear Lever or AppImageLauncher add it to the application menu with its icon.
+- **Linux archive** (`.tar.gz`): `openrage-gui` and `openrage`, plus `openrage.desktop` and `openrage.png` for a menu entry.
+- **Windows** (`.zip`): `openrage-gui.exe` and `openrage.exe`, both with the OpenRAGE icon. `SHA256SUMS.txt` lists the checksums of the archives.
 
 Releases are made by pushing a version tag (`git tag v0.2.0 && git push origin v0.2.0`, matching the version in `Cargo.toml`); the *Release* workflow builds both systems and publishes the release. It can also be run by hand from the Actions tab to build the archives without publishing.
 

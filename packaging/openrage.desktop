@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OpenRAGE
+GenericName=RAGE game explorer
+Comment=Browse, view and mod the files of GTA V and Red Dead Redemption 2
+Exec=openrage-gui %f
+Icon=openrage
+Terminal=false
+Categories=Development;
+Keywords=GTA;RDR2;OpenIV;mod;rpf;
+StartupWMClass=openrage-gui
