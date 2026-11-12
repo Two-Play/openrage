@@ -44,6 +44,8 @@ struct Block {
 
 #[derive(Debug, Clone)]
 pub struct Animation {
+    /// RDR2: the animation's flags (0 for GTA V).
+    pub flags: u16,
     pub frames: usize,
     pub frames_per_block: usize,
     pub duration: f32,
@@ -197,6 +199,18 @@ enum Channel {
 }
 
 impl Channel {
+    /// Whether the channel gives one float component.
+    fn is_float(&self) -> bool {
+        matches!(
+            self,
+            Channel::StaticFloat(_)
+                | Channel::RawFloat { .. }
+                | Channel::QuantizeFloat { .. }
+                | Channel::IndirectQuantizeFloat { .. }
+                | Channel::LinearFloat(_)
+        )
+    }
+
     fn frame_bits(&self) -> u32 {
         match self {
             Channel::RawFloat { .. } => 32,
@@ -263,14 +277,18 @@ fn read_channel(kind: u16, c: &mut Cursor, frames: usize) -> Result<Channel, Res
             c.pos += num_ints * 4;
             Channel::IndirectQuantizeFloat { bit: 0, frame_bits, table }
         }
-        6 => {
+        6 | 9 => {
             // `num_ints` covers the whole channel, this 16-byte header included.
             let start = c.pos;
             let num_ints = c.u32()? as usize;
             let counts = c.u32()?;
             let quantum = c.f32()?;
             let offset = c.f32()?;
-            let values = linear_float(c.data, c.pos * 8, frames, counts, quantum, offset);
+            let values = if kind == 9 {
+                chunk_starts(c.data, c.pos * 8, frames, counts, quantum, offset)
+            } else {
+                linear_float(c.data, c.pos * 8, frames, counts, quantum, offset)
+            };
             c.pos = start + (num_ints * 4).max(16);
             Channel::LinearFloat(values)
         }
@@ -282,6 +300,28 @@ fn read_channel(kind: u16, c: &mut Cursor, frames: usize) -> Result<Channel, Res
 /// Delta-coded values in chunks of 64 frames: per chunk a bit offset and a
 /// start value, then per frame a delta of the increment (`count3` low bits,
 /// unary high bits, sign bit).
+/// RDR2's kind-9 channels: the coding between chunk starts is not known
+/// yet, so the values are interpolated linearly between the exact values
+/// stored at the start of every 64-frame chunk (the last one is held).
+fn chunk_starts(data: &[u8], base: usize, frames: usize, counts: u32, quantum: f32, offset: f32) -> Vec<f32> {
+    const CHUNK: usize = 64;
+    let (c1, c2) = (counts & 0xFF, (counts >> 8) & 0xFF);
+    let chunks = frames.div_ceil(CHUNK).max(1);
+    let starts: Vec<f32> = (0..chunks)
+        .map(|i| bits(data, base + chunks * c1 as usize + i * c2 as usize, c2.min(32)) as f32 * quantum + offset)
+        .collect();
+    (0..frames)
+        .map(|f| {
+            let (i, t) = (f / CHUNK, (f % CHUNK) as f32 / CHUNK as f32);
+            match (starts.get(i), starts.get(i + 1)) {
+                (Some(a), Some(b)) => a + (b - a) * t,
+                (Some(a), None) => *a,
+                _ => 0.0,
+            }
+        })
+        .collect()
+}
+
 fn linear_float(data: &[u8], base: usize, frames: usize, counts: u32, quantum: f32, offset: f32) -> Vec<f32> {
     const CHUNK: usize = 64;
     let (c1, c2, c3) = (counts & 0xFF, (counts >> 8) & 0xFF, (counts >> 16) & 0xFF);
@@ -321,7 +361,11 @@ fn linear_float(data: &[u8], base: usize, frames: usize, counts: u32, quantum: f
 }
 
 /// Decodes one sequence block (header at `ptr`).
-fn read_block(res: &Resource, ptr: u64, tracks: usize) -> Result<Block, ResourceError> {
+/// RDR2 has a tenth channel kind after GTA V's nine (kind 9 here): floats
+/// with the parameters of GTA V's linear floats but another coding.
+const RDR2_KINDS: [u16; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+fn read_block(res: &Resource, ptr: u64, tracks: usize, rdr2: bool) -> Result<Block, ResourceError> {
     let data_len = res.u32(ptr + 0x04)? as usize;
     let frame_offset = res.u32(ptr + 0x0C)? as usize;
     let frames = res.u16(ptr + 0x16)? as usize;
@@ -337,10 +381,13 @@ fn read_block(res: &Resource, ptr: u64, tracks: usize) -> Result<Block, Resource
     // (anim sequence, slot, channel)
     let mut channels: Vec<(usize, usize, Channel)> = Vec::new();
     let mut params = Cursor { data, pos: 0 };
-    let mut item = list + 18;
+    let kinds = if rdr2 { 10 } else { 9 };
+    let mut item = list + kinds * 2;
     let mut frame_bit = 0usize;
-    for kind in 0..9u16 {
-        let n = count(kind as usize)?;
+    for stored in 0..kinds as u16 {
+        let n = count(stored as usize)?;
+        let kind = if rdr2 { RDR2_KINDS[stored as usize] } else { stored };
+
         for _ in 0..n {
             let raw = data.get(item..item + 2).ok_or_else(|| bad("channel item outside the block"))?;
             let raw = u16::from_le_bytes([raw[0], raw[1]]) as usize;
@@ -350,7 +397,8 @@ fn read_block(res: &Resource, ptr: u64, tracks: usize) -> Result<Block, Resource
             frame_bit += ch.frame_bits() as usize;
             let (seq, mut slot) = (raw >> 2, raw & 3);
             if let Channel::CachedQuaternion { index } = &mut ch {
-                *index = slot;
+                // RDR2 always derives w; its low bits mean something else there.
+                *index = if rdr2 { 3 } else { slot };
                 slot = if kind == 7 { 3 } else { 4 };
             }
             channels.push((seq, slot, ch));
@@ -388,8 +436,11 @@ fn group(channels: Vec<(usize, usize, Channel)>) -> Vec<Vec<Option<Channel>>> {
 /// Value of one anim sequence at a frame: a vector, or a quaternion when a
 /// cached-quaternion channel derives the fourth component.
 fn evaluate(slots: &[Option<Channel>], data: &[u8], frame: usize, frame_start: usize) -> [f32; 4] {
+    // All four components stored: nothing to derive (RDR2 marks such tracks
+    // with a cached-quaternion channel too).
+    let explicit = (0..4).all(|i| slots.get(i).and_then(|c| c.as_ref()).is_some_and(|c| c.is_float()));
     let cached = slots.iter().flatten().find_map(|c| match c {
-        Channel::CachedQuaternion { index } => Some(*index),
+        Channel::CachedQuaternion { index } if !explicit => Some(*index),
         _ => None,
     });
     if let Some(index) = cached {
@@ -456,9 +507,10 @@ fn read_animation(res: &Resource, ptr: u64) -> Result<Animation, ResourceError> 
             Ok(BoneTrack { bone: v as u16, format: (v >> 16) as u8, track: (v >> 24) as u8 })
         })
         .collect::<Result<_, ResourceError>>()?;
-    let blocks =
-        (0..seq_count).map(|i| read_block(res, res.u64(seq_ptr + i * 8)?, tracks.len())).collect::<Result<_, _>>()?;
-    Ok(Animation { frames, frames_per_block, duration, tracks, blocks })
+    let blocks = (0..seq_count)
+        .map(|i| read_block(res, res.u64(seq_ptr + i * 8)?, tracks.len(), false))
+        .collect::<Result<_, _>>()?;
+    Ok(Animation { flags: 0, frames, frames_per_block, duration, tracks, blocks })
 }
 
 impl Animation {
@@ -512,6 +564,9 @@ impl Animation {
 
 /// Parses a `.ycd` file.
 pub fn parse_ycd(res: &Resource) -> Result<ClipDictionary, ResourceError> {
+    if res.version == RDR2_VERSION {
+        return parse_ycd_rdr2(res);
+    }
     let root = Resource::ROOT;
     // Animations, by their address (clips refer to them by pointer).
     let mut animations: Vec<Animation> = Vec::new();
@@ -588,9 +643,131 @@ pub fn parse_ycd(res: &Resource) -> Result<ClipDictionary, ResourceError> {
     Ok(ClipDictionary { clips, animations })
 }
 
+/// A Red Dead Redemption 2 animation (`crAnimation` in clip dictionaries
+/// of version 58): the same sequence blocks as GTA V's, in a larger header.
+fn read_animation_rdr2(res: &Resource, ptr: u64) -> Result<Animation, ResourceError> {
+    let frames = res.u16(ptr + 0x24)? as usize;
+    let frames_per_block = res.u16(ptr + 0x26)? as usize;
+    let duration = f32::from_bits(res.u32(ptr + 0x28)?);
+    let seq_ptr = res.u64(ptr + 0x50)?;
+    let seq_count = res.u16(ptr + 0x58)? as u64;
+    let track_ptr = res.u64(ptr + 0x60)?;
+    let track_count = res.u16(ptr + 0x68)? as u64;
+    if seq_count > 4096 || track_count > 4096 {
+        return Err(bad("implausible animation"));
+    }
+    let tracks: Vec<BoneTrack> = (0..track_count)
+        .map(|i| {
+            let v = res.u32(track_ptr + i * 4)?;
+            Ok(BoneTrack { bone: v as u16, format: (v >> 16) as u8, track: (v >> 24) as u8 })
+        })
+        .collect::<Result<_, ResourceError>>()?;
+    let blocks = (0..seq_count)
+        .map(|i| read_block(res, res.u64(seq_ptr + i * 8)?, tracks.len(), true))
+        .collect::<Result<_, _>>()?;
+    Ok(Animation { flags: res.u16(ptr + 0x20)?, frames, frames_per_block, duration, tracks, blocks })
+}
+
+/// Walks a hash map (bucket pointers, entries chained at +0x10) and returns
+/// the object pointer (+0x08) of every entry.
+fn map_objects(res: &Resource, buckets: u64, count: u64) -> Result<Vec<u64>, ResourceError> {
+    let mut out = Vec::new();
+    for b in 0..count.min(65536) {
+        let mut entry = res.u64(buckets + b * 8)?;
+        let mut guard = 0;
+        while entry != 0 && guard < 100_000 {
+            let object = res.u64(entry + 0x08)?;
+            if object != 0 {
+                out.push(object);
+            }
+            entry = res.u64(entry + 0x10)?;
+            guard += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Parses a Red Dead Redemption 2 `.ycd` (version 58): a clip dictionary
+/// with its animation dictionaries embedded. Clips refer to animations by
+/// pointer; each clip has a list of animation parts (pointer, start, end, rate).
+pub fn parse_ycd_rdr2(res: &Resource) -> Result<ClipDictionary, ResourceError> {
+    let root = Resource::ROOT;
+    let mut animations = Vec::new();
+    let mut anim_ptrs = Vec::new();
+    let dicts = res.u64(root + 0x70)?;
+    let dict_count = res.u16(root + 0x78)? as u64;
+    for d in 0..dict_count.min(256) {
+        let dict = res.u64(dicts + d * 16)?;
+        if dict == 0 {
+            continue;
+        }
+        let (buckets, count) = (res.u64(dict + 0x48)?, res.u16(dict + 0x50)? as u64);
+        for anim in map_objects(res, buckets, count)? {
+            if !anim_ptrs.contains(&anim) {
+                animations.push(read_animation_rdr2(res, anim)?);
+                anim_ptrs.push(anim);
+            }
+        }
+    }
+    let index_of = |ptr: u64| anim_ptrs.iter().position(|&p| p == ptr);
+    let mut clips = Vec::new();
+    for clip in map_objects(res, res.u64(root + 0x48)?, res.u16(root + 0x50)? as u64)? {
+        let name_ptr = res.u64(clip + 0x28)?;
+        let name = if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() };
+        let name = name.strip_prefix("pack:/").unwrap_or(&name).trim_end_matches(".clip").to_owned();
+        // Parts (played one after another): each a list of animation
+        // layers and a duration. The first layer is the part's animation:
+        // pointer, then start, end and rate at 0x28.
+        let list = res.u64(clip + 0x68)?;
+        let n = res.u16(clip + 0x70)? as u64;
+        let mut parts = Vec::new();
+        for i in 0..n.min(256) {
+            let part = list + i * RDR2_CLIP_PART;
+            let (layers, layer_count) = (res.u64(part)?, res.u16(part + 8)?);
+            if layers == 0 || layer_count == 0 {
+                continue;
+            }
+            if let Some(animation) = index_of(res.u64(layers)?) {
+                parts.push(ClipPart {
+                    animation,
+                    start: f32::from_bits(res.u32(layers + 0x28)?),
+                    end: f32::from_bits(res.u32(layers + 0x2C)?),
+                    rate: f32::from_bits(res.u32(layers + 0x30)?),
+                });
+            }
+        }
+        let sequential = parts.len() > 1;
+        clips.push(Clip { name, parts, sequential });
+    }
+    clips.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(ClipDictionary { clips, animations })
+}
+
+/// Resource version of Red Dead Redemption 2's clip dictionaries.
+pub const RDR2_VERSION: u32 = 58;
+
+/// Size of a part of an RDR2 clip (layer list, count, capacity, duration).
+const RDR2_CLIP_PART: u64 = 0x18;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rdr2_kind9_interpolates_chunk_starts() {
+        // Two chunks (100 frames): 4-bit offsets, then 8-bit starts 10 and 20.
+        let (c1, c2) = (4u32, 8u32);
+        let mut v: u64 = 0;
+        v |= 10 << (2 * c1);
+        v |= 20 << (2 * c1 + c2);
+        let data = v.to_le_bytes();
+        let values = chunk_starts(&data, 0, 100, c1 | c2 << 8, 1.0, 0.0);
+        assert_eq!(values.len(), 100);
+        assert_eq!(values[0], 10.0);
+        assert_eq!(values[32], 15.0);
+        assert_eq!(values[64], 20.0);
+        assert_eq!(values[99], 20.0);
+    }
 
     #[test]
     fn joins_cutscene_sections() {

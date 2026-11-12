@@ -6,6 +6,28 @@ use rage_formats::math::{self, Mat4};
 
 use crate::expr::Local;
 
+/// Reads a clip dictionary (`.ycd`, GTA V or RDR2) or a cutscene's
+/// animation (`.cut`, its sections joined), mods included.
+pub fn load_clips(
+    game_dir: &std::path::Path,
+    keys: Option<std::sync::Arc<rage_crypto::GtaVKeys>>,
+    vpath: &str,
+) -> anyhow::Result<rage_formats::clip::ClipDictionary> {
+    use rage_rpf::vfs::Node;
+    match rage_mods::resolve(game_dir, vpath, keys)?.0 {
+        Node::ArchiveFile(rpf, id) if vpath.to_ascii_lowercase().ends_with(".cut") => {
+            crate::cutscene::animation(&rpf, id)
+        }
+        Node::ArchiveFile(rpf, id) => Ok(rage_formats::clip::parse_ycd(&rpf.read_resource(id)?)?),
+        Node::Rpf8File(rpf, i) => {
+            let entry =
+                rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| anyhow::anyhow!("archive table not readable"))?;
+            Ok(rage_formats::clip::parse_ycd(&rpf.read_resource(entry)?)?)
+        }
+        _ => anyhow::bail!("{vpath} is not a file inside an archive"),
+    }
+}
+
 /// Which animation tracks drive which skeleton bones.
 pub struct Binding {
     /// Per bone: translation, rotation and scale track indices.

@@ -183,6 +183,9 @@ enum Command {
         /// Instead of only reading files, decode every sound of every audio container.
         #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta"])]
         audio: bool,
+        /// Instead of only reading files, parse every clip dictionary (.ycd) and evaluate every frame.
+        #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta", "audio"])]
+        anims: bool,
     },
     /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
     Media {
@@ -372,11 +375,11 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if let Command::Rpf8 { path, list, textures, models, text, meta, audio } = &cli.command {
+    if let Command::Rpf8 { path, list, textures, models, text, meta, audio, anims } = &cli.command {
         return cmd_rpf8(
             path,
             *list,
-            Checks { textures: *textures, models: *models, texts: *text, meta: *meta, audio: *audio },
+            Checks { textures: *textures, models: *models, texts: *text, meta: *meta, audio: *audio, anims: *anims },
         );
     }
     if let Command::Rdr2Names { game, import } = &cli.command {
@@ -1166,14 +1169,8 @@ fn cmd_model(
                     Some((c, t)) => (c, t.parse::<f32>().context("bad time")?),
                     None => (rest, 0.0),
                 };
-                let (node, _) = rage_mods::resolve(game_dir, ycd, keys)?;
-                let vfs::Node::ArchiveFile(rpf, id) = node else { bail!("{ycd} is not a file") };
                 // A cutscene (.cut) plays its sections joined into one clip per actor.
-                let dict = if ycd.to_ascii_lowercase().ends_with(".cut") {
-                    openrage_app::cutscene::animation(&rpf, id)?
-                } else {
-                    rage_formats::clip::parse_ycd(&rpf.read_resource(id)?)?
-                };
+                let dict = openrage_app::anim::load_clips(game_dir, keys, ycd)?;
                 let c = dict.clips.iter().find(|c| c.name.eq_ignore_ascii_case(clip)).context("no such clip")?;
                 let (_, part, at) = c.part_at(secs).context("clip without animation")?;
                 let a = &dict.animations[part.animation];
@@ -1200,9 +1197,7 @@ fn cmd_model(
 }
 
 fn cmd_clips(game_dir: &Path, path: &str, clip: Option<&str>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
-    let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
-    let vfs::Node::ArchiveFile(rpf, id) = node else { bail!("{path} is not a file inside an archive") };
-    let dict = rage_formats::clip::parse_ycd(&rpf.read_resource(id)?)?;
+    let dict = openrage_app::anim::load_clips(game_dir, keys, path)?;
     outln!("{} clips, {} animations", dict.clips.len(), dict.animations.len());
     for c in &dict.clips {
         let parts: Vec<String> = c
@@ -2393,10 +2388,11 @@ struct Checks {
     texts: bool,
     meta: bool,
     audio: bool,
+    anims: bool,
 }
 
 fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
-    let Checks { textures, models, texts: text, meta, audio } = checks;
+    let Checks { textures, models, texts: text, meta, audio, anims } = checks;
     use rage_rpf::rpf8::{Compression, Rpf8};
     let keys = rdr2_keys()?;
     let names = rdr2_game_folder(path)
@@ -2513,7 +2509,7 @@ fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
         Ok(Some((awc.sounds.len(), secs)))
     }
     fn walk(rpf: &Rpf8, depth: usize, list: bool, checks: Checks, t: &mut Tally) {
-        let Checks { textures, models, texts, meta, audio } = checks;
+        let Checks { textures, models, texts, meta, audio, anims } = checks;
         let h = rpf.header();
         let Some(entries) = rpf.entries() else { return };
         t.readable += 1;
@@ -2540,6 +2536,31 @@ fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
                     Err(err) => {
                         t.failed += 1;
                         t.lines.push(format!("{indent}{name}: {err}"));
+                    }
+                }
+            } else if anims {
+                // Extension id 67 is `.#cd` (`.ycd` on PC).
+                if e.ext_id == 67 && e.is_resource {
+                    match rpf
+                        .read_resource(e)
+                        .map_err(|err| err.to_string())
+                        .and_then(|res| rage_formats::clip::parse_ycd(&res).map_err(|err| err.to_string()))
+                    {
+                        Ok(dict) => {
+                            for a in &dict.animations {
+                                for f in 0..a.frames {
+                                    for k in 0..a.tracks.len() {
+                                        let _ = a.value(k, f as f32);
+                                    }
+                                }
+                            }
+                            t.textures += dict.clips.len();
+                            t.triangles += dict.animations.len();
+                        }
+                        Err(err) => {
+                            t.failed += 1;
+                            t.lines.push(format!("{indent}{name}: {err}"));
+                        }
                     }
                 }
             } else if audio {
@@ -2695,6 +2716,9 @@ fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
     }
     if audio {
         outln!("\n{textures_total} sounds decoded ({:.1} hours)", triangles_total as f64 / 3600.0);
+    }
+    if anims {
+        outln!("\n{textures_total} clips, {triangles_total} animations read (every frame evaluated)");
     }
     outln!(
         "\n{ok} archives read ({nested} more nested in them), {empty} empty, {failed} failed; {plain} with a readable table ({entries_total} entries).{}",

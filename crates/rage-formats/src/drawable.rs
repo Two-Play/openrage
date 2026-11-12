@@ -651,8 +651,13 @@ fn read_shaders(res: &Resource, group: u64, layout_gen: Gen) -> Result<Vec<Shade
     Ok(shaders)
 }
 
-fn read_skeleton(res: &Resource, ptr: u64) -> Result<Skeleton, ResourceError> {
-    let bones = res.u64(ptr + 0x20)?;
+/// A skeleton: GTA V's bones list is at 0x20 (parent at bone+0x32, tag at
+/// +0x44); RDR2's at 0x28 (parent at +0x46, tag at +0x4A). Both keep the
+/// bone count at 0x5E and 0x50-byte bones with rotation, translation,
+/// scale and name pointer first.
+fn read_skeleton_gen(res: &Resource, ptr: u64, layout_gen: Gen) -> Result<Skeleton, ResourceError> {
+    let rdr2 = layout_gen == Gen::Rdr2;
+    let bones = res.u64(ptr + if rdr2 { 0x28 } else { 0x20 })?;
     let count = res.u16(ptr + 0x5E)? as u64;
     if bones == 0 || count > 2048 {
         return Err(bad("invalid skeleton"));
@@ -661,11 +666,11 @@ fn read_skeleton(res: &Resource, ptr: u64) -> Result<Skeleton, ResourceError> {
     for i in 0..count {
         let b = bones + i * 0x50;
         let f = |o: u64| -> Result<f32, ResourceError> { Ok(f32::from_bits(res.u32(b + o)?)) };
-        let name_ptr = res.u64(b + 0x38)?;
+        let name_ptr = res.u64(b + if rdr2 { 0x30 } else { 0x38 })?;
         out.push(Bone {
             name: if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() },
-            tag: res.u16(b + 0x44)?,
-            parent: res.u16(b + 0x32)? as i16,
+            tag: res.u16(b + if rdr2 { 0x4A } else { 0x44 })?,
+            parent: res.u16(b + if rdr2 { 0x46 } else { 0x32 })? as i16,
             rotation: [f(0x00)?, f(0x04)?, f(0x08)?, f(0x0C)?],
             translation: [f(0x10)?, f(0x14)?, f(0x18)?],
             scale: [f(0x20)?, f(0x24)?, f(0x28)?],
@@ -686,7 +691,7 @@ pub fn read_drawable_gen(res: &Resource, ptr: u64, layout_gen: Gen) -> Result<Dr
         Drawable { bounds_min: vec3(res, ptr + 0x30)?, bounds_max: vec3(res, ptr + 0x40)?, ..Default::default() };
     let skel = res.u64(ptr + 0x18)?;
     if skel != 0 {
-        d.skeleton = read_skeleton(res, skel).ok();
+        d.skeleton = read_skeleton_gen(res, skel, layout_gen).ok();
     }
     let world = d.skeleton.as_ref().map(Skeleton::world_transforms).unwrap_or_default();
     for lod in 0..4 {
