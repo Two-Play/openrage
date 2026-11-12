@@ -44,10 +44,18 @@ mod ty {
     pub const ENUM: u8 = 0x0e;
     pub const FLAGS: u8 = 0x0f;
     pub const MAP: u8 = 0x10;
+    /// RDR2: four floats in 16 bytes.
+    pub const VEC4V: u8 = 0x13;
+    /// RDR2: a 4×4 float matrix.
+    pub const MATRIX44: u8 = 0x17;
+    /// RDR2: a 64-bit unsigned integer.
+    pub const ULONG: u8 = 0x1f;
     pub const FLOAT3A: u8 = 0x14;
     pub const FLOAT4A: u8 = 0x15;
     pub const HFLOAT: u8 = 0x1e;
     pub const LONG: u8 = 0x20;
+    /// RDR2: 16 bytes of unknown meaning, written as hex.
+    pub const OPAQUE16: u8 = 0x24;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -85,6 +93,8 @@ pub struct Pso {
     blocks: Vec<Block>,
     structs: HashMap<u32, StructInfo>,
     enums: HashMap<u32, Vec<(u32, i32)>>,
+    /// Bit where the offset of a pointer starts: 12 (GTA V) or 20 (RDR2).
+    offset_shift: u32,
 }
 
 pub fn is_pso(data: &[u8]) -> bool {
@@ -114,12 +124,22 @@ fn f32_at(d: &[u8], at: usize) -> Result<f32, String> {
 }
 
 /// A pointer: the packed value is the first big-endian u32 of 8 bytes.
+/// A pointer: the first word, plus the top byte of the second word in bits
+/// 32..40 (RDR2 keeps the offset's high bits there).
 fn ptr_at(d: &[u8], at: usize) -> Result<u64, String> {
-    u32_at(d, at).map(u64::from)
+    let high = u32_at(d, at + 4).map_or(0, |w| u64::from(w >> 24));
+    u32_at(d, at).map(|w| u64::from(w) | high << 32)
 }
 
-fn unpack(ptr: u64) -> (usize, usize) {
-    ((ptr & 0xFFF) as usize, ((ptr >> 12) & 0xFFFFF) as usize)
+/// Block id and offset of a pointer. GTA V: offset in bits 12..32. RDR2:
+/// bits 20..32 are the low 12 offset bits, bits 32..40 the next 8.
+fn unpack_with(ptr: u64, offset_shift: u32) -> (usize, usize) {
+    let offset = if offset_shift == 20 {
+        ((ptr >> 20) & 0xFFF) | ((ptr >> 32) & 0xFF) << 12
+    } else {
+        (ptr >> offset_shift) & 0xFFFFF
+    };
+    ((ptr & 0xFFF) as usize, offset as usize)
 }
 
 fn vector_attrs(name: &str, v: &[f32]) -> String {
@@ -131,6 +151,15 @@ fn vector_attrs(name: &str, v: &[f32]) -> String {
 }
 
 pub fn parse(file: &[u8]) -> Result<Pso, PsoError> {
+    parse_with(file, 12)
+}
+
+/// A PSO file from Red Dead Redemption 2, whose pointers keep the offset from bit 20.
+pub fn parse_rdr2(file: &[u8]) -> Result<Pso, PsoError> {
+    parse_with(file, 20)
+}
+
+fn parse_with(file: &[u8], offset_shift: u32) -> Result<Pso, PsoError> {
     let err = |m: String| PsoError(m);
     let mut data = None;
     let mut map = None;
@@ -206,7 +235,7 @@ pub fn parse(file: &[u8]) -> Result<Pso, PsoError> {
             t => return Err(err(format!("unknown schema element type {t}"))),
         }
     }
-    Ok(Pso { data: data.to_vec(), root_block, blocks, structs, enums })
+    Ok(Pso { data: data.to_vec(), root_block, blocks, structs, enums, offset_shift })
 }
 
 /// Parses a PSO file and writes it as XML (see [`Pso::to_xml`]).
@@ -223,6 +252,18 @@ enum Tag {
 }
 
 impl Pso {
+    /// Splits a pointer into (block, offset). RDR2's files use both layouts
+    /// (offset from bit 20 in most, from bit 12 in some arrays): the RDR2
+    /// layout is taken when it lands inside a block, else the GTA V one.
+    fn unpack(&self, ptr: u64) -> (usize, usize) {
+        let (block, offset) = unpack_with(ptr, self.offset_shift);
+        if self.offset_shift == 12 || self.block(block).is_some_and(|b| offset < b.length.max(1)) {
+            return (block, offset);
+        }
+        let (b12, o12) = unpack_with(ptr, 12);
+        if self.block(b12).is_some_and(|b| o12 < b.length.max(1)) { (b12, o12) } else { (block, offset) }
+    }
+
     fn block(&self, id: usize) -> Option<&Block> {
         id.checked_sub(1).and_then(|i| self.blocks.get(i))
     }
@@ -258,6 +299,9 @@ impl Pso {
         struct_name: u32,
         depth: usize,
     ) {
+        if w.full() {
+            return;
+        }
         let Some(block) = self.block(block_id).copied() else {
             return w.error(level, format!("block {block_id} not found"));
         };
@@ -317,7 +361,9 @@ impl Pso {
             ty::SBYTE => w.value(level, ename, &(byte(at)? as i8).to_string()),
             ty::UBYTE => w.value(level, ename, &byte(at)?.to_string()),
             ty::ENUM => {
-                let v = match entry.sub {
+                // RDR2 counts the subtypes one higher: 1 = 32 bit, 2 = 16 bit, 3 = 8 bit.
+                let sub = if self.offset_shift == 20 { entry.sub.saturating_sub(1) } else { entry.sub };
+                let v = match sub {
                     0 => u32_at(d, at)? as i32,
                     1 => u16_at(d, at)? as i16 as i32,
                     2 => byte(at)? as i32,
@@ -332,22 +378,34 @@ impl Pso {
                     .flatten()
                     .filter(|e| e.name == ARRAYINFO)
                     .and_then(|e| self.enums.get(&e.key));
-                let v = match entry.sub {
-                    0 => u32_at(d, at)?,
-                    1 => u16_at(d, at)? as u32,
-                    2 => byte(at)? as u32,
+                // Bits as 32-bit words; RDR2's subtype 4 is a bit set whose
+                // size (in bits) is the high half of the entry's key.
+                let words: Vec<u32> = match entry.sub {
+                    0 => vec![u32_at(d, at)?],
+                    1 => vec![u16_at(d, at)? as u32],
+                    2 => vec![byte(at)? as u32],
+                    4 => {
+                        let bits = (entry.key >> 16).clamp(1, 4096) as usize;
+                        (0..bits.div_ceil(32)).map(|i| u32_at(d, at + i * 4)).collect::<Result<_, _>>()?
+                    }
                     s => return Err(format!("unexpected flags subtype {s}")),
+                };
+                let bit_set = |bit: i32| {
+                    usize::try_from(bit)
+                        .ok()
+                        .is_some_and(|b| words.get(b / 32).is_some_and(|w| w & (1 << (b % 32)) != 0))
                 };
                 match flags {
                     Some(values) => {
-                        let set: Vec<String> = values
-                            .iter()
-                            .filter(|(_, bit)| (0..32).contains(bit) && v & (1 << bit) != 0)
-                            .map(|(n, _)| names::field(*n))
-                            .collect();
+                        let set: Vec<String> =
+                            values.iter().filter(|(_, bit)| bit_set(*bit)).map(|(n, _)| names::field(*n)).collect();
                         w.string(level, ename, &set.join(" "));
                     }
-                    None if v != 0 => w.value(level, ename, &v.to_string()),
+                    None if words.len() == 1 && words[0] != 0 => w.value(level, ename, &words[0].to_string()),
+                    None if words.iter().any(|&x| x != 0) => {
+                        let hex: Vec<String> = words.iter().map(|x| format!("{x:08X}")).collect();
+                        w.value(level, ename, &hex.join(" "));
+                    }
                     None => w.empty(level, ename),
                 }
             }
@@ -356,7 +414,7 @@ impl Pso {
             ty::FLOAT3 | ty::FLOAT3A | ty::FLOAT4A => {
                 w.empty(level, &vector_attrs(ename, &[f32_at(d, at)?, f32_at(d, at + 4)?, f32_at(d, at + 8)?]))
             }
-            ty::FLOAT4 => w.empty(
+            ty::FLOAT4 | ty::VEC4V => w.empty(
                 level,
                 &vector_attrs(ename, &[f32_at(d, at)?, f32_at(d, at + 4)?, f32_at(d, at + 8)?, f32_at(d, at + 12)?]),
             ),
@@ -368,6 +426,13 @@ impl Pso {
             },
             ty::LONG => w.value(level, ename, &u64_at(d, at)?.to_string()),
             ty::MAP => self.map_node(w, level, at, entry, info, ename, depth)?,
+            ty::MATRIX44 => {
+                let m: Vec<String> =
+                    (0..16).map(|i| f32_at(d, at + i * 4).map(xml::float)).collect::<Result<_, _>>()?;
+                let rows: Vec<String> = m.chunks(4).map(|r| r.join(" ")).collect();
+                w.raw_array(level, ename, &rows, 1);
+            }
+            ty::ULONG => w.value(level, ename, &u64_at(d, at)?.to_string()),
             ty::SSHORT => w.value(level, ename, &(u16_at(d, at)? as i16).to_string()),
             ty::USHORT => w.value(level, ename, &u16_at(d, at)?.to_string()),
             ty::HFLOAT => w.value(level, ename, &(u16_at(d, at)? as i16).to_string()),
@@ -382,7 +447,7 @@ impl Pso {
                     w.close(level, ename);
                 }
                 3 | 4 => {
-                    let (id, off) = unpack(ptr_at(d, at)?);
+                    let (id, off) = self.unpack(ptr_at(d, at)?);
                     match self.block(id) {
                         Some(b) => {
                             // The pointed-to block's type is the actual (derived) type.
@@ -396,6 +461,10 @@ impl Pso {
                 }
                 s => return Err(format!("unexpected structure subtype {s}")),
             },
+            ty::OPAQUE16 => {
+                let b = d.get(at..at + 16).ok_or("16 bytes beyond the data")?;
+                w.value(level, ename, &b.iter().map(|x| format!("{x:02X}")).collect::<String>());
+            }
             other => return Err(format!("unexpected data type {other:#04x}")),
         }
         Ok(())
@@ -423,16 +492,17 @@ impl Pso {
                 String::from_utf8_lossy(&bytes[..end]).into_owned()
             }
             1 | 2 => {
-                let (id, off) = unpack(ptr_at(d, at)?);
+                let (id, off) = self.unpack(ptr_at(d, at)?);
                 self.string_at(id, off, None).unwrap_or_default()
             }
             3 => {
-                let (id, off) = unpack(ptr_at(d, at)?);
+                let (id, off) = self.unpack(ptr_at(d, at)?);
                 let (c1, c2) = (u16_at(d, at + 8)? as usize, u16_at(d, at + 10)? as usize);
                 let len = if c2 != 0 { c1.min(c2) } else { c1 };
                 if len == 0 { String::new() } else { self.string_at(id, off, Some(len)).unwrap_or_default() }
             }
-            7 | 8 => names::value(u32_at(d, at)?),
+            // Hashes (RDR2 adds more hash string kinds, 11 and 13).
+            7..=15 => names::value(u32_at(d, at)?),
             s => return Err(format!("unexpected string subtype {s}")),
         })
     }
@@ -470,10 +540,11 @@ impl Pso {
         let mut abs = at;
         let mut count = (entry.key >> 16) as usize;
         // String, hash and enum arrays always point elsewhere.
-        let external =
-            entry.sub == 0 || (entry.sub == 4 && item.sub == 3) || matches!(item.kind, ty::STRING | ty::ENUM);
+        let external = matches!(entry.sub, 0 | 5)
+            || (entry.sub == 4 && item.sub == 3)
+            || matches!(item.kind, ty::STRING | ty::ENUM);
         if external {
-            let (id, off) = unpack(ptr_at(d, at)?);
+            let (id, off) = self.unpack(ptr_at(d, at)?);
             a_block = id;
             a_off = off;
             count = u16_at(d, at + 8)? as usize;
@@ -508,7 +579,7 @@ impl Pso {
                     w.close(level, ename);
                 }
             }
-            ty::STRUCTURE if item.sub == 3 => {
+            ty::STRUCTURE if matches!(item.sub, 3 | 4) => {
                 if count == 0 {
                     w.empty(level, ename);
                     return Ok(());
@@ -516,11 +587,11 @@ impl Pso {
                 let ptrs = self.items(abs, count, 8)?;
                 w.open(level, ename);
                 for p in ptrs {
-                    let p = u32::from_be_bytes(p[..4].try_into().unwrap_or_default()) as u64;
+                    let p = ptr_at(p, 0).unwrap_or(0);
                     if p == 0 {
                         w.empty(level + 1, "Item");
                     } else {
-                        let (id, off) = unpack(p);
+                        let (id, off) = self.unpack(p);
                         self.node(w, level + 1, id, off, Tag::ItemAndType, 0, depth + 1);
                     }
                 }
@@ -546,7 +617,7 @@ impl Pso {
                 w.close(level, ename);
             }
             ty::STRING => match item.sub {
-                7 | 8 => {
+                7..=15 => {
                     let v: Vec<String> = u32s(self.items(abs, count, 4)?).into_iter().map(names::value).collect();
                     w.item_array(level, ename, &v);
                 }
@@ -557,8 +628,7 @@ impl Pso {
                         .items(abs, count, size)?
                         .into_iter()
                         .map(|b| {
-                            let p = u32::from_be_bytes(b[..4].try_into().unwrap_or_default()) as u64;
-                            let (id, off) = unpack(p);
+                            let (id, off) = self.unpack(ptr_at(b, 0).unwrap_or(0));
                             let len = (item.sub == 3).then(|| u16::from_be_bytes([b[8], b[9]]) as usize);
                             xml::escape(&self.string_at(id, off, len).unwrap_or_default())
                         })
@@ -571,9 +641,28 @@ impl Pso {
                 let v: Vec<String> = self.items(abs, count, 8)?.into_iter().map(|b| floats(b, 2)).collect();
                 w.raw_array(level, ename, &v, 1);
             }
-            ty::FLOAT3 => {
+            ty::FLOAT3 | ty::FLOAT3A => {
                 let v: Vec<String> = self.items(abs, count, 16)?.into_iter().map(|b| floats(b, 3)).collect();
                 w.raw_array(level, ename, &v, 1);
+            }
+            ty::FLOAT4 | ty::FLOAT4A | ty::VEC4V => {
+                let v: Vec<String> = self.items(abs, count, 16)?.into_iter().map(|b| floats(b, 4)).collect();
+                w.raw_array(level, ename, &v, 1);
+            }
+            ty::LONG | ty::ULONG => {
+                let v: Vec<String> = self
+                    .items(abs, count, 8)?
+                    .into_iter()
+                    .map(|b| {
+                        let x = u64::from_be_bytes(b[..8].try_into().unwrap_or_default());
+                        if item.kind == ty::LONG { (x as i64).to_string() } else { x.to_string() }
+                    })
+                    .collect();
+                w.raw_array(level, ename, &v, 10);
+            }
+            ty::SBYTE => {
+                let v: Vec<String> = self.items(abs, count, 1)?.into_iter().map(|b| (b[0] as i8).to_string()).collect();
+                w.raw_array(level, ename, &v, 10);
             }
             ty::UBYTE | ty::BOOL => {
                 let v: Vec<String> = self.items(abs, count, 1)?.into_iter().map(|b| b[0].to_string()).collect();
@@ -612,7 +701,7 @@ impl Pso {
         level: usize,
         at: usize,
         entry: &Entry,
-        _info: &StructInfo,
+        info: &StructInfo,
         ename: &str,
         depth: usize,
     ) -> Result<(), String> {
@@ -621,12 +710,14 @@ impl Pso {
         }
         let d = &self.data[..];
         let x1 = u32_at(d, at)?;
-        let (ptr, count) = if x1 != 0x0100_0000 {
+        // RDR2 leaves the rest of the first 8 bytes uninitialised: only the first byte counts.
+        let pointer_first = x1 == 0x0100_0000 || (self.offset_shift == 20 && x1 >> 24 == 1);
+        let (ptr, count) = if !pointer_first {
             (ptr_at(d, at + 16)?, u16_at(d, at + 2)? as usize)
         } else {
             (ptr_at(d, at + 8)?, u16_at(d, at + 16)? as usize)
         };
-        let (id, mut off) = unpack(ptr);
+        let (id, mut off) = self.unpack(ptr);
         if count == 0 {
             w.empty(level, ename);
             return Ok(());
@@ -635,13 +726,34 @@ impl Pso {
         if off >= block.length {
             off >>= 8;
         }
-        let st =
-            self.structs.get(&block.name).ok_or_else(|| format!("map type {} not found", names::field(block.name)))?;
-        let key_entry = *st.find(names::parse("Key")).ok_or("map Key entry missing")?;
-        let item_entry = *st.find(names::parse("Item")).ok_or("map Item entry missing")?;
-        if key_entry.kind != ty::STRING {
-            return Err("map key is not a string".into());
-        }
+        // GTA V describes the pairs by a structure with Key and Item fields.
+        // RDR2 describes them by two type entries of the owning structure
+        // (the map entry's key: key type index << 16 | item type index), and
+        // stores each pair as the key (4 bytes, padded to 8) and the item.
+        let pair_struct = self
+            .structs
+            .get(&block.name)
+            .filter(|st| st.find(names::parse("Key")).is_some() && st.find(names::parse("Item")).is_some());
+        let (key_entry, item_entry, pair_len) = match pair_struct {
+            Some(st) => (
+                *st.find(names::parse("Key")).expect("checked"),
+                *st.find(names::parse("Item")).expect("checked"),
+                st.length,
+            ),
+            None => {
+                let key_info = *info.entries.get((entry.key >> 16) as usize & 0xFFF).ok_or("map Key entry missing")?;
+                let mut item_info = *info.entries.get(entry.key as usize & 0xFFF).ok_or("map Item entry missing")?;
+                item_info.offset = 8;
+                let mut key_info = key_info;
+                key_info.offset = 0;
+                let item_size = match (item_info.kind, item_info.sub) {
+                    (ty::STRUCTURE, 0) => self.structs.get(&item_info.key).map_or(8, |s| s.length),
+                    (ty::STRING, 7 | 8) | (ty::UINT | ty::SINT | ty::ENUM | ty::FLOAT, _) => 4,
+                    _ => 8,
+                };
+                (key_info, item_info, (8 + item_size).next_multiple_of(8))
+            }
+        };
         w.open(level, ename);
         for _ in 0..count {
             if off >= block.length {
@@ -649,19 +761,25 @@ impl Pso {
                 break;
             }
             let base = block.offset + off;
-            let key = xml::escape(&self.string_value(&key_entry, base + key_entry.offset)?);
+            let key_at = base + key_entry.offset;
+            let key = match key_entry.kind {
+                ty::STRING => self.string_value(&key_entry, key_at)?,
+                ty::ENUM | ty::UINT | ty::SINT => names::value(u32_at(d, key_at)?),
+                _ => format!("{:#x}", u32_at(d, key_at)?),
+            };
+            let key = xml::escape(&key);
             match item_entry.kind {
                 ty::STRING => {
                     let s = self.string_value(&item_entry, base + item_entry.offset)?;
                     w.text(level + 1, &format!("Item type=\"String\" key=\"{key}\""), &s);
                 }
-                ty::STRUCTURE if item_entry.key != 0 => {
+                ty::STRUCTURE if item_entry.key != 0 && item_entry.sub != 3 => {
                     w.open(level + 1, &format!("Item type=\"{}\" key=\"{key}\"", names::field(item_entry.key)));
                     self.node(w, level + 1, id, off + item_entry.offset, Tag::None, item_entry.key, depth + 1);
                     w.close(level + 1, "Item");
                 }
                 ty::STRUCTURE => {
-                    let (pid, poff) = unpack(ptr_at(d, base + item_entry.offset)?);
+                    let (pid, poff) = self.unpack(ptr_at(d, base + item_entry.offset)?);
                     let pb = self.block(pid).ok_or("map item block not found")?;
                     w.open(level + 1, &format!("Item type=\"{}\" key=\"{key}\"", names::field(pb.name)));
                     if self.structs.get(&pb.name).is_some_and(|s| !s.entries.is_empty()) {
@@ -669,9 +787,15 @@ impl Pso {
                     }
                     w.close(level + 1, "Item");
                 }
-                _ => return Err("map item is not a structure or string".into()),
+                _ => {
+                    w.open(level + 1, &format!("Item key=\"{key}\""));
+                    if let Err(e) = self.entry(w, level + 2, id, block, off, &item_entry, info, "Value", depth + 1) {
+                        w.error(level + 2, format!("map value: {e}"));
+                    }
+                    w.close(level + 1, "Item");
+                }
             }
-            off += st.length;
+            off += pair_len;
         }
         w.close(level, ename);
         Ok(())

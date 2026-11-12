@@ -196,6 +196,19 @@ fn write(w: &mut Writer, level: usize, e: &Element) {
                         b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c).to_string()).collect();
                     w.raw_array_lines(inner, &v);
                 }
+                // Matrices and float lists: little-endian floats, a row per line
+                // (matrix34: the three axes and the position).
+                Some(kind @ ("matrix34" | "matrix44" | "float_array" | "vector3_array" | "vector4_array")) => {
+                    let per_row = match kind {
+                        "matrix34" | "vector3_array" => 3,
+                        "float_array" => 1,
+                        _ => 4,
+                    };
+                    let floats: Vec<String> =
+                        b.as_chunks::<4>().0.iter().map(|c| xml::float(f32::from_le_bytes(*c))).collect();
+                    let rows: Vec<String> = floats.chunks(per_row).map(|r| r.join(", ")).collect();
+                    w.raw_array_lines(inner, &rows);
+                }
                 Some(other) => w.error(inner, format!("unexpected content type {other}")),
                 None => {
                     let text = String::from_utf8_lossy(b.strip_suffix(&[0]).unwrap_or(b)).into_owned();

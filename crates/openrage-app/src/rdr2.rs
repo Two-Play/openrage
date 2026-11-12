@@ -199,6 +199,22 @@ pub fn texture_index(game: &Path) -> Option<Arc<TextureIndex>> {
         .clone()
 }
 
+/// Makes the file names found in the game known to metadata: archetype and
+/// model names in `.ymap`/`.ytyp` are hashes of exactly these names.
+pub fn register_names(index: &rage_rpf::rpf8_names::NameIndex) {
+    let names: Vec<String> = index
+        .names
+        .keys()
+        .filter(|h| index.trusted(**h))
+        .filter_map(|h| index.names.get(h))
+        .map(|n| {
+            let base = n.rsplit('/').next().unwrap_or(n);
+            base.split('.').next().unwrap_or(base).to_owned()
+        })
+        .collect();
+    rage_formats::names::register(names);
+}
+
 /// The RDR2 game folder an archive belongs to.
 pub fn game_folder(archive: &Path) -> Option<PathBuf> {
     archive.ancestors().find(|d| d.join("RDR2.exe").is_file()).map(Path::to_path_buf)
