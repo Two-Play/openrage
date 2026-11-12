@@ -54,6 +54,9 @@ openrage rpf8 --text <RDR2>                    # read every RDR2 text table (.yl
 openrage rpf8 --meta <RDR2>                    # convert all RDR2 metadata (.ymap, .ytyp, .ymt, .ymf) to XML
 openrage rpf8 --audio <RDR2>/x64/audio        # decode every RDR2 sound
 openrage rpf8 --anims <RDR2>/anim_0.rpf       # read every RDR2 clip dictionary
+openrage --game <RDR2> rdr2-ped                # list the RDR2 peds (people and animals) with their base skeletons
+openrage --game <RDR2> rdr2-ped cs_johnmarston # a ped's outfits: model, textures, palette of every part (--outfit N)
+openrage --game <RDR2> rdr2-ped --check        # resolve every part of every ped
 openrage world --radius 40 -- 350 4870 -60     # map objects near a point (builds the world cache)
 ```
 
