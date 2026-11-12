@@ -14,6 +14,7 @@ pub mod metadata;
 pub mod models;
 pub mod natives;
 pub mod oiv;
+pub mod rdr2;
 pub mod render;
 pub mod repack;
 pub mod setup;
