@@ -98,8 +98,8 @@
       var badge = el.querySelector(".os-badge");
       if (badge) badge.hidden = false;
     });
-    document.querySelectorAll(".os-buttons a[data-os]").forEach(function (a) {
-      var mine = a.getAttribute("data-os") === userOS;
+    document.querySelectorAll(".os-buttons a[data-os], .downloads [data-os] .btn").forEach(function (a) {
+      var mine = (a.getAttribute("data-os") || a.closest("[data-os]").getAttribute("data-os")) === userOS;
       a.classList.toggle("btn-primary", mine);
       a.classList.toggle("btn-secondary", !mine);
     });
