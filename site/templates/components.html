@@ -1,9 +1,13 @@
 {#- Components usable in templates and in Markdown content. -#}
 
+{#- Linux / Windows tabs in Markdown: wrap each system's part in
+    <div class="os-panel" data-os="linux"> … </div> inside <div class="os-tabs"> … </div>,
+    with blank lines around the Markdown. Without JavaScript both parts are shown. -#}
+
 {#- Download buttons for the latest release. In Markdown: {{ <downloads /> }} -#}
 {% component downloads(releases: string = "https://github.com/Two-Play/openrage/releases") %}
-<p>
-  <a class="btn btn-primary" data-release="linux" href="{{ releases }}/latest"><span>Linux (.tar.gz)<span class="size" data-size></span></span></a>
-  <a class="btn btn-primary" data-release="windows" href="{{ releases }}/latest"><span>Windows (.zip)<span class="size" data-size></span></span></a>
+<p class="os-buttons">
+  <a class="btn btn-primary" data-os="linux" data-release="linux" href="{{ releases }}/latest"><span>Linux (.tar.gz)<span class="size" data-size></span></span></a>
+  <a class="btn btn-primary" data-os="windows" data-release="windows" href="{{ releases }}/latest"><span>Windows (.zip)<span class="size" data-size></span></span></a>
 </p>
 {% endcomponent downloads %}

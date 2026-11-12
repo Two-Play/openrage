@@ -1,4 +1,4 @@
-// OpenRAGE website: theme toggle and latest-release links.
+// OpenRAGE website: theme toggle, lightbox, OS-aware downloads and tabs, latest-release links.
 // Everything works without JavaScript; this only adds conveniences.
 
 (function () {
@@ -76,6 +76,106 @@
     });
   }
 
+  // The visitor's operating system: shown first in downloads and guides.
+  var OS_KEY = "openrage-os";
+  var OS_NAMES = { linux: "Linux", windows: "Windows" };
+  function detectOS() {
+    var p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+    var ua = navigator.userAgent || "";
+    if (/win/i.test(p) || /Windows/.test(ua)) return "windows";
+    if (/android/i.test(ua)) return null;
+    if (/linux/i.test(p) || /Linux|X11|CrOS/.test(ua)) return "linux";
+    return null;
+  }
+  var userOS = detectOS();
+
+  // Downloads: the visitor's system first, marked, and the primary button.
+  if (userOS) {
+    document.querySelectorAll('[data-os="' + userOS + '"]').forEach(function (el) {
+      if (el.closest(".os-panel")) return;
+      var parent = el.parentNode;
+      if (parent.querySelector("[data-os]") !== el) parent.insertBefore(el, parent.firstElementChild);
+      var badge = el.querySelector(".os-badge");
+      if (badge) badge.hidden = false;
+    });
+    document.querySelectorAll(".os-buttons a[data-os], .downloads [data-os] .btn").forEach(function (a) {
+      var mine = (a.getAttribute("data-os") || a.closest("[data-os]").getAttribute("data-os")) === userOS;
+      a.classList.toggle("btn-primary", mine);
+      a.classList.toggle("btn-secondary", !mine);
+    });
+    var heroLabel = document.querySelector("[data-os-download] [data-os-label]");
+    if (heroLabel) heroLabel.textContent = "Download for " + OS_NAMES[userOS];
+  }
+
+  // Linux / Windows tabs. Without JS both parts stay visible with their headings.
+  var tabGroups = document.querySelectorAll(".os-tabs");
+  var tabSets = [];
+  function selectOS(os, store) {
+    tabSets.forEach(function (set) { set(os); });
+    if (store) { try { localStorage.setItem(OS_KEY, os); } catch (e) { /* storage unavailable */ } }
+  }
+  tabGroups.forEach(function (group, g) {
+    var panels = Array.prototype.filter.call(group.children, function (el) {
+      return el.classList.contains("os-panel");
+    });
+    if (panels.length < 2) return;
+    var list = document.createElement("div");
+    list.className = "os-tablist";
+    list.setAttribute("role", "tablist");
+    list.setAttribute("aria-label", "Operating system");
+    var tabs = panels.map(function (panel, i) {
+      var os = panel.getAttribute("data-os");
+      var id = "os-" + g + "-" + os;
+      panel.id = panel.id || id + "-panel";
+      panel.setAttribute("role", "tabpanel");
+      panel.setAttribute("aria-labelledby", id);
+      panel.setAttribute("tabindex", "0");
+      var heading = panel.querySelector("h2, h3, h4");
+      if (heading) heading.classList.add("visually-hidden");
+      var tab = document.createElement("button");
+      tab.type = "button";
+      tab.id = id;
+      tab.className = "os-tab";
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-controls", panel.id);
+      tab.textContent = OS_NAMES[os] || os;
+      if (os === userOS) {
+        var mark = document.createElement("span");
+        mark.className = "os-badge";
+        mark.textContent = "Your system";
+        tab.appendChild(document.createTextNode(" "));
+        tab.appendChild(mark);
+      }
+      tab.addEventListener("click", function () { selectOS(os, true); });
+      tab.addEventListener("keydown", function (e) {
+        var step = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+        if (!step) return;
+        e.preventDefault();
+        var next = tabs[(i + step + tabs.length) % tabs.length];
+        next.click();
+        next.focus();
+      });
+      list.appendChild(tab);
+      return tab;
+    });
+    group.insertBefore(list, group.firstChild);
+    group.classList.add("tabbed");
+    tabSets.push(function (os) {
+      var found = panels.some(function (p) { return p.getAttribute("data-os") === os; });
+      panels.forEach(function (panel, i) {
+        var on = found ? panel.getAttribute("data-os") === os : i === 0;
+        panel.hidden = !on;
+        tabs[i].setAttribute("aria-selected", on ? "true" : "false");
+        tabs[i].tabIndex = on ? 0 : -1;
+      });
+    });
+  });
+  if (tabSets.length) {
+    var stored = null;
+    try { stored = localStorage.getItem(OS_KEY); } catch (e) { /* storage unavailable */ }
+    selectOS(stored || userOS || "linux", false);
+  }
+
   // Fade sections in as they scroll into view (skipped for reduced motion).
   var reveals = document.querySelectorAll(".reveal");
   var calm = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -136,6 +236,8 @@
           if (size) size.textContent = " (" + (byKind[kind].size / 1048576).toFixed(0) + " MB)";
         }
       });
+      var hero = document.querySelector("[data-os-download]");
+      if (hero && userOS && byKind[userOS]) hero.href = byKind[userOS].browser_download_url;
       document.querySelectorAll("[data-release-info]").forEach(function (el) {
         el.hidden = false;
       });
