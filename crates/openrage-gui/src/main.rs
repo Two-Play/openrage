@@ -173,6 +173,29 @@ fn main() -> anyhow::Result<()> {
     }));
     wire_callbacks(&ui);
 
+    // Shows the progress of background loads (e.g. "Loading textures 5/13").
+    let progress_timer = slint::Timer::default();
+    let w = ui.as_weak();
+    progress_timer.start(slint::TimerMode::Repeated, Duration::from_millis(150), move || {
+        let Some(ui) = w.upgrade() else { return };
+        if !ui.get_preview_loading() {
+            return;
+        }
+        match openrage_app::progress::get() {
+            Some((label, done, total)) if total > 0 => {
+                ui.set_preview_progress(done as f32 / total as f32);
+                ui.set_preview_progress_text(format!("{label} {}/{total} · {} %", done + 1, done * 100 / total).into());
+            }
+            Some((label, _, _)) => {
+                ui.set_preview_progress(-1.0);
+                ui.set_preview_progress_text(format!("{label}…").into());
+            }
+            None => {
+                ui.set_preview_progress(-1.0);
+                ui.set_preview_progress_text(SharedString::new());
+            }
+        }
+    });
     refresh_games(&ui);
     let ready = with_app(|app| app.game_dir.is_some() && (app.keys.is_some() || rdr2_ready));
     if ask {
@@ -258,7 +281,8 @@ fn debug_snapshot(ui: &AppWindow) {
         let started = Instant::now();
         let (weak, timer) = (ui.as_weak(), std::rc::Rc::clone(&waiting));
         waiting.start(slint::TimerMode::Repeated, Duration::from_millis(250), move || {
-            let loading = weak.upgrade().is_some_and(|ui| ui.get_preview_loading());
+            let loading =
+                std::env::var("OPENRAGE_NO_WAIT").is_err() && weak.upgrade().is_some_and(|ui| ui.get_preview_loading());
             if (with_app(|a| a.suggest_pending) || loading) && started.elapsed() < Duration::from_secs(60) {
                 return;
             }
@@ -917,6 +941,40 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "delete" if ui.get_texture_mode() => ui.invoke_texture_remove(),
         "delete" => ui.invoke_archive_delete(),
         "uninstall" => ui.invoke_uninstall_group(),
+        "copy-hash" | "search-name" | "show-in-folder" => {
+            let item = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(row)?];
+                Some((item.name.clone(), item.vpath.clone()))
+            });
+            let Some((name, vpath)) = item else { return };
+            let stem = name.split('.').next().unwrap_or(&name).to_owned();
+            match action {
+                "copy-hash" => {
+                    let text = format!("0x{:08X}", rage_core::hash::joaat(&stem.to_ascii_lowercase()));
+                    let msg = match copy_to_clipboard(&text) {
+                        Ok(()) => format!("Copied {text} (hash of {stem})"),
+                        Err(e) => format!("Cannot copy to the clipboard: {e}"),
+                    };
+                    ui.set_status(msg.into());
+                }
+                "search-name" => start_search(ui, stem, true),
+                _ => {
+                    if let Some(v) = vpath {
+                        let folder = browser::parent(&v).unwrap_or_default();
+                        navigate(ui, &folder, true);
+                        let file = v.rsplit('/').next().unwrap_or(&v).to_owned();
+                        let row = with_app(|a| {
+                            let l = a.listing.as_ref()?;
+                            a.visible.iter().position(|&i| l.items[i].name.eq_ignore_ascii_case(&file))
+                        });
+                        if let Some(row) = row {
+                            ui.invoke_select_row(row as i32);
+                        }
+                    }
+                }
+            }
+        }
         "copy-name" | "copy-path" => {
             let text = with_app(|a| {
                 let listing = a.listing.as_ref()?;
