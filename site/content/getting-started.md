@@ -1,6 +1,6 @@
 +++
 title = "Getting started"
-description = "Install OpenRAGE from a release or build it from source, then set up the archive keys from your own copy of GTA V or Red Dead Redemption 2."
+description = "Switch from OpenIV in minutes: install OpenRAGE from a release or build it from source, then set up the archive keys from your own copy of GTA V or Red Dead Redemption 2."
 
 [extra]
 lead = "Install OpenRAGE, point it at your game and let it take the archive keys from your own copy."
@@ -68,6 +68,19 @@ your own copy of the game: check the game folder and click **Derive keys**. For 
 
 > [!WARNING]
 > **Never share the key cache.** It contains keys taken from your copy of the game.
+
+## Coming from OpenIV
+
+Nothing to migrate: OpenRAGE works with what you already have.
+
+- **Your `mods` folder stays as it is.** OpenRAGE reads it the way OpenIV.asi does, marks modded files, and writes
+  its own edits there too. Toggle **Mods** in the toolbar to see what your mods change.
+- **`.oiv` packages install as in OpenIV** (format 2.x), but you see every change before it is written, and you can
+  uninstall a package later from **History**.
+- **Same output:** DDS textures, WAV audio and `.oxt` game text match OpenIV's exports.
+- **Same safety:** OpenRAGE starts read-only; **Read-only → Editing** unlocks changes, like OpenIV's edit mode.
+- **New:** undo for every change, search across the whole game, Linux, GTA V Enhanced and RDR2.
+- **Not yet:** importing models. Keep OpenIV for that; both tools share the same `mods` folder.
 
 ## Set up Red Dead Redemption 2
 

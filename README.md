@@ -4,7 +4,7 @@
 
 # OpenRAGE
 
-**An open-source explorer and modding toolkit for Rockstar's RAGE engine games — on Linux and Windows.**
+**The open-source successor to OpenIV — mod GTA V and explore Red Dead Redemption 2 on Linux and Windows.**
 
 Browse and search every archive, preview textures, models, sounds and animations, read metadata as XML,<br>
 edit game text and install `.oiv` packages — compatible with OpenIV's `mods` folder, with undo.
@@ -28,13 +28,17 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 </div>
 
 > [!NOTE]
-> OpenRAGE is an independent community project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive. It contains **no game files and no encryption keys**: keys are taken from your own copy of the game at runtime.
+> OpenRAGE is an independent community project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive, nor made by the OpenIV team. It contains **no game files and no encryption keys**: keys are taken from your own copy of the game at runtime.
 
 ## Highlights
 
+OpenIV's last release was in January 2022. OpenRAGE picks up where it left off and stays compatible with it.
+
 - **Explorer and search:** archives, even nested ones, open like folders; names, hashes and full text of the whole game in milliseconds.
 - **Every major format:** textures, models, audio, animations, metadata as XML, collisions, paths, nav meshes, cutscenes, scripts, game text.
+- **Coming from OpenIV?** Your `mods` folder and `.oiv` packages work as they are ([how to switch](https://two-play.github.io/openrage/getting-started/#coming-from-openiv)).
 - **Mods, safely:** changes go to OpenIV's `mods` folder, never into your game files; every change and every `.oiv` package can be undone.
+- **Ready for GTA VI:** support follows as fast as possible once GTA VI comes to PC.
 - **Tested on the whole game:** every format is checked against every file of GTA V ([details](https://two-play.github.io/openrage/#status)).
 
 <table>
@@ -56,6 +60,7 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 |---|---|---|
 | **GTA V** (Legacy & Enhanced) | ✅ read and edit (mods folder, with undo) | ✅ textures · models · audio · animations · metadata · text · collisions · paths · cutscenes · scripts |
 | **Red Dead Redemption 2** | ✅ read, with keys from your own game | ◐ textures · models · texts (read-only) |
+| **GTA VI** | 🔜 next: as fast as possible once it comes to PC | – |
 | **GTA IV** | 🔜 planned | – |
 
 ## Installation
