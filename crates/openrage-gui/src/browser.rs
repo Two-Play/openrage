@@ -19,6 +19,9 @@ pub enum ItemKind {
     Texture,
     /// A sound inside an opened audio container.
     Sound,
+    /// An RDR2 ped's outfit file (`.ymt` in a `metapeds*.rpf` archive):
+    /// metadata that also opens as the ped put together from its parts.
+    Ped,
 }
 
 impl ItemKind {
@@ -465,7 +468,15 @@ fn list_rpf8(vpath: String, rpf: Arc<rage_rpf::Rpf8>, dir: String, origin: Origi
             if e.is_encrypted() {
                 info.push("enc".into());
             }
-            (if e.is_resource { ItemKind::Resource } else { ItemKind::File }, info.join(", "))
+            let kind = if openrage_app::models::is_rdr2_ped_file(&name, rpf.display_name()) {
+                info.insert(0, "ped".into());
+                ItemKind::Ped
+            } else if e.is_resource {
+                ItemKind::Resource
+            } else {
+                ItemKind::File
+            };
+            (kind, info.join(", "))
         };
         items.push(Item { name, kind, size: e.size(), info, entry: None, vpath: None, mark: None, detail: None });
     }

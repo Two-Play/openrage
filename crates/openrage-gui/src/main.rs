@@ -226,36 +226,7 @@ fn debug_snapshot(ui: &AppWindow) {
     let weak = ui.as_weak();
     slint::Timer::single_shot(Duration::from_secs(5), move || {
         let Some(ui) = weak.upgrade() else { return };
-        if std::env::var("OPENRAGE_VIEWER").is_ok() {
-            open_viewer(&ui);
-        }
-        if let Some(v) = viewer::newest() {
-            if let Ok(tab) = std::env::var("OPENRAGE_TAB") {
-                v.set_panel_tab(tab.parse().unwrap_or(0));
-            }
-            // `OPENRAGE_ANIM_SEARCH=<text or .ycd path>` fills the clip dictionary results first.
-            if let Ok(text) = std::env::var("OPENRAGE_ANIM_SEARCH") {
-                v.invoke_anim_search(text.into());
-            }
-            if let Ok(spec) = std::env::var("OPENRAGE_ANIM") {
-                use slint::Model;
-                let (result, clip) = spec.split_once(':').unwrap_or(("0", "walk"));
-                v.invoke_anim_open(result.parse().unwrap_or(0));
-                let rows = v.get_anim_clips();
-                if let Some(i) = (0..rows.row_count()).find(|&i| rows.row_data(i).is_some_and(|r| r.name == clip)) {
-                    v.invoke_anim_select(i as i32);
-                }
-            }
-            if let Ok(hex) = std::env::var("OPENRAGE_PAINT") {
-                use slint::Model;
-                let rows = v.get_materials();
-                for i in 0..rows.row_count() {
-                    if rows.row_data(i).is_some_and(|r| r.label == "Primary paint") {
-                        v.invoke_material_hex(i as i32, hex.clone().into());
-                    }
-                }
-            }
-        }
+        debug_viewer(&ui);
         if std::env::var("OPENRAGE_FLY").is_ok()
             && let Some(v) = viewer::newest()
         {
@@ -298,9 +269,55 @@ fn debug_snapshot(ui: &AppWindow) {
     });
 }
 
+/// The viewer part of [`debug_snapshot`]: `OPENRAGE_VIEWER` opens the selected
+/// model, then the viewer hooks run.
+#[cfg(debug_assertions)]
+fn debug_viewer(ui: &AppWindow) {
+    if std::env::var("OPENRAGE_VIEWER").is_ok() {
+        open_viewer(ui);
+    }
+    if let Some(v) = viewer::newest() {
+        if let Ok(tab) = std::env::var("OPENRAGE_TAB") {
+            v.set_panel_tab(tab.parse().unwrap_or(0));
+        }
+        // `OPENRAGE_OUTFIT=<n>`: an RDR2 ped's outfit (loads in the background).
+        if let Ok(n) = std::env::var("OPENRAGE_OUTFIT") {
+            let n = n.parse().unwrap_or(0);
+            v.set_outfit_index(n);
+            v.invoke_outfit_selected(n);
+        }
+        // `OPENRAGE_ANIM_SEARCH=<text or .ycd path>` fills the clip dictionary results first.
+        if let Ok(text) = std::env::var("OPENRAGE_ANIM_SEARCH") {
+            v.invoke_anim_search(text.into());
+        }
+        if let Ok(spec) = std::env::var("OPENRAGE_ANIM") {
+            use slint::Model;
+            let (result, clip) = spec.split_once(':').unwrap_or(("0", "walk"));
+            v.invoke_anim_open(result.parse().unwrap_or(0));
+            let rows = v.get_anim_clips();
+            if let Some(i) = (0..rows.row_count()).find(|&i| rows.row_data(i).is_some_and(|r| r.name == clip)) {
+                v.invoke_anim_select(i as i32);
+            }
+        }
+        if let Ok(hex) = std::env::var("OPENRAGE_PAINT") {
+            use slint::Model;
+            let rows = v.get_materials();
+            for i in 0..rows.row_count() {
+                if rows.row_data(i).is_some_and(|r| r.label == "Primary paint") {
+                    v.invoke_material_hex(i as i32, hex.clone().into());
+                }
+            }
+        }
+    }
+}
+
 /// The part of [`debug_snapshot`] after selecting a file.
 #[cfg(debug_assertions)]
 fn debug_snapshot_rest(ui: &AppWindow, path: String) {
+    // A file selected by `OPENRAGE_SELECT` opens in the viewer only now.
+    if viewer::newest().is_none() && std::env::var("OPENRAGE_SELECT").is_ok() {
+        debug_viewer(ui);
+    }
     if let Ok(i) = std::env::var("OPENRAGE_SUGGEST") {
         ui.invoke_suggestion_open(i.parse().unwrap_or(0));
     }
@@ -377,7 +394,9 @@ fn debug_snapshot_rest(ui: &AppWindow, path: String) {
         return;
     }
     let weak = ui.as_weak();
-    slint::Timer::single_shot(Duration::from_secs(2), move || {
+    // An outfit loading in the background needs a few more seconds.
+    let wait = if std::env::var("OPENRAGE_OUTFIT").is_ok() { 30 } else { 2 };
+    slint::Timer::single_shot(Duration::from_secs(wait), move || {
         let Some(ui) = weak.upgrade() else { return };
         let snap = match (viewer::newest(), editor::newest(), history::window()) {
             _ if let Some(x) = xmlview::newest() => {
@@ -1266,7 +1285,8 @@ fn mark_index(mark: Option<Mark>) -> i32 {
 }
 
 fn is_model_item(item: &Item) -> bool {
-    item.kind == ItemKind::Resource && openrage_app::models::is_model(&item.name) && item.mark != Some(Mark::Removed)
+    (item.kind == ItemKind::Ped || (item.kind == ItemKind::Resource && openrage_app::models::is_model(&item.name)))
+        && item.mark != Some(Mark::Removed)
 }
 
 /// Items with a large view: models, textures and images.
@@ -1304,7 +1324,7 @@ fn is_text_file(item: &Item) -> bool {
 
 /// Binary metadata files, shown as XML.
 fn is_meta_file(item: &Item) -> bool {
-    matches!(item.kind, ItemKind::File | ItemKind::Resource)
+    matches!(item.kind, ItemKind::File | ItemKind::Resource | ItemKind::Ped)
         && item.mark != Some(Mark::Removed)
         && openrage_app::metadata::is_metadata(&item.name)
 }
@@ -2820,12 +2840,23 @@ fn particle_rows(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> M
 }
 
 fn load_model_preview(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> anyhow::Result<ModelPreview> {
-    openrage_app::models::load(game_dir, keys, vpath).map(|loaded| {
-        let materials = openrage_app::render::Materials::new(&loaded);
-        let name = loaded.drawables.first().map(|(n, _)| n.clone()).unwrap_or_default();
-        let look = std::sync::RwLock::new(loaded.default_look());
-        ModelPreview { loaded, look, materials, name }
-    })
+    openrage_app::models::load(game_dir, keys, vpath).map(model_preview)
+}
+
+/// A loaded model ready to show: default look, materials, a name for exports.
+fn model_preview(loaded: openrage_app::models::LoadedModel) -> ModelPreview {
+    let materials = openrage_app::render::Materials::new(&loaded);
+    let name = match &loaded.ped {
+        Some(p) => format!("{}_outfit_{}", p.name.to_ascii_lowercase(), p.outfit),
+        None => loaded.drawables.first().map(|(n, _)| n.clone()).unwrap_or_default(),
+    };
+    let look = std::sync::RwLock::new(loaded.default_look());
+    ModelPreview { loaded, look, materials, name }
+}
+
+/// The configured game folder.
+fn game_dir() -> Option<std::path::PathBuf> {
+    with_app(|a| a.game_dir.clone())
 }
 
 /// Loads a model in the background and opens it in a viewer playing `ycd`.

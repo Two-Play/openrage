@@ -172,6 +172,9 @@ enum Command {
         /// Check every outfit of every ped: all parts must be found in the game.
         #[arg(long, conflicts_with_all = ["name", "outfit"])]
         check: bool,
+        /// With --check: also put every ped together (its first outfit) as the viewer does.
+        #[arg(long, requires = "check")]
+        load: bool,
     },
     /// Inspect Red Dead Redemption 2 archives (RPF8): a file or every .rpf in a folder.
     Rpf8 {
@@ -245,6 +248,9 @@ enum Command {
         /// Pose the model with a clip for --render: `<path of .ycd>:<clip name>[@seconds]`.
         #[arg(long)]
         anim: Option<String>,
+        /// RDR2 ped outfit files (`…/metapeds.rpf/<ped>.ymt`): which outfit to put together (default 0).
+        #[arg(long)]
+        outfit: Option<usize>,
     },
     /// List the clips of a clip dictionary (.ycd).
     Clips {
@@ -432,7 +438,7 @@ fn run() -> Result<()> {
         Command::Verify { path, particles: true, .. } => cmd_verify_particles(&game_dir, &path, keys),
         Command::Verify { path, text: true, .. } => cmd_verify_text(&game_dir, &path, keys),
         Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
-        Command::Rdr2Ped { name, outfit, check } => cmd_rdr2_ped(&game_dir, name.as_deref(), outfit, check),
+        Command::Rdr2Ped { name, outfit, check, load } => cmd_rdr2_ped(&game_dir, name.as_deref(), outfit, check, load),
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
         Command::Verify { path, textures: true, rebuild, .. } => cmd_verify_textures(&game_dir, &path, rebuild, keys),
@@ -441,8 +447,9 @@ fn run() -> Result<()> {
         }
         Command::Textures { path, export, png, .. } => cmd_textures(&game_dir, &path, export.as_deref(), png, keys),
         Command::Index => cmd_index(&game_dir, keys),
-        Command::Model { path, export, render, yaw, anim } => {
-            cmd_model(&game_dir, &path, export.as_deref(), render.as_deref(), yaw, anim.as_deref(), keys)
+        Command::Model { path, export, render, yaw, anim, outfit } => {
+            let view = ModelOutput { export: export.as_deref(), render: render.as_deref(), yaw, anim: anim.as_deref() };
+            cmd_model(&game_dir, &path, outfit, view, keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
         Command::World { x, y, z, radius } => {
@@ -1108,16 +1115,33 @@ fn cmd_undo(game_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What `openrage model` writes besides the listing.
+struct ModelOutput<'a> {
+    export: Option<&'a Path>,
+    render: Option<&'a Path>,
+    yaw: f32,
+    anim: Option<&'a str>,
+}
+
 fn cmd_model(
     game_dir: &Path,
     path: &str,
-    export: Option<&Path>,
-    render: Option<&Path>,
-    yaw: f32,
-    anim: Option<&str>,
+    outfit: Option<usize>,
+    output: ModelOutput,
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
-    let model = openrage_app::models::load(game_dir, keys.clone(), path)?;
+    let ModelOutput { export, render, yaw, anim } = output;
+    let model = match outfit {
+        Some(n) => {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let stem = name.split('.').next().unwrap_or(name);
+            openrage_app::models::load_rdr2_ped(game_dir, stem, n)?
+        }
+        None => openrage_app::models::load(game_dir, keys.clone(), path)?,
+    };
+    if let Some(p) = &model.ped {
+        outln!("{}: outfit {} of {}", p.name, p.outfit, p.outfits);
+    }
     if let Some(s) = &model.skeleton {
         outln!("skeleton: {} bones", s.bones.len());
     }
@@ -2813,7 +2837,7 @@ fn rdr2_game_folder(path: &Path) -> Option<PathBuf> {
     start.ancestors().find(|d| d.join("RDR2.exe").is_file()).map(Path::to_path_buf)
 }
 
-fn cmd_rdr2_ped(game: &Path, name: Option<&str>, outfit: Option<usize>, check: bool) -> Result<()> {
+fn cmd_rdr2_ped(game: &Path, name: Option<&str>, outfit: Option<usize>, check: bool, load: bool) -> Result<()> {
     use openrage_app::metaped;
     if !game.join("RDR2.exe").is_file() {
         bail!("{} is not a Red Dead Redemption 2 folder", game.display());
@@ -2822,6 +2846,7 @@ fn cmd_rdr2_ped(game: &Path, name: Option<&str>, outfit: Option<usize>, check: b
     let peds = metaped::ped_list(game)?;
     let name = match name {
         Some(n) if !check => n,
+        _ if check && load => return load_rdr2_peds(game, &peds, started),
         _ if check => return check_rdr2_peds(game, &peds, started),
         _ => {
             for p in &peds {
@@ -2916,6 +2941,60 @@ impl PedFinder {
             None => Self::show(hash, false),
         }
     }
+}
+
+/// Puts every ped together (its first outfit) as the viewer does: parts,
+/// skeleton and textures; reports what fails or stays untextured.
+fn load_rdr2_peds(game: &Path, peds: &[openrage_app::metaped::Ped], started: Instant) -> Result<()> {
+    use rayon::prelude::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    PedFinder::new(game)?; // builds the index first, once
+    let done = AtomicUsize::new(0);
+    let failed: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let (parts, shaders, untextured, no_skeleton) =
+        (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    // A few at a time: a ped takes a few hundred MB while it is read.
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+    pool.install(|| {
+        peds.par_iter().for_each(|p| {
+            match openrage_app::models::load_rdr2_ped(game, &p.name, 0) {
+                Ok(m) => {
+                    parts.fetch_add(m.parts.len(), Ordering::Relaxed);
+                    if m.skeleton.is_none() {
+                        no_skeleton.fetch_add(1, Ordering::Relaxed);
+                    }
+                    for (_, d) in &m.drawables {
+                        for s in &d.shaders {
+                            shaders.fetch_add(1, Ordering::Relaxed);
+                            if s.base_texture().is_none_or(|t| m.texture(d, t).is_none()) {
+                                untextured.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+                Err(e) => failed.lock().unwrap().push(format!("{}: {e:#}", p.name)),
+            }
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            eprint!("\r{n}/{} peds", peds.len());
+        })
+    });
+    eprintln!();
+    let failed = failed.into_inner().unwrap();
+    outln!(
+        "{} peds put together, {} parts; {} of {} shaders without their colour texture; {} without a skeleton",
+        peds.len() - failed.len(),
+        parts.into_inner(),
+        untextured.into_inner(),
+        shaders.into_inner(),
+        no_skeleton.into_inner()
+    );
+    outln!("{} failed", failed.len());
+    for f in failed.iter().take(20) {
+        outln!("  {f}");
+    }
+    eprintln!("{:.1} s", started.elapsed().as_secs_f64());
+    Ok(())
 }
 
 /// Checks every ped: its outfit file, every part's model and textures, its palette.

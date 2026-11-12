@@ -46,8 +46,19 @@ pub struct LoadedModel {
     /// The ped's expressions for its parts (face and helper bones), in the
     /// order they run.
     pub expressions: Vec<rage_formats::expression::Expression>,
+    /// An RDR2 ped put together from one of its outfits.
+    pub ped: Option<PedOutfit>,
     /// Material index per drawable and shader.
     shader_material: Vec<Vec<usize>>,
+}
+
+/// Which outfit of an RDR2 ped a model shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PedOutfit {
+    /// The ped's name (its outfit file without `.ymt`).
+    pub name: String,
+    pub outfit: usize,
+    pub outfits: usize,
 }
 
 /// A material of a model: every shader with this name, in any part.
@@ -584,6 +595,7 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
             shader_material: Vec::new(),
             skeleton,
             expressions: Vec::new(),
+            ped: None,
         };
         model.collect_materials();
         return Ok(model);
@@ -665,6 +677,7 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         shader_material: Vec::new(),
         skeleton,
         expressions: Vec::new(),
+        ped: None,
     };
     model.collect_materials();
     Ok(model)
@@ -695,15 +708,52 @@ fn fit_to_skeleton(drawables: &mut [(String, Drawable)], skeleton: &drawable::Sk
                 })
                 .collect();
             if map.iter().enumerate().any(|(i, &m)| i as u16 != m) {
-                for mesh in &mut d.meshes {
+                // Meshes that name their bones by tag are bound below.
+                for mesh in d.meshes.iter_mut().filter(|m| m.bone_tags.is_empty()) {
                     for b in &mut mesh.bone_indices {
                         *b = b.map(|i| map.get(i as usize).copied().unwrap_or(i));
                     }
                 }
             }
         }
+        bind_by_tags(d, skeleton);
         bind_cloth(d, skeleton);
         bind_pinned(d, skeleton);
+    }
+}
+
+/// RDR2 ped parts name their bones by tag ([`drawable::Mesh::bone_tags`]):
+/// each index becomes the skeleton bone with that tag. A tag the skeleton
+/// lacks (hair bones of the part's own skeleton) follows the part's own
+/// ancestors to one it has, else the head.
+fn bind_by_tags(d: &mut Drawable, skeleton: &drawable::Skeleton) {
+    let head = skeleton.find_name("SKEL_Head").unwrap_or(0) as u16;
+    let own = d.skeleton.clone();
+    let resolve = |tag: u16| -> u16 {
+        if let Some(b) = skeleton.find_tag(tag) {
+            return b as u16;
+        }
+        let Some(own) = &own else { return head };
+        let mut b = own.find_tag(tag);
+        let mut guard = 0;
+        while let Some(k) = b.filter(|_| guard < 512) {
+            if let Some(m) = skeleton.find_tag(own.bones[k].tag) {
+                return m as u16;
+            }
+            b = usize::try_from(own.bones[k].parent).ok().filter(|&p| p < own.bones.len());
+            guard += 1;
+        }
+        head
+    };
+    for mesh in &mut d.meshes {
+        if mesh.bone_tags.is_empty() {
+            continue;
+        }
+        let map: Vec<u16> = mesh.bone_tags.iter().map(|&t| resolve(t)).collect();
+        for b in &mut mesh.bone_indices {
+            *b = b.map(|i| map.get(i as usize).copied().unwrap_or(head));
+        }
+        mesh.bone_tags.clear();
     }
 }
 
@@ -935,6 +985,10 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
     let name = full.rsplit('/').next().unwrap_or(&full).to_owned();
     let lower = name.to_ascii_lowercase();
     let stem = name.split('.').next().unwrap_or(&name).to_owned();
+    if is_rdr2_ped_file(&full, rpf.display_name()) {
+        let game = crate::rdr2::game_folder(rpf.path()).context("not inside an RDR2 game folder")?;
+        return load_rdr2_ped(&game, &stem, 0);
+    }
     crate::progress::set("Reading the model", 0, 0);
     let res = rpf.read_resource(entry)?;
     let drawables: Vec<(String, Drawable)> = if lower.ends_with(".ydr") {
@@ -1017,35 +1071,8 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
         }
     }
     // The rest from shared dictionaries elsewhere, through the texture index.
-    if let Some(game) = crate::rdr2::game_folder(rpf.path())
-        && let Some(index) = crate::rdr2::texture_index(&game)
-    {
-        let have = |n: &str, ext: &[(String, TextureDictionary)]| {
-            drawables.iter().any(|(_, d)| {
-                d.textures.as_ref().is_some_and(|t| t.textures.iter().any(|x| x.name.eq_ignore_ascii_case(n)))
-            }) || ext.iter().any(|(_, t)| t.textures.iter().any(|x| x.name.eq_ignore_ascii_case(n)))
-        };
-        let wanted: Vec<String> =
-            drawables.iter().flat_map(|(_, d)| d.shaders.iter().flat_map(|s| s.textures.iter().cloned())).collect();
-        // Which shared dictionaries are needed (one per texture not found yet).
-        let mut needed: Vec<(String, crate::rdr2::Location)> = Vec::new();
-        for name in wanted {
-            if needed.len() >= 32 || have(&name, &external) {
-                continue;
-            }
-            let Some(loc) = index.find(&name) else { continue };
-            if needed.iter().any(|(_, l)| l == loc) {
-                continue;
-            }
-            needed.push((name, loc.clone()));
-        }
-        let total = needed.len() as u64;
-        for (k, (name, loc)) in needed.into_iter().enumerate() {
-            crate::progress::set("Loading shared textures", k as u64, total);
-            if let Some(dict) = crate::rdr2::open_dictionary(&game, &loc) {
-                external.push((format!("{name} (shared)"), dict));
-            }
-        }
+    if let Some(game) = crate::rdr2::game_folder(rpf.path()) {
+        rdr2_shared_textures(&game, &drawables, &mut external, 32);
     }
     let skeleton = base.or_else(|| drawables.iter().find_map(|(_, d)| d.skeleton.clone()));
     let mut model = LoadedModel {
@@ -1056,9 +1083,184 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
         shader_material: Vec::new(),
         skeleton,
         expressions: Vec::new(),
+        ped: None,
     };
     model.collect_materials();
     Ok(model)
+}
+
+/// Adds the shared texture dictionaries the drawables' shaders need (at most
+/// `limit`), found through the texture index.
+fn rdr2_shared_textures(
+    game: &Path,
+    drawables: &[(String, Drawable)],
+    external: &mut Vec<(String, TextureDictionary)>,
+    limit: usize,
+) {
+    let Some(index) = crate::rdr2::texture_index(game) else { return };
+    let have = |n: &str, ext: &[(String, TextureDictionary)]| {
+        drawables.iter().any(|(_, d)| {
+            d.textures.as_ref().is_some_and(|t| t.textures.iter().any(|x| x.name.eq_ignore_ascii_case(n)))
+        }) || ext.iter().any(|(_, t)| t.textures.iter().any(|x| x.name.eq_ignore_ascii_case(n)))
+    };
+    let wanted: Vec<String> =
+        drawables.iter().flat_map(|(_, d)| d.shaders.iter().flat_map(|s| s.textures.iter().cloned())).collect();
+    // Which shared dictionaries are needed (one per texture not found yet).
+    let mut needed: Vec<(String, crate::rdr2::Location)> = Vec::new();
+    for name in wanted {
+        if needed.len() >= limit || have(&name, external) {
+            continue;
+        }
+        let Some(loc) = index.find(&name) else { continue };
+        if needed.iter().any(|(_, l)| l == loc) {
+            continue;
+        }
+        needed.push((name, loc.clone()));
+    }
+    let total = needed.len() as u64;
+    for (k, (name, loc)) in needed.into_iter().enumerate() {
+        crate::progress::set("Loading shared textures", k as u64, total);
+        if let Some(dict) = crate::rdr2::open_dictionary(game, &loc) {
+            external.push((format!("{name} (shared)"), dict));
+        }
+    }
+}
+
+/// Whether an RDR2 file is a ped's outfit file: a `.ymt` in one of the
+/// `metapeds*.rpf` archives (not the ped list `metapeds.ymt` itself).
+pub fn is_rdr2_ped_file(name: &str, archive: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let base = name.rsplit('/').next().unwrap_or(&name);
+    let archive = archive.to_ascii_lowercase().replace('\\', "/");
+    let archive = archive.rsplit('/').next().unwrap_or(&archive);
+    base.ends_with(".ymt") && base != "metapeds.ymt" && archive.starts_with("metapeds") && archive.ends_with(".rpf")
+}
+
+/// Puts an RDR2 ped together from one of its outfits: every part's model on
+/// the ped's base skeleton, with the outfit's colour and normal textures.
+/// Reports its steps to [`crate::progress`].
+pub fn load_rdr2_ped(game: &Path, ped: &str, outfit: usize) -> Result<LoadedModel> {
+    let result = load_rdr2_ped_inner(game, ped, outfit);
+    crate::progress::clear();
+    result
+}
+
+fn load_rdr2_ped_inner(game: &Path, ped: &str, outfit: usize) -> Result<LoadedModel> {
+    use crate::metaped;
+    crate::progress::set("Indexing the peds' models (once)", 0, 0);
+    let index = metaped::index(game, |done, total| {
+        crate::progress::set("Indexing the peds' models (once)", done as u64, total as u64)
+    })
+    .context("no RDR2 keys")?;
+    let textures = crate::rdr2::texture_index(game);
+    crate::progress::set("Reading the outfits", 0, 0);
+    let outfits = metaped::load_outfits(game, &index, ped)?;
+    if outfits.is_empty() {
+        bail!("{ped} has no outfits");
+    }
+    let chosen = outfit.min(outfits.len() - 1);
+    let assets = &outfits[chosen].assets;
+    // Models: each from its drawable dictionary (merged dictionaries hold several).
+    let mut dictionaries: HashMap<crate::rdr2::Location, Vec<(u32, Drawable)>> = HashMap::new();
+    let mut drawables: Vec<(String, Drawable)> = Vec::new();
+    for (k, a) in assets.iter().enumerate() {
+        crate::progress::set("Reading the parts", k as u64, assets.len() as u64);
+        let Some(at) = index.drawable(a.drawable) else { continue };
+        if !dictionaries.contains_key(&at.file) {
+            let read = metaped::open_location(game, &at.file)
+                .and_then(|(rpf, i)| rpf.read_resource(rpf.entries()?.get(i)?).ok())
+                .and_then(|res| drawable::parse_ydd_rdr2(&res).ok())
+                .unwrap_or_default();
+            dictionaries.insert(at.file.clone(), read);
+        }
+        let Some((_, d)) = dictionaries.get(&at.file).and_then(|list| list.get(at.index as usize)) else { continue };
+        let mut d = d.clone();
+        let name_of = |hash: u32| textures.as_ref().and_then(|t| t.name_of(hash)).map(str::to_owned);
+        if let Some(albedo) = name_of(a.albedo) {
+            replace_texture(&mut d, "_ab", &albedo);
+        }
+        if let Some(normal) = name_of(a.normal) {
+            replace_texture(&mut d, "_nm", &normal);
+        }
+        let label = rage_formats::names::value(a.drawable);
+        let label = if label.starts_with("hash_") {
+            let file = at.file.chain.last().map(|h| rage_formats::names::value(*h)).unwrap_or_default();
+            format!("{file}#{}", at.index)
+        } else {
+            label
+        };
+        drawables.push((label, d));
+    }
+    if drawables.is_empty() {
+        bail!("none of the parts of {ped}'s outfit {chosen} were found");
+    }
+    // The base skeleton: as the ped list names it, else guessed from the name.
+    crate::progress::set("Reading the skeleton", 0, 0);
+    let base = metaped::peds(game)
+        .ok()
+        .and_then(|peds| peds.iter().find(|p| p.name.eq_ignore_ascii_case(ped)).map(metaped::base_fragment))
+        .and_then(|frag| rdr2_skeleton_named(game, &frag))
+        .or_else(|| rdr2_base_skeleton_in(game, ped));
+    if let Some(sk) = &base {
+        fit_to_skeleton(&mut drawables, sk);
+    }
+    let parts = drawables
+        .iter()
+        .enumerate()
+        .map(|(k, (n, _))| Part {
+            name: n.clone(),
+            group: String::new(),
+            drawable: k,
+            transform: math::IDENTITY,
+            visible: true,
+            bone: None,
+        })
+        .collect();
+    let mut external = Vec::new();
+    rdr2_shared_textures(game, &drawables, &mut external, 96);
+    let skeleton = base.or_else(|| drawables.iter().find_map(|(_, d)| d.skeleton.clone()));
+    let mut model = LoadedModel {
+        drawables,
+        parts,
+        external,
+        materials: Vec::new(),
+        shader_material: Vec::new(),
+        skeleton,
+        expressions: Vec::new(),
+        ped: Some(PedOutfit { name: ped.to_owned(), outfit: chosen, outfits: outfits.len() }),
+    };
+    model.collect_materials();
+    Ok(model)
+}
+
+/// The part of a texture name before its variation (`pant_mf1_061_c3_000_ab`
+/// → `pant_mf1_061`): everything before the first `_c<digit>` token.
+fn texture_stem(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower.split('_').collect();
+    let end = tokens
+        .iter()
+        .position(|t| t.len() >= 2 && t.starts_with('c') && t[1..].chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(tokens.len());
+    tokens[..end].join("_")
+}
+
+/// Puts `texture` in place of the shader textures ending in `suffix` (`_ab`,
+/// `_nm`) that belong to the same piece (same name stem); when none does,
+/// in place of all of them.
+fn replace_texture(d: &mut Drawable, suffix: &str, texture: &str) {
+    let stem = texture_stem(texture);
+    let ends = |n: &str| n.to_ascii_lowercase().ends_with(suffix);
+    let same = d.shaders.iter().any(|s| s.textures.iter().any(|t| ends(t) && texture_stem(t) == stem));
+    for shader in &mut d.shaders {
+        let fits = |t: &str| ends(t) && (!same || texture_stem(t) == stem);
+        for t in shader.textures.iter_mut().filter(|t| fits(t)) {
+            *t = texture.to_owned();
+        }
+        for (_, t) in shader.samplers.iter_mut().filter(|(_, t)| fits(t)) {
+            *t = texture.to_owned();
+        }
+    }
 }
 
 /// Where RDR2 keeps the peds' base skeletons (`meta_base_<ped>.yft`).
@@ -1068,8 +1270,20 @@ const RDR2_BASE_SKELETONS: &str = "packs_0.rpf/packs/base/models/metaped_fragmen
 /// `a_c_bear_01_merge_2` → `meta_base_bear_01` (the longest name that exists,
 /// with or without the `a_c_`/`cs_` prefix).
 fn rdr2_base_skeleton(rpf: &rage_rpf::Rpf8, stem: &str) -> Option<drawable::Skeleton> {
-    let game = crate::rdr2::game_folder(rpf.path())?;
-    let (Node::Rpf8Dir(frags, _), _) = rage_mods::resolve(&game, RDR2_BASE_SKELETONS, None).ok()? else {
+    rdr2_base_skeleton_in(&crate::rdr2::game_folder(rpf.path())?, stem)
+}
+
+/// A base skeleton by its file name (`meta_base_male.yft`).
+fn rdr2_skeleton_named(game: &Path, file: &str) -> Option<drawable::Skeleton> {
+    let (Node::Rpf8Dir(frags, _), _) = rage_mods::resolve(game, RDR2_BASE_SKELETONS, None).ok()? else {
+        return None;
+    };
+    let entry = frags.entries()?.get(frags.find(file)?)?.clone();
+    drawable::parse_fragment_rdr2(&frags.read_resource(&entry).ok()?).ok()?.drawable.skeleton
+}
+
+fn rdr2_base_skeleton_in(game: &Path, stem: &str) -> Option<drawable::Skeleton> {
+    let (Node::Rpf8Dir(frags, _), _) = rage_mods::resolve(game, RDR2_BASE_SKELETONS, None).ok()? else {
         return None;
     };
     let lower = stem.to_ascii_lowercase();
@@ -1092,6 +1306,71 @@ fn rdr2_base_skeleton(rpf: &rage_rpf::Rpf8, stem: &str) -> Option<drawable::Skel
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ped_textures() {
+        assert_eq!(texture_stem("pant_mf1_061_c3_000_ab"), "pant_mf1_061");
+        assert_eq!(texture_stem("Head_MR1_sc08_rough_c0_046_ab"), "head_mr1_sc08_rough");
+        assert_eq!(texture_stem("eyes_gen_0000_c0_999_ab"), "eyes_gen_0000");
+        assert!(is_rdr2_ped_file("cs_johnmarston.ymt", "packs_0.rpf/packs/base/data/metapeds/metapeds.rpf"));
+        assert!(is_rdr2_ped_file("a_c_cow.ymt", "update_4.rpf/x/metapeds_val.rpf"));
+        assert!(!is_rdr2_ped_file("metapeds.ymt", "packs_0.rpf/x/metapeds.rpf"));
+        assert!(!is_rdr2_ped_file("shop_items.ymt", "packs_0.rpf"));
+        let shader = |names: &[&str]| drawable::Shader {
+            name_hash: 0,
+            textures: names.iter().map(|n| n.to_string()).collect(),
+            samplers: names.iter().map(|n| (0, n.to_string())).collect(),
+        };
+        let mut d = Drawable {
+            shaders: vec![
+                shader(&["hand_MR1_000_c0_000_ab", "hand_MR1_000_c0_000_nm"]),
+                shader(&["hand_MR1_001_c0_000_ab", "hand_MR1_001_c0_000_nm"]),
+            ],
+            ..Default::default()
+        };
+        // Only the piece the texture belongs to changes.
+        replace_texture(&mut d, "_ab", "hand_mr1_001_c0_015_ab");
+        assert_eq!(d.shaders[0].textures[0], "hand_MR1_000_c0_000_ab");
+        assert_eq!(d.shaders[1].textures[0], "hand_mr1_001_c0_015_ab");
+        assert_eq!(d.shaders[1].samplers[0].1, "hand_mr1_001_c0_015_ab");
+        // No piece of that name: every colour texture changes.
+        replace_texture(&mut d, "_nm", "other_c0_000_nm");
+        assert!(d.shaders.iter().all(|s| s.textures[1] == "other_c0_000_nm"));
+    }
+
+    #[test]
+    fn ped_parts_bind_by_tag() {
+        let bone = |name: &str, tag: u16, parent: i16| drawable::Bone {
+            name: name.into(),
+            tag,
+            parent,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+            ..Default::default()
+        };
+        let base = drawable::Skeleton {
+            bones: vec![bone("SKEL_ROOT", 0, -1), bone("SKEL_Pelvis", 11816, 0), bone("SKEL_Head", 31086, 1)],
+        };
+        // Hair: the part's own skeleton has bones the base lacks.
+        let d = Drawable {
+            skeleton: Some(drawable::Skeleton {
+                bones: vec![bone("MH_HairRoot", 500, -1), bone("MH_Hair_00", 501, 0)],
+            }),
+            meshes: vec![drawable::Mesh {
+                bone_indices: vec![[0, 1, 2, 0]],
+                bone_weights: vec![[0.5, 0.25, 0.25, 0.0]],
+                bone_tags: vec![31086, 11816, 501],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut parts = vec![("hair".to_owned(), d)];
+        fit_to_skeleton(&mut parts, &base);
+        let mesh = &parts[0].1.meshes[0];
+        // Head, pelvis, and the hair bone falls back to the head.
+        assert_eq!(mesh.bone_indices[0], [2, 1, 2, 2]);
+        assert!(mesh.bone_tags.is_empty());
+    }
 
     #[test]
     fn cloth_follows_the_nearest_bones() {

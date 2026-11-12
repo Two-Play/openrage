@@ -452,6 +452,21 @@ pub fn ped_list(game: &Path) -> Result<Vec<Ped>> {
     parse_ped_list(&xml.text)
 }
 
+/// The ped list of a game folder, read once.
+pub fn peds(game: &Path) -> Result<Arc<Vec<Ped>>> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Vec<Ped>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(p) = cache.lock().ok().and_then(|c| c.get(game).cloned()) {
+        return Ok(p);
+    }
+    let list = Arc::new(ped_list(game)?);
+    if let Ok(mut c) = cache.lock() {
+        c.insert(game.to_path_buf(), list.clone());
+    }
+    Ok(list)
+}
+
 /// Reads a ped's outfits (from its outfit file in the base packs or a DLC pack).
 pub fn load_outfits(game: &Path, index: &AssetIndex, ped: &str) -> Result<Vec<Outfit>> {
     let loc = index.outfit_file(ped).with_context(|| format!("no outfit file for {ped}"))?;
