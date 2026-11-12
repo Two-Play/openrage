@@ -44,6 +44,14 @@ export struct XmlLine {
     spans: [XmlSpan],
 }
 
+// A game that has been set up, for the game switcher.
+export struct GameRow {
+    name: string,
+    path: string,
+    is-default: bool,
+    is-current: bool,
+}
+
 export struct InfoRow {
     // Empty key: a note spanning the whole row.
     key: string,
@@ -994,6 +1002,15 @@ export component AppWindow inherits Window {
     // Transparent when the text is not a color.
     pure callback parse-hex(string) -> color;
     in-out property <string> accent-hex;
+    // Games set up so far and the chooser shown at start or from File → Switch game….
+    in property <[GameRow]> games;
+    in-out property <bool> game-chooser-visible;
+    in-out property <bool> game-chooser-can-cancel;
+    in-out property <bool> game-remember;
+    // No default game: ask at every start.
+    in property <bool> ask-game: true;
+    callback game-chosen(int, bool);
+    callback ask-game-changed(bool);
     in-out property <bool> settings-visible;
     // The configured game for the settings page: short name and folder.
     in property <string> settings-game;
@@ -1035,6 +1052,12 @@ export component AppWindow inherits Window {
         } else {
             root.unlock-visible = true;
         }
+    }
+
+    public function open-game-chooser(can-cancel: bool) {
+        root.game-chooser-can-cancel = can-cancel;
+        root.game-remember = false;
+        root.game-chooser-visible = true;
     }
 
     public function open-settings() {
@@ -1128,6 +1151,11 @@ export component AppWindow inherits Window {
                 activated => { root.save-png(); }
             }
             MenuSeparator { }
+            MenuItem {
+                title: @tr("Switch game…");
+                enabled: root.games.length > 0;
+                activated => { root.open-game-chooser(true); }
+            }
             MenuItem {
                 title: @tr("Settings…");
                 icon: @image-url("icons/menu/settings.svg");
@@ -2500,6 +2528,75 @@ export component AppWindow inherits Window {
         cancel => { root.unlock-visible = false; }
     }
 
+    // Which game to open: at start (several games, no default) or File → Switch game….
+    if root.game-chooser-visible: Dialog {
+        title: @tr("Open a game");
+        panel-width: 560px;
+        panel-height: 150px + root.games.length * 64px + 60px;
+        closable: root.game-chooser-can-cancel;
+        close => { root.game-chooser-visible = false; }
+        for g[i] in root.games: Rectangle {
+            height: 56px;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: card-ta.has-hover ? Theme.accent : Theme.border;
+            background: g.is-current ? Theme.accent-subtle : card-ta.has-hover ? Theme.hover : transparent;
+            card-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.game-chooser-visible = false;
+                    root.game-chosen(i, root.game-remember);
+                }
+            }
+            HorizontalLayout {
+                padding: Theme.space-s;
+                spacing: Theme.space-m;
+                Image {
+                    source: @image-url("logo.svg");
+                    width: 36px;
+                    height: 36px;
+                    y: (parent.height - self.height) / 2;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: g.name + (g.is-default ? "  · " + @tr("default") : "") + (g.is-current ? "  · " + @tr("open now") : "");
+                        font-weight: 600;
+                        color: Theme.text;
+                    }
+                    Text {
+                        text: g.path;
+                        font-size: Theme.font-small;
+                        overflow: elide;
+                        color: Theme.text-muted;
+                    }
+                }
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+        }
+        CheckBox {
+            text: @tr("Always open this game (change it in Settings)");
+            checked <=> root.game-remember;
+        }
+        HorizontalLayout {
+            alignment: space-between;
+            Button {
+                text: @tr("Add a game…");
+                clicked => {
+                    root.game-chooser-visible = false;
+                    root.open-setup();
+                }
+            }
+            if root.game-chooser-can-cancel: Button {
+                text: @tr("Cancel");
+                clicked => { root.game-chooser-visible = false; }
+            }
+        }
+    }
+
     // Settings page: appearance, game, behaviour.
     if root.settings-visible: Dialog {
         title: @tr("Settings");
@@ -2645,13 +2742,28 @@ export component AppWindow inherits Window {
                 }
                 HorizontalLayout {
                     alignment: start;
+                    spacing: Theme.space-s;
                     Button {
-                        text: @tr("Change game or keys…");
+                        text: @tr("Switch game…");
+                        enabled: root.games.length > 1;
+                        clicked => {
+                            root.settings-visible = false;
+                            root.open-game-chooser(true);
+                        }
+                    }
+                    Button {
+                        text: @tr("Add or change a game…");
                         clicked => {
                             root.settings-visible = false;
                             root.open-setup();
                         }
                     }
+                }
+                CheckBox {
+                    text: @tr("Ask which game to open at start");
+                    enabled: root.games.length > 1;
+                    checked: root.ask-game;
+                    toggled => { root.ask-game-changed(self.checked); }
                 }
                 Rectangle {
                     height: 1px;
