@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use openrage_app::anim::Binding;
@@ -52,6 +53,45 @@ struct State {
 
 type Shared = Rc<RefCell<Option<State>>>;
 
+/// How far the background loads are, shown on the scene while they run.
+#[derive(Default)]
+struct LoadProgress {
+    /// What is loading; empty when nothing is.
+    label: std::sync::Mutex<String>,
+    done: AtomicUsize,
+    /// 0: amount unknown.
+    total: AtomicUsize,
+}
+
+impl LoadProgress {
+    fn set(&self, label: &str, done: usize, total: usize) {
+        if let Ok(mut l) = self.label.lock() {
+            label.clone_into(&mut l);
+        }
+        self.done.store(done, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    fn step(&self, done: usize, total: usize) {
+        self.done.store(done, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    /// Shows the progress on the window; false once nothing loads any more.
+    fn show(&self, win: &SceneWindow) -> bool {
+        let label = self.label.lock().map(|l| l.clone()).unwrap_or_default();
+        let (done, total) = (self.done.load(Ordering::Relaxed), self.total.load(Ordering::Relaxed));
+        if total > 0 && !label.is_empty() {
+            win.set_load_text(format!("{label} {done}/{total}").into());
+            win.set_load_progress(done as f32 / total as f32);
+        } else {
+            win.set_load_text(label.clone().into());
+            win.set_load_progress(-1.0);
+        }
+        !label.is_empty()
+    }
+}
+
 thread_local! {
     static OPEN: RefCell<Vec<(u64, SceneWindow, Shared)>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -82,18 +122,20 @@ pub fn open(ui: &AppWindow, cut_path: String, cut: Cutscene, models: Vec<Option<
     OPEN.with(|o| o.borrow_mut().push((id, win.clone_strong(), Rc::clone(&state))));
 
     let Some((game_dir, keys)) = crate::with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone()))) else { return };
+    let progress = watch_progress(&win);
     let weak = win.as_weak();
     std::thread::spawn(move || {
-        let loaded = load(&game_dir, keys, &cut_path, &cut.actors, &models);
+        let loaded = load(&game_dir, keys, &cut_path, &cut.actors, &models, &progress);
         let _ = weak.upgrade_in_event_loop(move |win| match loaded {
             Ok((dict, previews)) => {
                 if let Some(state) =
                     OPEN.with(|o| o.borrow().iter().find(|(i, ..)| *i == id).map(|(_, _, s)| Rc::clone(s)))
                 {
-                    start(&win, &state, id, dict, &cut, previews);
+                    start(&win, &state, id, dict, &cut, previews, progress);
                 }
             }
             Err(e) => {
+                progress.set("", 0, 0);
                 win.set_loading(false);
                 win.set_status(format!("Cannot load the cutscene: {e:#}").into());
             }
@@ -109,11 +151,16 @@ fn load(
     cut_path: &str,
     actors: &[Actor],
     models: &[Option<String>],
+    progress: &LoadProgress,
 ) -> anyhow::Result<Loaded> {
+    progress.set("Loading the animation …", 0, 0);
     let (node, _) = rage_mods::resolve(game_dir, cut_path, keys.clone())?;
     let Node::ArchiveFile(rpf, id) = node else { anyhow::bail!("{cut_path} is not inside an archive") };
     let dict = cutscene::animation(&rpf, id)?;
     let game_dir: PathBuf = game_dir.to_owned();
+    let total = models.iter().filter(|m| m.is_some()).count();
+    let done = AtomicUsize::new(0);
+    progress.set("Loading the actors' models", 0, total);
     // Models load in parallel; most cutscenes have a dozen or more.
     let previews = std::thread::scope(|s| {
         let handles: Vec<_> = models
@@ -121,8 +168,12 @@ fn load(
             .zip(actors)
             .map(|(m, actor)| {
                 let (game_dir, keys) = (&game_dir, keys.clone());
+                let done = &done;
                 s.spawn(move || {
-                    let mut loaded = openrage_app::models::load(game_dir, keys.clone(), m.as_ref()?).ok()?;
+                    let path = m.as_ref()?;
+                    let loaded = openrage_app::models::load(game_dir, keys.clone(), path);
+                    progress.step(done.fetch_add(1, Ordering::Relaxed) + 1, total);
+                    let mut loaded = loaded.ok()?;
                     // Props whose textures live in the dictionary their archetype names.
                     if let Some(type_file) = &actor.type_file
                         && let Some(extra) = cutscene::prop_textures(game_dir, keys, type_file, &actor.name)
@@ -148,6 +199,7 @@ fn start(
     dict: ClipDictionary,
     cut: &Cutscene,
     previews: Vec<Option<ModelPreview>>,
+    progress: Arc<LoadProgress>,
 ) {
     let clips = cutscene::actor_clips(&cut.actors, &dict);
     let mut actors = Vec::new();
@@ -227,7 +279,7 @@ fn start(
         show_lights: !cut.lights.is_empty(),
         timer: slint::Timer::default(),
     });
-    load_surroundings(win, id, cut, (lo, hi));
+    load_surroundings(win, id, cut, (lo, hi), progress);
     win.set_playing(true);
     let (w, s) = (win.as_weak(), Rc::clone(state));
     if let Some(st) = state.borrow().as_ref() {
@@ -258,8 +310,17 @@ fn hide_oversized_parts(preview: &ModelPreview, look: &mut Look) {
 
 /// Loads the map objects around the scene in the background (the world
 /// cache is built on first use, which takes a little while).
-fn load_surroundings(win: &SceneWindow, id: u64, cut: &Cutscene, bounds: ([f32; 3], [f32; 3])) {
-    let Some((game_dir, keys)) = crate::with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone()))) else { return };
+fn load_surroundings(
+    win: &SceneWindow,
+    id: u64,
+    cut: &Cutscene,
+    bounds: ([f32; 3], [f32; 3]),
+    progress: Arc<LoadProgress>,
+) {
+    let Some((game_dir, keys)) = crate::with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone()))) else {
+        progress.set("", 0, 0);
+        return;
+    };
     // Scene → world: rotate about Z, then move to the scene's origin.
     let to_world = math::mul(
         &math::from_trs(cut.offset, [0.0, 0.0, 0.0, 1.0], [1.0; 3]),
@@ -271,14 +332,18 @@ fn load_surroundings(win: &SceneWindow, id: u64, cut: &Cutscene, bounds: ([f32; 
     let centre = math::transform_point(&to_world, centre_local);
     let half = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt() / 2.0;
     let radius = (half + 25.0).clamp(30.0, 120.0);
-    win.set_status(format!("{} · loading the surroundings …", win.get_status()).into());
+    progress.set("Reading the map …", 0, 0);
     let weak = win.as_weak();
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<Vec<(ModelPreview, Vec<Mat4>)>> {
             let world = openrage_app::world::load(&game_dir, keys.clone())?;
             let files = openrage_app::world::files(&game_dir)?;
+            progress.set("Finding the map objects around the scene …", 0, 0);
             let placed = openrage_app::world::objects_near(&world, &game_dir, keys.clone(), centre, radius);
-            let models = openrage_app::world::load_models(&world, &files, &game_dir, keys, &placed);
+            progress.set("Loading the surroundings", 0, 0);
+            let models = openrage_app::world::load_models(&world, &files, &game_dir, keys, &placed, &|done, total| {
+                progress.step(done, total)
+            });
             Ok(models
                 .into_iter()
                 .map(|(name, loaded, transforms)| {
@@ -289,6 +354,7 @@ fn load_surroundings(win: &SceneWindow, id: u64, cut: &Cutscene, bounds: ([f32; 
                 })
                 .collect())
         })();
+        progress.set("", 0, 0);
         let _ = weak.upgrade_in_event_loop(move |win| {
             let Some(state) = OPEN.with(|o| o.borrow().iter().find(|(i, ..)| *i == id).map(|(_, _, s)| Rc::clone(s)))
             else {
@@ -297,7 +363,7 @@ fn load_surroundings(win: &SceneWindow, id: u64, cut: &Cutscene, bounds: ([f32; 
             if let Some(st) = state.borrow_mut().as_mut() {
                 st.surroundings_pending = false;
             }
-            let status = win.get_status().to_string().replace(" · loading the surroundings …", "");
+            let status = win.get_status().to_string();
             match result {
                 Ok(models) => {
                     let objects: usize = models.iter().map(|(_, p)| p.len()).sum();
@@ -326,6 +392,21 @@ fn load_surroundings(win: &SceneWindow, id: u64, cut: &Cutscene, bounds: ([f32; 
             render_frame(&win, &state);
         });
     });
+}
+
+/// Shows the loads' progress on the window until they are done.
+fn watch_progress(win: &SceneWindow) -> Arc<LoadProgress> {
+    let progress = Arc::new(LoadProgress::default());
+    let timer = Rc::new(slint::Timer::default());
+    let (weak, p, t) = (win.as_weak(), Arc::clone(&progress), Rc::clone(&timer));
+    // The timer keeps itself alive through its own callback until it stops.
+    timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
+        let busy = weak.upgrade().is_some_and(|w| p.show(&w));
+        if !busy {
+            t.stop();
+        }
+    });
+    progress
 }
 
 /// The cutscene's lights for the renderer. Their intensities use a unit of

@@ -328,10 +328,23 @@ fn debug_snapshot_rest(ui: &AppWindow, path: String) {
         return;
     }
     // `OPENRAGE_SCENE=<cut>` (+ `OPENRAGE_SCENE_TIME`, `OPENRAGE_FREE`): the whole cutscene.
+    // `OPENRAGE_SCENE_SNAP_AT=<ms>` takes the picture that soon (while loading);
+    // `OPENRAGE_SCENE_PLAY=<s>` plays that long and quits without a picture.
     if let Ok(cut) = std::env::var("OPENRAGE_SCENE") {
         open_xml_view(ui, cut);
         if let Some(x) = xmlview::newest() {
             x.invoke_play_scene();
+        }
+        if let Ok(at) = std::env::var("OPENRAGE_SCENE_SNAP_AT") {
+            let path = path.clone();
+            slint::Timer::single_shot(Duration::from_millis(at.parse().unwrap_or(1000)), move || {
+                if let Some(Ok(img)) = scene::newest().map(|w| w.window().take_snapshot()) {
+                    let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
+                        .map(|png| std::fs::write(&path, png));
+                }
+                let _ = slint::quit_event_loop();
+            });
+            return;
         }
         let waiting = std::rc::Rc::new(slint::Timer::default());
         let (started, timer) = (Instant::now(), std::rc::Rc::clone(&waiting));
@@ -340,6 +353,12 @@ fn debug_snapshot_rest(ui: &AppWindow, path: String) {
                 return;
             }
             timer.stop();
+            if let Ok(secs) = std::env::var("OPENRAGE_SCENE_PLAY") {
+                slint::Timer::single_shot(Duration::from_secs(secs.parse().unwrap_or(10)), || {
+                    let _ = slint::quit_event_loop();
+                });
+                return;
+            }
             let time = std::env::var("OPENRAGE_SCENE_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0);
             scene::debug_pose(time, std::env::var("OPENRAGE_FREE").is_ok());
             let path = path.clone();
