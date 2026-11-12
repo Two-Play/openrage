@@ -123,19 +123,23 @@ fn f32_at(d: &[u8], at: usize) -> Result<f32, String> {
     be::<4>(d, at).map(f32::from_be_bytes)
 }
 
-/// A pointer: the packed value is the first big-endian u32 of 8 bytes.
-/// A pointer: the first word, plus the top byte of the second word in bits
-/// 32..40 (RDR2 keeps the offset's high bits there).
+/// A pointer: the first big-endian word, plus the next two bytes as a
+/// little-endian u16 in bits 32..48 (RDR2 keeps the offset's high bits there;
+/// GTA V leaves them zero).
 fn ptr_at(d: &[u8], at: usize) -> Result<u64, String> {
-    let high = u32_at(d, at + 4).map_or(0, |w| u64::from(w >> 24));
+    let high = match (d.get(at + 4), d.get(at + 5)) {
+        (Some(lo), Some(hi)) => u64::from(*lo) | u64::from(*hi) << 8,
+        _ => 0,
+    };
     u32_at(d, at).map(|w| u64::from(w) | high << 32)
 }
 
 /// Block id and offset of a pointer. GTA V: offset in bits 12..32. RDR2:
-/// bits 20..32 are the low 12 offset bits, bits 32..40 the next 8.
+/// bits 20..32 are the low 12 offset bits, bits 32..48 the rest (offsets
+/// past 1 MB in a block need more than the first byte of them).
 fn unpack_with(ptr: u64, offset_shift: u32) -> (usize, usize) {
     let offset = if offset_shift == 20 {
-        ((ptr >> 20) & 0xFFF) | ((ptr >> 32) & 0xFF) << 12
+        ((ptr >> 20) & 0xFFF) | ((ptr >> 32) & 0xFFFF) << 12
     } else {
         (ptr >> offset_shift) & 0xFFFFF
     };
@@ -275,7 +279,12 @@ impl Pso {
 
     /// The file as XML, formatted like CodeWalker's export, plus problems found.
     pub fn to_xml(&self) -> (String, Vec<String>) {
-        let mut w = Writer::new();
+        self.to_xml_with_limit(crate::xml::MAX_OUTPUT)
+    }
+
+    /// Like [`Pso::to_xml`] with another output limit.
+    pub fn to_xml_with_limit(&self, limit: usize) -> (String, Vec<String>) {
+        let mut w = Writer::with_limit(limit);
         self.node(&mut w, 0, self.root_block, 0, Tag::Structure, 0, 0);
         w.finish()
     }
@@ -799,5 +808,23 @@ impl Pso {
         }
         w.close(level, ename);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rdr2_pointer_offsets_past_one_megabyte() {
+        // assets_albedo.ymt: block 1, offset 0x123F90 (low 12 bits in the
+        // first word, the rest as a little-endian u16 after it).
+        let raw = [0xF9, 0x00, 0x00, 0x01, 0x23, 0x01, 0x00, 0x00];
+        assert_eq!(unpack_with(ptr_at(&raw, 0).unwrap(), 20), (1, 0x12_3F90));
+        let small = [0x13, 0x80, 0x00, 0x01, 0xE4, 0x00, 0x00, 0x00];
+        assert_eq!(unpack_with(ptr_at(&small, 0).unwrap(), 20), (1, 0xE_4138));
+        // GTA V: offset in bits 12..32 of the first word only.
+        let gta = [0x00, 0x12, 0x30, 0x02, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(unpack_with(ptr_at(&gta, 0).unwrap(), 12), (2, 0x123));
     }
 }
