@@ -43,6 +43,9 @@ pub struct LoadedModel {
     /// The skeleton skinned meshes are bound to (for peds: from the `.yft`
     /// next to the `.ydd`).
     pub skeleton: Option<drawable::Skeleton>,
+    /// The ped's expressions for its parts (face and helper bones), in the
+    /// order they run.
+    pub expressions: Vec<rage_formats::expression::Expression>,
     /// Material index per drawable and shader.
     shader_material: Vec<Vec<usize>>,
 }
@@ -409,6 +412,54 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
 }
 
 fn load_inner(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result<LoadedModel> {
+    let mut model = load_model(game_dir, keys.clone(), vpath)?;
+    if model.skeleton.is_some() && model.drawables.len() > 1 {
+        let name = vpath.rsplit('/').next().unwrap_or(vpath);
+        let stem = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+        model.expressions = ped_expressions(game_dir, keys, &stem, &model.drawables);
+    }
+    Ok(model)
+}
+
+/// Where the game keeps the peds' expressions.
+const EXPRESSIONS: &str = "x64c.rpf/anim/expressions.rpf";
+
+/// The expressions of a ped: its dictionary (named after the ped; the story
+/// characters use `p_m_zero` …), the face setup first, then one per part.
+fn ped_expressions(
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    ped: &str,
+    drawables: &[(String, Drawable)],
+) -> Vec<rage_formats::expression::Expression> {
+    let dictionary = match ped {
+        "player_zero" => "p_m_zero".to_owned(),
+        "player_one" => "p_m_one".to_owned(),
+        "player_two" => "p_m_two".to_owned(),
+        other => other.to_owned(),
+    };
+    let Some(dict) = [dictionary.as_str(), "default"].iter().find_map(|d| {
+        let (Node::ArchiveFile(rpf, id), _) =
+            rage_mods::resolve(game_dir, &format!("{EXPRESSIONS}/{d}.yed"), keys.clone()).ok()?
+        else {
+            return None;
+        };
+        rage_formats::expression::parse(&rpf.read_resource(id).ok()?).ok()
+    }) else {
+        return Vec::new();
+    };
+    let wanted = |e: &rage_formats::expression::Expression| {
+        let n = e.name.to_ascii_lowercase();
+        let n = n.trim_start_matches("pack:/").trim_end_matches(".expr");
+        drawables.iter().any(|(d, _)| d.eq_ignore_ascii_case(n))
+    };
+    let mut out: Vec<_> =
+        dict.expressions.iter().filter(|e| e.name.to_ascii_lowercase().ends_with("faceinit.expr")).cloned().collect();
+    out.extend(dict.expressions.iter().filter(|e| wanted(e)).cloned());
+    out
+}
+
+fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result<LoadedModel> {
     let (node, _) = rage_mods::resolve(game_dir, vpath, keys.clone())?;
     if let Node::Rpf8File(rpf, i) = node {
         return load_rdr2(&rpf, i);
@@ -525,8 +576,15 @@ fn load_inner(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         if let Some(sk) = &skeleton {
             fit_to_skeleton(&mut drawables, sk);
         }
-        let mut model =
-            LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
+        let mut model = LoadedModel {
+            drawables,
+            parts,
+            external,
+            materials: Vec::new(),
+            shader_material: Vec::new(),
+            skeleton,
+            expressions: Vec::new(),
+        };
         model.collect_materials();
         return Ok(model);
     } else if lower.ends_with(".yft") {
@@ -599,8 +657,15 @@ fn load_inner(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
     if let Some(sk) = &skeleton {
         fit_to_skeleton(&mut drawables, sk);
     }
-    let mut model =
-        LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
+    let mut model = LoadedModel {
+        drawables,
+        parts,
+        external,
+        materials: Vec::new(),
+        shader_material: Vec::new(),
+        skeleton,
+        expressions: Vec::new(),
+    };
     model.collect_materials();
     Ok(model)
 }
@@ -623,6 +688,7 @@ fn fit_to_skeleton(drawables: &mut [(String, Drawable)], skeleton: &drawable::Sk
             }
         }
         bind_cloth(d, skeleton);
+        bind_pinned(d, skeleton);
     }
 }
 
@@ -652,6 +718,29 @@ fn bind_cloth(d: &mut Drawable, skeleton: &drawable::Skeleton) {
         let (indices, weights) = mesh.positions.iter().map(|p| nearest_bones(&segments, *p)).unzip();
         mesh.bone_indices = indices;
         mesh.bone_weights = weights;
+    }
+}
+
+/// Binds vertices held by the skeleton's root to the nearest body bones.
+/// Cloth parts pin some vertices to the root for the cloth simulation; the
+/// root stays at the feet, so without it those vertices are left behind as
+/// long strips when the ped moves.
+fn bind_pinned(d: &mut Drawable, skeleton: &drawable::Skeleton) {
+    let roots: Vec<usize> = skeleton.bones.iter().enumerate().filter(|(_, b)| b.parent < 0).map(|(i, _)| i).collect();
+    let mut segments = None;
+    for mesh in &mut d.meshes {
+        for i in 0..mesh.bone_indices.len().min(mesh.bone_weights.len()).min(mesh.positions.len()) {
+            let (b, w) = (mesh.bone_indices[i], mesh.bone_weights[i]);
+            let pinned: f32 = (0..4).filter(|&k| roots.contains(&(b[k] as usize))).map(|k| w[k]).sum();
+            let total: f32 = w.iter().sum();
+            if total > 0.0 && pinned / total > 0.5 {
+                let segments = segments.get_or_insert_with(|| body_segments(skeleton));
+                if segments.is_empty() {
+                    return;
+                }
+                (mesh.bone_indices[i], mesh.bone_weights[i]) = nearest_bones(segments, mesh.positions[i]);
+            }
+        }
     }
 }
 
@@ -933,8 +1022,15 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
         }
     }
     let skeleton = drawables.iter().find_map(|(_, d)| d.skeleton.clone());
-    let mut model =
-        LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
+    let mut model = LoadedModel {
+        drawables,
+        parts,
+        external,
+        materials: Vec::new(),
+        shader_material: Vec::new(),
+        skeleton,
+        expressions: Vec::new(),
+    };
     model.collect_materials();
     Ok(model)
 }

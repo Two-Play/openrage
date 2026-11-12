@@ -4,12 +4,17 @@ use rage_formats::clip::{Animation, TRACK_BONE_ROTATION, TRACK_BONE_SCALE, TRACK
 use rage_formats::drawable::Skeleton;
 use rage_formats::math::{self, Mat4};
 
+use crate::expr::Local;
+
 /// Which animation tracks drive which skeleton bones.
 pub struct Binding {
     /// Per bone: translation, rotation and scale track indices.
     tracks: Vec<[Option<usize>; 3]>,
     /// Inverse bind pose per bone.
     inverse_bind: Vec<Mat4>,
+    /// The ped's expressions bound to this skeleton and animation.
+    programs: Vec<crate::expr::Program>,
+    parents: Vec<Option<usize>>,
 }
 
 impl Binding {
@@ -26,7 +31,20 @@ impl Binding {
             tracks[b][slot] = Some(i);
         }
         let inverse_bind = skeleton.world_transforms().iter().map(math::inverse_affine).collect();
-        Self { tracks, inverse_bind }
+        let parents =
+            skeleton.bones.iter().enumerate().map(|(i, b)| usize::try_from(b.parent).ok().filter(|&p| p < i)).collect();
+        Self { tracks, inverse_bind, programs: Vec::new(), parents }
+    }
+
+    /// Also runs the ped's expressions each frame (face and helper bones).
+    pub fn with_expressions(
+        mut self,
+        skeleton: &Skeleton,
+        animation: &Animation,
+        expressions: &[rage_formats::expression::Expression],
+    ) -> Self {
+        self.programs = expressions.iter().map(|e| crate::expr::Program::new(e, skeleton, animation)).collect();
+        self
     }
 
     /// How many bones the animation moves.
@@ -36,14 +54,33 @@ impl Binding {
 
     /// Skinning matrices (posed world × inverse bind) at a fractional frame.
     pub fn skin(&self, skeleton: &Skeleton, animation: &Animation, frame: f32) -> Vec<Mat4> {
+        let rest: Vec<Local> = skeleton
+            .bones
+            .iter()
+            .map(|b| Local { translation: b.translation, rotation: b.rotation, scale: b.scale })
+            .collect();
+        let mut pose: Vec<Local> = rest
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let [t, rot, s] = self.tracks.get(i).copied().unwrap_or_default();
+                let value = |track: Option<usize>| track.and_then(|k| animation.value(k, frame));
+                Local {
+                    translation: value(t).map_or(r.translation, |v| [v[0], v[1], v[2]]),
+                    rotation: value(rot).unwrap_or(r.rotation),
+                    scale: value(s).map_or(r.scale, |v| [v[0], v[1], v[2]]),
+                }
+            })
+            .collect();
+        if !self.programs.is_empty() {
+            let mut controls = crate::expr::Controls::new();
+            for p in &self.programs {
+                p.run(&mut pose, &rest, &self.parents, animation, frame, &mut controls);
+            }
+        }
         let mut world: Vec<Mat4> = Vec::with_capacity(skeleton.bones.len());
-        for (i, bone) in skeleton.bones.iter().enumerate() {
-            let [t, r, s] = self.tracks.get(i).copied().unwrap_or_default();
-            let value = |track: Option<usize>| track.and_then(|k| animation.value(k, frame));
-            let translation = value(t).map_or(bone.translation, |v| [v[0], v[1], v[2]]);
-            let rotation = value(r).unwrap_or(bone.rotation);
-            let scale = value(s).map_or(bone.scale, |v| [v[0], v[1], v[2]]);
-            let local = math::from_trs(translation, rotation, scale);
+        for (i, (bone, l)) in skeleton.bones.iter().zip(&pose).enumerate() {
+            let local = math::from_trs(l.translation, l.rotation, l.scale);
             let w = match usize::try_from(bone.parent).ok().filter(|&p| p < i) {
                 Some(p) => math::mul(&world[p], &local),
                 None => local,

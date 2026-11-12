@@ -389,12 +389,16 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         {
             let mut st = s.borrow_mut();
             let skeleton = st.model().and_then(|m| m.loaded.skeleton.clone());
+            let expressions = st.model().map(|m| m.loaded.expressions.clone()).unwrap_or_default();
             let Some(a) = st.anim.as_mut() else { return };
             let Some(clip) = a.dict.clips.get(i as usize) else { return };
             let bindings: Vec<Option<Binding>> = clip
                 .parts
                 .iter()
-                .map(|p| skeleton.as_ref().map(|sk| Binding::new(sk, &a.dict.animations[p.animation])))
+                .map(|p| {
+                    let anim = &a.dict.animations[p.animation];
+                    skeleton.as_ref().map(|sk| Binding::new(sk, anim).with_expressions(sk, anim, &expressions))
+                })
                 .collect();
             let moved = bindings.first().and_then(Option::as_ref).map_or(0, Binding::animated_bones);
             a.bindings = bindings;
