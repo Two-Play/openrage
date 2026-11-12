@@ -171,6 +171,9 @@ enum Command {
         /// Instead of only reading files, parse every texture dictionary and decode every texture.
         #[arg(long)]
         textures: bool,
+        /// Instead of only reading files, parse every model (.ydr, .yft, .ydd).
+        #[arg(long)]
+        models: bool,
     },
     /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
     Media {
@@ -360,8 +363,8 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if let Command::Rpf8 { path, list, textures } = &cli.command {
-        return cmd_rpf8(path, *list, *textures);
+    if let Command::Rpf8 { path, list, textures, models } = &cli.command {
+        return cmd_rpf8(path, *list, *textures, *models);
     }
     if let Command::Rdr2Names { game, import } = &cli.command {
         return cmd_rdr2_names(game, import.as_deref());
@@ -588,6 +591,11 @@ fn cmd_info(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
             outln!("Encrypted:   {}", if e.is_encrypted() { format!("yes (key {})", e.key_id) } else { "no".into() });
             if let Some(v) = e.resource_version() {
                 outln!("Resource version: {v}");
+                outln!(
+                    "Pages:       {} virtual, {} physical",
+                    e.size_or_flags & 0xFFFF_FFF0,
+                    e.size_or_flags >> 32 & 0xFFFF_FFF0
+                );
             }
         }
         Node::Dir(p) | Node::PlainFile(p) => outln!("{} is not inside an archive", p.display()),
@@ -2361,7 +2369,7 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn cmd_rpf8(path: &Path, list: bool, textures: bool) -> Result<()> {
+fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool) -> Result<()> {
     use rage_rpf::rpf8::{Compression, Rpf8};
     let keys = rdr2_keys()?;
     let names = rdr2_game_folder(path)
@@ -2394,7 +2402,9 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool) -> Result<()> {
         readable: usize,
         entries: usize,
         failed: usize,
+        /// Textures decoded or models parsed.
         textures: usize,
+        triangles: usize,
         lines: Vec<String>,
     }
     /// Parses a texture dictionary and decodes all its textures; returns how many.
@@ -2415,7 +2425,29 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool) -> Result<()> {
         }
         Ok(dict.textures.len())
     }
-    fn walk(rpf: &Rpf8, depth: usize, list: bool, textures: bool, t: &mut Tally) {
+    /// Parses a model; returns its triangle count.
+    fn check_model(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
+        use rage_formats::drawable;
+        let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
+        let drawables = match e.ext_id {
+            3 => vec![drawable::parse_fragment_rdr2(&res).map_err(|err| err.to_string())?.drawable],
+            4 => drawable::parse_ydd_rdr2(&res).map_err(|err| err.to_string())?.into_iter().map(|(_, d)| d).collect(),
+            _ => vec![drawable::parse_ydr_rdr2(&res).map_err(|err| err.to_string())?],
+        };
+        let triangles: usize = drawables.iter().map(|d| d.triangle_count()).sum();
+        if drawables.iter().all(|d| d.meshes.is_empty()) {
+            return Err("no meshes".into());
+        }
+        for d in &drawables {
+            for m in &d.meshes {
+                if m.positions.iter().any(|p| p.iter().any(|v| !v.is_finite() || v.abs() > 1.0e6)) {
+                    return Err("implausible vertex positions".into());
+                }
+            }
+        }
+        Ok(triangles)
+    }
+    fn walk(rpf: &Rpf8, depth: usize, list: bool, textures: bool, models: bool, t: &mut Tally) {
         let h = rpf.header();
         let Some(entries) = rpf.entries() else { return };
         t.readable += 1;
@@ -2437,11 +2469,24 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool) -> Result<()> {
                 match rpf.open_child(e) {
                     Ok(child) => {
                         t.nested += 1;
-                        walk(&child, depth + 1, list, textures, t);
+                        walk(&child, depth + 1, list, textures, models, t);
                     }
                     Err(err) => {
                         t.failed += 1;
                         t.lines.push(format!("{indent}{name}: {err}"));
+                    }
+                }
+            } else if models {
+                if matches!(e.ext_id, 2..=4) && e.is_resource {
+                    match check_model(rpf, e) {
+                        Ok(n) => {
+                            t.textures += 1;
+                            t.triangles += n;
+                        }
+                        Err(err) => {
+                            t.failed += 1;
+                            t.lines.push(format!("{indent}{name}: {err}"));
+                        }
                     }
                 }
             } else if textures {
@@ -2495,7 +2540,7 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool) -> Result<()> {
                             h.platform,
                             rpf.size()
                         ));
-                        walk(&rpf, 0, list, textures, &mut t);
+                        walk(&rpf, 0, list, textures, models, &mut t);
                     }
                     Err(e) => {
                         t.failed += 1;
@@ -2508,6 +2553,7 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool) -> Result<()> {
     };
     let (mut ok, mut nested, mut plain, mut entries_total, mut failed, mut empty) = (0, 0, 0, 0usize, 0, 0);
     let mut textures_total = 0;
+    let mut triangles_total = 0;
     for (_, t) in &tallies {
         for l in &t.lines {
             outln!("{l}");
@@ -2521,9 +2567,13 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool) -> Result<()> {
         entries_total += t.entries;
         failed += t.failed;
         textures_total += t.textures;
+        triangles_total += t.triangles;
     }
     if textures {
         outln!("\n{textures_total} textures decoded");
+    }
+    if models {
+        outln!("\n{textures_total} models parsed ({triangles_total} triangles)");
     }
     outln!(
         "\n{ok} archives read ({nested} more nested in them), {empty} empty, {failed} failed; {plain} with a readable table ({entries_total} entries).{}",
@@ -2637,6 +2687,20 @@ fn cmd_rdr2_names(game: &Path, import: Option<&Path>) -> Result<()> {
         }
     }
     index.save(&path)?;
+    if import.is_none() {
+        let textures = openrage_app::rdr2::build_texture_index(game, &files, &keys, |done, total| {
+            eprint!("\rindexing textures: {done}/{total} archives")
+        });
+        eprintln!();
+        let tpath = openrage_app::rdr2::TextureIndex::default_path(game).context("no cache folder")?;
+        textures.save(&tpath)?;
+        outln!(
+            "{} textures in {} dictionaries indexed; stored in {}",
+            textures.textures.len(),
+            textures.dictionaries.len(),
+            tpath.display()
+        );
+    }
     outln!(
         "{} of {} entry names known ({:.1} %); stored in {} ({:.0} s)",
         index.trusted_count(),

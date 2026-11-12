@@ -258,7 +258,8 @@ fn debug_snapshot(ui: &AppWindow) {
         let started = Instant::now();
         let (weak, timer) = (ui.as_weak(), std::rc::Rc::clone(&waiting));
         waiting.start(slint::TimerMode::Repeated, Duration::from_millis(250), move || {
-            if with_app(|a| a.suggest_pending) && started.elapsed() < Duration::from_secs(60) {
+            let loading = weak.upgrade().is_some_and(|ui| ui.get_preview_loading());
+            if (with_app(|a| a.suggest_pending) || loading) && started.elapsed() < Duration::from_secs(60) {
                 return;
             }
             timer.stop();
