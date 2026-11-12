@@ -20,3 +20,6 @@ rage-resource.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 rayon.workspace = true
+
+[build-dependencies]
+winresource = "0.1"

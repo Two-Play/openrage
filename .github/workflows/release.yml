@@ -1,7 +1,8 @@
 name: Release
 
-# Pushing a tag such as v0.2.0 builds OpenRAGE for Linux and Windows and
-# publishes a GitHub release with the archives and their SHA-256 checksums.
+# Pushing a tag such as v0.2.0 builds OpenRAGE for Linux (.tar.gz and
+# AppImage) and Windows (.zip) and publishes a GitHub release with them and
+# their SHA-256 checksums.
 # "Run workflow" (manual) builds the same archives without publishing, to
 # try a release first. Tests are not repeated here: CI runs them on every
 # change to main, which is where release tags are cut from.
@@ -55,22 +56,41 @@ jobs:
         run: |
           ref="${GITHUB_REF_NAME//\//-}"
           dir="openrage-${ref}-${{ matrix.name }}"
-          mkdir -p "$dir"
+          mkdir -p "$dir" out
           cp README.md LICENSE NOTICE.md "$dir/"
           cp crates/rage-tfit2/LICENSE "$dir/LICENSE-AGPL-3.0"
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp target/release/openrage.exe target/release/openrage-gui.exe "$dir/"
-            7z a -tzip "$dir.zip" "$dir" > /dev/null
-            echo "ASSET=$dir.zip" >> "$GITHUB_ENV"
+            7z a -tzip "out/$dir.zip" "$dir" > /dev/null
           else
             cp target/release/openrage target/release/openrage-gui "$dir/"
-            tar czf "$dir.tar.gz" "$dir"
-            echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
+            cp packaging/openrage.desktop packaging/openrage.png "$dir/"
+            tar czf "out/$dir.tar.gz" "$dir"
           fi
+      - name: AppImage
+        if: runner.os == 'Linux'
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          app=OpenRAGE.AppDir
+          mkdir -p "$app/usr/bin" "$app/usr/share/applications" "$app/usr/share/icons/hicolor/256x256/apps" "$app/usr/share/doc/openrage"
+          cp target/release/openrage target/release/openrage-gui "$app/usr/bin/"
+          cp packaging/AppRun "$app/AppRun"
+          chmod +x "$app/AppRun"
+          cp packaging/openrage.desktop "$app/openrage.desktop"
+          cp packaging/openrage.desktop "$app/usr/share/applications/"
+          cp packaging/openrage.png "$app/openrage.png"
+          cp packaging/openrage.png "$app/.DirIcon"
+          cp packaging/openrage.png "$app/usr/share/icons/hicolor/256x256/apps/"
+          cp README.md LICENSE NOTICE.md "$app/usr/share/doc/openrage/"
+          cp crates/rage-tfit2/LICENSE "$app/usr/share/doc/openrage/LICENSE-AGPL-3.0"
+          curl -sSfL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          # No FUSE on the runners: let the tool unpack itself.
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool --no-appstream "$app" "out/openrage-${ref}-x86_64.AppImage"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ env.ASSET }}
+          path: out/*
           if-no-files-found: error
 
   publish:
