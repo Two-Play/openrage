@@ -7,9 +7,9 @@ description = "OpenRAGE is a free, open-source explorer and modding toolkit for 
 
 [extra]
 # **bold** parts are shown in the accent colour.
-headline = "Explore and mod **GTA V** and **RDR2**"
+headline = "The open modding toolkit for **RAGE engine** games"
 # One short line under the headline; the longer description belongs in features_intro.
-lead = "Free, open-source explorer and modding toolkit for Rockstar's RAGE engine games."
+lead = "Browse every archive, preview every file and mod GTA V safely. Free, on Linux and Windows."
 notice = """
 OpenRAGE is an independent community project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive.
 It contains **no game files and no encryption keys**: keys are taken from your own copy of the game at runtime.
