@@ -520,8 +520,11 @@ fn load_inner(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         // A streamed ped (online characters, story characters): the fragment
         // holds the skeleton, the folder next to it the components.
         let skeleton = drawable::parse_fragment(&res)?.drawable.skeleton;
-        let (drawables, parts, textures) = streamed_ped(&rpf, folder)?;
+        let (mut drawables, parts, textures) = streamed_ped(&rpf, folder)?;
         external.extend(textures);
+        if let Some(sk) = &skeleton {
+            fit_to_skeleton(&mut drawables, sk);
+        }
         let mut model =
             LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
         model.collect_materials();
@@ -592,10 +595,111 @@ fn load_inner(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         let tid = rpf.find_child(dir, &format!("{stem}.yft"))?;
         drawable::parse_fragment(&rpf.read_resource(tid).ok()?).ok()?.drawable.skeleton
     });
+    let mut drawables = drawables;
+    if let Some(sk) = &skeleton {
+        fit_to_skeleton(&mut drawables, sk);
+    }
     let mut model =
         LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
     model.collect_materials();
     Ok(model)
+}
+
+/// Makes the meshes of every drawable use the model's skeleton: blend indices
+/// of a drawable with its own skeleton point into that one (whose bone order
+/// may differ, as in the story characters' components), so they are mapped
+/// by bone tag; cloth meshes are bound to the body.
+fn fit_to_skeleton(drawables: &mut [(String, Drawable)], skeleton: &drawable::Skeleton) {
+    for (_, d) in drawables.iter_mut() {
+        if let Some(own) = &d.skeleton {
+            let map: Vec<u16> =
+                own.bones.iter().enumerate().map(|(i, b)| skeleton.find_tag(b.tag).unwrap_or(i) as u16).collect();
+            if map.iter().enumerate().any(|(i, &m)| i as u16 != m) {
+                for mesh in &mut d.meshes {
+                    for b in &mut mesh.bone_indices {
+                        *b = b.map(|i| map.get(i as usize).copied().unwrap_or(i));
+                    }
+                }
+            }
+        }
+        bind_cloth(d, skeleton);
+    }
+}
+
+/// Shaders of ped meshes the game moves by cloth simulation (skirts, coats).
+/// Their blend weights are not skinning data, so skinning them as such tears
+/// them into spikes.
+fn is_cloth_shader(hash: u32) -> bool {
+    matches!(rage_formats::shaders::name(hash), Some("ped_cloth" | "ped_cloth_enveff"))
+}
+
+/// Binds the cloth meshes of a ped to the body bones nearest to each vertex
+/// (the two closest bone segments, by inverse squared distance), so they
+/// follow the animation like clothes on the body instead of being torn apart.
+fn bind_cloth(d: &mut Drawable, skeleton: &drawable::Skeleton) {
+    let cloth: Vec<bool> = d.shaders.iter().map(|s| is_cloth_shader(s.name_hash)).collect();
+    if !cloth.contains(&true) {
+        return;
+    }
+    let segments = body_segments(skeleton);
+    if segments.is_empty() {
+        return;
+    }
+    for mesh in &mut d.meshes {
+        if !cloth.get(mesh.shader as usize).copied().unwrap_or(false) {
+            continue;
+        }
+        let (indices, weights) = mesh.positions.iter().map(|p| nearest_bones(&segments, *p)).unzip();
+        mesh.bone_indices = indices;
+        mesh.bone_weights = weights;
+    }
+}
+
+/// The body's main bones as segments from the bone to its first main child
+/// (fingers, toes, face and helper bones left out).
+fn body_segments(skeleton: &drawable::Skeleton) -> Vec<(u16, [f32; 3], [f32; 3])> {
+    let world = skeleton.world_transforms();
+    let main = |name: &str| {
+        let n = name.to_ascii_lowercase();
+        n.starts_with("skel_") && n != "skel_root" && !n.contains("finger") && !n.contains("toe")
+    };
+    let pos = |i: usize| [world[i][12], world[i][13], world[i][14]];
+    skeleton
+        .bones
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| main(&b.name))
+        .map(|(i, _)| {
+            let child = skeleton.bones.iter().position(|c| usize::try_from(c.parent).ok() == Some(i) && main(&c.name));
+            (i as u16, pos(i), child.map_or(pos(i), pos))
+        })
+        .collect()
+}
+
+fn nearest_bones(segments: &[(u16, [f32; 3], [f32; 3])], p: [f32; 3]) -> ([u16; 4], [f32; 4]) {
+    let distance = |(_, a, b): &(u16, [f32; 3], [f32; 3])| {
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+        let len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+        let t =
+            if len2 > 1e-9 { ((ap[0] * ab[0] + ap[1] * ab[1] + ap[2] * ab[2]) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let d = [ap[0] - t * ab[0], ap[1] - t * ab[1], ap[2] - t * ab[2]];
+        d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+    };
+    let (mut best, mut second) = ((0u16, f32::MAX), (0u16, f32::MAX));
+    for s in segments {
+        let d = distance(s);
+        if d < best.1 {
+            second = best;
+            best = (s.0, d);
+        } else if d < second.1 {
+            second = (s.0, d);
+        }
+    }
+    let w = |d: f32| 1.0 / (d + 1e-4);
+    let (w1, w2) = (w(best.1), if second.1 < f32::MAX { w(second.1) } else { 0.0 });
+    let total = w1 + w2;
+    ([best.0, second.0, 0, 0], [w1 / total, w2 / total, 0.0, 0.0])
 }
 
 /// A texture dictionary from the base game's vehicle archive (shared by many vehicles).
@@ -833,4 +937,20 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
         LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
     model.collect_materials();
     Ok(model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloth_follows_the_nearest_bones() {
+        // A thigh going down from the pelvis, and the spine going up.
+        let segments = [(1u16, [0.0, 0.0, 0.0], [0.0, 0.0, -0.4]), (2, [0.0, 0.0, 0.0], [0.0, 0.0, 0.5])];
+        let (bones, weights) = nearest_bones(&segments, [0.1, 0.0, -0.3]);
+        assert_eq!(bones[0], 1);
+        assert!(weights[0] > weights[1] && (weights.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        let (bones, _) = nearest_bones(&segments, [0.1, 0.0, 0.4]);
+        assert_eq!(bones[0], 2);
+    }
 }
