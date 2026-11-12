@@ -180,6 +180,9 @@ enum Command {
         /// Instead of only reading files, convert all metadata (.ymap, .ytyp, .ymt, .ymf) to XML.
         #[arg(long, conflicts_with_all = ["textures", "models", "text"])]
         meta: bool,
+        /// Instead of only reading files, decode every sound of every audio container.
+        #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta"])]
+        audio: bool,
     },
     /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
     Media {
@@ -369,8 +372,12 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if let Command::Rpf8 { path, list, textures, models, text, meta } = &cli.command {
-        return cmd_rpf8(path, *list, *textures, *models, *text, *meta);
+    if let Command::Rpf8 { path, list, textures, models, text, meta, audio } = &cli.command {
+        return cmd_rpf8(
+            path,
+            *list,
+            Checks { textures: *textures, models: *models, texts: *text, meta: *meta, audio: *audio },
+        );
     }
     if let Command::Rdr2Names { game, import } = &cli.command {
         return cmd_rdr2_names(game, import.as_deref());
@@ -2378,7 +2385,18 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool, meta: bool) -> Result<()> {
+/// Which files `openrage rpf8` parses instead of only reading them.
+#[derive(Clone, Copy)]
+struct Checks {
+    textures: bool,
+    models: bool,
+    texts: bool,
+    meta: bool,
+    audio: bool,
+}
+
+fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
+    let Checks { textures, models, texts: text, meta, audio } = checks;
     use rage_rpf::rpf8::{Compression, Rpf8};
     let keys = rdr2_keys()?;
     let names = rdr2_game_folder(path)
@@ -2476,16 +2494,26 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool, m
         let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
         Ok(rage_formats::ldb::parse(&res).map_err(|err| err.to_string())?.len())
     }
-    /// Which files to parse instead of only reading them.
-    #[derive(Clone, Copy)]
-    struct Checks {
-        textures: bool,
-        models: bool,
-        texts: bool,
-        meta: bool,
+    /// Decodes every sound of an audio container; `None` when it is not one.
+    fn check_audio(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<Option<(usize, f32)>, String> {
+        let data = rpf.read(e).map_err(|err| err.to_string())?;
+        if !data.starts_with(b"ADAT") {
+            return Ok(None);
+        }
+        let awc = rage_formats::awc::Awc::parse_rdr2(data).map_err(|err| err.to_string())?;
+        if awc.stream_format.is_some() {
+            let pcm = awc.decode_stream().map_err(|err| err.to_string())?;
+            return Ok(Some((1, pcm.duration_secs())));
+        }
+        let mut secs = 0.0;
+        for i in 0..awc.sounds.len() {
+            secs +=
+                awc.decode_sound(i).map_err(|err| format!("sound {:08x}: {err}", awc.sounds[i].id))?.duration_secs();
+        }
+        Ok(Some((awc.sounds.len(), secs)))
     }
     fn walk(rpf: &Rpf8, depth: usize, list: bool, checks: Checks, t: &mut Tally) {
-        let Checks { textures, models, texts, meta } = checks;
+        let Checks { textures, models, texts, meta, audio } = checks;
         let h = rpf.header();
         let Some(entries) = rpf.entries() else { return };
         t.readable += 1;
@@ -2512,6 +2540,21 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool, m
                     Err(err) => {
                         t.failed += 1;
                         t.lines.push(format!("{indent}{name}: {err}"));
+                    }
+                }
+            } else if audio {
+                // Audio containers have no extension (their hash covers the path).
+                if e.ext_id == 0xFF && !e.is_resource {
+                    match check_audio(rpf, e) {
+                        Ok(Some((sounds, secs))) => {
+                            t.textures += sounds;
+                            t.triangles += secs.round() as usize;
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            t.failed += 1;
+                            t.lines.push(format!("{indent}{name}: {err}"));
+                        }
                     }
                 }
             } else if meta {
@@ -2609,7 +2652,7 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool, m
                             h.platform,
                             rpf.size()
                         ));
-                        walk(&rpf, 0, list, Checks { textures, models, texts: text, meta }, &mut t);
+                        walk(&rpf, 0, list, checks, &mut t);
                     }
                     Err(e) => {
                         t.failed += 1;
@@ -2649,6 +2692,9 @@ fn cmd_rpf8(path: &Path, list: bool, textures: bool, models: bool, text: bool, m
     }
     if meta {
         outln!("\n{textures_total} metadata files converted ({triangles_total} parts not read)");
+    }
+    if audio {
+        outln!("\n{textures_total} sounds decoded ({:.1} hours)", triangles_total as f64 / 3600.0);
     }
     outln!(
         "\n{ok} archives read ({nested} more nested in them), {empty} empty, {failed} failed; {plain} with a readable table ({entries_total} entries).{}",

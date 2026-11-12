@@ -11,5 +11,6 @@ rage-resource.workspace = true
 png = "0.18"
 texture2ddecoder = "0.1"
 symphonia = { version = "0.6", default-features = false, features = ["mp3"] }
+lewton = { version = "0.10", default-features = false }
 thiserror.workspace = true
 flate2.workspace = true

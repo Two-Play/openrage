@@ -248,6 +248,13 @@ pub fn list(
         Node::Rpf8File(rpf, i) if is_texture_dict(&rpf.entry_name(i)) => {
             Ok((list_rpf8_textures(vpath, rpf, i, origin)?, None))
         }
+        Node::Rpf8File(rpf, i) if is_audio(&rpf.entry_name(i)) => {
+            let entry = rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| RpfError::NotFound(vpath.clone()))?;
+            let data = rpf.read(entry)?;
+            let awc = rage_formats::awc::Awc::parse_rdr2(data)
+                .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
+            Ok((audio_listing(vpath, awc, origin), None))
+        }
         Node::ArchiveFile(..) | Node::PlainFile(_) | Node::Rpf8File(..) => {
             let name = last_segment(&vpath);
             let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys, overlay)?;
@@ -351,9 +358,17 @@ fn list_audio(
     origin: Origin,
     keys: Option<&GtaVKeys>,
 ) -> Result<Listing, RpfError> {
-    let data = rpf.read(id)?;
+    list_audio_data(vpath, rpf.read(id)?, origin, keys)
+}
+
+fn list_audio_data(vpath: String, data: Vec<u8>, origin: Origin, keys: Option<&GtaVKeys>) -> Result<Listing, RpfError> {
     let awc = openrage_app::audio::parse(data, keys)
         .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
+    Ok(audio_listing(vpath, awc, origin))
+}
+
+/// The sounds of an audio container as a listing.
+fn audio_listing(vpath: String, awc: rage_formats::awc::Awc, origin: Origin) -> Listing {
     let item = |name: String, size: u64, info: String| Item {
         name,
         kind: ItemKind::Sound,
@@ -385,7 +400,7 @@ fn list_audio(
             })
             .collect(),
     };
-    Ok(Listing { vpath, origin, location: Location::Audio { awc: Arc::new(awc) }, items })
+    Listing { vpath, origin, location: Location::Audio { awc: Arc::new(awc) }, items }
 }
 
 /// `83.4` → `1:23.4`.
