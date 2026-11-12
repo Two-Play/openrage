@@ -45,6 +45,12 @@ Take-Two Interactive Software, Inc. OpenRAGE is not affiliated with them.
 MPEG audio is decoded with Symphonia (https://github.com/pdeljanov/Symphonia),
 licensed under the Mozilla Public License 2.0; its source is available there.
 
+## lewton
+
+Vorbis audio (Red Dead Redemption 2) is decoded with lewton
+(https://github.com/RustAudio/lewton), licensed under the MIT or Apache-2.0
+license.
+
 ## RDR2-RPF-Tool
 
 The TFIT2-CBC cipher and the strided file encryption of Red Dead Redemption 2

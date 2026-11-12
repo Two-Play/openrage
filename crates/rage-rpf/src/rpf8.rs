@@ -327,7 +327,19 @@ impl Rpf8 {
 
     /// The display name of entry `i`: its path when known, else `hash/XXXXXXXX.ext`.
     pub fn entry_name(&self, i: usize) -> String {
-        self.entries.as_ref().map(|e| e[i].display_name(self.header.platform)).unwrap_or_default()
+        let Some(e) = self.entries.as_ref().and_then(|e| e.get(i)) else { return String::new() };
+        // The audio archives' files have no extension of their own (their
+        // hash covers the whole path): they are audio containers.
+        if e.path.is_none() && e.ext_id == 0xFF && !e.is_resource && self.is_audio_archive() {
+            return format!("hash/{:08X}.awc", e.hash);
+        }
+        e.display_name(self.header.platform)
+    }
+
+    /// Whether this is one of the game's sound archives (`x64/audio/…`).
+    fn is_audio_archive(&self) -> bool {
+        let path = self.path.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        path.contains("/x64/audio/")
     }
 
     /// The entry at a path (case-insensitive).

@@ -14,6 +14,13 @@
 //!
 //! Encryption is XXTEA with the game's AWC key; the caller passes the
 //! decryption function.
+//!
+//! Red Dead Redemption 2 uses the same container, unencrypted, mostly with
+//! Vorbis: a sound's format chunk (`0x76`) holds the three Vorbis headers
+//! (each with a 32-bit length) after 32 bytes of samples, rate and codec;
+//! a stream keeps each channel's headers in a chunk (`0x7F`) of a stream
+//! named after the channel. The data is cut into 2048-byte units of Vorbis
+//! packets, each with a 16-bit length.
 
 const MAGIC: u32 = 0x5441_4441; // "ADAT"
 
@@ -29,6 +36,10 @@ pub const CHUNK_STREAM_FORMAT: u8 = 0x48;
 pub const CHUNK_SEEK_TABLE: u8 = 0xA3;
 pub const CHUNK_MARKERS: u8 = 0xBD;
 pub const CHUNK_PEAK: u8 = 0x36;
+/// RDR2: a sound's format, with the Vorbis headers.
+pub const CHUNK_FORMAT_RDR2: u8 = 0x76;
+/// RDR2: a stream channel's Vorbis headers.
+pub const CHUNK_VORBIS_HEADERS: u8 = 0x7F;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AwcError {
@@ -49,6 +60,7 @@ fn damaged(msg: impl Into<String>) -> AwcError {
 pub enum Codec {
     Pcm16,
     Adpcm,
+    Vorbis,
     Other(u8),
 }
 
@@ -57,6 +69,7 @@ impl Codec {
         match b {
             0 => Self::Pcm16,
             4 => Self::Adpcm,
+            8 => Self::Vorbis,
             other => Self::Other(other),
         }
     }
@@ -65,6 +78,7 @@ impl Codec {
         match self {
             Self::Pcm16 => "PCM".into(),
             Self::Adpcm => "IMA ADPCM".into(),
+            Self::Vorbis => "Vorbis".into(),
             Self::Other(c) => format!("codec {c}"),
         }
     }
@@ -87,6 +101,8 @@ pub struct Sound {
     pub codec: Codec,
     /// Channel index inside a multi-channel stream.
     pub channel: Option<usize>,
+    /// Vorbis: where its three headers are (offset and size in the data).
+    pub headers: Option<(usize, usize)>,
 }
 
 impl Sound {
@@ -130,7 +146,16 @@ fn u64_at(d: &[u8], o: usize) -> Result<u64, AwcError> {
 impl Awc {
     /// Parses a container. `decrypt` decrypts a buffer with the AWC key
     /// (`None`: no key available).
-    pub fn parse(mut data: Vec<u8>, decrypt: Option<Decrypt>) -> Result<Self, AwcError> {
+    pub fn parse(data: Vec<u8>, decrypt: Option<Decrypt>) -> Result<Self, AwcError> {
+        Self::parse_for(data, decrypt, false)
+    }
+
+    /// Parses a Red Dead Redemption 2 container: never encrypted, whatever its flags say.
+    pub fn parse_rdr2(data: Vec<u8>) -> Result<Self, AwcError> {
+        Self::parse_for(data, None, true)
+    }
+
+    fn parse_for(mut data: Vec<u8>, decrypt: Option<Decrypt>, rdr2: bool) -> Result<Self, AwcError> {
         let mut encrypted = false;
         if u32_at(&data, 0)? != MAGIC {
             let decrypt = decrypt.ok_or(AwcError::NoKey)?;
@@ -174,12 +199,15 @@ impl Awc {
             streams.push((id, chunks));
         }
 
+        // RDR2's containers are not encrypted; their flag bits mean other things.
+        let rdr2 = rdr2
+            || streams.iter().flat_map(|(_, c)| c).any(|c| matches!(c.kind, CHUNK_FORMAT_RDR2 | CHUNK_VORBIS_HEADERS));
         let mut awc = Awc { data, flags, streams, sounds: Vec::new(), stream_format: None, encrypted };
         if flags & 4 != 0 {
             awc.read_stream_format()?;
         } else {
             awc.read_formats()?;
-            if flags & 2 != 0 {
+            if flags & 2 != 0 && !rdr2 {
                 let decrypt = decrypt.ok_or(AwcError::NoKey)?;
                 for (_, chunks) in &awc.streams {
                     for c in chunks.iter().filter(|c| c.kind == CHUNK_DATA) {
@@ -188,7 +216,7 @@ impl Awc {
                 }
             }
         }
-        if flags & 4 != 0 && flags & 8 != 0 {
+        if flags & 4 != 0 && flags & 8 != 0 && !rdr2 {
             let decrypt = decrypt.ok_or(AwcError::NoKey)?;
             let (Some(format), Some(chunk)) = (&awc.stream_format, awc.chunk(0, CHUNK_DATA).cloned()) else {
                 return Err(damaged("stream without data"));
@@ -210,6 +238,31 @@ impl Awc {
 
     fn read_formats(&mut self) -> Result<(), AwcError> {
         for (i, (id, _)) in self.streams.iter().enumerate() {
+            if let Some(f) = self.chunk(i, CHUNK_FORMAT_RDR2) {
+                // Samples, loop start, rate, headroom, …, codec at 28, header
+                // size at 30, then the Vorbis headers.
+                let d = &self.data[f.offset..f.offset + f.size];
+                if d.len() < 32 {
+                    return Err(damaged("short format chunk"));
+                }
+                let header_size = u16_at(d, 30)? as usize;
+                // Without headers of its own, a Vorbis sound has them in a
+                // headers chunk of the same stream.
+                let headers = if header_size > 0 {
+                    Some((f.offset + 32, header_size.min(f.size - 32)))
+                } else {
+                    self.chunk(i, CHUNK_VORBIS_HEADERS).map(|c| (c.offset, c.size))
+                };
+                self.sounds.push(Sound {
+                    id: *id,
+                    samples: u32_at(d, 0)?,
+                    sample_rate: u16_at(d, 8)? as u32,
+                    codec: Codec::from_byte(d[28]),
+                    channel: None,
+                    headers,
+                });
+                continue;
+            }
             let Some(f) = self.chunk(i, CHUNK_FORMAT) else { continue };
             let d = &self.data[f.offset..f.offset + f.size];
             if d.len() < 20 {
@@ -221,6 +274,7 @@ impl Awc {
                 sample_rate: u16_at(d, 8)? as u32,
                 codec: Codec::from_byte(d[19]),
                 channel: None,
+                headers: None,
             });
         }
         Ok(())
@@ -239,12 +293,21 @@ impl Awc {
         }
         for c in 0..channels {
             let o = 12 + c * 16;
+            let id = u32_at(d, o)?;
+            // RDR2: the channel's Vorbis headers are in a stream with its id.
+            let headers = self
+                .streams
+                .iter()
+                .find(|(sid, _)| *sid == id & 0x1FFF_FFFF)
+                .and_then(|(_, chunks)| chunks.iter().find(|ch| ch.kind == CHUNK_VORBIS_HEADERS))
+                .map(|ch| (ch.offset, ch.size));
             self.sounds.push(Sound {
-                id: u32_at(d, o)?,
+                id,
                 samples: u32_at(d, o + 4)?,
                 sample_rate: u16_at(d, o + 10)? as u32,
                 codec: Codec::from_byte(*d.get(o + 12).ok_or_else(|| damaged("truncated"))?),
                 channel: Some(c),
+                headers,
             });
         }
         self.stream_format = Some(StreamFormat { block_count, block_size, channels });
@@ -401,10 +464,56 @@ fn decode_mpeg_frames(data: &[u8]) -> Result<Vec<i16>, AwcError> {
     Ok(out)
 }
 
-fn decode_codec(codec: Codec, data: &[u8], samples: usize) -> Result<Vec<i16>, AwcError> {
-    let mut out = match codec {
+/// The three Vorbis header packets, each after a 32-bit length.
+fn vorbis_headers(d: &[u8]) -> Result<[&[u8]; 3], AwcError> {
+    let mut at = 0;
+    let mut packets = [&d[..0]; 3];
+    for p in &mut packets {
+        let len = u32_at(d, at)? as usize;
+        *p = d.get(at + 4..at + 4 + len).ok_or_else(|| damaged("Vorbis header outside its chunk"))?;
+        at += 4 + len;
+    }
+    Ok(packets)
+}
+
+/// Decodes Vorbis packets (16-bit length each) stored in 2048-byte units;
+/// returns the first channel's samples.
+pub fn decode_vorbis(headers: &[u8], data: &[u8]) -> Result<Vec<i16>, AwcError> {
+    use lewton::audio::{PreviousWindowRight, read_audio_packet};
+    use lewton::header::{read_header_ident, read_header_setup};
+    let [ident, _comment, setup] = vorbis_headers(headers)?;
+    let ident = read_header_ident(ident).map_err(|e| damaged(format!("Vorbis ident header: {e:?}")))?;
+    let setup = read_header_setup(setup, ident.audio_channels, (ident.blocksize_0, ident.blocksize_1))
+        .map_err(|e| damaged(format!("Vorbis setup header: {e:?}")))?;
+    let mut window = PreviousWindowRight::new();
+    let mut out = Vec::new();
+    for unit in data.chunks(2048) {
+        let mut at = 0;
+        while at + 2 <= unit.len() {
+            let len = u16::from_le_bytes([unit[at], unit[at + 1]]) as usize;
+            if len == 0 || len == 0xFFFF || at + 2 + len > unit.len() {
+                break;
+            }
+            let packet = &unit[at + 2..at + 2 + len];
+            at += 2 + len;
+            let pcm = read_audio_packet(&ident, &setup, packet, &mut window)
+                .map_err(|e| damaged(format!("Vorbis packet: {e:?}")))?;
+            if let Some(first) = pcm.first() {
+                out.extend_from_slice(first);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn decode_codec(sound: &Sound, all: &[u8], data: &[u8], samples: usize) -> Result<Vec<i16>, AwcError> {
+    let mut out = match sound.codec {
         Codec::Pcm16 => data.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect(),
         Codec::Adpcm => decode_adpcm(data, samples),
+        Codec::Vorbis => {
+            let (at, len) = sound.headers.ok_or_else(|| damaged("Vorbis sound without headers"))?;
+            decode_vorbis(all.get(at..at + len).ok_or_else(|| damaged("Vorbis headers outside the file"))?, data)?
+        }
         Codec::Other(7) => decode_mp3(data)?,
         Codec::Other(c) => return Err(damaged(format!("unsupported codec {c}"))),
     };
@@ -425,13 +534,30 @@ impl Awc {
         let stream = self.streams.iter().position(|(id, _)| *id == sound.id).ok_or_else(|| damaged("no stream"))?;
         let chunk = self.chunk(stream, CHUNK_DATA).ok_or_else(|| damaged("sound without data"))?;
         let data = &self.data[chunk.offset..chunk.offset + chunk.size];
-        let samples = decode_codec(sound.codec, data, sound.samples as usize)?;
+        let samples = decode_codec(sound, &self.data, data, sound.samples as usize)?;
         Ok(Pcm { sample_rate: sound.sample_rate, channels: 1, samples })
     }
 
     /// The data of each channel of a multi-channel stream: per block the bytes
     /// and the number of samples the block contributes.
     fn stream_channels(&self) -> Result<StreamBlocks<'_>, AwcError> {
+        // GTA V (and RDR2's Vorbis streams) describe each channel of a block
+        // in 24 bytes; RDR2's PCM/ADPCM streams in 16 (no MPEG fields).
+        // The right layout adds up to the first channel's sample count.
+        let expected = self.sounds.first().map_or(0, |s| s.samples as i64);
+        let miss = |blocks: &StreamBlocks<'_>| -> i64 {
+            let total: i64 = blocks.first().map_or(0, |b| b.iter().map(|(_, skip, n)| *n as i64 - *skip as i64).sum());
+            (total - expected).abs()
+        };
+        match (self.stream_channels_with(24), self.stream_channels_with(16)) {
+            (Ok(a), Ok(b)) => Ok(if miss(&b) < miss(&a) { b } else { a }),
+            (Ok(a), Err(_)) => Ok(a),
+            (Err(_), Ok(b)) => Ok(b),
+            (Err(e), Err(_)) => Err(e),
+        }
+    }
+
+    fn stream_channels_with(&self, info_size: usize) -> Result<StreamBlocks<'_>, AwcError> {
         let format = self.stream_format.as_ref().ok_or_else(|| damaged("not a stream"))?;
         let chunk = self.chunk(0, CHUNK_DATA).ok_or_else(|| damaged("stream without data"))?;
         let mut channels = vec![Vec::new(); format.channels];
@@ -445,15 +571,15 @@ impl Awc {
             // channels' data from the next 2048-byte boundary.
             let mut infos = Vec::with_capacity(format.channels);
             for c in 0..format.channels {
-                let o = c * 24;
+                let o = c * info_size;
                 infos.push((
                     u32_at(d, o + 4)? as usize,
                     u32_at(d, o + 8)? as usize,
                     u32_at(d, o + 12)? as usize,
-                    u32_at(d, o + 20)? as usize,
+                    if info_size >= 24 { u32_at(d, o + 20)? as usize } else { 0 },
                 ));
             }
-            let mut pos = format.channels * 24 + infos.iter().map(|(entries, ..)| entries * 4).sum::<usize>();
+            let mut pos = format.channels * info_size + infos.iter().map(|(entries, ..)| entries * 4).sum::<usize>();
             pos = pos.div_ceil(0x800) * 0x800;
             for (c, (entries, skip, samples, bytes)) in infos.into_iter().enumerate() {
                 // MPEG channels give their size in bytes and follow each other
@@ -485,7 +611,8 @@ impl Awc {
         for (blocks, sound) in channels.iter().zip(&self.sounds) {
             let mut out = Vec::with_capacity(sound.samples as usize);
             for (b, (data, skip, samples)) in blocks.iter().enumerate() {
-                let mut pcm = decode_codec(sound.codec, data, 0).map_err(|e| {
+                let limit = if sound.codec == Codec::Adpcm { *samples } else { 0 };
+                let mut pcm = decode_codec(sound, &self.data, data, limit).map_err(|e| {
                     let head: Vec<String> = data.iter().take(8).map(|x| format!("{x:02x}")).collect();
                     damaged(format!(
                         "channel {} block {b} ({} bytes: {}): {e}",
@@ -560,6 +687,49 @@ mod tests {
         assert_eq!(&wav[0..4], b"RIFF");
         assert_eq!(wav.len(), 44 + 8);
         assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 22050);
+    }
+
+    /// The same sound in RDR2's layout: a 32-byte `0x76` format chunk
+    /// (codec at 28) and the encryption flag bit that RDR2 uses otherwise.
+    #[test]
+    fn parses_rdr2_format_chunk() {
+        let samples: [i16; 3] = [5, -5, 300];
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0xFF02u16.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(0x77u32 | (2 << 29)).to_le_bytes());
+        let format_at = 16 + 4 + 16;
+        let data_at = format_at + 32;
+        let chunk =
+            |kind: u8, size: usize, offset: usize| ((kind as u64) << 56) | ((size as u64) << 28) | offset as u64;
+        out.extend_from_slice(&chunk(CHUNK_FORMAT_RDR2, 32, format_at).to_le_bytes());
+        out.extend_from_slice(&chunk(CHUNK_DATA, data.len(), data_at).to_le_bytes());
+        let mut format = vec![0u8; 32];
+        format[0..4].copy_from_slice(&3u32.to_le_bytes());
+        format[8..10].copy_from_slice(&32000u16.to_le_bytes());
+        format[28] = 0; // PCM; 8 would be Vorbis with headers after byte 32
+        out.extend_from_slice(&format);
+        out.extend_from_slice(&data);
+        let awc = Awc::parse(out, None).unwrap();
+        assert_eq!(awc.sounds[0].sample_rate, 32000);
+        assert_eq!(awc.sounds[0].codec, Codec::Pcm16);
+        assert_eq!(awc.decode_sound(0).unwrap().samples, vec![5, -5, 300]);
+    }
+
+    #[test]
+    fn vorbis_header_packets() {
+        let mut d = Vec::new();
+        for p in [&b"\x01vorbis"[..], b"\x03vorbis", b"\x05vorbis!"] {
+            d.extend_from_slice(&(p.len() as u32).to_le_bytes());
+            d.extend_from_slice(p);
+        }
+        let [a, b, c] = vorbis_headers(&d).unwrap();
+        assert_eq!((a.len(), b.len(), c.len()), (7, 7, 8));
+        assert!(vorbis_headers(&d[..10]).is_err());
     }
 
     #[test]

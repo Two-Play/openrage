@@ -3094,8 +3094,11 @@ fn save_png_image(img: &slint::Image, name: String, main: Weak<AppWindow>) {
 
 /// Selecting an `.awc`: its sounds as a list (click one to play it).
 fn show_audio_container(ui: &AppWindow, vpath: String, mut info: Meta) {
-    let keys = with_app(|a| a.keys.clone());
-    match read_file(ui, &vpath).and_then(|d| openrage_app::audio::parse(d, keys.as_deref())) {
+    let (keys, rdr2) = with_app(|a| (a.keys.clone(), a.game_dir.as_deref().is_some_and(is_rdr2_dir)));
+    let parse = |d: Vec<u8>| -> anyhow::Result<rage_formats::awc::Awc> {
+        if rdr2 { Ok(rage_formats::awc::Awc::parse_rdr2(d)?) } else { openrage_app::audio::parse(d, keys.as_deref()) }
+    };
+    match read_file(ui, &vpath).and_then(parse) {
         Ok(awc) => {
             let (names, rows): (Vec<String>, Vec<ClipRow>) = match &awc.stream_format {
                 Some(f) => {
@@ -3249,6 +3252,11 @@ fn read_file(ui: &AppWindow, vpath: &str) -> anyhow::Result<Vec<u8>> {
     match rage_mods::resolve(&game_dir, vpath, keys)?.0 {
         Node::ArchiveFile(rpf, id) => Ok(rpf.read(id)?),
         Node::PlainFile(p) => Ok(std::fs::read(p)?),
+        Node::Rpf8File(rpf, i) => {
+            let entry =
+                rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| anyhow::anyhow!("archive table not readable"))?;
+            Ok(rpf.read(entry)?)
+        }
         _ => anyhow::bail!("{vpath} is not a file"),
     }
 }
