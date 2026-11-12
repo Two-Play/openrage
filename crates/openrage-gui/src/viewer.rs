@@ -370,7 +370,11 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
                 win.set_anim_clips(ModelRc::new(VecModel::from(rows)));
                 win.set_anim_dictionary(name.into());
                 win.set_anim_clip(-1);
-                win.set_anim_status(format!("{} clips · {}", dict.clips.len(), vpath).into());
+                // RDR2 dictionaries: one channel kind is not decoded yet and
+                // is interpolated between values every 64 frames.
+                let rdr2 = dict.animations.iter().any(|a| a.flags != 0);
+                let note = if rdr2 { " · RDR2: some motion is approximated" } else { "" };
+                win.set_anim_status(format!("{} clips · {vpath}{note}", dict.clips.len()).into());
                 s.borrow_mut().anim = Some(AnimState {
                     dict: Arc::new(dict),
                     clip: None,
@@ -406,12 +410,14 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
             a.time = 0.0;
             a.playing = true;
             a.last = Instant::now();
+            let rdr2 = a.dict.animations.iter().any(|x| x.flags != 0);
             if let Some(win) = w.upgrade() {
                 win.set_anim_clip(i);
                 if moved == 0 {
                     win.set_anim_status("This clip animates none of the model's bones (different skeleton).".into());
                 } else {
-                    win.set_anim_status(format!("{moved} bones animated").into());
+                    let note = if rdr2 { " · RDR2: some motion is approximated" } else { "" };
+                    win.set_anim_status(format!("{moved} bones animated{note}").into());
                 }
             }
         }
@@ -519,7 +525,13 @@ fn render(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>) {
 
 fn anim_search(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>, text: &str) {
     let Some(win) = w.upgrade() else { return };
-    let found = crate::find_files(text, ".ycd", 200);
+    // A full path (from "Copy path") opens directly: RDR2 has no search index.
+    let text = text.trim();
+    let found = if text.contains('/') && text.to_ascii_lowercase().ends_with(".ycd") {
+        vec![text.to_owned()]
+    } else {
+        crate::find_files(text, ".ycd", 200)
+    };
     let rows: Vec<ClipRow> = found
         .iter()
         .map(|v| {

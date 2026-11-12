@@ -163,7 +163,7 @@ name = "Red Dead Redemption 2"
 archives_status = "ok"
 archives = "RPF8 read: decryption with keys from your own game, Oodle decompression, browsing and extracting in the GUI"
 formats_status = "partial"
-formats = "textures, models (viewer, glTF export), texts, metadata and audio (read-only)"
+formats = "textures, models (viewer, glTF export), texts, metadata, audio and animations (read-only)"
 
 [[extra.games]]
 name = "GTA VI"
@@ -243,7 +243,7 @@ edge = "openrage"
 [[extra.compare]]
 feature = "Other games"
 openiv = "GTA IV, EFLC, Max Payne 3"
-openrage = "RDR2 archives, textures, models, texts, metadata and audio; GTA VI as soon as it is on PC; GTA IV planned"
+openrage = "RDR2 archives, textures, models, texts, metadata, audio and animations; GTA VI as soon as it is on PC; GTA IV planned"
 edge = "openiv"
 
 [[extra.compare]]

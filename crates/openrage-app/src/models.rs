@@ -677,8 +677,23 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
 fn fit_to_skeleton(drawables: &mut [(String, Drawable)], skeleton: &drawable::Skeleton) {
     for (_, d) in drawables.iter_mut() {
         if let Some(own) = &d.skeleton {
-            let map: Vec<u16> =
-                own.bones.iter().enumerate().map(|(i, b)| skeleton.find_tag(b.tag).unwrap_or(i) as u16).collect();
+            // A bone the main skeleton lacks (RDR2's facial bones) follows its
+            // nearest ancestor that it has, else the head.
+            let head = skeleton.find_name("SKEL_Head");
+            let map: Vec<u16> = (0..own.bones.len())
+                .map(|i| {
+                    let mut b = Some(i);
+                    let mut guard = 0;
+                    while let Some(k) = b.filter(|_| guard < 512) {
+                        if let Some(m) = skeleton.find_tag(own.bones[k].tag) {
+                            return m as u16;
+                        }
+                        b = usize::try_from(own.bones[k].parent).ok().filter(|&p| p < own.bones.len());
+                        guard += 1;
+                    }
+                    head.unwrap_or(i) as u16
+                })
+                .collect();
             if map.iter().enumerate().any(|(i, &m)| i as u16 != m) {
                 for mesh in &mut d.meshes {
                     for b in &mut mesh.bone_indices {
@@ -939,7 +954,18 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
     } else {
         bail!("{name}: only .ydr, .ydd and .yft models of Red Dead Redemption 2 can be shown so far");
     };
-    let layout = if drawables.len() > 1 { grid_layout(&drawables) } else { vec![math::IDENTITY] };
+    // A ped's parts (".ydd" of a metaped) are bound to its base skeleton,
+    // kept in a fragment of its own; they then stand on one spot.
+    let mut drawables = drawables;
+    let base = (lower.ends_with(".ydd")).then(|| rdr2_base_skeleton(rpf, &stem)).flatten();
+    if let Some(sk) = &base {
+        fit_to_skeleton(&mut drawables, sk);
+    }
+    let layout = if drawables.len() > 1 && base.is_none() {
+        grid_layout(&drawables)
+    } else {
+        vec![math::IDENTITY; drawables.len()]
+    };
     let parts = drawables
         .iter()
         .enumerate()
@@ -1021,7 +1047,7 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
             }
         }
     }
-    let skeleton = drawables.iter().find_map(|(_, d)| d.skeleton.clone());
+    let skeleton = base.or_else(|| drawables.iter().find_map(|(_, d)| d.skeleton.clone()));
     let mut model = LoadedModel {
         drawables,
         parts,
@@ -1033,6 +1059,34 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
     };
     model.collect_materials();
     Ok(model)
+}
+
+/// Where RDR2 keeps the peds' base skeletons (`meta_base_<ped>.yft`).
+const RDR2_BASE_SKELETONS: &str = "packs_0.rpf/packs/base/models/metaped_fragments.rpf";
+
+/// The base skeleton of an RDR2 ped part: `a_c_cow_merge_4` → `meta_base_cow`,
+/// `a_c_bear_01_merge_2` → `meta_base_bear_01` (the longest name that exists,
+/// with or without the `a_c_`/`cs_` prefix).
+fn rdr2_base_skeleton(rpf: &rage_rpf::Rpf8, stem: &str) -> Option<drawable::Skeleton> {
+    let game = crate::rdr2::game_folder(rpf.path())?;
+    let (Node::Rpf8Dir(frags, _), _) = rage_mods::resolve(&game, RDR2_BASE_SKELETONS, None).ok()? else {
+        return None;
+    };
+    let lower = stem.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower.split('_').collect();
+    let starts = [0usize, 1, 2].into_iter().filter(|&s| s < tokens.len());
+    for start in starts {
+        for end in (start + 1..=tokens.len()).rev() {
+            let name = format!("meta_base_{}.yft", tokens[start..end].join("_"));
+            let Some(i) = frags.find(&name) else { continue };
+            let entry = frags.entries()?.get(i)?.clone();
+            let skeleton = drawable::parse_fragment_rdr2(&frags.read_resource(&entry).ok()?).ok()?.drawable.skeleton;
+            if skeleton.as_ref().is_some_and(|s| s.bones.iter().any(|b| b.name.eq_ignore_ascii_case("SKEL_ROOT"))) {
+                return skeleton;
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
