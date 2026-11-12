@@ -560,6 +560,33 @@ fn load_inner(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
             external.push((c, dict));
         }
     }
+    if lower.ends_with(".yft") {
+        // Vehicles from DLC packs have no vehshare.ytd beside them: use the game's own.
+        let mut shared = Vec::new();
+        if !external.iter().any(|(n, _)| n == "vehshare.ytd") {
+            shared.push("vehshare.ytd".to_owned());
+        }
+        // Interiors come from shared dictionaries named after the texture
+        // (supergt_interior → vehicles_supergt_interior.ytd).
+        for d in drawables.iter().map(|(_, d)| d) {
+            for t in d.shaders.iter().filter_map(|s| s.base_texture()) {
+                let t = t.to_ascii_lowercase();
+                let dict = format!("vehicles_{t}.ytd");
+                if t.ends_with("_interior") && !shared.contains(&dict) {
+                    shared.push(dict);
+                }
+            }
+        }
+        for name in shared {
+            let local = rpf
+                .find_child(dir, &name)
+                .and_then(|tid| rpf.read_resource(tid).ok())
+                .and_then(|r| rage_formats::ytd::parse(&r).ok());
+            if let Some(dict) = local.or_else(|| base_vehicle_textures(game_dir, keys.clone(), &name)) {
+                external.push((name, dict));
+            }
+        }
+    }
     // Peds keep their skeleton in a fragment next to the drawable dictionary.
     let skeleton = drawables.iter().find_map(|(_, d)| d.skeleton.clone()).or_else(|| {
         let tid = rpf.find_child(dir, &format!("{stem}.yft"))?;
@@ -569,6 +596,13 @@ fn load_inner(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         LoadedModel { drawables, parts, external, materials: Vec::new(), shader_material: Vec::new(), skeleton };
     model.collect_materials();
     Ok(model)
+}
+
+/// A texture dictionary from the base game's vehicle archive (shared by many vehicles).
+fn base_vehicle_textures(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, name: &str) -> Option<TextureDictionary> {
+    let path = format!("x64e.rpf/levels/gta5/vehicles.rpf/{name}");
+    let (Node::ArchiveFile(rpf, id), _) = rage_mods::resolve(game_dir, &path, keys).ok()? else { return None };
+    rage_formats::ytd::parse(&rpf.read_resource(id).ok()?).ok()
 }
 
 /// Like [`grid_layout`], but every drawable is scaled to the same size: for
