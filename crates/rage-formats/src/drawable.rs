@@ -54,6 +54,10 @@ pub struct Mesh {
     /// their weights; empty for meshes that are not skinned.
     pub bone_indices: Vec<[u16; 4]>,
     pub bone_weights: Vec<[f32; 4]>,
+    /// RDR2 ped parts: the bone tags the blend indices stand for (index `i`
+    /// is the bone tagged `bone_tags[i]` of the skeleton the part is worn
+    /// on); empty when the indices are skeleton indices already.
+    pub bone_tags: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -560,12 +564,26 @@ fn read_models(
         let geoms = res.u64(model + 0x08)?;
         let gcount = res.u16(model + 0x10)? as u64;
         let mapping = res.u64(model + 0x20)?;
-        let binding = res.u32(model + 0x28)?;
+        // RDR2 keeps a pointer at 0x28 (the bone tags of a part without a
+        // skeleton of its own) and the binding at 0x30.
+        let rdr2 = layout_gen == Gen::Rdr2;
+        let binding = res.u32(model + if rdr2 { 0x30 } else { 0x28 })?;
         let skinned = (binding >> 8) & 0xFF != 0;
         let bone = (!skinned && binding >> 24 != 0).then_some((binding >> 24) as usize);
+        let tags: Vec<u16> = match (rdr2 && skinned).then(|| res.u64(model + 0x28)).transpose()? {
+            Some(table) if (0x5000_0000..0x7000_0000).contains(&table) => {
+                (0..(binding & 0xFF) as u64).map(|k| res.u16(table + k * 2)).collect::<Result<_, _>>()?
+            }
+            _ => Vec::new(),
+        };
         for i in 0..gcount {
-            let mut mesh = read_geometry(res, res.u64(geoms + i * 8)?, layout_gen)?;
+            let g = res.u64(geoms + i * 8)?;
+            let mut mesh = read_geometry(res, g, layout_gen)?;
             mesh.shader = if mapping != 0 { res.u16(mapping + i * 2)? } else { 0 };
+            // Without a bone table of its own the geometry's indices point into the model's tags.
+            if !tags.is_empty() && !mesh.bone_indices.is_empty() && res.u64(g + 0x18)? == 0 {
+                mesh.bone_tags = tags.clone();
+            }
             out.push((mesh, bone));
         }
     }

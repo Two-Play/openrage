@@ -2973,6 +2973,10 @@ export component ViewerWindow inherits Window {
     in property <bool> fly-mode;
     in property <[PartRow]> parts;
     in property <[MaterialRow]> materials;
+    // RDR2 peds: the outfits to choose from (empty for other models).
+    in property <[string]> outfits;
+    in-out property <int> outfit-index;
+    in property <string> outfit-status;
     // Animation: whether the model can be animated, dictionaries found by the
     // search, the opened dictionary's clips and the player state.
     in property <bool> has-skeleton;
@@ -3005,6 +3009,7 @@ export component ViewerWindow inherits Window {
     callback focus-lost();
     callback part-toggled(int, bool);
     callback all-parts(bool);
+    callback outfit-selected(int);
     callback material-visible(int, bool);
     callback material-color(int, color);
     callback material-hex(int, string);
@@ -3199,6 +3204,26 @@ export component ViewerWindow inherits Window {
                             VerticalLayout {
                                 padding: Theme.space-m;
                                 spacing: Theme.space-s;
+                                if root.outfits.length > 0: HorizontalLayout {
+                                    spacing: Theme.space-s;
+                                    Text {
+                                        text: @tr("Outfit");
+                                        vertical-alignment: center;
+                                        color: Theme.text-muted;
+                                    }
+                                    ComboBox {
+                                        horizontal-stretch: 1;
+                                        model: root.outfits;
+                                        current-index <=> root.outfit-index;
+                                        selected => { root.outfit-selected(self.current-index); }
+                                    }
+                                }
+                                if root.outfit-status != "": Text {
+                                    text: root.outfit-status;
+                                    wrap: word-wrap;
+                                    font-size: Theme.font-small;
+                                    color: Theme.text-muted;
+                                }
                                 HorizontalLayout {
                                     spacing: Theme.space-s;
                                     alignment: end;

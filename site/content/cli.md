@@ -57,6 +57,8 @@ openrage rpf8 --anims <RDR2>/anim_0.rpf       # read every RDR2 clip dictionary
 openrage --game <RDR2> rdr2-ped                # list the RDR2 peds (people and animals) with their base skeletons
 openrage --game <RDR2> rdr2-ped cs_johnmarston # a ped's outfits: model, textures, palette of every part (--outfit N)
 openrage --game <RDR2> rdr2-ped --check        # resolve every part of every ped
+openrage --game <RDR2> rdr2-ped --check --load # … and put every ped together as the viewer does
+openrage --game <RDR2> model …/metapeds.rpf/cs_johnmarston.ymt --outfit 5 --render john.png   # a ped from its parts
 openrage world --radius 40 -- 350 4870 -60     # map objects near a point (builds the world cache)
 ```
 

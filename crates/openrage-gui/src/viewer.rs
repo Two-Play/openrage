@@ -81,6 +81,8 @@ struct State {
     fast: bool,
     timer: slint::Timer,
     last_tick: Instant,
+    /// Waits for an outfit loading in the background.
+    outfit_timer: slint::Timer,
 }
 
 impl State {
@@ -163,6 +165,11 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
     };
     if let Content::Model(m) = &content {
         refresh_lists(&win, m, &entries);
+        if let Some(p) = &m.loaded.ped {
+            let names: Vec<slint::SharedString> = (0..p.outfits).map(|k| slint::format!("Outfit {k}")).collect();
+            win.set_outfits(ModelRc::new(VecModel::from(names)));
+            win.set_outfit_index(p.outfit as i32);
+        }
     }
     let has_skeleton = matches!(&content, Content::Model(m) if m.loaded.skeleton.is_some());
     win.set_has_skeleton(has_skeleton);
@@ -178,6 +185,7 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         fast: false,
         timer: slint::Timer::default(),
         last_tick: Instant::now(),
+        outfit_timer: slint::Timer::default(),
     }));
 
     let (w, s) = (win.as_weak(), Rc::clone(&state));
@@ -287,6 +295,8 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         change_look(&s.borrow(), |look| look.parts.iter_mut().for_each(|v| *v = on));
         look_changed(&w, &s, &main);
     });
+    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    win.on_outfit_selected(move |n| change_outfit(&w, &s, n));
     let (w, s) = (win.as_weak(), Rc::clone(&state));
     let main = ui.as_weak();
     win.on_material_visible(move |i, on| {
@@ -500,6 +510,47 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         render(&win.as_weak(), &state);
         OPEN.with(|o| o.borrow_mut().push((id, win)));
     }
+}
+
+/// Loads another outfit of an RDR2 ped in the background and shows it in
+/// place of the current one (camera and animation stay).
+fn change_outfit(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>, outfit: i32) {
+    let Some(ped) = state.borrow().model().and_then(|m| m.loaded.ped.clone()) else { return };
+    let Some(game) = crate::game_dir() else { return };
+    if let Some(win) = w.upgrade() {
+        win.set_outfit_status(format!("Loading outfit {outfit} …").into());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(openrage_app::models::load_rdr2_ped(&game, &ped.name, outfit.max(0) as usize));
+    });
+    // Poll for the result on the UI thread (the state is not Send).
+    let (w, s) = (w.clone(), Rc::clone(state));
+    state.borrow().outfit_timer.start(slint::TimerMode::Repeated, Duration::from_millis(50), move || {
+        let Ok(result) = rx.try_recv() else { return };
+        s.borrow().outfit_timer.stop();
+        let Some(win) = w.upgrade() else { return };
+        match result {
+            Ok(loaded) => {
+                let preview = Arc::new(crate::model_preview(loaded));
+                let entries = part_entries(&preview.loaded);
+                refresh_lists(&win, &preview, &entries);
+                let clip = {
+                    let mut st = s.borrow_mut();
+                    st.entries = entries;
+                    st.content = Content::Model(preview);
+                    st.anim.as_ref().and_then(|a| a.clip)
+                };
+                win.set_outfit_status("".into());
+                // The new parts need the clip bound to them again.
+                if let Some(c) = clip {
+                    win.invoke_anim_select(c as i32);
+                }
+                render(&w, &s);
+            }
+            Err(e) => win.set_outfit_status(format!("Cannot load outfit {outfit}: {e:#}").into()),
+        }
+    });
 }
 
 /// Drops a closed window (later, not from inside its own callback).
