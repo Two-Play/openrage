@@ -218,7 +218,7 @@ h3 { font-size: 1.15rem; margin: 0 0 0.35rem; }
   line-height: 1.08;
   letter-spacing: -0.025em;
   margin: 0 auto 1rem;
-  max-width: 16ch;
+  max-width: 24ch;
   text-wrap: balance;
 }
 .hero h1 strong {
