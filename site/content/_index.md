@@ -19,7 +19,7 @@ It contains **no game files and no encryption keys**: keys are taken from your o
 features_title = "Highlights"
 features_intro = "What OpenRAGE can open, show and change today."
 screenshots_title = "Screenshots"
-screenshots_intro = "The screenshots show OpenRAGE displaying files from the author's own copy of the game."
+screenshots_intro = "Click a picture to enlarge it. The screenshots show files from the author's own copy of the game."
 games_title = "Supported games"
 games_intro = "GTA V comes first; Red Dead Redemption 2 archives and textures work, GTA IV is planned."
 details_summary = "Checked against the whole game"
@@ -96,33 +96,47 @@ width = 1155
 height = 798
 alt = "Viewer window with a car painted blue and its list of materials"
 title = "Model viewer"
-caption = "materials, paint, parts and animations"
+caption = "materials, paint, parts, glTF export"
+
+[[extra.screenshots]]
+image = "animation.png"
+width = 1155
+height = 798
+alt = "A pedestrian model playing a walking animation in the viewer"
+title = "Animations"
+caption = "clips play on skinned models"
+
+[[extra.screenshots]]
+image = "collision.png"
+width = 1155
+height = 798
+alt = "Collision mesh of a downtown skyscraper, coloured by material"
+title = "Collisions"
+caption = "coloured by material, in 3D"
+
+[[extra.screenshots]]
+image = "search.png"
+width = 1512
+height = 945
+alt = "Search for the hash 0xB779A091 finding the Adder car files"
+title = "Search"
+caption = "names, hashes and text of the whole game"
 
 [[extra.screenshots]]
 image = "metadata.png"
-width = 1512
-height = 945
-alt = "Archetype file of a map shown as XML in the preview"
-title = "Metadata as XML"
-caption = "maps, archetypes, cutscenes, …"
+width = 1155
+height = 756
+alt = "Map placement file shown as a structure tree with its values"
+title = "Metadata"
+caption = "maps, archetypes, cutscenes as XML"
 
 [[extra.screenshots]]
 image = "text-table.png"
-width = 1512
-height = 945
-alt = "Game text table shown as OpenIV oxt text"
+width = 1029
+height = 798
+alt = "Game text table shown as OpenIV oxt text in the editor"
 title = "Game text"
 caption = "`.gxt2` as editable `.oxt`"
-
-[[extra.screenshots]]
-image = "explorer-dark.png"
-dark = "explorer-light.png"
-width = 1512
-height = 945
-alt = "OpenRAGE explorer in dark mode"
-dark_alt = "OpenRAGE explorer in light mode"
-title = "Light and dark mode"
-caption = "follows the system or your choice"
 
 # ---------------------------------------------------------- Supported games
 # Status: ok, partial, planned or none.

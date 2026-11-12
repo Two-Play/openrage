@@ -277,8 +277,8 @@ section.alt { background: var(--bg-alt); border-block: 1px solid var(--border); 
 
 .gallery {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
-  gap: 1.5rem;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+  gap: 1rem 1.1rem;
   margin: 0;
 }
 .gallery figure { margin: 0; }
@@ -287,7 +287,7 @@ section.alt { background: var(--bg-alt); border-block: 1px solid var(--border); 
   border: 1px solid var(--border);
   box-shadow: var(--shadow);
 }
-.gallery figcaption { margin-top: 0.6rem; font-size: 0.95rem; color: var(--text-muted); }
+.gallery figcaption { margin-top: 0.5rem; font-size: 0.88rem; line-height: 1.4; color: var(--text-muted); }
 .gallery figcaption strong { color: var(--text); }
 
 /* Tables */
