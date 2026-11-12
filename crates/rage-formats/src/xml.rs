@@ -35,8 +35,10 @@ pub struct Writer {
     pub out: String,
     /// Things that could not be read; also written as `<error>` elements.
     pub errors: Vec<String>,
-    /// The output reached [`MAX_OUTPUT`]; nothing more is written.
+    /// The output reached the limit; nothing more is written.
     truncated: bool,
+    /// The most text to write (0: [`MAX_OUTPUT`]).
+    limit: usize,
 }
 
 impl Writer {
@@ -45,6 +47,12 @@ impl Writer {
         w.out.push_str(HEADER);
         w.out.push('\n');
         w
+    }
+
+    /// A writer with another limit than [`MAX_OUTPUT`] (for big files read
+    /// by the application rather than shown).
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit, ..Self::new() }
     }
 
     /// Whether the output is full; callers walking nested data stop then.
@@ -57,9 +65,10 @@ impl Writer {
         if self.truncated {
             return false;
         }
-        if self.out.len() > MAX_OUTPUT {
+        let limit = if self.limit == 0 { MAX_OUTPUT } else { self.limit };
+        if self.out.len() > limit {
             self.truncated = true;
-            let msg = format!("output truncated at {} MB: the data nests too much to show in full", MAX_OUTPUT >> 20);
+            let msg = format!("output truncated at {} MB: the data nests too much to show in full", limit >> 20);
             self.out.push_str("<error>");
             self.out.push_str(&msg);
             self.out.push_str("</error>\n");

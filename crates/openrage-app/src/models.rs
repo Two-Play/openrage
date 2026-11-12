@@ -1163,6 +1163,8 @@ fn load_rdr2_ped_inner(game: &Path, ped: &str, outfit: usize) -> Result<LoadedMo
     // Models: each from its drawable dictionary (merged dictionaries hold several).
     let mut dictionaries: HashMap<crate::rdr2::Location, Vec<(u32, Drawable)>> = HashMap::new();
     let mut drawables: Vec<(String, Drawable)> = Vec::new();
+    // The outfit asset each drawable comes from.
+    let mut owners: Vec<&metaped::Asset> = Vec::new();
     for (k, a) in assets.iter().enumerate() {
         crate::progress::set("Reading the parts", k as u64, assets.len() as u64);
         let Some(at) = index.drawable(a.drawable) else { continue };
@@ -1190,6 +1192,7 @@ fn load_rdr2_ped_inner(game: &Path, ped: &str, outfit: usize) -> Result<LoadedMo
             label
         };
         drawables.push((label, d));
+        owners.push(a);
     }
     if drawables.is_empty() {
         bail!("none of the parts of {ped}'s outfit {chosen} were found");
@@ -1218,6 +1221,8 @@ fn load_rdr2_ped_inner(game: &Path, ped: &str, outfit: usize) -> Result<LoadedMo
         .collect();
     let mut external = Vec::new();
     rdr2_shared_textures(game, &drawables, &mut external, 96);
+    crate::progress::set("Colouring with tint palettes", 0, 0);
+    tint_parts(game, &mut drawables, &owners, &mut external, textures.as_deref());
     let skeleton = base.or_else(|| drawables.iter().find_map(|(_, d)| d.skeleton.clone()));
     let mut model = LoadedModel {
         drawables,
@@ -1231,6 +1236,71 @@ fn load_rdr2_ped_inner(game: &Path, ped: &str, outfit: usize) -> Result<LoadedMo
     };
     model.collect_materials();
     Ok(model)
+}
+
+/// Colours the tinted colour textures of ped parts with their palette rows
+/// ([`crate::tint`]): each becomes a new texture (named after the texture
+/// and its tints) that the part's shaders use instead.
+fn tint_parts(
+    game: &Path,
+    drawables: &mut [(String, Drawable)],
+    owners: &[&crate::metaped::Asset],
+    external: &mut Vec<(String, TextureDictionary)>,
+    index: Option<&crate::rdr2::TextureIndex>,
+) {
+    let tinted = crate::metaped::tinted_albedos(game);
+    let Some(palettes) = crate::metaped::palette_dictionary(game) else { return };
+    let mut baked: Vec<Texture> = Vec::new();
+    for ((_, d), a) in drawables.iter_mut().zip(owners) {
+        let name = index.and_then(|i| i.name_of(a.albedo));
+        if a.palette == 0 || !tinted.is_tinted(a.albedo, name) {
+            continue;
+        }
+        let Some(name) = name else { continue };
+        let Some(palette) = palettes.textures.iter().find(|t| joaat(&t.name.to_ascii_lowercase()) == a.palette) else {
+            continue;
+        };
+        let new_name = format!("{name}+{}_{}_{}", a.tints[0], a.tints[1], a.tints[2]);
+        if !baked.iter().any(|t| t.name == new_name) {
+            let find =
+                |dict: &TextureDictionary| dict.textures.iter().find(|t| t.name.eq_ignore_ascii_case(name)).cloned();
+            let Some(albedo) =
+                d.textures.as_ref().and_then(find).or_else(|| external.iter().find_map(|(_, x)| find(x)))
+            else {
+                continue;
+            };
+            let (Some(rgba), Some(pal)) = (albedo.to_rgba(), palette.to_rgba()) else { continue };
+            let data = crate::tint::bake(&rgba, &pal, palette.width as usize, palette.height as usize, a.tints);
+            baked.push(Texture {
+                name: new_name.clone(),
+                width: albedo.width.max(1),
+                height: albedo.height.max(1),
+                depth: 1,
+                levels: 1,
+                format: rage_formats::texture::Format::R8G8B8A8_UNORM,
+                dimension: albedo.dimension,
+                usage: albedo.usage,
+                data,
+            });
+        }
+        for shader in &mut d.shaders {
+            for t in shader.textures.iter_mut().filter(|t| t.eq_ignore_ascii_case(name)) {
+                *t = new_name.clone();
+            }
+            for (_, t) in shader.samplers.iter_mut().filter(|(_, t)| t.eq_ignore_ascii_case(name)) {
+                *t = new_name.clone();
+            }
+        }
+    }
+    if baked.is_empty() {
+        return;
+    }
+    // A dictionary of their own, shaped like the palettes' one.
+    let mut dict = (*palettes).clone();
+    dict.stored.clear();
+    dict.errors.clear();
+    dict.textures = baked;
+    external.push(("tinted (palettes)".to_owned(), dict));
 }
 
 /// The part of a texture name before its variation (`pant_mf1_061_c3_000_ab`
