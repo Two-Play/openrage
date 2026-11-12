@@ -8,7 +8,12 @@ use anyhow::{Context, Result};
 
 #[derive(Default, Clone)]
 pub struct Config {
+    /// The game opened last.
     pub game_dir: Option<PathBuf>,
+    /// Every game set up so far (GTA V, RDR2, …), to switch between them.
+    pub games: Vec<PathBuf>,
+    /// The game to open at start without asking (`None`: ask when there are several).
+    pub default_game: Option<PathBuf>,
     /// Key blob used during setup, remembered so keys can be re-derived after game updates.
     pub magic_path: Option<PathBuf>,
     /// GUI color scheme: `system`, `light` or `dark`.
@@ -36,6 +41,8 @@ impl Config {
             let v = v.trim();
             match k.trim() {
                 "game_dir" => cfg.game_dir = Some(PathBuf::from(v)),
+                "game" => cfg.games.push(PathBuf::from(v)),
+                "default_game" => cfg.default_game = Some(PathBuf::from(v)),
                 "magic_path" => cfg.magic_path = Some(PathBuf::from(v)),
                 "theme" => cfg.theme = Some(v.to_owned()),
                 "accent" => cfg.accent = Some(v.to_owned()),
@@ -53,6 +60,12 @@ impl Config {
         if let Some(p) = &self.game_dir {
             text.push_str(&format!("game_dir={}\n", p.display()));
         }
+        for g in &self.games {
+            text.push_str(&format!("game={}\n", g.display()));
+        }
+        if let Some(p) = &self.default_game {
+            text.push_str(&format!("default_game={}\n", p.display()));
+        }
         if let Some(p) = &self.magic_path {
             text.push_str(&format!("magic_path={}\n", p.display()));
         }
@@ -67,5 +80,26 @@ impl Config {
         }
         let path = dir.join("settings.conf");
         fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+    }
+}
+
+impl Config {
+    /// Adds a game to the list of games set up (once).
+    pub fn remember_game(&mut self, dir: &std::path::Path) {
+        if !self.games.iter().any(|g| g == dir) {
+            self.games.push(dir.to_path_buf());
+        }
+    }
+
+    /// The games set up so far, including the one opened last (older settings
+    /// only had that), without duplicates.
+    pub fn known_games(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for g in self.game_dir.iter().chain(&self.games) {
+            if !out.contains(g) {
+                out.push(g.clone());
+            }
+        }
+        out
     }
 }

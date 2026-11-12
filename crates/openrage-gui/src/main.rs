@@ -110,7 +110,15 @@ fn main() -> anyhow::Result<()> {
     let ui = AppWindow::new()?;
     let cfg = Config::load();
     let keys = load_keys().unwrap_or(None);
-    let game_dir = cfg.game_dir.clone().filter(|d| detect::is_gta5_dir(d) || is_rdr2_dir(d));
+    // Several games set up and none chosen as default: ask (after the window is up).
+    let known = installed_games(&cfg);
+    let default = cfg.default_game.clone().filter(|d| known.contains(d));
+    let ask = default.is_none() && known.len() > 1;
+    let game_dir = if ask {
+        None
+    } else {
+        default.or_else(|| cfg.game_dir.clone().filter(|d| known.contains(d))).or_else(|| known.first().cloned())
+    };
     let rdr2_ready = game_dir.as_deref().is_some_and(|d| is_rdr2_dir(d) && register_rdr2(d));
 
     APP.with(|a| {
@@ -165,8 +173,11 @@ fn main() -> anyhow::Result<()> {
     }));
     wire_callbacks(&ui);
 
+    refresh_games(&ui);
     let ready = with_app(|app| app.game_dir.is_some() && (app.keys.is_some() || rdr2_ready));
-    if ready {
+    if ask {
+        ui.invoke_open_game_chooser(false);
+    } else if ready {
         start_browsing(&ui);
     } else {
         show_setup(&ui, false);
@@ -225,6 +236,10 @@ fn debug_snapshot(ui: &AppWindow) {
         }
         if std::env::var("OPENRAGE_EDIT").is_ok() {
             ui.set_edit_mode(true);
+        }
+        if let Ok(i) = std::env::var("OPENRAGE_PICK_GAME") {
+            ui.set_game_chooser_visible(false);
+            ui.invoke_game_chosen(i.parse().unwrap_or(0), false);
         }
         if std::env::var("OPENRAGE_SETTINGS").is_ok() {
             ui.invoke_open_settings();
@@ -635,6 +650,21 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_open_viewer(move || with_ui(&w, open_viewer));
     let w = ui.as_weak();
     ui.on_row_action(move |i, action| with_ui(&w, |ui| row_action(ui, i as usize, &action)));
+    let w = ui.as_weak();
+    ui.on_game_chosen(move |i, remember| with_ui(&w, |ui| open_game(ui, i as usize, remember)));
+    let w = ui.as_weak();
+    ui.on_ask_game_changed(move |ask| {
+        with_ui(&w, |ui| {
+            let saved = with_app(|a| {
+                a.cfg.default_game = if ask { None } else { a.game_dir.clone() };
+                a.cfg.save()
+            });
+            refresh_games(ui);
+            if let Err(e) = saved {
+                ui.set_status(format!("Could not save the settings: {e}").into());
+            }
+        })
+    });
     let w = ui.as_weak();
     ui.on_accent_chosen(move |mode, color| {
         accent::set(mode, color);
@@ -4041,6 +4071,52 @@ fn set_busy(ui: &AppWindow, busy: bool, status: String) {
 // ---------------------------------------------------------------------------
 // Setup
 
+/// The games set up so far that are still installed.
+fn installed_games(cfg: &Config) -> Vec<PathBuf> {
+    cfg.known_games().into_iter().filter(|d| detect::is_gta5_dir(d) || is_rdr2_dir(d)).collect()
+}
+
+/// Fills the game switcher (File → Switch game…, settings).
+fn refresh_games(ui: &AppWindow) {
+    let (rows, ask) = with_app(|a| {
+        let rows: Vec<GameRow> = installed_games(&a.cfg)
+            .iter()
+            .map(|d| GameRow {
+                name: detect::game_name(d).unwrap_or("Game").into(),
+                path: d.display().to_string().into(),
+                is_default: a.cfg.default_game.as_ref() == Some(d),
+                is_current: a.game_dir.as_ref() == Some(d),
+            })
+            .collect();
+        (rows, a.cfg.default_game.is_none())
+    });
+    ui.set_games(ModelRc::new(VecModel::from(rows)));
+    ui.set_ask_game(ask);
+}
+
+/// Opens a game that was set up before (from the chooser); `remember` makes it the default.
+fn open_game(ui: &AppWindow, index: usize, remember: bool) {
+    let Some(dir) = with_app(|a| installed_games(&a.cfg).get(index).cloned()) else { return };
+    let ready = if is_rdr2_dir(&dir) { register_rdr2(&dir) } else { with_app(|a| a.keys.is_some()) };
+    let saved = with_app(|a| {
+        a.game_dir = Some(dir.clone());
+        a.cfg.game_dir = Some(dir.clone());
+        if remember {
+            a.cfg.default_game = Some(dir.clone());
+        }
+        a.cfg.save()
+    });
+    refresh_games(ui);
+    if ready {
+        start_browsing(ui);
+    } else {
+        show_setup(ui, true);
+    }
+    if let Err(e) = saved {
+        ui.set_status(format!("Could not save the settings: {e}").into());
+    }
+}
+
 /// Whether a folder is a Red Dead Redemption 2 installation.
 fn is_rdr2_dir(dir: &Path) -> bool {
     dir.join("RDR2.exe").is_file()
@@ -4100,11 +4176,13 @@ fn run_setup(ui: &AppWindow) {
             return;
         }
         let saved = with_app(|a| {
+            a.cfg.remember_game(&game_dir);
             a.game_dir = Some(game_dir.clone());
             a.cfg.game_dir = Some(game_dir);
             a.cfg.save()
         });
         ui.set_setup_visible(false);
+        refresh_games(ui);
         start_browsing(ui);
         if let Err(e) = saved {
             ui.set_status(format!("Could not save the settings: {e}").into());
@@ -4160,6 +4238,7 @@ fn run_setup(ui: &AppWindow) {
 fn finish_setup(ui: &AppWindow, game_dir: PathBuf, magic: Option<PathBuf>, keys: Arc<GtaVKeys>) {
     let saved = with_app(|a| {
         a.keys = Some(keys);
+        a.cfg.remember_game(&game_dir);
         a.game_dir = Some(game_dir.clone());
         a.cfg.game_dir = Some(game_dir);
         a.cfg.magic_path = magic;
@@ -4167,6 +4246,7 @@ fn finish_setup(ui: &AppWindow, game_dir: PathBuf, magic: Option<PathBuf>, keys:
     });
     ui.set_setup_running(false);
     ui.set_setup_visible(false);
+    refresh_games(ui);
     start_browsing(ui);
     if let Err(e) = saved {
         ui.set_status(format!("Could not save settings: {e:#}").into());
