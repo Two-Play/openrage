@@ -403,6 +403,9 @@ enum Command {
         /// Put every kept original back.
         #[arg(long, conflicts_with = "restore")]
         restore_all: bool,
+        /// Restore without asking (the changes leave the history).
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Rewrite an archive with replaced/added/removed entries, OpenIV style (experimental).
     #[command(hide = true)]
@@ -452,7 +455,12 @@ enum PluginCommand {
         yes: bool,
     },
     /// Remove a plugin installed into your plugin folder.
-    Uninstall { id: String },
+    Uninstall {
+        id: String,
+        /// Remove without asking.
+        #[arg(short, long)]
+        yes: bool,
+    },
     /// Pack a plugin folder (plugin.toml, the .wasm, README/LICENSE) into a package (.orp).
     Pack {
         dir: PathBuf,
@@ -519,7 +527,12 @@ enum OivCommand {
     /// List installed packages.
     List,
     /// Undo everything a package installed.
-    Uninstall { name: String },
+    Uninstall {
+        name: String,
+        /// Uninstall without asking.
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 fn main() {
@@ -705,7 +718,9 @@ fn run() -> Result<()> {
         }
         Command::Undo => cmd_undo(&game_dir),
         Command::WriteTarget { target } => cmd_write_target(&game_dir, target.as_deref()),
-        Command::Originals { restore, restore_all } => cmd_originals(&game_dir, restore.as_deref(), restore_all),
+        Command::Originals { restore, restore_all, yes } => {
+            cmd_originals(&game_dir, restore.as_deref(), restore_all, yes)
+        }
         Command::Mods { changes, deep } => cmd_mods(&game_dir, changes, deep, keys),
         Command::Repack { archive, out, sets, removes } => cmd_repack(&game_dir, &archive, &out, &sets, &removes, keys),
         Command::Search { query, limit, lang } => {
@@ -1004,6 +1019,15 @@ fn report_rpf8_extract(rpf: &rage_rpf::Rpf8, dir: &str, file: Option<usize>, out
         eprintln!("warning: {f}");
     }
     outln!("{} file(s) ({}) extracted to {}, {} failed", s.files, human(s.bytes), out.display(), s.failures.len());
+    extraction_result(s.failures.len())
+}
+
+/// Extraction goes on past single failures, but the command still fails then,
+/// so scripts notice.
+fn extraction_result(failures: usize) -> Result<()> {
+    if failures > 0 {
+        bail!("{failures} file(s) could not be extracted (see the warnings above)");
+    }
     Ok(())
 }
 
@@ -1037,7 +1061,7 @@ fn cmd_extract(game_dir: &Path, path: &str, out: &Path, expand: bool, keys: Opti
                 s.target.display(),
                 s.failures.len()
             );
-            return Ok(());
+            return extraction_result(s.failures.len());
         }
         Node::Dir(_) | Node::PlainFile(_) => bail!("{path} is not inside an archive"),
     };
@@ -1052,7 +1076,7 @@ fn cmd_extract(game_dir: &Path, path: &str, out: &Path, expand: bool, keys: Opti
         summary.target.display(),
         if summary.failures.is_empty() { String::new() } else { format!(" ({} failures)", summary.failures.len()) }
     );
-    Ok(())
+    extraction_result(summary.failures.len())
 }
 
 fn cmd_mods(game_dir: &Path, changes: bool, deep: bool, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
@@ -1682,15 +1706,7 @@ fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) 
                 for perm in perms {
                     outln!("  {perm}: {}", perm.description());
                 }
-                if !yes {
-                    eprint!("Grant and enable it? [y/N] ");
-                    let mut answer = String::new();
-                    std::io::stdin().read_line(&mut answer)?;
-                    if !answer.trim().eq_ignore_ascii_case("y") {
-                        outln!("Cancelled.");
-                        return Ok(());
-                    }
-                }
+                confirm("Grant and enable it?", *yes)?;
             }
             openrage_app::plugins::enable(cfg, id, perms);
             cfg.save()?;
@@ -1725,15 +1741,7 @@ fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) 
             if let Some(old) = registry.get(&m.id) {
                 outln!("Replaces:    {} {} in {}", old.manifest.name, old.manifest.version, old.dir.display());
             }
-            if !yes {
-                eprint!("Install? [y/N] ");
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer)?;
-                if !answer.trim().eq_ignore_ascii_case("y") {
-                    outln!("Cancelled.");
-                    return Ok(());
-                }
-            }
+            confirm("Install?", *yes)?;
             let root = openrage_plugins::user_dir().context("no per-user config folder")?;
             let dir = pkg.install(&root)?;
             outln!("Installed into {}.", dir.display());
@@ -1747,7 +1755,8 @@ fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) 
             }
             Ok(())
         }
-        PluginCommand::Uninstall { id } => {
+        PluginCommand::Uninstall { id, yes } => {
+            confirm(&format!("Remove the plugin {id}?"), *yes)?;
             let root = openrage_plugins::user_dir().context("no per-user config folder")?;
             if let Some(p) = registry.get(id)
                 && !p.dir.starts_with(&root)
@@ -1948,15 +1957,7 @@ fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) 
                 for w in &result.writes {
                     outln!("  {} ({})", w.vpath, human(w.data.len() as u64));
                 }
-                if !yes {
-                    eprint!("Apply? [y/N] ");
-                    let mut answer = String::new();
-                    std::io::stdin().read_line(&mut answer)?;
-                    if !answer.trim().eq_ignore_ascii_case("y") {
-                        outln!("Cancelled; nothing was changed.");
-                        return Ok(());
-                    }
-                }
+                confirm("Apply?", *yes)?;
                 let description = format!("{}: {}", p.manifest.name, spec.title.trim_end_matches('…'));
                 let group = openrage_app::plugins::group_name(&description);
                 for line in
@@ -2009,15 +2010,7 @@ fn cmd_oiv(game_dir: &Path, cmd: OivCommand, keys: Option<Arc<GtaVKeys>>) -> Res
             if !report.blockers.is_empty() {
                 bail!("the package cannot be installed");
             }
-            if !yes {
-                eprint!("Install into the mods folder? [y/N] ");
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer)?;
-                if !answer.trim().eq_ignore_ascii_case("y") {
-                    outln!("Cancelled.");
-                    return Ok(());
-                }
-            }
+            confirm("Install into the mods folder?", yes)?;
             let started = Instant::now();
             install::install(game_dir, keys, &pkg)?;
             outln!(
@@ -2039,7 +2032,8 @@ fn cmd_oiv(game_dir: &Path, cmd: OivCommand, keys: Option<Arc<GtaVKeys>>) -> Res
                 outln!("{name}  ({n} recorded changes)");
             }
         }
-        OivCommand::Uninstall { name } => {
+        OivCommand::Uninstall { name, yes } => {
+            confirm(&format!("Undo everything \"{name}\" installed?"), yes)?;
             let undone = install::uninstall(game_dir, &name)?;
             outln!("Uninstalled \"{name}\" ({} changes undone).", undone.len());
         }
@@ -2093,14 +2087,40 @@ fn cmd_write_target(game_dir: &Path, target: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_originals(game_dir: &Path, restore: Option<&str>, restore_all: bool) -> Result<()> {
+/// Asks before a change; `yes` (from `--yes`) skips the question. Without a
+/// terminal to ask on, the command fails instead of guessing, and declining
+/// is an error too, so scripts see that nothing was done.
+fn confirm(question: &str, yes: bool) -> Result<()> {
+    use std::io::IsTerminal;
+    if yes {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("{question} needs confirmation: pass --yes to run without asking");
+    }
+    eprint!("{question} [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        bail!("cancelled; nothing was changed");
+    }
+    Ok(())
+}
+
+fn cmd_originals(game_dir: &Path, restore: Option<&str>, restore_all: bool, yes: bool) -> Result<()> {
     let kept = install::originals(game_dir)?;
     if let Some(rel) = restore {
+        confirm(&format!("Put the original of {rel} back? Its changes leave the history."), yes)?;
         let path = install::restore_original(game_dir, rel)?;
         outln!("Restored {} (its changes are no longer in the history).", path.display());
         return Ok(());
     }
     if restore_all {
+        if kept.is_empty() {
+            outln!("No game files were changed in place.");
+            return Ok(());
+        }
+        confirm(&format!("Put {} original(s) back? Their changes leave the history.", kept.len()), yes)?;
         for rel in &kept {
             install::restore_original(game_dir, rel)?;
             outln!("Restored {rel}");
