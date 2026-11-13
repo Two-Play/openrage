@@ -52,6 +52,8 @@ impl Plugin for Probe {
                     out.push(OutputFile::new("list.txt", names.join("\n")));
                 }
                 "game" => out.push(OutputFile::new("game.txt", format!("{:?}", host::current_game()))),
+                // The XML of the metadata file named in the argument.
+                "xml" => out.push(OutputFile::new("xml.txt", host::load_xml(arg.trim())?)),
                 // Loads the model it was handed, then the one named in the argument.
                 "model.ydr" => {
                     let own = host::load_model(&input.vpath)?;

@@ -163,6 +163,14 @@ interface host {
     /// them). Same permission rule as `read-file`.
     load-texture: func(vpath: string, name: string) -> result<image, string>;
 
+    /// A metadata file of the game (`.ymt`, `.ymap`, `.ytyp`, `.meta`, PSO,
+    /// RBF and the other files the explorer shows as XML) as that XML, so
+    /// plugins need not parse the binary formats. Same permission rule as
+    /// `read-file`.
+    /// Added to API 0.3 later: plugins that use it need an OpenRAGE that
+    /// has it (others refuse to load them).
+    load-xml: func(vpath: string) -> result<string, string>;
+
     /// Builds a game model file from `model`, on top of the model at
     /// `template` (its shaders, textures and settings stay; so far a GTA V
     /// Enhanced `.ydr`). Meshes use the template's shaders: the model's

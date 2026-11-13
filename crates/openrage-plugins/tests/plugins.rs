@@ -104,6 +104,12 @@ impl GameFiles for FakeGame {
         let meshes = if vpath.ends_with("model.ydr") { vec![mesh()] } else { vec![mesh(), mesh()] };
         Ok(openrage_plugins::Model { meshes, materials: vec![material] })
     }
+    fn xml(&self, vpath: &str) -> Result<String> {
+        match vpath {
+            "a.rpf/x.ymt" => Ok("<CPedModelInfo />".into()),
+            _ => bail!("{vpath} is not a metadata file"),
+        }
+    }
 }
 
 fn run(
@@ -350,4 +356,21 @@ fn validates_plugin_components() {
     // A core module (not a component) and garbage are refused.
     assert!(host.validate(b"\0asm\x01\0\0\0").is_err());
     assert!(host.validate(b"not wasm").is_err());
+}
+
+#[test]
+fn plugins_read_metadata_as_xml() {
+    let host = host();
+    let reg = registry(&[("probe", &[Permission::ReadGame, Permission::WriteMods])]);
+    let mut probe = reg.get("probe").unwrap().clone();
+    let game: Arc<dyn GameFiles> = Arc::new(FakeGame);
+    assert_eq!(run(&host, &probe, game.clone(), "xml", "a.rpf/x.ymt").unwrap()[0].1, "<CPedModelInfo />");
+    let e = run(&host, &probe, game.clone(), "xml", "a.rpf/x.txt").unwrap_err();
+    assert!(format!("{e:#}").contains("not a metadata file"), "{e:#}");
+    let e = run(&host, &probe, game.clone(), "xml", "../x.ymt").unwrap_err();
+    assert!(format!("{e:#}").contains("not a path inside the game folder"), "{e:#}");
+    // Files of the game other than the handed ones need read-game.
+    probe.granted.clear();
+    let e = run(&host, &probe, game, "xml", "a.rpf/x.ymt").unwrap_err();
+    assert!(format!("{e:#}").contains("permission read-game"), "{e:#}");
 }
