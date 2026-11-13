@@ -363,6 +363,18 @@ impl Gta4Archive {
         if !entries[0].is_dir() {
             return Err(self.corrupt("the first entry is not a folder"));
         }
+        // Every entry belongs to one folder. Folders sharing entries would make
+        // a walk over the tree exponential in the number of folders.
+        let mut claimed = vec![false; count];
+        for e in &entries {
+            if let Gta4EntryKind::Dir { children } = &e.kind {
+                for c in children.clone() {
+                    if std::mem::replace(&mut claimed[c], true) {
+                        return Err(self.corrupt(format!("entry {c} is listed by more than one folder")));
+                    }
+                }
+            }
+        }
         self.entries = entries;
         Ok(())
     }

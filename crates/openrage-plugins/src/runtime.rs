@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
-use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
@@ -246,7 +246,16 @@ impl Host {
         let ctx = Ctx {
             wasi,
             table: ResourceTable::new(),
-            limits: StoreLimitsBuilder::new().memory_size(self.limits.memory).instances(16).tables(64).build(),
+            limits: Budget {
+                per_memory: StoreLimitsBuilder::new()
+                    .memory_size(self.limits.memory)
+                    .instances(16)
+                    .tables(64)
+                    .memories(16)
+                    .table_elements(1 << 20)
+                    .build(),
+                left: self.limits.memory,
+            },
             files,
             permissions: plugin.granted.clone(),
             may_write,
@@ -388,11 +397,47 @@ fn check_outputs(outputs: &[OutputFile]) -> Result<()> {
     Ok(())
 }
 
+/// The memory limit of a plugin, for all its memories together: wasmtime's
+/// own limits apply to each linear memory alone, and a component may have
+/// several (one per core instance, or more with multi-memory).
+struct Budget {
+    per_memory: StoreLimits,
+    /// Bytes the plugin may still grow its memories by.
+    left: usize,
+}
+
+impl ResourceLimiter for Budget {
+    fn memory_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
+        let grow = desired.saturating_sub(current);
+        if grow > self.left || !self.per_memory.memory_growing(current, desired, maximum)? {
+            return Ok(false);
+        }
+        self.left -= grow;
+        Ok(true)
+    }
+
+    fn table_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
+        self.per_memory.table_growing(current, desired, maximum)
+    }
+
+    fn instances(&self) -> usize {
+        self.per_memory.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.per_memory.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.per_memory.memories()
+    }
+}
+
 /// What one call's sandbox holds.
 struct Ctx {
     wasi: WasiCtx,
     table: ResourceTable,
-    limits: StoreLimits,
+    limits: Budget,
     files: Arc<dyn GameFiles>,
     permissions: Vec<Permission>,
     log: Vec<LogLine>,

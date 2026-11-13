@@ -20,6 +20,8 @@ pub enum RpfError {
     NotADirectory(String),
     #[error("{0} is not a nested archive")]
     NotAnArchive(String),
+    #[error("{0}: archives are nested more than {max} levels deep", max = crate::MAX_NESTING)]
+    TooDeep(String),
     #[error("path not found: {0}")]
     NotFound(String),
     #[error("not a file or directory: {0}")]

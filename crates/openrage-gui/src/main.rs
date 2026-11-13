@@ -4470,6 +4470,12 @@ fn open_with_system(ui: &AppWindow, vpath: String) {
         }
     };
     let name = vpath.rsplit('/').next().unwrap_or("file").to_owned();
+    // Archive contents are untrusted: the system would run programs and
+    // scripts instead of showing them.
+    if openrage_app::plugins::is_executable(&name) {
+        ui.set_status(format!("{name} could run as a program; export it instead to look at it").into());
+        return;
+    }
     let result = (|| -> std::io::Result<PathBuf> {
         let dir = std::env::temp_dir().join("openrage-open").join(format!("{:x}", rage_core::hash::joaat(&vpath)));
         std::fs::create_dir_all(&dir)?;
@@ -4494,7 +4500,9 @@ fn open_with_system(ui: &AppWindow, vpath: String) {
         }
     };
     let launched = if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd").args(["/C", "start", ""]).arg(&path).spawn()
+        // Not `cmd /C start`: cmd.exe would interpret `&`, `|` and `^` in the
+        // file name (which comes from the archive) as commands.
+        std::process::Command::new("explorer.exe").arg(&path).spawn()
     } else if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(&path).spawn()
     } else {

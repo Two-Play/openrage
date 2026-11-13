@@ -159,7 +159,7 @@ pub fn parse(res: &Resource) -> Result<Meta, MetaError> {
         let at = infos + i * 24;
         let entries_ptr = res.u64(at + 8)?;
         let count = res.u32(at + 0x10)? as u64;
-        let mut entries = Vec::with_capacity(count as usize);
+        let mut entries = Vec::with_capacity(count.min(0x10000) as usize);
         for e in 0..count.min(0x10000) {
             // GTA V: (name, value), 8 bytes; RDR2: (value, name), 16 bytes.
             if res.version == VERSION_RDR2 {

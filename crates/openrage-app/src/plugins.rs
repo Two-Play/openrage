@@ -622,8 +622,18 @@ fn utc_minute(secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
 }
 
-/// Loose files plugins may not write: anything a game or a loader could run.
-const BLOCKED: &[&str] = &["asi", "dll", "exe", "bat", "cmd", "com", "ps1", "vbs", "js", "sh", "scr", "msi", "lnk"];
+/// Extensions of files a game, a mod loader or the system could run.
+const EXECUTABLE: &[&str] = &[
+    "asi", "dll", "exe", "bat", "cmd", "com", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "hta", "sh", "scr",
+    "msi", "lnk", "pif", "cpl", "reg", "jar", "desktop", "appimage",
+];
+
+/// Whether a file name has an extension that could be run (see [`EXECUTABLE`]).
+/// Plugins may not write such files, and the explorer does not hand them to
+/// the system to open.
+pub fn is_executable(name: &str) -> bool {
+    EXECUTABLE.contains(&openrage_plugins::manifest::extension(name).as_str())
+}
 
 /// Applies the changes a plugin asked for to the `mods` folder: files inside
 /// archives through the archive editor, loose files directly; everything is
@@ -651,8 +661,8 @@ pub fn apply_writes(
                 if rel.split('/').any(|seg| seg.to_ascii_lowercase().ends_with(".rpf")) {
                     bail!("{}: no such archive in the game", w.vpath);
                 }
-                let ext = openrage_plugins::manifest::extension(rel);
-                if BLOCKED.contains(&ext.as_str()) {
+                if is_executable(rel) {
+                    let ext = openrage_plugins::manifest::extension(rel);
                     bail!("{}: plugins may not write .{ext} files", w.vpath);
                 }
                 loose.push((rel.to_owned(), &w.data));
