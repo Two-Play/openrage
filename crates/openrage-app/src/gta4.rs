@@ -596,6 +596,25 @@ pub fn sco_listing(name: &str, data: &[u8]) -> Result<String> {
     Ok(header + &s.listing().map_err(|e| anyhow::anyhow!(e))?)
 }
 
+/// Whether FusionFix is installed: it (with the Ultimate ASI Loader) makes the
+/// game load files from the `update` folder, where OpenRAGE writes changes.
+pub fn update_folder_loaded(game: &Path) -> bool {
+    let Some(plugins) = vfs::find_case_insensitive(game, "plugins") else { return false };
+    fs::read_dir(plugins).is_ok_and(|rd| {
+        rd.flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+            n.contains("fusionfix") && n.ends_with(".asi")
+        })
+    })
+}
+
+/// A note for changes written into the `update` folder while FusionFix is missing.
+pub fn update_folder_note(game: &Path) -> Option<&'static str> {
+    (is_gta4_dir(game) && !update_folder_loaded(game)).then_some(
+        "FusionFix is not installed: the game only loads the update folder with it (github.com/ThirteenAG/GTAIV.EFLC.FusionFix).",
+    )
+}
+
 /// The GTA IV game folder an archive belongs to (the folder holding `GTAIV.exe`).
 pub fn game_folder(archive: &Path) -> Option<PathBuf> {
     archive.ancestors().skip(1).find(|d| is_gta4_dir(d)).map(Path::to_owned)

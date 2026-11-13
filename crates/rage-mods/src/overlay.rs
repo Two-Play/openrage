@@ -11,12 +11,22 @@ use rage_rpf::vfs::{self, Node};
 /// Name of OpenIV's mods folder inside the game directory.
 pub const MODS_FOLDER: &str = "mods";
 
+/// GTA IV's counterpart: the `update` folder FusionFix (with the Ultimate
+/// ASI Loader) loads files from instead of the game's own.
+pub const UPDATE_FOLDER: &str = "update";
+
+/// The overlay folder's name for the game in `game_dir`: `update` for GTA IV
+/// (the folder holding `GTAIV.exe`), `mods` otherwise.
+pub fn folder_name(game_dir: &Path) -> &'static str {
+    if game_dir.join("GTAIV.exe").is_file() { UPDATE_FOLDER } else { MODS_FOLDER }
+}
+
 /// OpenRAGE's own data inside the mods folder (journal, temporary files); never part of a mod.
 pub const OPENRAGE_FOLDER: &str = ".openrage";
 
-/// The `mods` folder of a game installation, if present.
+/// The `mods` folder of a game installation (GTA IV: the `update` folder), if present.
 pub fn mods_dir(game_dir: &Path) -> Option<PathBuf> {
-    vfs::match_case_insensitive(game_dir, MODS_FOLDER).filter(|p| p.is_dir())
+    vfs::match_case_insensitive(game_dir, folder_name(game_dir)).filter(|p| p.is_dir())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,7 +68,7 @@ pub fn scan(game_dir: &Path) -> Vec<ModFile> {
             out.push(ModFile {
                 kind: if replaces { ModFileKind::Replaces } else { ModFileKind::New },
                 size: meta.len(),
-                is_archive: name.to_ascii_lowercase().ends_with(".rpf"),
+                is_archive: name.to_ascii_lowercase().ends_with(".rpf") || name.to_ascii_lowercase().ends_with(".img"),
                 rel,
             });
         }

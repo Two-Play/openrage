@@ -34,12 +34,14 @@ pub struct Target {
 pub fn split(game_dir: &Path, vpath: &str) -> Option<Target> {
     let mods = rage_mods::mods_dir(game_dir);
     let mut segs: Vec<&str> = vpath.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
-    if segs.first().is_some_and(|s| s.eq_ignore_ascii_case(rage_mods::overlay::MODS_FOLDER)) {
+    if segs.first().is_some_and(|s| s.eq_ignore_ascii_case(rage_mods::overlay::folder_name(game_dir))) {
         segs.remove(0);
     }
     for n in 1..=segs.len() {
         let prefix = segs[..n].join("/");
-        if !prefix.to_ascii_lowercase().ends_with(".rpf") {
+        // GTA IV image archives are edited as well.
+        let lower = prefix.to_ascii_lowercase();
+        if !lower.ends_with(".rpf") && !lower.ends_with(".img") {
             continue;
         }
         let is_file = |root: &Path| vfs::find_case_insensitive(root, &prefix).is_some_and(|p| p.is_file());
@@ -78,7 +80,7 @@ pub(crate) fn mods_dir_or_create(game_dir: &Path) -> Result<PathBuf> {
     match rage_mods::mods_dir(game_dir) {
         Some(m) => Ok(m),
         None => {
-            let m = game_dir.join(rage_mods::overlay::MODS_FOLDER);
+            let m = game_dir.join(rage_mods::overlay::folder_name(game_dir));
             fs::create_dir_all(&m).with_context(|| format!("creating {}", m.display()))?;
             Ok(m)
         }
@@ -105,7 +107,13 @@ fn ensure_in_mods(game_dir: &Path, mods: &Path, archive: &str, journal: &Journal
     // `fs::copy` uses copy_file_range on Linux, which reflinks on btrfs/XFS.
     fs::copy(&source, &tmp).with_context(|| format!("copying {} into the mods folder", source.display()))?;
     fs::rename(&tmp, &dest)?;
-    journal.record_created(&rel, &format!("Copied {rel} into the mods folder"))?;
+    journal.record_created(
+        &rel,
+        &format!(
+            "Copied {rel} into the {} folder",
+            mods.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        ),
+    )?;
     Ok((dest, rel, true))
 }
 
@@ -213,11 +221,61 @@ pub fn apply_grouped(
 ) -> Result<Applied> {
     let mods = mods_dir_or_create(game_dir)?;
     let journal = Journal::new(&mods).grouped(group);
+    if archive.to_ascii_lowercase().ends_with(".img") {
+        return apply_img(game_dir, &mods, archive, ops, description, &journal);
+    }
+    if let Some(p) = vfs::find_case_insensitive(game_dir, archive)
+        && rage_rpf::Gta4Archive::file_is_gta4(&p)
+    {
+        bail!("{archive}: changing GTA IV .rpf archives is not supported yet (only .img)");
+    }
     let (path, rel, created) = ensure_in_mods(game_dir, &mods, archive, &journal)?;
     let mut editor = ArchiveEditor::open(&path, keys.clone())?;
     let temp_root = mods.join(".openrage").join("tmp");
     apply_ops(&mut editor, ops, &keys, &temp_root)?;
     let stats = editor.commit(&mut |backup| {
+        journal
+            .record_edit(&rel, description, backup)
+            .map(|_| ())
+            .map_err(|e| rage_rpf::RpfError::Io(std::io::Error::other(e.to_string())))
+    })?;
+    Ok(Applied { path, created, stats })
+}
+
+/// Applies `ops` to a GTA IV image archive (`.img`), copied once into the
+/// overlay folder (`update`). Image archives have no folders: every path is
+/// an entry name.
+fn apply_img(
+    game_dir: &Path,
+    mods: &Path,
+    archive: &str,
+    ops: &[(String, Op)],
+    description: &str,
+    journal: &Journal,
+) -> Result<Applied> {
+    use rage_rpf::gta4_editor::{ImgEdit, commit_img_with};
+    let flat = |p: &str| -> Result<String> {
+        let p = p.trim_matches('/');
+        if p.is_empty() || p.contains('/') {
+            bail!("{p}: image archives have no folders");
+        }
+        Ok(p.to_owned())
+    };
+    let edits: Vec<ImgEdit> = ops
+        .iter()
+        .map(|(path, op)| {
+            Ok(match op {
+                Op::Set(data) => ImgEdit::Set { name: flat(path)?, data: data.clone() },
+                Op::Remove => ImgEdit::Remove { name: flat(path)? },
+                Op::Rename(to) => ImgEdit::Rename { from: flat(path)?, to: flat(to)? },
+                Op::SetRaw(_) => bail!("{path}: stored GTA V entries cannot go into a GTA IV archive"),
+                Op::CreateDir => bail!("{path}: image archives have no folders"),
+            })
+        })
+        .collect::<Result<_>>()?;
+    let (path, rel, created) = ensure_in_mods(game_dir, mods, archive, journal)?;
+    let key = rage_rpf::gta4::default_key();
+    let stats = commit_img_with(&path, key.as_deref(), &edits, &mut |backup| {
         journal
             .record_edit(&rel, description, backup)
             .map(|_| ())
@@ -236,6 +294,35 @@ pub fn apply_at(
 ) -> Result<Applied> {
     let Some(target) = split(game_dir, vpath) else { bail!("{vpath} is not inside an archive") };
     apply(game_dir, keys, &target.archive, &[(target.inner, op)], description)
+}
+
+/// Writes a loose file (not inside an archive) into the overlay folder
+/// (`mods`, GTA IV: `update`) at the same path, so the game loads it instead
+/// of its own; recorded for undo. Returns the written file.
+pub fn put_loose(game_dir: &Path, vpath: &str, data: &[u8], description: &str) -> Result<PathBuf> {
+    let mods = mods_dir_or_create(game_dir)?;
+    let folder = rage_mods::overlay::folder_name(game_dir);
+    let rel = vpath.trim_start_matches('/');
+    let rel = rel.strip_prefix(&format!("{folder}/")).unwrap_or(rel);
+    let safe = vfs::safe_relative_path(rel).with_context(|| format!("{vpath}: not a valid path"))?;
+    // Keep the game's casing when the file replaces one of the game's.
+    let rel = vfs::find_case_insensitive(game_dir, rel)
+        .and_then(|p| p.strip_prefix(game_dir).ok().map(|r| r.to_string_lossy().replace('\\', "/")))
+        .unwrap_or_else(|| safe.to_string_lossy().replace('\\', "/"));
+    Journal::new(&mods).write_file(false, &rel, data, description)
+}
+
+/// Removes a loose file from the overlay folder (the game's own file is used
+/// again); recorded for undo.
+pub fn remove_loose(game_dir: &Path, vpath: &str, description: &str) -> Result<()> {
+    let mods = rage_mods::mods_dir(game_dir).context("there is no overlay folder")?;
+    let folder = rage_mods::overlay::folder_name(game_dir);
+    let rel = vpath.trim_start_matches('/');
+    let rel = rel.strip_prefix(&format!("{folder}/")).unwrap_or(rel);
+    if vfs::find_case_insensitive(&mods, rel).is_none_or(|p| !p.is_file()) {
+        bail!("{vpath} is not in the {folder} folder; game files themselves are never deleted");
+    }
+    Journal::new(&mods).delete_file(rel, description)
 }
 
 /// Creates a new, empty top-level archive in the mods folder (e.g. a new DLC pack).

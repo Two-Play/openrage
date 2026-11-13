@@ -161,12 +161,7 @@ impl Document {
             crlf: false,
             bom: false,
             tab_mark,
-            // GTA IV has no mods folder a changed table could go to.
-            locked_reason: if kind == Kind::Gxt {
-                "GTA IV text tables are read-only for now.".into()
-            } else {
-                String::new()
-            },
+            locked_reason: String::new(),
             converted: None,
             table: Some(kind),
         })
@@ -212,6 +207,7 @@ pub fn open(ui: &AppWindow, doc: Document) {
         return;
     }
     let Ok(win) = EditorWindow::new() else { return };
+    win.set_overlay_folder(crate::overlay_name().into());
     win.set_theme_mode(ui.get_theme_mode());
     crate::accent::apply(&win);
     win.set_mono_font(ui.get_mono_font());
@@ -241,7 +237,7 @@ pub fn open(ui: &AppWindow, doc: Document) {
             }
         };
         win.set_saving(true);
-        win.set_status("Saving into the mods folder…".into());
+        win.set_status(format!("Saving into the {} folder…", crate::overlay_name()).into());
         let w2 = w.clone();
         crate::save_file(&ui, doc.vpath.clone(), bytes, format!("Edited {}", doc.name), move |result| {
             let Some(win) = w2.upgrade() else { return };

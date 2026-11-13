@@ -6,6 +6,7 @@
 pub mod editor;
 mod error;
 pub mod gta4;
+pub mod gta4_editor;
 mod rpf7;
 pub mod rpf8;
 pub mod rpf8_exe;

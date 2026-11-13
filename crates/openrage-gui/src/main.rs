@@ -1204,6 +1204,7 @@ fn start_browsing(ui: &AppWindow) {
     ui.set_settings_game_dir(
         with_app(|a| a.game_dir.as_ref().map(|d| d.display().to_string())).unwrap_or_default().into(),
     );
+    ui.set_overlay_folder(overlay_name().into());
     let mods = with_app(|a| a.game_dir.as_deref().and_then(rage_mods::mods_dir).is_some());
     with_app(|a| a.overlay = mods);
     ui.set_mods_available(mods);
@@ -1379,7 +1380,9 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
     if !history_mode {
         ui.set_history_group(SharedString::new());
     }
-    let archive_mode = with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Archive(..))));
+    let archive_mode = with_app(|a| {
+        matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Archive(..) | Location::Gta4(..)))
+    });
     ui.set_audio_mode_folder(with_app(|a| {
         matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Audio { .. }))
     }));
@@ -1632,9 +1635,10 @@ fn show_folder_info(ui: &AppWindow) {
                 return Some((
                     "History".into(),
                     String::new(),
-                    vec![note(
-                        "Every change OpenRAGE made to the mods folder. Select a package entry to uninstall the whole package.",
-                    )],
+                    vec![note(format!(
+                        "Every change OpenRAGE made to the {} folder. Select a package entry to uninstall the whole package.",
+                        overlay_name()
+                    ))],
                     ("history", badges::NEUTRAL),
                 ));
             }
@@ -1692,7 +1696,7 @@ fn show_folder_info(ui: &AppWindow) {
         };
         let mut meta = place;
         match l.origin {
-            Origin::Mods => meta.push(kv("Source", "mods folder (replaces the game's version)")),
+            Origin::Mods => meta.push(kv("Source", format!("{} folder (replaces the game's version)", overlay_name()))),
             Origin::Merged => meta.push(kv("Source", "game folder merged with its mods counterpart")),
             Origin::Base => {}
         }
@@ -2782,6 +2786,23 @@ fn show_search_results(ui: &AppWindow, query: String, results: rage_index::Searc
 /// Marks the entries of a folder inside a modded archive (added / changed /
 /// removed relative to the original). Runs in the background.
 fn start_folder_diff(ui: &AppWindow) {
+    // GTA IV archives in the update folder: compared with the game's copy.
+    let gta4 = with_app(|a| {
+        let l = a.listing.as_ref()?;
+        let Location::Gta4(arc, dir) = &l.location else { return None };
+        (a.overlay && l.origin == Origin::Mods).then(|| (l.vpath.clone(), Arc::clone(arc), *dir, a.game_dir.clone()))
+    });
+    if let Some((vpath, arc, dir, Some(game_dir))) = gta4 {
+        let weak = ui.as_weak();
+        std::thread::spawn(move || {
+            let diff = match vfs::resolve(&game_dir, &vpath, None) {
+                Ok(Node::Gta4Dir(base, bdir)) => Some(rage_mods::compare_gta4_folders(&arc, dir, &base, bdir)),
+                _ => None,
+            };
+            let _ = weak.upgrade_in_event_loop(move |ui| apply_folder_diff(&ui, &vpath, diff));
+        });
+        return;
+    }
     let Some((vpath, rpf, dir, game_dir, keys, generation, counter)) = with_app(|a| {
         let l = a.listing.as_ref()?;
         let Location::Archive(rpf, dir) = &l.location else { return None };
@@ -2816,58 +2837,64 @@ fn start_folder_diff(ui: &AppWindow) {
             if counter.load(Ordering::SeqCst) != generation {
                 return;
             }
-            let applied = with_app(|a| {
-                let l = a.listing.as_mut().filter(|l| l.vpath == vpath)?;
-                match &diff {
-                    Some(d) => {
-                        for item in &mut l.items {
-                            item.mark = match d.marks.get(&item.name.to_ascii_lowercase()) {
-                                Some(rage_mods::Mark::Added) => Some(Mark::Added),
-                                Some(rage_mods::Mark::Changed) => Some(Mark::Changed),
-                                _ => None,
-                            };
-                        }
-                        for r in &d.removed {
-                            l.items.push(Item {
-                                name: r.name.clone(),
-                                kind: if r.is_archive {
-                                    ItemKind::Archive
-                                } else if r.is_dir {
-                                    ItemKind::Dir
-                                } else {
-                                    ItemKind::File
-                                },
-                                size: r.size,
-                                info: String::new(),
-                                entry: None,
-                                vpath: None,
-                                mark: Some(Mark::Removed),
-                                detail: None,
-                            });
-                        }
-                    }
-                    None => l.items.iter_mut().for_each(|i| i.mark = Some(Mark::New)),
-                }
-                Some(a.selected.map(|s| l.items[s].name.clone()))
-            });
-            if let Some(selected) = applied {
-                refresh_files(&ui, None);
-                if let Some(name) = selected {
-                    let row = with_app(|a| {
-                        let l = a.listing.as_ref()?;
-                        a.visible.iter().position(|&i| l.items[i].name == name)
-                    });
-                    ui.set_file_selected(row.map_or(-1, |r| r as i32));
-                }
-            }
+            apply_folder_diff(&ui, &vpath, diff);
         });
     });
+}
+
+/// Marks the items of the listing at `vpath` as added, changed or removed
+/// (`None`: the whole folder is new), keeping the selection.
+fn apply_folder_diff(ui: &AppWindow, vpath: &str, diff: Option<rage_mods::FolderDiff>) {
+    let applied = with_app(|a| {
+        let l = a.listing.as_mut().filter(|l| l.vpath == vpath)?;
+        match &diff {
+            Some(d) => {
+                for item in &mut l.items {
+                    item.mark = match d.marks.get(&item.name.to_ascii_lowercase()) {
+                        Some(rage_mods::Mark::Added) => Some(Mark::Added),
+                        Some(rage_mods::Mark::Changed) => Some(Mark::Changed),
+                        _ => None,
+                    };
+                }
+                for r in &d.removed {
+                    l.items.push(Item {
+                        name: r.name.clone(),
+                        kind: if r.is_archive {
+                            ItemKind::Archive
+                        } else if r.is_dir {
+                            ItemKind::Dir
+                        } else {
+                            ItemKind::File
+                        },
+                        size: r.size,
+                        info: String::new(),
+                        entry: None,
+                        vpath: None,
+                        mark: Some(Mark::Removed),
+                        detail: None,
+                    });
+                }
+            }
+            None => l.items.iter_mut().for_each(|i| i.mark = Some(Mark::New)),
+        }
+        Some(a.selected.map(|s| l.items[s].name.clone()))
+    });
+    if let Some(selected) = applied {
+        refresh_files(ui, None);
+        if let Some(name) = selected {
+            let row = with_app(|a| {
+                let l = a.listing.as_ref()?;
+                a.visible.iter().position(|&i| l.items[i].name == name)
+            });
+            ui.set_file_selected(row.map_or(-1, |r| r as i32));
+        }
+    }
 }
 
 fn start_changes(ui: &AppWindow, record: bool) {
     let Some((game_dir, keys)) = with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone()))) else { return };
     if rage_mods::mods_dir(&game_dir).is_none() {
-        ui.set_status("This game has no mods folder.".into());
+        ui.set_status(format!("This game has no {} folder.", overlay_name()).into());
         return;
     }
     ui.set_status("Comparing mods with the original files…".into());
@@ -2915,7 +2942,8 @@ fn show_changes(ui: &AppWindow, changes: Vec<rage_mods::Change>, ms: u128, recor
         })
         .collect();
     let identical = changes.iter().filter(|c| c.kind == ChangeKind::IdenticalCopy).count();
-    let mut summary = format!("{} changes from {} files in the mods folder · {ms} ms", items.len(), files.len());
+    let mut summary =
+        format!("{} changes from {} files in the {} folder · {ms} ms", items.len(), files.len(), overlay_name());
     if identical > 0 {
         let noun = if identical == 1 { "copy" } else { "copies" };
         summary.push_str(&format!(" · {identical} unchanged {noun} of game files (can be deleted)"));
@@ -3018,13 +3046,22 @@ enum Prompt {
 fn selected_entry() -> Option<(String, String)> {
     with_app(|a| {
         let l = a.listing.as_ref()?;
-        if !matches!(l.location, Location::Archive(..)) {
-            return None;
-        }
         let item = &l.items[a.selected?];
-        item.entry?;
+        match l.location {
+            Location::Archive(..) => {
+                item.entry?;
+            }
+            // GTA IV archives: every listed entry (removed ones are shown greyed out).
+            Location::Gta4(..) if item.mark != Some(Mark::Removed) => {}
+            _ => return None,
+        }
         Some((browser::join(&l.vpath, &item.name), item.name.clone()))
     })
+}
+
+/// The overlay folder of the current game: `mods`, or `update` for GTA IV.
+pub(crate) fn overlay_name() -> &'static str {
+    with_app(|a| a.game_dir.as_deref().map(rage_mods::overlay::folder_name)).unwrap_or("mods")
 }
 
 fn open_prompt(ui: &AppWindow, prompt: Prompt, title: &str, value: &str) {
@@ -3076,7 +3113,7 @@ fn run_archive_ops(ui: &AppWindow, ops: Vec<(String, OpTarget)>, description: St
     else {
         return;
     };
-    set_busy(ui, true, "Writing into the mods folder…".into());
+    set_busy(ui, true, format!("Writing into the {} folder…", overlay_name()));
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let started = Instant::now();
@@ -3123,7 +3160,12 @@ fn run_archive_ops(ui: &AppWindow, ops: Vec<(String, OpTarget)>, description: St
                     refresh_undo(&ui);
                     let mut msg = format!("{description} — {:.2}s", started.elapsed().as_secs_f32());
                     if applied.created {
-                        msg.push_str(" (archive copied into the mods folder first)");
+                        msg.push_str(&format!(" (archive copied into the {} folder first)", overlay_name()));
+                    }
+                    if let Some(note) =
+                        with_app(|a| a.game_dir.clone()).and_then(|d| openrage_app::gta4::update_folder_note(&d))
+                    {
+                        msg.push_str(&format!(" — {note}"));
                     }
                     ui.set_status(msg.into());
                 }
@@ -3136,7 +3178,7 @@ fn run_archive_ops(ui: &AppWindow, ops: Vec<(String, OpTarget)>, description: St
 fn archive_import(ui: &AppWindow, dropped: Option<Vec<PathBuf>>) {
     let Some(dir) = with_app(|a| {
         let l = a.listing.as_ref()?;
-        matches!(l.location, Location::Archive(..)).then(|| l.vpath.clone())
+        matches!(l.location, Location::Archive(..) | Location::Gta4(..)).then(|| l.vpath.clone())
     }) else {
         ui.set_status("Open a folder inside an archive to import files.".into());
         return;
@@ -4078,7 +4120,7 @@ fn save_file(
                 None => {
                     let rel = vpath.strip_prefix("mods/").unwrap_or(&vpath).to_owned();
                     let mods = rage_mods::mods_dir(&game_dir)
-                        .unwrap_or_else(|| game_dir.join(rage_mods::overlay::MODS_FOLDER));
+                        .unwrap_or_else(|| game_dir.join(rage_mods::overlay::folder_name(&game_dir)));
                     std::fs::create_dir_all(&mods)?;
                     let path =
                         openrage_app::journal::Journal::new(&mods).write_file(false, &rel, &data, &description)?;
