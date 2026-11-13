@@ -121,7 +121,12 @@ openrage plugin preview x64a.rpf/data/x.dat    # show a file the way a plugin pr
 openrage plugin preview --file x.bin --plugin strings
 openrage plugin preview --file x.xyz --png x.png   # save an image preview
 openrage plugin run strings export x64a.rpf/data/x.dat --out exported/
+openrage plugin run strings export x64a.rpf/data --out exported/   # batch actions also take folders and archives
+openrage plugin run gxt2-patch apply update/update.rpf/x64/data/lang/american_rel.rpf/global.gxt2 --pick patch.oxt
 ```
+
+Actions that change game files list the changes and ask before applying them to the `mods` folder (`-y` skips the
+question); `openrage undo` reverts them.
 
 Previews and actions also work without a game set up, on files from disk (`--file`). See
 [Writing plugins](@/plugins.md) for the plugin folders and how to write your own.

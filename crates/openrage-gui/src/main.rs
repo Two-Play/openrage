@@ -259,6 +259,10 @@ fn debug_snapshot(ui: &AppWindow) {
             });
             if let Some(row) = row {
                 select_row(&ui, row);
+                // `OPENRAGE_PLUGIN_RUN=<n>` runs the selected file's n-th plugin action.
+                if let Ok(i) = std::env::var("OPENRAGE_PLUGIN_RUN") {
+                    row_action(&ui, row, &format!("plugin:{i}"));
+                }
             }
         }
         // Wait (up to a minute) until the models for a clip dictionary are found.
@@ -268,7 +272,7 @@ fn debug_snapshot(ui: &AppWindow) {
         waiting.start(slint::TimerMode::Repeated, Duration::from_millis(250), move || {
             let loading =
                 std::env::var("OPENRAGE_NO_WAIT").is_err() && weak.upgrade().is_some_and(|ui| ui.get_preview_loading());
-            if (with_app(|a| a.suggest_pending) || loading) && started.elapsed() < Duration::from_secs(60) {
+            if (with_app(|a| a.suggest_pending || a.busy) || loading) && started.elapsed() < Duration::from_secs(60) {
                 return;
             }
             timer.stop();
@@ -1009,13 +1013,17 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         select_row(ui, row);
     }
     if let Some(index) = action.strip_prefix("plugin:").and_then(|i| i.parse::<usize>().ok()) {
-        let vpath = with_app(|a| {
+        let target = with_app(|a| {
             let listing = a.listing.as_ref()?;
             let item = &listing.items[*a.visible.get(row)?];
-            Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            let vpath = item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name));
+            Some((item.name.clone(), vpath, plugin_target(item)?))
         });
-        if let Some(vpath) = vpath {
-            run_plugin_action(ui, index, vpath);
+        if let Some((name, vpath, folder)) = target {
+            match plugins::action_at(&name, folder, index) {
+                Some(action) => run_plugin_action(ui, action, vpath),
+                None => ui.set_status("This plugin action is no longer available.".into()),
+            }
         }
         return;
     }
@@ -1449,13 +1457,27 @@ fn is_openable(item: &Item) -> bool {
 
 /// Context-menu entries plugins add for a file.
 fn plugin_actions(item: &Item) -> ModelRc<SharedString> {
-    let file =
-        matches!(item.kind, ItemKind::File | ItemKind::Resource | ItemKind::Ped) && item.mark != Some(Mark::Removed);
-    let titles = if file { plugins::action_titles(&item.name) } else { Vec::new() };
+    let titles = match plugin_target(item) {
+        Some(folder) => plugins::action_titles(&item.name, folder),
+        None => Vec::new(),
+    };
     if titles.is_empty() {
         return ModelRc::default();
     }
     ModelRc::new(VecModel::from(titles.into_iter().map(SharedString::from).collect::<Vec<_>>()))
+}
+
+/// Whether plugin actions apply to a list item: `Some(false)` for a file,
+/// `Some(true)` for a folder or archive (batch actions), `None` otherwise.
+fn plugin_target(item: &Item) -> Option<bool> {
+    if item.mark == Some(Mark::Removed) {
+        return None;
+    }
+    match item.kind {
+        ItemKind::File | ItemKind::Resource | ItemKind::Ped => Some(false),
+        ItemKind::Dir | ItemKind::Archive => Some(true),
+        _ => None,
+    }
 }
 
 fn file_row(item: &Item) -> FileRow {
@@ -1931,30 +1953,112 @@ fn plugin_preview(
     Some(plugins::preview(id, game, vpath, &data))
 }
 
-/// Runs a plugin's action on a file and saves what it produces: one file
-/// where the user picks, several into a folder the user picks.
-fn run_plugin_action(ui: &AppWindow, index: usize, vpath: String) {
-    let game = plugins::GameContext { dir: with_app(|a| a.game_dir.clone()), keys: with_app(|a| a.keys.clone()) };
-    ui.set_status(format!("Running plugin on {vpath}…").into());
+/// Runs a plugin's action on a file, folder or archive: asks for the files
+/// it wants from disk, shows progress (cancellable), saves what it produces
+/// (one file with a save dialog, several into a folder) and applies its
+/// changes to the mods folder as one step History can undo.
+fn run_plugin_action(ui: &AppWindow, action: plugins::ActionRef, vpath: String) {
+    if action.modify && !ui.get_edit_mode() {
+        ui.set_status(
+            format!(
+                "{} changes game files: unlock editing first (Read-only button in the toolbar).",
+                action.title.trim_end_matches('…')
+            )
+            .into(),
+        );
+        return;
+    }
+    if with_app(|a| a.busy) {
+        return;
+    }
+    let (game_dir, keys) = with_app(|a| (a.game_dir.clone(), a.keys.clone()));
+    let game = plugins::GameContext { dir: game_dir.clone(), keys: keys.clone() };
+    let current = with_app(|a| a.listing.as_ref().map(|l| l.vpath.clone())).unwrap_or_default();
+    let cancel = with_app(|a| {
+        a.cancel.store(false, Ordering::Relaxed);
+        Arc::clone(&a.cancel)
+    });
     let weak = ui.as_weak();
     std::thread::spawn(move || {
-        let status = match plugins::run_action(index, &game, &vpath) {
-            Err(e) => e,
-            Ok(result) => save_plugin_outputs(result),
+        let title = action.title.trim_end_matches('…').to_owned();
+        let mut picked = Vec::new();
+        if !action.pick.is_empty() {
+            let exts: Vec<&str> = action.pick.iter().map(String::as_str).collect();
+            let dialog_title = if action.pick_title.is_empty() { title.clone() } else { action.pick_title.clone() };
+            let Some(paths) =
+                rfd::FileDialog::new().set_title(dialog_title).add_filter(exts.join(", "), &exts).pick_files()
+            else {
+                return;
+            };
+            for path in paths {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                match std::fs::read(&path) {
+                    Ok(data) => picked.push(openrage_app::plugins::Picked { name, data }),
+                    Err(e) => {
+                        let msg = format!("Cannot read {}: {e}", path.display());
+                        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+                        return;
+                    }
+                }
+            }
+        }
+        let start = format!("{title}…");
+        let _ = weak.upgrade_in_event_loop(move |ui| set_busy(&ui, true, start));
+        let mut last = Instant::now();
+        let result = plugins::run(&action, &game, &vpath, &picked, &mut |done, total, path| {
+            if last.elapsed() > Duration::from_millis(100) {
+                last = Instant::now();
+                let msg = format!("{title}: {done} of {total} — {path}");
+                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+            }
+            !cancel.load(Ordering::Relaxed)
+        });
+        let mut mods_changed = false;
+        let msg = match result {
+            Err(e) => format!("{}: {e}", action.plugin_name),
+            Ok(r) if r.cancelled => "Cancelled; nothing was saved or changed.".to_owned(),
+            Ok(r) => {
+                let mut parts = Vec::new();
+                if !r.outputs.is_empty() {
+                    parts.push(save_plugin_outputs(&title, &r.outputs));
+                }
+                if !r.writes.is_empty() {
+                    let description = format!("{}: {title}", action.plugin_name);
+                    let group = openrage_app::plugins::group_name(&description);
+                    match game_dir.as_deref().map(|dir| {
+                        openrage_app::plugins::apply_writes(dir, keys.clone(), &r.writes, &description, &group)
+                    }) {
+                        Some(Ok(done)) => {
+                            mods_changed = true;
+                            parts.push(format!("Changed {} (undo in History)", done.join(", ")));
+                        }
+                        Some(Err(e)) => parts.push(format!("Changing files failed: {e:#}")),
+                        None => parts.push("No game is open to change".to_owned()),
+                    }
+                }
+                if let Some((path, error)) = r.failures.first() {
+                    parts.push(format!("{} of {} files failed ({path}: {error})", r.failures.len(), r.files));
+                }
+                parts.retain(|p| !p.is_empty());
+                if parts.is_empty() && r.outputs.is_empty() {
+                    let last = r.log.last().map(|l| format!(": {}", l.message)).unwrap_or_default();
+                    parts.push(format!("{}: nothing to save or change{last}", action.plugin_name));
+                }
+                parts.join(" · ")
+            }
         };
-        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(status.into()));
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if mods_changed {
+                after_mods_change(&ui, &current);
+            }
+            set_busy(&ui, false, msg);
+        });
     });
 }
 
-fn save_plugin_outputs(result: plugins::ActionResult) -> String {
-    let plugin = &result.plugin;
-    let outputs = match result.outputs {
-        Ok(o) => o,
-        Err(e) => {
-            let last = result.log.last().map(|l| format!(" ({})", l.message)).unwrap_or_default();
-            return format!("{plugin}: {e}{last}");
-        }
-    };
+/// Saves the files an action produced; returns the status text ("" if the
+/// user cancelled the dialog).
+fn save_plugin_outputs(title: &str, outputs: &[openrage_plugins::OutputFile]) -> String {
     let write = |dir: &Path, o: &openrage_plugins::OutputFile| -> anyhow::Result<PathBuf> {
         // The host has checked that the names stay inside the folder.
         let rel = vfs::safe_relative_path(&o.name).ok_or_else(|| anyhow::anyhow!("bad file name {}", o.name))?;
@@ -1965,11 +2069,11 @@ fn save_plugin_outputs(result: plugins::ActionResult) -> String {
         std::fs::write(&path, &o.data)?;
         Ok(path)
     };
-    match outputs.as_slice() {
-        [] => format!("{plugin}: {} produced no files", result.title),
+    match outputs {
+        [] => String::new(),
         [one] => {
             let name = one.name.rsplit('/').next().unwrap_or(&one.name);
-            let Some(path) = rfd::FileDialog::new().set_title(&result.title).set_file_name(name).save_file() else {
+            let Some(path) = rfd::FileDialog::new().set_title(title).set_file_name(name).save_file() else {
                 return String::new();
             };
             match std::fs::write(&path, &one.data) {
@@ -1978,8 +2082,8 @@ fn save_plugin_outputs(result: plugins::ActionResult) -> String {
             }
         }
         many => {
-            let title = format!("{}: choose a folder for {} files", result.title, many.len());
-            let Some(dir) = rfd::FileDialog::new().set_title(title).pick_folder() else { return String::new() };
+            let dialog = format!("{title}: choose a folder for {} files", many.len());
+            let Some(dir) = rfd::FileDialog::new().set_title(dialog).pick_folder() else { return String::new() };
             match many.iter().map(|o| write(&dir, o)).collect::<anyhow::Result<Vec<_>>>() {
                 Ok(paths) => format!("Saved {} files in {}", paths.len(), dir.display()),
                 Err(e) => format!("Saving failed: {e:#}"),

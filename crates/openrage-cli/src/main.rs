@@ -412,7 +412,8 @@ enum PluginCommand {
         #[arg(long)]
         png: Option<PathBuf>,
     },
-    /// Run a plugin's action on files and save what it produces.
+    /// Run a plugin's action on files (or, for batch actions, folders and
+    /// archives), save what it produces and apply its changes to the mods folder.
     Run {
         /// The plugin.
         id: String,
@@ -424,9 +425,15 @@ enum PluginCommand {
         /// Read the PATHS from disk instead of from the game.
         #[arg(long)]
         file: bool,
-        /// Folder to save the results in.
+        /// Files from disk for actions that ask for them (e.g. a patch); repeatable.
+        #[arg(long)]
+        pick: Vec<PathBuf>,
+        /// Folder to save the results in (needed when the action produces files).
         #[arg(short, long)]
-        out: PathBuf,
+        out: Option<PathBuf>,
+        /// Apply changes to the mods folder without asking.
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -615,7 +622,7 @@ fn run() -> Result<()> {
         Command::Plugin(cmd) => {
             let game: Arc<dyn openrage_plugins::GameFiles> =
                 Arc::new(openrage_app::plugins::GameDir::new(&game_dir, keys.clone()));
-            cmd_plugin(&mut cfg, Some((&game_dir, game)), &cmd)
+            cmd_plugin(&mut cfg, Some((&game_dir, keys, game)), &cmd)
         }
         Command::Undo => cmd_undo(&game_dir),
         Command::Mods { changes, deep } => cmd_mods(&game_dir, changes, deep, keys),
@@ -1318,7 +1325,7 @@ fn print_report(report: &openrage_app::oiv::install::Report) {
     }
 }
 
-type GameContext<'a> = (&'a Path, Arc<dyn openrage_plugins::GameFiles>);
+type GameContext<'a> = (&'a Path, Option<Arc<GtaVKeys>>, Arc<dyn openrage_plugins::GameFiles>);
 
 fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) -> Result<()> {
     use openrage_plugins::{Host, Limits};
@@ -1327,7 +1334,7 @@ fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) 
         registry.get(id).with_context(|| format!("no plugin {id:?} is installed (see `openrage plugin list`)"))
     };
     let files: Arc<dyn openrage_plugins::GameFiles> =
-        game.as_ref().map_or_else(|| Arc::new(openrage_plugins::NoGame) as _, |g| Arc::clone(&g.1));
+        game.as_ref().map_or_else(|| Arc::new(openrage_plugins::NoGame) as _, |g| Arc::clone(&g.2));
     let game_id = files.game();
     // Reads a picked file, from the game or from disk.
     let read = |path: &str, from_disk: bool| -> Result<(String, Vec<u8>)> {
@@ -1342,7 +1349,7 @@ fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) 
     };
     let print_log = |log: &[openrage_plugins::LogLine]| {
         for line in log {
-            eprintln!("[plugin] {:?}: {}", line.level, line.message);
+            eprintln!("[plugin] {}: {}", openrage_plugins::level_name(line.level), line.message);
         }
     };
 
@@ -1397,7 +1404,14 @@ fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) 
                 outln!("Preview:     {}", v.extensions.join(", "));
             }
             for a in &m.actions {
-                outln!("Action:      {} — {} [{}]", a.id, a.title, a.extensions.join(", "));
+                let mut notes = vec![format!("{:?}", a.kind).to_ascii_lowercase()];
+                if a.batch {
+                    notes.push("also on folders".into());
+                }
+                if !a.pick.is_empty() {
+                    notes.push(format!("asks for {}", a.pick.join("/")));
+                }
+                outln!("Action:      {} — {} [{}] ({})", a.id, a.title, a.extensions.join(", "), notes.join(", "));
             }
             Ok(())
         }
@@ -1480,35 +1494,124 @@ fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) 
             }
             Ok(())
         }
-        PluginCommand::Run { id, action, paths, file, out } => {
+        PluginCommand::Run { id, action, paths, file, pick, out, yes } => {
             let p = find(id)?;
             if !p.enabled() {
                 bail!("{} is not enabled (`openrage plugin enable {id}`)", p.manifest.name);
             }
-            if p.manifest.action(action).is_none() {
+            let Some(spec) = p.manifest.action(action) else {
                 let ids: Vec<_> = p.manifest.actions.iter().map(|a| a.id.as_str()).collect();
                 bail!("{} has no action {action:?} (it has: {})", p.manifest.name, ids.join(", "));
-            }
-            let inputs = paths
+            };
+            let picked = pick
                 .iter()
-                .map(|path| read(path, *file).map(|(vpath, data)| openrage_plugins::Input { vpath, data }))
+                .map(|f| -> Result<openrage_app::plugins::Picked> {
+                    let name = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    Ok(openrage_app::plugins::Picked {
+                        name,
+                        data: fs::read(f).with_context(|| format!("reading {}", f.display()))?,
+                    })
+                })
                 .collect::<Result<Vec<_>>>()?;
             let host = Host::new(Limits::default())?;
             let component = host.compile(p)?;
-            let outcome = host.run_action(p, &component, files, action, &inputs);
-            print_log(&outcome.log);
-            let outputs = outcome.value.with_context(|| format!("{} failed", p.manifest.name))?;
-            for o in &outputs {
-                // The host has checked that names stay inside `out`.
-                let target = out.join(rage_rpf::vfs::safe_relative_path(&o.name).context("bad output name")?);
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)?;
+            let result = if *file {
+                // Files from disk: one call, no folders.
+                let mut inputs = Vec::new();
+                for path in paths {
+                    let (vpath, data) = read(path, true)?;
+                    inputs.push(openrage_plugins::Input { vpath, data, picked: false });
                 }
-                fs::write(&target, &o.data).with_context(|| format!("writing {}", target.display()))?;
-                outln!("Saved {} ({})", target.display(), human(o.data.len() as u64));
+                inputs.extend(picked.iter().map(|f| openrage_plugins::Input {
+                    vpath: f.name.clone(),
+                    data: f.data.clone(),
+                    picked: true,
+                }));
+                let outcome = host.run_action(p, &component, Arc::clone(&files), action, &inputs);
+                let outputs = outcome.value;
+                openrage_app::plugins::RunResult {
+                    outputs: match outputs {
+                        Ok(o) => o,
+                        Err(e) => {
+                            print_log(&outcome.log);
+                            return Err(e.context(format!("{} failed", p.manifest.name)));
+                        }
+                    },
+                    writes: outcome.writes,
+                    log: outcome.log,
+                    files: paths.len(),
+                    ..Default::default()
+                }
+            } else {
+                let mut last = Instant::now();
+                openrage_app::plugins::run_action(
+                    &host,
+                    p,
+                    &component,
+                    Arc::clone(&files),
+                    action,
+                    paths,
+                    &picked,
+                    &mut |done, total, path| {
+                        if last.elapsed().as_millis() > 200 || done == total {
+                            eprint!("\r[{done}/{total}] {:<60.60}", path);
+                            last = Instant::now();
+                        }
+                        true
+                    },
+                )
+                .with_context(|| format!("{} failed", p.manifest.name))?
+            };
+            if result.files > 1 {
+                eprintln!();
             }
-            if outputs.is_empty() {
-                outln!("The plugin produced no files.");
+            print_log(&result.log);
+            for (path, error) in &result.failures {
+                eprintln!("failed: {path}: {error}");
+            }
+            if !result.outputs.is_empty() {
+                let out = out.as_ref().context("the action produced files; pass --out <DIR> to save them")?;
+                for o in &result.outputs {
+                    // The host has checked that names stay inside `out`.
+                    let target = out.join(rage_rpf::vfs::safe_relative_path(&o.name).context("bad output name")?);
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&target, &o.data).with_context(|| format!("writing {}", target.display()))?;
+                    outln!("Saved {} ({})", target.display(), human(o.data.len() as u64));
+                }
+            }
+            if !result.writes.is_empty() {
+                let Some((game_dir, keys, _)) = &game else {
+                    bail!("the action changes game files, but no game is set up")
+                };
+                outln!("{} wants to change {} file(s) (into the mods folder):", p.manifest.name, result.writes.len());
+                for w in &result.writes {
+                    outln!("  {} ({})", w.vpath, human(w.data.len() as u64));
+                }
+                if !yes {
+                    eprint!("Apply? [y/N] ");
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer)?;
+                    if !answer.trim().eq_ignore_ascii_case("y") {
+                        outln!("Cancelled; nothing was changed.");
+                        return Ok(());
+                    }
+                }
+                let description = format!("{}: {}", p.manifest.name, spec.title.trim_end_matches('…'));
+                let group = openrage_app::plugins::group_name(&description);
+                for line in
+                    openrage_app::plugins::apply_writes(game_dir, keys.clone(), &result.writes, &description, &group)?
+                {
+                    outln!("Changed {line}");
+                }
+                outln!("Undo with `openrage undo` or in History (\"{group}\").");
+            }
+            if result.outputs.is_empty() && result.writes.is_empty() {
+                outln!("The plugin produced no files and changed nothing.");
+            }
+            if !result.failures.is_empty() {
+                bail!("{} of {} files failed", result.failures.len(), result.files + result.failures.len());
             }
             Ok(())
         }

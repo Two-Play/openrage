@@ -15,8 +15,8 @@ This archive contains both versions:
              to the application menu if you like.
 
 Both folders also contain "openrage", the command-line tool, and "plugins"
-with an example plugin ("strings"; MIT OR Apache-2.0). Plugins stay off until
-you turn them on in Settings > Plugins.
+with two example plugins ("strings" and "gxt2-patch"; MIT OR Apache-2.0).
+Plugins stay off until you turn them on in Settings > Plugins.
 
 On first start OpenRAGE finds your game and sets up the archive keys from
 your own copy of the game. OpenRAGE contains no game files and no keys.

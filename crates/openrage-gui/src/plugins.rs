@@ -9,9 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use openrage_app::config::Config;
-use openrage_plugins::{
-    Component, GameFiles, GameId, Host, Input, Limits, LogLine, NoGame, Plugin, Registry, Status, View,
-};
+use openrage_plugins::{Component, GameFiles, GameId, Host, Limits, LogLine, NoGame, Plugin, Registry, Status, View};
 use rage_crypto::GtaVKeys;
 
 struct State {
@@ -74,11 +72,58 @@ pub fn file_type(name: &str) -> Option<(String, String)> {
     state.registry.file_type(name, open_game()).map(|(n, c)| (n.to_owned(), c.to_owned()))
 }
 
-/// Titles of the actions plugins offer for a file, in the order
-/// [`run_action`] takes their index.
-pub fn action_titles(name: &str) -> Vec<String> {
+/// A context-menu entry of a plugin.
+#[derive(Clone)]
+pub struct ActionRef {
+    pub plugin_id: String,
+    pub plugin_name: String,
+    pub action_id: String,
+    pub title: String,
+    /// Changes game files (needs editing unlocked).
+    pub modify: bool,
+    /// Extensions of files to ask the user for.
+    pub pick: Vec<String>,
+    pub pick_title: String,
+}
+
+/// The actions plugins offer for a file, or for a folder or archive (batch
+/// actions only).
+fn actions(name: &str, folder: bool) -> Vec<ActionRef> {
     let Some(state) = state() else { return Vec::new() };
-    state.registry.actions_for(name, open_game()).into_iter().map(|(_, a)| a.title.clone()).collect()
+    let game = open_game();
+    let found: Vec<(&Plugin, &openrage_plugins::Action)> = if folder {
+        state
+            .registry
+            .plugins
+            .iter()
+            .filter(|p| p.enabled() && p.manifest.supports(game))
+            .flat_map(|p| p.manifest.actions.iter().filter(|a| a.batch).map(move |a| (p, a)))
+            .collect()
+    } else {
+        state.registry.actions_for(name, game)
+    };
+    found
+        .into_iter()
+        .map(|(p, a)| ActionRef {
+            plugin_id: p.manifest.id.clone(),
+            plugin_name: p.manifest.name.clone(),
+            action_id: a.id.clone(),
+            title: a.title.clone(),
+            modify: a.kind == openrage_plugins::ActionKind::Modify,
+            pick: a.pick.clone(),
+            pick_title: a.pick_title.clone(),
+        })
+        .collect()
+}
+
+/// Titles of the actions for a file or folder, in the order [`action_at`]
+/// takes their index.
+pub fn action_titles(name: &str, folder: bool) -> Vec<String> {
+    actions(name, folder).into_iter().map(|a| a.title).collect()
+}
+
+pub fn action_at(name: &str, folder: bool, index: usize) -> Option<ActionRef> {
+    actions(name, folder).into_iter().nth(index)
 }
 
 /// The plugin that previews this file, and whether it names the file's
@@ -156,7 +201,10 @@ pub fn preview(id: &str, game: &GameContext, vpath: &str, data: &[u8]) -> Previe
 /// The last lines a plugin logged, as notes for the info panel.
 fn log_lines(log: &[LogLine]) -> Vec<(String, String)> {
     let skip = log.len().saturating_sub(5);
-    log[skip..].iter().map(|l| (String::new(), format!("{:?}: {}", l.level, l.message))).collect()
+    log[skip..]
+        .iter()
+        .map(|l| (String::new(), format!("{}: {}", openrage_plugins::level_name(l.level), l.message)))
+        .collect()
 }
 
 /// A tree as indented lines.
@@ -200,37 +248,29 @@ fn table_text(columns: &[String], rows: &[Vec<String>]) -> String {
     out
 }
 
-/// The files an action produced, with what the plugin logged.
-pub struct ActionResult {
-    pub plugin: String,
-    pub title: String,
-    pub outputs: Result<Vec<openrage_plugins::OutputFile>, String>,
-    pub log: Vec<LogLine>,
-}
-
-/// Runs the `index`-th action [`action_titles`] listed for `name` on one file
-/// (call it from a worker thread).
-pub fn run_action(index: usize, game: &GameContext, vpath: &str) -> Result<ActionResult, String> {
-    let state = state().ok_or("plugins are not loaded")?;
-    let name = vpath.rsplit('/').next().unwrap_or(vpath);
-    let (plugin, action) = state
-        .registry
-        .actions_for(name, open_game())
-        .into_iter()
-        .nth(index)
-        .ok_or("this action is no longer available")?;
-    let (id, action_id, title) = (plugin.manifest.id.clone(), action.id.clone(), action.title.clone());
+/// Runs an action on a file, folder or archive (call it from a worker
+/// thread). `progress` gets (done, total, path) for batch runs and cancels
+/// by returning `false`.
+pub fn run(
+    action: &ActionRef,
+    game: &GameContext,
+    vpath: &str,
+    picked: &[openrage_app::plugins::Picked],
+    progress: &mut dyn FnMut(usize, usize, &str) -> bool,
+) -> Result<openrage_app::plugins::RunResult, String> {
     let files = game.files();
-    let data = files.read(vpath).map_err(|e| format!("cannot read {vpath}: {e:#}"))?;
-    with_plugin(&id, |host, plugin, component| {
-        let inputs = [Input { vpath: vpath.to_owned(), data }];
-        let outcome = host.run_action(plugin, component, files, &action_id, &inputs);
-        Ok(ActionResult {
-            plugin: plugin.manifest.name.clone(),
-            title: title.trim_end_matches('…').to_owned(),
-            outputs: outcome.value.map_err(|e| format!("{e:#}")),
-            log: outcome.log,
-        })
+    with_plugin(&action.plugin_id, |host, plugin, component| {
+        openrage_app::plugins::run_action(
+            host,
+            plugin,
+            component,
+            files,
+            &action.action_id,
+            &[vpath.to_owned()],
+            picked,
+            progress,
+        )
+        .map_err(|e| format!("{e:#}"))
     })
 }
 

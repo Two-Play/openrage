@@ -1,0 +1,13 @@
+[package]
+name = "gxt2-patch"
+description = "OpenRAGE example plugin: apply an OpenIV .oxt text patch to a GTA V text table"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+openrage-plugin-sdk.workspace = true

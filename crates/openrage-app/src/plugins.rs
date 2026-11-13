@@ -6,8 +6,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
-use openrage_plugins::{DirEntry, GameFiles, GameId, Permission, Registry};
+use anyhow::{Context, Result, bail};
+use openrage_plugins::{
+    Action, Component, DirEntry, GameFiles, GameId, Host, Input, LogLine, ModWrite, OutputFile, Permission, Plugin,
+    Registry,
+};
 use rage_crypto::GtaVKeys;
 use rage_rpf::vfs::Node;
 
@@ -151,9 +154,292 @@ impl GameFiles for GameDir {
     }
 }
 
+/// A file the user chose from disk for an action that asks for files (`pick`).
+pub struct Picked {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+/// What running an action produced.
+#[derive(Default)]
+pub struct RunResult {
+    /// Files to save, named relative to where the user saves them.
+    pub outputs: Vec<OutputFile>,
+    /// Changes to game files (see [`apply_writes`]).
+    pub writes: Vec<ModWrite>,
+    pub log: Vec<LogLine>,
+    /// Files the action ran on.
+    pub files: usize,
+    /// Files it failed on, with the reason (batch runs go on after a failure).
+    pub failures: Vec<(String, String)>,
+    pub cancelled: bool,
+}
+
+/// Most files one batch run handles.
+const MAX_BATCH: usize = 200_000;
+
+/// Whether a virtual path is a folder or an archive (something to list).
+fn is_folder(files: &dyn GameFiles, vpath: &str) -> bool {
+    files.list(vpath).is_ok()
+}
+
+/// The files below `root` (folders and archives included) that `action` applies to.
+fn batch_files(files: &dyn GameFiles, root: &str, action: &Action) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.trim_end_matches('/').to_owned()];
+    while let Some(dir) = stack.pop() {
+        let mut entries = files.list(&dir)?;
+        entries.reverse();
+        for e in entries {
+            let path = if dir.is_empty() { e.name.clone() } else { format!("{dir}/{}", e.name) };
+            if e.is_dir {
+                stack.push(path);
+            } else if openrage_plugins::manifest::matches(&action.extensions, &e.name, true) {
+                out.push(path);
+                if out.len() > MAX_BATCH {
+                    bail!("{root} holds more than {MAX_BATCH} matching files; pick a smaller folder");
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Runs an action on files and folders of the game (folders only for batch
+/// actions: then once for every matching file inside, with `progress` called
+/// before each file; returning `false` from it cancels). Without folders,
+/// all files go to the plugin in one call. `picked` files go with every call.
+#[allow(clippy::too_many_arguments)]
+pub fn run_action(
+    host: &Host,
+    plugin: &Plugin,
+    component: &Component,
+    files: Arc<dyn GameFiles>,
+    action_id: &str,
+    targets: &[String],
+    picked: &[Picked],
+    progress: &mut dyn FnMut(usize, usize, &str) -> bool,
+) -> Result<RunResult> {
+    let action = plugin.manifest.action(action_id).with_context(|| format!("no action {action_id:?}"))?;
+    if !action.pick.is_empty() && picked.is_empty() {
+        bail!("{} needs a file from disk ({})", action.title, action.pick.join(", "));
+    }
+    let picked_inputs: Vec<Input> =
+        picked.iter().map(|p| Input { vpath: p.name.clone(), data: p.data.clone(), picked: true }).collect();
+    let mut result = RunResult::default();
+
+    // (path, where outputs go relative to the save folder)
+    let mut jobs: Vec<(String, String)> = Vec::new();
+    let mut batch = false;
+    for target in targets {
+        let target = target.replace('\\', "/");
+        if is_folder(&*files, &target) {
+            if !action.batch {
+                bail!("{} works on files, not on folders like {target}", action.title);
+            }
+            batch = true;
+            let top = target.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_owned();
+            for path in batch_files(&*files, &target, action)? {
+                let rel = path[target.trim_end_matches('/').len()..].trim_start_matches('/');
+                let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
+                let prefix =
+                    [top.as_str(), dir].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join("/");
+                jobs.push((path, prefix));
+            }
+        } else {
+            jobs.push((target, String::new()));
+        }
+    }
+
+    let finish = |result: &mut RunResult, outcome: openrage_plugins::Outcome<Vec<OutputFile>>, prefix: &str| {
+        result.log.extend(outcome.log);
+        for w in outcome.writes {
+            result.writes.retain(|o| !o.vpath.eq_ignore_ascii_case(&w.vpath));
+            result.writes.push(w);
+        }
+        outcome.value.map(|outputs| {
+            for mut o in outputs {
+                if !prefix.is_empty() {
+                    o.name = format!("{prefix}/{}", o.name);
+                }
+                result.outputs.push(o);
+            }
+        })
+    };
+
+    if !batch {
+        let mut inputs = Vec::new();
+        for (path, _) in &jobs {
+            let data = files.read(path).with_context(|| format!("reading {path}"))?;
+            inputs.push(Input { vpath: path.clone(), data, picked: false });
+        }
+        inputs.extend(picked_inputs);
+        result.files = jobs.len();
+        let outcome = host.run_action(plugin, component, Arc::clone(&files), action_id, &inputs);
+        finish(&mut result, outcome, "")?;
+        return Ok(result);
+    }
+
+    let total = jobs.len();
+    for (i, (path, prefix)) in jobs.iter().enumerate() {
+        if !progress(i, total, path) {
+            result.cancelled = true;
+            return Ok(result);
+        }
+        let data = match files.read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                result.failures.push((path.clone(), format!("{e:#}")));
+                continue;
+            }
+        };
+        let mut inputs = vec![Input { vpath: path.clone(), data, picked: false }];
+        inputs.extend(picked_inputs.iter().cloned());
+        let outcome = host.run_action(plugin, component, Arc::clone(&files), action_id, &inputs);
+        result.files += 1;
+        if let Err(e) = finish(&mut result, outcome, prefix) {
+            result.failures.push((path.clone(), format!("{e:#}")));
+        }
+    }
+    // Two files of a batch may produce the same name in one folder: keep the first.
+    let mut seen = std::collections::HashSet::new();
+    result.outputs.retain(|o| seen.insert(o.name.to_ascii_lowercase()));
+    progress(total, total, "");
+    Ok(result)
+}
+
+/// A History group name for one run of a plugin action (with the time, so
+/// each run can be undone on its own).
+pub fn group_name(description: &str) -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    format!("{description} ({})", utc_minute(secs))
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC) of a Unix time.
+fn utc_minute(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let (hour, minute) = ((secs % 86_400) / 3600, (secs % 3600) / 60);
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+/// Loose files plugins may not write: anything a game or a loader could run.
+const BLOCKED: &[&str] = &["asi", "dll", "exe", "bat", "cmd", "com", "ps1", "vbs", "js", "sh", "scr", "msi", "lnk"];
+
+/// Applies the changes a plugin asked for to the `mods` folder: files inside
+/// archives through the archive editor, loose files directly; everything is
+/// recorded in the journal under `group` so History can undo it at once.
+/// Returns one line per changed archive or file.
+pub fn apply_writes(
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    writes: &[ModWrite],
+    description: &str,
+    group: &str,
+) -> Result<Vec<String>> {
+    use crate::install::{self, Op};
+    let mut per_archive: Vec<(String, Vec<(String, Op)>)> = Vec::new();
+    let mut loose: Vec<(String, &[u8])> = Vec::new();
+    for w in writes {
+        match install::split(game_dir, &w.vpath) {
+            Some(t) if t.inner.is_empty() => bail!("{} is an archive; plugins change files inside it", w.vpath),
+            Some(t) => match per_archive.iter_mut().find(|(a, _)| a.eq_ignore_ascii_case(&t.archive)) {
+                Some((_, ops)) => ops.push((t.inner, Op::Set(w.data.clone()))),
+                None => per_archive.push((t.archive, vec![(t.inner, Op::Set(w.data.clone()))])),
+            },
+            None => {
+                let rel = w.vpath.strip_prefix("mods/").unwrap_or(&w.vpath);
+                if rel.split('/').any(|seg| seg.to_ascii_lowercase().ends_with(".rpf")) {
+                    bail!("{}: no such archive in the game", w.vpath);
+                }
+                let ext = openrage_plugins::manifest::extension(rel);
+                if BLOCKED.contains(&ext.as_str()) {
+                    bail!("{}: plugins may not write .{ext} files", w.vpath);
+                }
+                loose.push((rel.to_owned(), &w.data));
+            }
+        }
+    }
+    let mut done = Vec::new();
+    for (archive, ops) in &per_archive {
+        let applied = install::apply_grouped(game_dir, keys.clone(), archive, ops, description, Some(group))?;
+        let copied = if applied.created { " (copied there first)" } else { "" };
+        done.push(format!("{} file(s) in mods/{archive}{copied}", ops.len()));
+    }
+    if !loose.is_empty() {
+        let mods = install::mods_dir_or_create(game_dir)?;
+        let journal = crate::journal::Journal::new(&mods).grouped(Some(group));
+        for (rel, data) in loose {
+            journal.write_file(false, &rel, data, description)?;
+            done.push(format!("mods/{rel}"));
+        }
+    }
+    Ok(done)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applies_writes_to_mods_with_undo() {
+        let tmp = std::env::temp_dir().join(format!("openrage-app-plugin-writes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("common")).unwrap();
+        let mut w = rage_rpf::ArchiveWriter::new();
+        w.add_file("data/a.txt", b"original".to_vec()).unwrap();
+        fs::write(tmp.join("test.rpf"), w.build().unwrap()).unwrap();
+        let write = |vpath: &str, data: &[u8]| ModWrite { vpath: vpath.into(), data: data.to_vec() };
+
+        let done = apply_writes(
+            &tmp,
+            None,
+            &[
+                write("test.rpf/data/a.txt", b"patched"),
+                write("test.rpf/data/b.txt", b"new"),
+                write("common/x.meta", b"loose"),
+            ],
+            "Test: patch",
+            "Test: patch (now)",
+        )
+        .unwrap();
+        assert_eq!(done, ["2 file(s) in mods/test.rpf (copied there first)", "mods/common/x.meta"]);
+        let game = GameDir::new(&tmp, None);
+        assert_eq!(game.read("test.rpf/data/a.txt").unwrap(), b"patched");
+        assert_eq!(game.read("test.rpf/data/b.txt").unwrap(), b"new");
+        assert_eq!(fs::read(tmp.join("mods/common/x.meta")).unwrap(), b"loose");
+        // The game's own archive is untouched.
+        let original = rage_rpf::Rpf7::open(&tmp.join("test.rpf"), None).unwrap();
+        assert_eq!(original.entries().len(), 3);
+
+        for bad in ["test.rpf", "missing.rpf/a.txt", "dinput8.dll", "scripts/x.asi"] {
+            assert!(apply_writes(&tmp, None, &[write(bad, b"x")], "Test", "Test (bad)").is_err(), "{bad}");
+        }
+
+        // One History group: undone at once.
+        let journal = crate::journal::Journal::new(&tmp.join("mods"));
+        assert_eq!(journal.groups().unwrap(), [("Test: patch (now)".to_owned(), 3)]);
+        journal.undo_group("Test: patch (now)").unwrap();
+        assert_eq!(game.read("test.rpf/data/a.txt").unwrap(), b"original");
+        assert!(!tmp.join("mods/common/x.meta").exists());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn formats_times() {
+        assert_eq!(utc_minute(0), "1970-01-01 00:00 UTC");
+        assert_eq!(utc_minute(1_794_571_380), "2026-11-13 12:03 UTC");
+        assert_eq!(utc_minute(951_782_400), "2000-02-29 00:00 UTC");
+    }
 
     #[test]
     fn enabling_stores_grants() {
