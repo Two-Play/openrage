@@ -207,6 +207,12 @@ pub fn parse_at(res: &Resource, at: u64) -> Result<(Drawable, Stats), ResourceEr
     let mut b = Builder::default();
     let mut stats = Stats::default();
     bound(res, at, &math::IDENTITY, &mut b, &mut stats, 0)?;
+    Ok(finish(b, stats))
+}
+
+/// Turns built collision meshes into a drawable: one mesh per material type,
+/// shader name hash [`MATERIAL_BASE`] + material type.
+pub(crate) fn finish(b: Builder, mut stats: Stats) -> (Drawable, Stats) {
     let mut d = Drawable { name: "collision".into(), ..Default::default() };
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
     stats.materials = b.meshes.iter().map(|(m, _)| *m).collect();
@@ -225,7 +231,7 @@ pub fn parse_at(res: &Resource, at: u64) -> Result<(Drawable, Stats), ResourceEr
         (d.bounds_min, d.bounds_max) = (lo, hi);
     }
     stats.primitives = b.primitives;
-    Ok((d, stats))
+    (d, stats)
 }
 
 /// Names of the material types, from the game's `materials.dat` (one material
