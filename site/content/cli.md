@@ -179,6 +179,17 @@ Set up the keys first: `openrage --game "/path/to/Grand Theft Auto V" keys`, or 
 
 ## In scripts
 
+`--json` prints machine-readable results for `ls`, `search` and `history`. `ls` writes one JSON array, row by row,
+so `ls -r` over a whole archive starts right away:
+
+```
+openrage --json ls -r update/update.rpf | jq -r '.[] | select(.kind == "resource") | .path'
+openrage --json search adder | jq '.hits[].path'
+openrage --json history
+```
+
+Commands that write files take `-o`/`--out`; for `model`, `map`, `audio` and `textures` it is the same as `--export`.
+
 Commands that install, uninstall or put originals back ask first; `-y`/`--yes` answers for you. Without a terminal to ask on (in a script or a pipe) they stop instead of guessing.
 
 The exit code is `0` when everything worked, `2` for wrong arguments and `1` for everything else, also when only some files could not be extracted or a question was answered with no. Messages go to standard error, results to standard output.

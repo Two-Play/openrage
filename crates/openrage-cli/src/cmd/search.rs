@@ -50,6 +50,39 @@ pub(crate) fn cmd_search(
     let started = Instant::now();
     let results = index.search(query, limit, lang)?;
     let elapsed = started.elapsed();
+    let reason = |r: &rage_index::HitReason| match r {
+        rage_index::HitReason::Name => "name",
+        rage_index::HitReason::NameHash => "hash",
+        rage_index::HitReason::Content => "text",
+    };
+    let needle = results.hash.map(|h| format!("0x{h:08X}")).unwrap_or_else(|| query.to_owned());
+    if json() {
+        let hits: Vec<_> = results
+            .hits
+            .iter()
+            .map(|hit| {
+                let snippet = (hit.reason == rage_index::HitReason::Content)
+                    .then(|| content_snippet(game_dir, &hit.vpath, &hit.name, &needle, keys.clone()))
+                    .flatten();
+                serde_json::json!({
+                    "match": reason(&hit.reason),
+                    "size": hit.size,
+                    "path": hit.vpath,
+                    "line": snippet,
+                })
+            })
+            .collect();
+        let value = serde_json::json!({
+            "query": query,
+            "query_hash": format!("0x{:08X}", results.query_hash),
+            "hash": results.hash.map(|h| format!("0x{h:08X}")),
+            "hash_strings": results.dictionary,
+            "hits": hits,
+            "limited": results.limited,
+        });
+        outln!("{value:#}");
+        return Ok(());
+    }
     match results.hash {
         Some(hash) => {
             outln!("Hash 0x{hash:08X} = {} (signed {})", hash, hash as i32);
@@ -63,17 +96,11 @@ pub(crate) fn cmd_search(
         None => outln!("joaat(\"{query}\") = 0x{:08X}", results.query_hash),
     }
     for hit in &results.hits {
-        let tag = match hit.reason {
-            rage_index::HitReason::Name => "name",
-            rage_index::HitReason::NameHash => "hash",
-            rage_index::HitReason::Content => "text",
-        };
-        outln!("{tag:<5} {:>8}  {}", human(hit.size), hit.vpath);
-        if hit.reason == rage_index::HitReason::Content {
-            let needle = results.hash.map(|h| format!("0x{h:08X}")).unwrap_or_else(|| query.to_owned());
-            if let Some(line) = content_snippet(game_dir, &hit.vpath, &hit.name, &needle, keys.clone()) {
-                outln!("      └ {line}");
-            }
+        outln!("{:<5} {:>8}  {}", reason(&hit.reason), human(hit.size), hit.vpath);
+        if hit.reason == rage_index::HitReason::Content
+            && let Some(line) = content_snippet(game_dir, &hit.vpath, &hit.name, &needle, keys.clone())
+        {
+            outln!("      └ {line}");
         }
     }
     eprintln!(

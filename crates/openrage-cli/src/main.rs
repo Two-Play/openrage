@@ -35,6 +35,47 @@ mod cmd;
 use cli::*;
 use cmd::*;
 
+/// `--json`: commands that support it print JSON instead of text.
+static JSON: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn json() -> bool {
+    JSON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The rows of a listing: lines of text, or with `--json` one JSON array that
+/// is written row by row (a recursive listing of the game has millions).
+pub(crate) struct Rows {
+    json: bool,
+    first: bool,
+}
+
+impl Rows {
+    pub(crate) fn start() -> Self {
+        let json = json();
+        if json {
+            outln!("[");
+        }
+        Self { json, first: true }
+    }
+
+    /// One row: `text` for the text output, `value` for JSON.
+    pub(crate) fn row(&mut self, text: impl FnOnce() -> String, value: serde_json::Value) {
+        if self.json {
+            let sep = if self.first { "" } else { "," };
+            outln!("{sep}{value}");
+        } else {
+            outln!("{}", text());
+        }
+        self.first = false;
+    }
+
+    pub(crate) fn finish(self) {
+        if self.json {
+            outln!("]");
+        }
+    }
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
@@ -44,6 +85,7 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    JSON.store(cli.json, std::sync::atomic::Ordering::Relaxed);
     let mut cfg = Config::load();
     let game_dir = cli.game.clone().or_else(|| cfg.game_dir.clone());
 

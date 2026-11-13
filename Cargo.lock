@@ -4015,6 +4015,7 @@ dependencies = [
  "rage-resource",
  "rage-rpf",
  "rayon",
+ "serde_json",
  "winresource",
 ]
 
