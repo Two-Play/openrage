@@ -1549,7 +1549,7 @@ fn is_viewable(item: &Item) -> bool {
 /// Files that open in the text editor (by extension; binary contents are
 /// detected when opening).
 fn is_text_file(item: &Item) -> bool {
-    const TEXT: [&str; 18] = [
+    const TEXT: [&str; 19] = [
         "xml",
         "meta",
         "txt",
@@ -1568,6 +1568,7 @@ fn is_text_file(item: &Item) -> bool {
         "gxt2",
         "nametable",
         "yldb",
+        "wpl",
     ];
     let ext = item.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
     matches!(item.kind, ItemKind::File) && item.mark != Some(Mark::Removed) && TEXT.contains(&ext.as_str())
@@ -4217,6 +4218,20 @@ pub(crate) fn open_editor(ui: &AppWindow, vpath: String) {
         return;
     }
     ui.set_status(format!("Opening {vpath} …").into());
+    if vpath.to_ascii_lowercase().ends_with(".wpl") {
+        // GTA IV placement file: as text, converted back on saving.
+        let game = with_app(|a| a.game_dir.clone());
+        let read = read_file(ui, &vpath)
+            .and_then(|d| openrage_app::gta4::wpl_to_text(game.as_deref(), &d).map(|(text, _)| (text, d)));
+        match read {
+            Ok((text, data)) => {
+                editor::open(ui, editor::Document::placement(vpath, text, data));
+                ui.set_status(SharedString::new());
+            }
+            Err(e) => ui.set_status(format!("Cannot open {vpath}: {e:#}").into()),
+        }
+        return;
+    }
     match read_file(ui, &vpath) {
         Ok(data) => open_text_data(ui, vpath, &data),
         Err(e) => ui.set_status(format!("Cannot open {vpath}: {e:#}").into()),
@@ -4431,6 +4446,11 @@ fn save_file(
                 }
             }
         })();
+        let ide = vpath.to_ascii_lowercase().ends_with(".ide");
+        if ide && result.is_ok() {
+            // New or renamed models: read the definitions again.
+            openrage_app::gta4::forget_texture_index(&game_dir);
+        }
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if result.is_ok() {
                 after_mods_change(&ui, &current);

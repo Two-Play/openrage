@@ -338,6 +338,10 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
+        // OpenRAGE's own data (journal, kept originals) is not part of the game.
+        if p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(rage_mods::overlay::OPENRAGE_FOLDER)) {
+            continue;
+        }
         if p.is_dir() {
             collect_files(&p, out);
         } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("ide") || e.eq_ignore_ascii_case("img")) {
@@ -347,9 +351,21 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// The texture index of a game folder, built once.
-pub fn texture_index(game: &Path) -> Arc<TextureIndex> {
+fn index_cache() -> &'static Mutex<HashMap<PathBuf, Arc<TextureIndex>>> {
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<TextureIndex>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
+    CACHE.get_or_init(Default::default)
+}
+
+/// Drops the cached index of `game`, so the next use reads the `.ide` files
+/// again (after one was edited).
+pub fn forget_texture_index(game: &Path) {
+    if let Ok(mut c) = index_cache().lock() {
+        c.remove(game);
+    }
+}
+
+pub fn texture_index(game: &Path) -> Arc<TextureIndex> {
+    let cache = index_cache();
     if let Some(i) = cache.lock().ok().and_then(|c| c.get(game).cloned()) {
         return i;
     }
@@ -544,6 +560,32 @@ pub fn animation_models(game: &Path, tags: &std::collections::HashSet<u16>) -> V
 
 /// A placement file (`.wpl`) as IPL-style text, with model names from the
 /// game's `.ide` files when `game` is given; also returns the number of records.
+/// Turns edited placement text back into a `.wpl`; lines unchanged from
+/// `original` keep its bytes. Model names become their hash.
+pub fn wpl_from_text(text: &str, original: Option<&[u8]>) -> Result<Vec<u8>> {
+    let original = original.map(rage_formats::wpl::parse).transpose()?;
+    let wpl = rage_formats::wpl::from_text(text, rage_core::hash::joaat, original.as_ref())?;
+    Ok(rage_formats::wpl::write(&wpl))
+}
+
+/// Checks the text form of a placement file: converted to text (with model
+/// names) and back it must give the same bytes. Returns the record count and
+/// how many records would lose bytes without the original (left-over text).
+pub fn wpl_round_trip(game: Option<&Path>, data: &[u8]) -> Result<(usize, usize)> {
+    let (text, records) = wpl_to_text(game, data)?;
+    anyhow::ensure!(wpl_from_text(&text, Some(data))? == data, "text form does not convert back identically");
+    let plain = rage_formats::wpl::from_text(&text, rage_core::hash::joaat, None)?;
+    let original = rage_formats::wpl::parse(data)?;
+    anyhow::ensure!(plain.instances == original.instances, "object placements do not convert back identically");
+    let lossy = plain
+        .other
+        .iter()
+        .zip(&original.other)
+        .map(|((_, a), (_, b))| a.iter().zip(b).filter(|(x, y)| x != y).count())
+        .sum();
+    Ok((records, lossy))
+}
+
 pub fn wpl_to_text(game: Option<&Path>, data: &[u8]) -> Result<(String, usize)> {
     let wpl = rage_formats::wpl::parse(data)?;
     let index = game.map(texture_index);

@@ -38,6 +38,9 @@ pub struct Document {
     pub converted: Option<String>,
     /// A binary text table shown as text; saving converts it back.
     pub table: Option<Kind>,
+    /// A GTA IV placement file (`.wpl`) shown as text: its original bytes.
+    /// Saving converts the text back; unchanged lines keep their bytes.
+    pub placement: Option<Vec<u8>>,
 }
 
 impl Document {
@@ -67,6 +70,7 @@ impl Document {
                     locked_reason: String::new(),
                     converted: None,
                     table: None,
+                    placement: None,
                 })
             }
             _ => {
@@ -83,6 +87,7 @@ impl Document {
                         .into(),
                     converted: None,
                     table: None,
+                    placement: None,
                 })
             }
         }
@@ -104,6 +109,7 @@ impl Document {
             locked_reason,
             converted: Some(format.to_owned()),
             table: None,
+            placement: None,
         }
     }
 
@@ -120,6 +126,7 @@ impl Document {
             locked_reason: "Disassembled from the compiled script for reading; scripts cannot be edited here.".into(),
             converted: Some(SCRIPT.into()),
             table: None,
+            placement: None,
         }
     }
 
@@ -139,6 +146,7 @@ impl Document {
                 .into(),
             converted: Some(RDR2_TEXT.into()),
             table: None,
+            placement: None,
         }
     }
 
@@ -164,12 +172,35 @@ impl Document {
             locked_reason: String::new(),
             converted: None,
             table: Some(kind),
+            placement: None,
         })
     }
 
-    /// What saving writes: the text, or for text tables the converted file.
+    /// A GTA IV placement file (`.wpl`) as editable text (see
+    /// [`openrage_app::gta4::wpl_to_text`]).
+    pub fn placement(vpath: String, text: String, original: Vec<u8>) -> Self {
+        let name = vpath.rsplit('/').next().unwrap_or(&vpath).to_owned();
+        Self {
+            vpath,
+            name,
+            text,
+            crlf: false,
+            bom: false,
+            tab_mark: false,
+            locked_reason: String::new(),
+            converted: None,
+            table: None,
+            placement: Some(original),
+        }
+    }
+
+    /// What saving writes: the text, or for text tables and placement files the converted file.
     pub fn save_bytes(&self, text: &str) -> Result<Vec<u8>, String> {
         let bytes = self.encode(text);
+        if let Some(original) = &self.placement {
+            return openrage_app::gta4::wpl_from_text(&String::from_utf8_lossy(&bytes), Some(original))
+                .map_err(|e| format!("{e:#}"));
+        }
         match self.table {
             Some(kind) => texttable::from_text(kind, &String::from_utf8_lossy(&bytes)).map_err(|e| format!("{e:#}")),
             None => Ok(bytes),
