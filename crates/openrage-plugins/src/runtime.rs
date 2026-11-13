@@ -161,6 +161,22 @@ impl Host {
             .with_context(|| format!("loading {}", path.display()))
     }
 
+    /// Checks that `wasm` is a plugin this OpenRAGE can run: a component
+    /// exporting the plugin world and importing nothing else.
+    pub fn validate(&self, wasm: &[u8]) -> Result<()> {
+        let component =
+            Component::new(&self.engine, wasm).map_err(anyhow::Error::from).context("not a WebAssembly component")?;
+        let pre = self
+            .linker
+            .instantiate_pre(&component)
+            .map_err(anyhow::Error::from)
+            .context("it needs functions OpenRAGE does not offer")?;
+        bindings::PluginPre::new(pre)
+            .map_err(anyhow::Error::from)
+            .context("it does not export the plugin interface of this OpenRAGE")?;
+        Ok(())
+    }
+
     /// Asks the plugin to preview a file.
     pub fn preview(
         &self,

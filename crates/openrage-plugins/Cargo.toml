@@ -10,6 +10,10 @@ anyhow.workspace = true
 dirs.workspace = true
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+sha2.workspace = true
+zip.workspace = true
+# The zlib backend zip uses for deflate (the default, pure Rust).
+flate2.workspace = true
 # Only what running components needs: no profiling (ittapi), cache, WAT
 # parser or debugger support.
 wasmtime = { version = "50", default-features = false, features = [

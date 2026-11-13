@@ -340,3 +340,13 @@ fn plugin_models_are_checked_and_shown() {
         other => panic!("expected a model, got {other:?}"),
     }
 }
+
+#[test]
+fn validates_plugin_components() {
+    let host = host();
+    let strings = plugin_dir().join("strings/strings.wasm");
+    host.validate(&std::fs::read(strings).unwrap()).unwrap();
+    // A core module (not a component) and garbage are refused.
+    assert!(host.validate(b"\0asm\x01\0\0\0").is_err());
+    assert!(host.validate(b"not wasm").is_err());
+}

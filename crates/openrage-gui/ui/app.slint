@@ -128,6 +128,8 @@ export struct PluginRow {
     enabled: bool,
     // The folder could not be loaded (`permissions` holds the reason).
     broken: bool,
+    // Installed into the user's plugin folder (can be uninstalled here).
+    removable: bool,
 }
 
 export struct FileRow {
@@ -1107,6 +1109,14 @@ export component AppWindow inherits Window {
     callback plugin-toggled(string, bool);
     callback open-plugin-folder();
     callback reload-plugins();
+    callback pick-plugin-package();
+    callback uninstall-plugin(string);
+    // Plugin package (.orp) waiting for the user's go-ahead.
+    in-out property <bool> plugin-pkg-visible;
+    in property <string> plugin-pkg-title;
+    in property <string> plugin-pkg-subtitle;
+    in property <string> plugin-pkg-details;
+    callback plugin-pkg-confirm();
     in-out property <bool> settings-visible;
     // The configured game for the settings page: short name and folder.
     in property <string> settings-game;
@@ -3121,6 +3131,14 @@ export component AppWindow inherits Window {
                         accessible-label: @tr("Enable {}", p.title);
                         toggled => { root.plugin-toggled(p.id, self.checked); }
                     }
+                    if p.removable: VerticalLayout {
+                        alignment: center;
+                        Button {
+                            text: @tr("Uninstall");
+                            accessible-label: @tr("Uninstall {}", p.title);
+                            clicked => { root.uninstall-plugin(p.id); }
+                        }
+                    }
                 }
                 Text {
                     text: root.plugin-folder;
@@ -3131,6 +3149,11 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     alignment: start;
                     spacing: Theme.space-s;
+                    Button {
+                        text: @tr("Install plugin…");
+                        primary: true;
+                        clicked => { root.pick-plugin-package(); }
+                    }
                     Button {
                         text: @tr("Open plugin folder");
                         clicked => { root.open-plugin-folder(); }
@@ -3148,6 +3171,51 @@ export component AppWindow inherits Window {
                 text: @tr("Close");
                 primary: true;
                 clicked => { root.settings-visible = false; }
+            }
+        }
+    }
+
+    // Installing a plugin package: what it is and may do, before anything is written.
+    if root.plugin-pkg-visible: Dialog {
+        title: root.plugin-pkg-title;
+        subtitle: root.plugin-pkg-subtitle;
+        panel-width: 640px;
+        panel-height: 460px;
+        close => { root.plugin-pkg-visible = false; }
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.surface-raised;
+            border-radius: Theme.radius;
+            ScrollView {
+                content-width: max(self.visible-width, details.preferred-width + 16px);
+                content-height: max(self.visible-height, details.preferred-height + 16px);
+                details := Text {
+                    x: 8px;
+                    y: 8px;
+                    width: parent.visible-width - 16px;
+                    text: root.plugin-pkg-details;
+                    wrap: word-wrap;
+                    color: Theme.text;
+                }
+            }
+        }
+        Text {
+            text: @tr("Plugins run in a sandbox. A new plugin stays off until you turn it on in Settings → Plugins.");
+            wrap: word-wrap;
+            font-size: Theme.font-small;
+            color: Theme.text-muted;
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: Theme.space-s;
+            Button {
+                text: @tr("Cancel");
+                clicked => { root.plugin-pkg-visible = false; }
+            }
+            Button {
+                text: @tr("Install");
+                primary: true;
+                clicked => { root.plugin-pkg-confirm(); }
             }
         }
     }

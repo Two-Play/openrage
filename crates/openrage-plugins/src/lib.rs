@@ -9,6 +9,7 @@
 //! environment, and each call has a memory and a time limit.
 
 pub mod manifest;
+pub mod package;
 mod registry;
 mod runtime;
 

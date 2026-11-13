@@ -410,6 +410,26 @@ enum PluginCommand {
     },
     /// Disable a plugin.
     Disable { id: String },
+    /// Install a plugin package (.orp) into your plugin folder (it stays off
+    /// until you enable it; an update keeps your choice).
+    Install {
+        file: PathBuf,
+        /// Install without asking.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Remove a plugin installed into your plugin folder.
+    Uninstall { id: String },
+    /// Pack a plugin folder (plugin.toml, the .wasm, README/LICENSE) into a package (.orp).
+    Pack {
+        dir: PathBuf,
+        /// Where to write the package (default: <id>-<version>.orp).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// The built component, if it is not in the folder (e.g. target/wasm32-wasip2/release/x.wasm).
+        #[arg(long)]
+        wasm: Option<PathBuf>,
+    },
     /// Show a file the way a plugin previews it.
     Preview {
         /// Virtual path in the game (or a file on disk with --file).
@@ -515,6 +535,9 @@ fn run() -> Result<()> {
                     | PluginCommand::Info { .. }
                     | PluginCommand::Enable { .. }
                     | PluginCommand::Disable { .. }
+                    | PluginCommand::Install { .. }
+                    | PluginCommand::Uninstall { .. }
+                    | PluginCommand::Pack { .. }
             ))
     {
         return cmd_plugin(&mut cfg, None, cmd);
@@ -1485,6 +1508,89 @@ fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) 
             openrage_app::plugins::enable(cfg, id, perms);
             cfg.save()?;
             outln!("Enabled {}.", p.manifest.name);
+            Ok(())
+        }
+        PluginCommand::Install { file, yes } => {
+            let pkg = openrage_plugins::package::Package::open(file)?;
+            let m = &pkg.manifest;
+            Host::new(Limits::default())?
+                .validate(&pkg.files.iter().find(|(n, _)| n.eq_ignore_ascii_case(&m.wasm)).expect("checked").1)
+                .with_context(|| format!("{} cannot run in this OpenRAGE", m.name))?;
+            outln!("{} {} ({})", m.name, m.version, m.id);
+            if !m.description.is_empty() {
+                outln!("{}", m.description);
+            }
+            if !m.authors.is_empty() {
+                outln!("Authors:     {}", m.authors.join(", "));
+            }
+            outln!("Licence:     {}", if m.license.is_empty() { "not stated" } else { &m.license });
+            if !m.homepage.is_empty() {
+                outln!("Homepage:    {}", m.homepage);
+            }
+            if m.permissions.is_empty() {
+                outln!("Permissions: none (it sees only the files you open with it)");
+            }
+            for perm in &m.permissions {
+                outln!("Permission:  {perm} — {}", perm.description());
+            }
+            outln!("Package:     {} files, {}", pkg.files.len(), human(pkg.size));
+            outln!("SHA-256:     {}", pkg.sha256);
+            if let Some(old) = registry.get(&m.id) {
+                outln!("Replaces:    {} {} in {}", old.manifest.name, old.manifest.version, old.dir.display());
+            }
+            if !yes {
+                eprint!("Install? [y/N] ");
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    outln!("Cancelled.");
+                    return Ok(());
+                }
+            }
+            let root = openrage_plugins::user_dir().context("no per-user config folder")?;
+            let dir = pkg.install(&root)?;
+            outln!("Installed into {}.", dir.display());
+            let reg = openrage_app::plugins::registry(cfg);
+            match reg.get(&m.id).map(|p| &p.status) {
+                Some(openrage_plugins::Status::Enabled) => outln!("It is on."),
+                Some(openrage_plugins::Status::NeedsApproval(_)) => {
+                    outln!("It asks for more permissions than before: `openrage plugin enable {}` turns it on.", m.id)
+                }
+                _ => outln!("It is off until you turn it on: `openrage plugin enable {}`.", m.id),
+            }
+            Ok(())
+        }
+        PluginCommand::Uninstall { id } => {
+            let root = openrage_plugins::user_dir().context("no per-user config folder")?;
+            if let Some(p) = registry.get(id)
+                && !p.dir.starts_with(&root)
+            {
+                bail!("{} is not in your plugin folder but in {}; remove that folder yourself", id, p.dir.display());
+            }
+            let removed = openrage_plugins::package::uninstall(&root, id)?;
+            if openrage_app::plugins::disable(cfg, id) {
+                cfg.save()?;
+            }
+            outln!("Removed {}.", removed.display());
+            Ok(())
+        }
+        PluginCommand::Pack { dir, out, wasm } => {
+            let data = openrage_plugins::package::pack(dir, wasm.as_deref())?;
+            let pkg = openrage_plugins::package::Package::from_bytes(&data)?;
+            let m = &pkg.manifest;
+            let out = out.clone().unwrap_or_else(|| {
+                PathBuf::from(format!("{}-{}.{}", m.id, m.version, openrage_plugins::package::EXTENSION))
+            });
+            fs::write(&out, &data).with_context(|| format!("writing {}", out.display()))?;
+            outln!(
+                "Packed {} {} into {} ({} files, {})",
+                m.name,
+                m.version,
+                out.display(),
+                pkg.files.len(),
+                human(pkg.size)
+            );
+            outln!("SHA-256: {}", pkg.sha256);
             Ok(())
         }
         PluginCommand::Disable { id } => {

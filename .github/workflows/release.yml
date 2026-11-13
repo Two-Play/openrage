@@ -101,6 +101,13 @@ jobs:
           chmod +x appimagetool
           # No FUSE on the runners: let the tool unpack itself.
           ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool --no-appstream "$app" "out/openrage-${ref}-x86_64.AppImage"
+      # The example plugins also as packages (.orp) to install from the release page.
+      - name: Plugin packages
+        if: runner.os == 'Linux'
+        run: |
+          for dir in shipped-plugins/*/; do
+            target/release/openrage plugin pack "$dir" --out "out/$(basename "$dir").orp"
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}

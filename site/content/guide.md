@@ -102,9 +102,11 @@ Plugins add previews and actions for file types OpenRAGE does not handle itself.
 in a sandbox: a plugin sees only the files you open with it and, if you allow it, reads the game's files. It cannot
 change anything, open other files or go online.
 
-- **Install:** put a plugin's folder into your plugin folder: `~/.config/openrage/plugins` (Linux),
-  `%APPDATA%\openrage\plugins` (Windows) or `plugins` next to the program. **Settings → Plugins → Open plugin folder**
-  opens it; **Reload plugins** picks up new ones. The download comes with three example plugins: *Strings* (shows and
+- **Install:** **Settings → Plugins → Install plugin…** installs a plugin package (`.orp`); opening an `.orp` with
+  OpenRAGE does the same. You first see what the plugin is, what it may do and its SHA-256 checksum (compare it with
+  the one the author publishes). **Uninstall** removes it again. A plugin folder also works: put it into your plugin
+  folder (`~/.config/openrage/plugins` on Linux, `%APPDATA%\openrage\plugins` on Windows, or `plugins` next to the
+  program); **Open plugin folder** opens it, **Reload plugins** picks up new ones. The download comes with three example plugins: *Strings* (shows and
   exports the readable text of any file), *Text patch* (applies an OpenIV `.oxt` file to a `.gxt2`) and *OBJ tools*
   (exports models as OBJ with their textures, shows `.obj` files in 3D).
 - **Enable:** **Settings → Plugins** lists each plugin with what it does, its licence and the permissions it asks

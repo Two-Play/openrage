@@ -51,7 +51,7 @@ fn core_icon(ext: &str) -> Option<(&'static str, Color)> {
         "awc" | "rel" | "dat151" | "dat54" | "dat4" | "dat10" | "dat15" | "dat16" | "dat22" => ("audio", rgb(0xDB4F8A)),
         "ysc" | "sco" | "asi" | "dll" | "lua" | "cs" => ("script", rgb(0xE05252)),
         "gxt2" | "gxt" => ("lang", rgb(0x5B76DE)),
-        "oiv" | "zip" | "7z" | "rar" => ("package", rgb(0xD9822B)),
+        "oiv" | "orp" | "zip" | "7z" | "rar" => ("package", rgb(0xD9822B)),
         _ => return None,
     })
 }
@@ -128,6 +128,7 @@ fn known_name(ext: &str) -> &'static str {
         "bik" => "Bink video",
         "nametable" => "Name table",
         "ugc" => "UGC (JSON)",
+        "orp" => "OpenRAGE plugin",
         "xml" => "XML",
         "meta" => "Meta",
         "dat" => "Data",

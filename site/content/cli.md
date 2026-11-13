@@ -122,6 +122,9 @@ openrage plugin list                           # installed plugins, their state,
 openrage plugin info strings                   # what a plugin adds and the permissions it asks for
 openrage plugin enable strings                 # enable it, granting its permissions (asks first; -y to skip)
 openrage plugin disable strings
+openrage plugin install obj-tools.orp          # install a plugin package (shows what it is and its SHA-256 first)
+openrage plugin uninstall obj-tools            # remove it from your plugin folder
+openrage plugin pack my-plugin/ --wasm target/wasm32-wasip2/release/my_plugin.wasm   # make a package
 openrage plugin preview x64a.rpf/data/x.dat    # show a file the way a plugin previews it
 openrage plugin preview --file x.bin --plugin strings
 openrage plugin preview --file x.xyz --png x.png   # save an image preview
