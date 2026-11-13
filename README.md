@@ -58,7 +58,7 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 
 | Game | Archives | Formats |
 |---|---|---|
-| **GTA V** (Legacy & Enhanced) | ✅ read and edit (mods folder, with undo) | ✅ textures · models · audio · animations · metadata · text · collisions · paths · cutscenes · scripts · ◐ model import from OBJ (Enhanced .ydr, preview) |
+| **GTA V** (Legacy & Enhanced) | ✅ read and edit (mods folder, with undo) | ✅ textures · models · audio · animations · metadata · text · collisions · paths · cutscenes · scripts · ◐ model import from OBJ (Enhanced .ydr, preview; explorer via the OBJ tools plugin) |
 | **Red Dead Redemption 2** | ✅ read, with keys from your own game | ◐ textures · models · texts · metadata · audio · animations · ped outfits (read-only) |
 | **GTA VI** | 🔜 next: as fast as possible once it comes to PC | – |
 | **GTA IV** (Complete Edition) | ✅ read (IMG3, RPF2, RPF3), key from your own `GTAIV.exe` | ◐ textures · models · collisions · animations · text · scripts · maps in 3D · editing `.img`, `.rpf`, loose files and textures (`.wtd`, inside `.wdr`) (update folder, or the game files with originals kept) |

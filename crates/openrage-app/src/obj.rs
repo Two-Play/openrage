@@ -141,7 +141,7 @@ pub fn read(text: &str) -> Result<Vec<ObjMesh>> {
 }
 
 /// Splits a mesh into pieces of at most [`MAX_VERTICES`] vertices.
-fn split(m: NewMesh) -> Vec<NewMesh> {
+pub fn split(m: NewMesh) -> Vec<NewMesh> {
     if m.positions.len() <= MAX_VERTICES {
         return vec![m];
     }

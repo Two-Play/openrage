@@ -5,6 +5,8 @@
 //!   to it is not read).
 //! - Export: game models as `.obj` + `.mtl` + one PNG per texture, through
 //!   `load-model` and `load-texture`: the plugin never parses game formats.
+//! - Replace: a drawable's meshes with an OBJ, through `build-model` (which
+//!   keeps the drawable's shaders and textures) and `write-mod-file`.
 //!
 //! The game is Z-up with DirectX texture coordinates (v down); OBJ is
 //! usually Y-up with v up, so both are converted.
@@ -12,7 +14,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use openrage_plugin_sdk::bindings::openrage::plugin::host::{load_model, load_texture};
+use openrage_plugin_sdk::bindings::openrage::plugin::host::{build_model, load_model, load_texture};
 use openrage_plugin_sdk::bindings::openrage::plugin::types::{Material, Mesh, Model};
 use openrage_plugin_sdk::file_name;
 use openrage_plugin_sdk::prelude::*;
@@ -32,14 +34,36 @@ impl Plugin for ObjTools {
     }
 
     fn run_action(action: String, inputs: Vec<Input>) -> Result<Vec<OutputFile>, String> {
-        if action != "export" {
-            return Err(format!("unknown action {action:?}"));
+        match action.as_str() {
+            "export" => {
+                let mut out = Vec::new();
+                for input in inputs.iter().filter(|i| !i.picked) {
+                    out.extend(export(&input.vpath)?);
+                }
+                Ok(out)
+            }
+            "replace" => {
+                let obj = inputs.iter().find(|i| i.picked).ok_or("choose an OBJ file")?;
+                let model = parse_obj(&String::from_utf8_lossy(&obj.data))?;
+                for target in inputs.iter().filter(|i| !i.picked) {
+                    // The drawable keeps its shaders and textures; OpenRAGE writes the meshes.
+                    let file = build_model(&target.vpath, &model)?;
+                    write_mod_file(&target.vpath, &file)?;
+                    let triangles: usize = model.meshes.iter().map(|m| m.indices.len() / 3).sum();
+                    log(
+                        Level::Info,
+                        format!(
+                            "{}: {} meshes, {triangles} triangles from {}",
+                            target.vpath,
+                            model.meshes.len(),
+                            obj.vpath
+                        ),
+                    );
+                }
+                Ok(Vec::new())
+            }
+            _ => Err(format!("unknown action {action:?}")),
         }
-        let mut out = Vec::new();
-        for input in inputs.iter().filter(|i| !i.picked) {
-            out.extend(export(&input.vpath)?);
-        }
-        Ok(out)
     }
 }
 

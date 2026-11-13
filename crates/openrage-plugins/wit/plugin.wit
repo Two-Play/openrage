@@ -163,6 +163,16 @@ interface host {
     /// them). Same permission rule as `read-file`.
     load-texture: func(vpath: string, name: string) -> result<image, string>;
 
+    /// Builds a game model file from `model`, on top of the model at
+    /// `template` (its shaders, textures and settings stay; so far a GTA V
+    /// Enhanced `.ydr`). Meshes use the template's shaders: the model's
+    /// materials go to them in order, or to shader n for a material named
+    /// `#n`. Returns the file's bytes, e.g. for `write-mod-file`. Same
+    /// permission rule as `read-file` for the template.
+    /// Added to API 0.3 later: plugins that use it need an OpenRAGE that
+    /// has it (others refuse to load them).
+    build-model: func(template: string, model: model) -> result<list<u8>, string>;
+
     /// Changes a file of the game, e.g. `x64a.rpf/data/lang/x.gxt2`. The
     /// change goes into the `mods` folder (archives are copied there first),
     /// never into the game's own files. Changes are applied together once

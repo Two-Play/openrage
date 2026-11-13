@@ -3,12 +3,14 @@ id = "obj-tools"
 name = "OBJ tools"
 version = "0.1.0"
 api = "0.3"
-description = "Shows Wavefront OBJ models in the 3D view and exports the game's models as OBJ with their textures (PNG)."
+description = "Shows Wavefront OBJ models in the 3D view, exports the game's models as OBJ with their textures (PNG) and replaces a model's meshes with an OBJ (GTA V Enhanced .ydr)."
 authors = ["OpenRAGE contributors"]
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/Two-Play/openrage"
 wasm = "obj_tools.wasm"
-# No permissions: it reads only the models you export with it.
+# Viewing and exporting read only the files you use them on; replacing a
+# model writes the new one into the mods folder (undo in History).
+permissions = ["write-mods"]
 
 [[file-types]]
 extensions = ["obj"]
@@ -24,3 +26,11 @@ title = "Export as OBJ…"
 kind = "export"
 extensions = ["ydr", "yft", "ydd", "wdr", "wdd", "wft"]
 batch = true
+
+[[actions]]
+id = "replace"
+title = "Replace with OBJ…"
+kind = "modify"
+extensions = ["ydr"]
+pick = ["obj"]
+pick-title = "Choose the OBJ model"
