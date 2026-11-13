@@ -153,6 +153,59 @@ pub fn compare_folders(m: &Rpf7, mdir: EntryId, b: &Rpf7, bdir: EntryId, mode: C
     diff
 }
 
+/// Like [`compare_folders`] for GTA IV archives (`.img`, RPF2/RPF3). Entries
+/// at the same place with the same size are taken as unchanged (an edited
+/// copy keeps untouched entries where they were); others are compared by
+/// their stored bytes.
+pub fn compare_gta4_folders(
+    m: &rage_rpf::Gta4Archive,
+    mdir: rage_rpf::Gta4EntryId,
+    b: &rage_rpf::Gta4Archive,
+    bdir: rage_rpf::Gta4EntryId,
+) -> FolderDiff {
+    use rage_rpf::Gta4EntryKind as K;
+    let place = |k: &K| match k {
+        K::Dir { .. } => None,
+        K::File { offset, stored, .. } | K::Resource { offset, stored, .. } => Some((*offset, *stored)),
+    };
+    let base_children: HashMap<String, rage_rpf::Gta4EntryId> =
+        b.children(bdir).map(|id| (b.entry(id).name.to_ascii_lowercase(), id)).collect();
+    let mut diff = FolderDiff::default();
+    for mid in m.children(mdir) {
+        let me = m.entry(mid);
+        let key = me.name.to_ascii_lowercase();
+        let mark = match base_children.get(&key) {
+            None => Mark::Added,
+            Some(&bid) => {
+                let be = b.entry(bid);
+                let same = match (place(&me.kind), place(&be.kind)) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) if x == y => true,
+                    (Some((_, xs)), Some((_, ys))) if xs == ys => {
+                        matches!((m.read(mid), b.read(bid)), (Ok(x), Ok(y)) if x == y)
+                    }
+                    _ => false,
+                };
+                if same { Mark::Unchanged } else { Mark::Changed }
+            }
+        };
+        diff.marks.insert(key, mark);
+    }
+    for (key, &bid) in &base_children {
+        if !diff.marks.contains_key(key) {
+            let e = b.entry(bid);
+            diff.removed.push(RemovedEntry {
+                name: e.name.clone(),
+                is_dir: e.is_dir(),
+                is_archive: false,
+                size: e.size(),
+            });
+        }
+    }
+    diff.removed.sort_by_key(|x| x.name.to_lowercase());
+    diff
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
     /// A whole file that only exists in mods.
@@ -300,6 +353,41 @@ pub fn list_changes(
         if files_identical(&mod_path, &base_path) {
             out.push(Change { vpath: f.rel.clone(), kind: ChangeKind::IdenticalCopy, is_dir: false, size: f.size });
             continue;
+        }
+        // GTA IV archives: one level of entries, compared by name.
+        if f.is_archive && rage_rpf::Gta4Archive::file_is_gta4(&base_path) {
+            let pair = rage_rpf::Gta4Archive::open_default(&mod_path)
+                .ok()
+                .zip(rage_rpf::Gta4Archive::open_default(&base_path).ok());
+            if let Some((m, b)) = pair {
+                let d = compare_gta4_folders(&m, rage_rpf::Gta4Archive::ROOT, &b, rage_rpf::Gta4Archive::ROOT);
+                let before = out.len();
+                let mut names: Vec<(&String, &Mark)> = d.marks.iter().filter(|(_, k)| **k != Mark::Unchanged).collect();
+                names.sort_by(|a, b| a.0.cmp(b.0));
+                for (key, mark) in names {
+                    let id = m.find_child(rage_rpf::Gta4Archive::ROOT, key);
+                    let (name, size) = id.map_or((key.clone(), 0), |i| (m.entry(i).name.clone(), m.entry(i).size()));
+                    let kind = if *mark == Mark::Added { ChangeKind::Added } else { ChangeKind::Modified };
+                    out.push(Change { vpath: format!("{}/{name}", f.rel), kind, is_dir: false, size });
+                }
+                for r in &d.removed {
+                    out.push(Change {
+                        vpath: format!("{}/{}", f.rel, r.name),
+                        kind: ChangeKind::Removed,
+                        is_dir: false,
+                        size: r.size,
+                    });
+                }
+                if out.len() == before {
+                    out.push(Change {
+                        vpath: f.rel.clone(),
+                        kind: ChangeKind::IdenticalCopy,
+                        is_dir: false,
+                        size: f.size,
+                    });
+                }
+                continue;
+            }
         }
         let archives = if f.is_archive {
             Rpf7::open(&mod_path, keys.clone()).ok().zip(Rpf7::open(&base_path, keys.clone()).ok())

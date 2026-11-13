@@ -284,7 +284,7 @@ fn merge_mods(game_dir: &Path, listing: &mut Listing) {
 fn merge_mods_inner(game_dir: &Path, listing: &mut Listing) {
     let Some(mods) = rage_mods::mods_dir(game_dir) else { return };
     if listing.vpath.is_empty() {
-        listing.items.retain(|i| !i.name.eq_ignore_ascii_case(rage_mods::overlay::MODS_FOLDER));
+        listing.items.retain(|i| !i.name.eq_ignore_ascii_case(rage_mods::overlay::folder_name(game_dir)));
     }
 
     if listing.origin == Origin::Mods {

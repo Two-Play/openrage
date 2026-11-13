@@ -1,10 +1,10 @@
 +++
 title = "GTA IV"
-description = "GTA IV and its episodes in OpenRAGE: setup, archives, textures, models, texts, placement files, maps, collisions, animations, scripts and search."
+description = "GTA IV and its episodes in OpenRAGE: setup, archives, textures, models, texts, placement files, maps, collisions, animations, scripts, search and editing."
 
 [extra]
 docs = true
-lead = "The Complete Edition on Steam, including *The Lost and Damned* and *The Ballad of Gay Tony*. Read-only for now."
+lead = "The Complete Edition on Steam, including *The Lost and Damned* and *The Ballad of Gay Tony*. Changes go into the `update` folder and can be undone."
 toc = true
 +++
 
@@ -25,17 +25,17 @@ openrage ls pc/models/cdimages
 
 | What | Files | Status |
 |---|---|---|
-| Archives | `.img` (IMG3), `.rpf` (RPF2, RPF3) | browse and extract |
+| Archives | `.img` (IMG3), `.rpf` (RPF2, RPF3) | browse and extract; change `.img` archives |
 | Textures | `.wtd` | view, export DDS/PNG |
 | Models | `.wdr`, `.wdd`, `.wft` | view, export glTF |
-| Texts | `.gxt` | view |
+| Texts | `.gxt` | view and edit |
 | Placement files and maps | `.wpl`, map archives | view as text and in 3D, export glTF |
 | Collisions | `.wbn`, `.wbd`, in `.wft` | view, export glTF |
 | Animations | `.wad` | play on peds |
 | Scripts | `.sco` | read the disassembly |
 | Search | everything above, `.ide`, `.dat`, `.gxt` | names, hashes and full text |
 
-Changing GTA IV files is not available yet.
+Changes go into the `update` folder; see [Editing](#editing). Changing `.rpf` archives is not available yet.
 
 ## Search
 
@@ -147,3 +147,31 @@ openrage model pc/anim/cutsprops.img/cs_andrei.wdd --anim "pc/anim/anim.img/faci
 ```
 
 **Checked:** 1,772 dictionaries, 22,866 animations, every frame evaluated, no errors.
+
+## Editing
+
+GTA IV has no `mods` folder. With [FusionFix](https://github.com/ThirteenAG/GTAIV.EFLC.FusionFix) installed, the game
+loads files from the `update` folder next to `GTAIV.exe` in place of the originals at the same path, so
+`update/pc/models/cdimages/vehicles.img` replaces `pc/models/cdimages/vehicles.img`. OpenRAGE writes every change
+there, as it uses the `mods` folder for GTA V; the game folder itself stays untouched. Without FusionFix the game
+ignores the `update` folder, and OpenRAGE says so when you make a change.
+
+- **Archives (`.img`):** the first change copies the whole archive into the `update` folder; that copy is edited from
+  then on. Import, replace, rename and remove entries as in GTA V. Resources (`.wtd`, `.wdr`, `.wft`, …) keep their
+  type and flags from their header.
+- **Loose files** (`.dat`, `.ide`, `.gxt`, …) are written to the `update` folder under the same path.
+- **Texts:** `.gxt` files open in the text editor and save into the `update` folder.
+- **Changes and history:** **Changes** lists every file and archive entry that differs from the game, **History**
+  every change OpenRAGE made; all of them can be undone. The browser hides the `update` folder and shows its files in
+  place of the originals.
+- `.rpf` archives (the episodes' and some audio) cannot be changed yet.
+
+```
+openrage put admiral.wtd pc/models/cdimages/vehicles.img/       # import into a copy of the archive in update/
+openrage mv pc/models/cdimages/vehicles.img/a.wft pc/models/cdimages/vehicles.img/b.wft
+openrage rm pc/models/cdimages/vehicles.img/biff.wft
+openrage put handling.dat common/data/                          # a loose file, written to update/common/data/
+openrage mods --changes                                         # everything that differs from the game
+openrage history
+openrage undo
+```

@@ -54,6 +54,8 @@ openrage verify --collisions                   # every .wbn and .wbd, and every 
 openrage clips pc/anim/anim.img/move_m@generic.wad                    # the animations of a .wad
 openrage model pc/models/cdimages/componentpeds.img/m_y_gmaf_hi_01.wdd --anim "pc/anim/anim.img/move_m@generic.wad:sprint@0.2" --render sprint.png
 openrage verify --animations                   # every .wad, every frame of every bone track
+openrage put admiral.wtd pc/models/cdimages/vehicles.img/   # edit: GTA IV uses the update folder (needs FusionFix)
+openrage put handling.dat common/data/          # loose files go to update/<same path>
 ```
 
 ## Formats: textures, models, audio, animations, metadata, text

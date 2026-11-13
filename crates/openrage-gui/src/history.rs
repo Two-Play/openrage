@@ -18,6 +18,7 @@ pub fn open(ui: &AppWindow) {
         Some(w) => w,
         None => {
             let Ok(win) = HistoryWindow::new() else { return };
+            win.set_overlay_folder(crate::overlay_name().into());
             let main = ui.as_weak();
             win.on_undo(move || {
                 if let Some(ui) = main.upgrade() {

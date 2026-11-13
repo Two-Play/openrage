@@ -15,5 +15,8 @@
 pub mod compare;
 pub mod overlay;
 
-pub use compare::{Change, ChangeKind, CompareMode, FolderDiff, Mark, RemovedEntry, compare_folders, list_changes};
+pub use compare::{
+    Change, ChangeKind, CompareMode, FolderDiff, Mark, RemovedEntry, compare_folders, compare_gta4_folders,
+    list_changes,
+};
 pub use overlay::{ModFile, ModFileKind, Origin, mods_dir, resolve, scan};

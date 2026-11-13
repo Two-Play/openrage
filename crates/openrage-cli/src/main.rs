@@ -1263,7 +1263,7 @@ fn cmd_verify_textures(game_dir: &Path, within: &str, rebuild: bool, keys: Optio
 
 fn report(applied: &install::Applied, started: Instant) {
     if applied.created {
-        outln!("Copied the archive into the mods folder first.");
+        outln!("Copied the archive into the overlay folder first (mods; GTA IV: update).");
     }
     outln!(
         "Written to {} ({} appended{}, {:.2}s). Undo with `openrage undo`.",
@@ -1280,6 +1280,26 @@ fn report(applied: &install::Applied, started: Instant) {
 
 fn cmd_edit(game_dir: &Path, path: &str, op: Op, description: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     let started = Instant::now();
+    if let Some(note) = openrage_app::gta4::update_folder_note(game_dir) {
+        eprintln!("note: {note}");
+    }
+    // Loose files (not inside an archive) go into the overlay folder.
+    if install::split(game_dir, path).is_none() {
+        let folder = rage_mods::overlay::folder_name(game_dir);
+        match op {
+            Op::Set(data) => {
+                let written = install::put_loose(game_dir, path, &data, description)?;
+                outln!("Written to {} (into the {folder} folder). Undo with `openrage undo`.", written.display());
+                return Ok(());
+            }
+            Op::Remove => {
+                install::remove_loose(game_dir, path, description)?;
+                outln!("Removed {path} from the {folder} folder. Undo with `openrage undo`.");
+                return Ok(());
+            }
+            _ => bail!("{path} is not inside an archive"),
+        }
+    }
     let applied = install::apply_at(game_dir, keys, path, op, description)?;
     report(&applied, started);
     Ok(())
