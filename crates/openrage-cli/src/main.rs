@@ -242,7 +242,7 @@ enum Command {
         /// Virtual path of the .ypt.
         path: String,
     },
-    /// Show a text table (.gxt2 as OpenIV .oxt text, .nametable one name per line).
+    /// Show a text table (.gxt2 as OpenIV .oxt text, .nametable one name per line; GTA IV .gxt) or a GTA IV placement file (.wpl).
     Text {
         /// Virtual path of the file.
         path: String,
@@ -250,7 +250,7 @@ enum Command {
         #[arg(short, long)]
         out: Option<PathBuf>,
     },
-    /// Show a model (.ydr, .yft, .ydd) and optionally export it as glTF (.glb).
+    /// Show a model (.ydr, .yft, .ydd; GTA IV .wdr, .wft, .wdd) and optionally export it as glTF (.glb).
     Model {
         /// Virtual path of the model.
         path: String,
@@ -468,6 +468,7 @@ fn run() -> Result<()> {
         Command::Verify { path, paths: true, .. } => cmd_verify_paths(&game_dir, &path, keys),
         Command::Verify { path, collisions: true, .. } => cmd_verify_collisions(&game_dir, &path, keys),
         Command::Verify { path, particles: true, .. } => cmd_verify_particles(&game_dir, &path, keys),
+        Command::Verify { path, text: true, .. } if gta4 => cmd_verify_gta4_text(&game_dir, &path),
         Command::Verify { path, text: true, .. } => cmd_verify_text(&game_dir, &path, keys),
         Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
         Command::Rdr2Ped { name, outfit, check, load } => cmd_rdr2_ped(&game_dir, name.as_deref(), outfit, check, load),
@@ -1729,6 +1730,14 @@ fn cmd_script(
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
     let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
+    if let Node::Gta4File(a, id) = &node {
+        let rows = openrage_app::gta4::sco_rows(&a.read(*id)?).context("not a GTA IV script (.sco)")?;
+        for (k, v) in rows {
+            outln!("{k:<17} {v}");
+        }
+        outln!("(GTA IV scripts cannot be disassembled yet.)");
+        return Ok(());
+    }
     let Node::ArchiveFile(rpf, id) = node else { bail!("{path} is not a file inside an archive") };
     let s = rage_formats::ysc::parse(&rpf.read_resource(id)?)?;
     let text = if strings {
@@ -2050,13 +2059,33 @@ fn cmd_verify_particles(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys
 
 fn cmd_text(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     use openrage_app::texttable::{self, Kind};
-    let kind = Kind::of(path).context("not a text table (.gxt2 or .nametable)")?;
+    if path.to_ascii_lowercase().ends_with(".wpl") {
+        let data = match rage_mods::resolve(game_dir, path, keys)?.0 {
+            Node::Gta4File(a, id) => a.read(id)?,
+            Node::PlainFile(p) => fs::read(p)?,
+            _ => bail!("{path} is not a file"),
+        };
+        let (text, count) = openrage_app::gta4::wpl_to_text(Some(game_dir), &data)?;
+        return match out {
+            Some(file) => {
+                fs::write(file, &text)?;
+                outln!("Wrote {} ({count} records)", file.display());
+                Ok(())
+            }
+            None => {
+                outln!("{}", text.trim_end());
+                Ok(())
+            }
+        };
+    }
+    let kind = Kind::of(path).context("not a text table (.gxt2, .nametable, .gxt) or placement file (.wpl)")?;
     if let Ok(names) = open_index(game_dir).and_then(|i| Ok(i.known_names()?)) {
         rage_formats::names::register(names);
     }
     let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
     let data = match node {
         Node::ArchiveFile(rpf, id) => rpf.read(id)?,
+        Node::Gta4File(a, id) => a.read(id)?,
         Node::PlainFile(p) => fs::read(p)?,
         _ => bail!("{path} is not a file"),
     };
@@ -2828,6 +2857,76 @@ fn cmd_verify_gta4_models(game_dir: &Path, within: &str) -> Result<()> {
     );
     if !total.errors.is_empty() {
         bail!("{} errors", total.errors.len());
+    }
+    Ok(())
+}
+
+/// Reads every GTA IV text table (`.gxt`: to text and back, identical), every
+/// placement file (`.wpl`, on disk and in archives) and every script header (`.sco`).
+fn cmd_verify_gta4_text(game_dir: &Path, within: &str) -> Result<()> {
+    let started = Instant::now();
+    let dir = match vfs::resolve(game_dir, within, None)? {
+        Node::Dir(d) => d,
+        _ => bail!("{within} is not a folder"),
+    };
+    let mut disk = Vec::new();
+    collect_archives(&dir, &["gxt", "wpl"], &mut disk);
+    let mut errors = Vec::new();
+    let (mut tables, mut strings, mut placements, mut records, mut scripts) = (0, 0, 0, 0, 0);
+    for p in &disk {
+        let rel = p.strip_prefix(game_dir).unwrap_or(p).to_string_lossy().replace('\\', "/");
+        let data = fs::read(p)?;
+        if rel.to_ascii_lowercase().ends_with(".gxt") {
+            let check = rage_formats::gxt::parse(&data).map_err(anyhow::Error::from).and_then(|t| {
+                let text = rage_formats::gxt::to_text(&t, |_| None);
+                let back = rage_formats::gxt::parse(&rage_formats::gxt::write(&rage_formats::gxt::from_text(&text)?))?;
+                anyhow::ensure!(back == t, "text form does not convert back identically");
+                Ok(t)
+            });
+            match check {
+                Ok(t) => {
+                    tables += t.len();
+                    strings += t.iter().map(|t| t.entries.len()).sum::<usize>();
+                }
+                Err(e) => errors.push(format!("{rel}: {e:#}")),
+            }
+        } else {
+            placements += 1;
+            match rage_formats::wpl::parse(&data) {
+                Ok(w) => records += rage_formats::wpl::record_count(&w),
+                Err(e) => errors.push(format!("{rel}: {e}")),
+            }
+        }
+    }
+    let (starts, open_errors) = gta4_starts(game_dir, within)?;
+    errors.extend(open_errors);
+    for (prefix, a, root) in &starts {
+        vfs::walk_gta4(a, *root, prefix, &mut |id, p| {
+            let lower = a.entry(id).name.to_ascii_lowercase();
+            if lower.ends_with(".wpl") {
+                placements += 1;
+                match a.read(id).map_err(anyhow::Error::from).and_then(|d| Ok(rage_formats::wpl::parse(&d)?)) {
+                    Ok(w) => records += rage_formats::wpl::record_count(&w),
+                    Err(e) => errors.push(format!("{p}: {e:#}")),
+                }
+            } else if lower.ends_with(".sco") {
+                scripts += 1;
+                if a.read(id).ok().and_then(|d| rage_formats::sco::header(&d)).is_none() {
+                    errors.push(format!("{p}: not a script"));
+                }
+            }
+        });
+    }
+    for e in errors.iter().take(50) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{tables} text tables ({strings} strings), {placements} placement files ({records} records), {scripts} scripts, {} errors ({:.1}s)",
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() {
+        bail!("{} errors", errors.len());
     }
     Ok(())
 }

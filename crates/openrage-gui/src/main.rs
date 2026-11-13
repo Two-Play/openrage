@@ -1970,6 +1970,23 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
                 Err(e) => (vec![kv("Error", e)], String::new()),
             }
         }
+        PreviewSource::DiskFile(path) if openrage_app::texttable::Kind::of(&path.to_string_lossy()).is_some() => {
+            let kind = openrage_app::texttable::Kind::of(&path.to_string_lossy()).expect("checked");
+            match std::fs::read(&path) {
+                Ok(data) => text_table_preview(kind, &data),
+                Err(e) => (vec![kv("Error", e)], String::new()),
+            }
+        }
+        PreviewSource::DiskFile(path) if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("wpl")) => {
+            let game = openrage_app::gta4::game_folder(&path);
+            match std::fs::read(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|d| openrage_app::gta4::wpl_to_text(game.as_deref(), &d))
+            {
+                Ok(converted) => wpl_preview(table_text_preview("GTA IV placement file", Ok(converted))),
+                Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new()),
+            }
+        }
         PreviewSource::DiskFile(path) => {
             let mut data = Vec::new();
             match File::open(&path).and_then(|f| f.take(1 << 20).read_to_end(&mut data)) {
@@ -2068,6 +2085,11 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
 /// A text table shown as text in the preview.
 fn text_table_preview(kind: openrage_app::texttable::Kind, data: &[u8]) -> (Meta, String) {
     table_text_preview(kind.name(), openrage_app::texttable::to_text(kind, data))
+}
+
+/// A placement file's preview: it cannot be opened in the editor.
+fn wpl_preview((meta, text): (Meta, String)) -> (Meta, String) {
+    (meta.into_iter().filter(|(k, v)| !(k.is_empty() && v.contains("ouble-click"))).collect(), text)
 }
 
 /// A text table already converted to text (with its entry count) for the preview.
@@ -2217,6 +2239,26 @@ fn gta4_preview(a: &rage_rpf::Gta4Archive, i: rage_rpf::Gta4EntryId) -> (Meta, S
                     (meta, String::new())
                 }
             }
+        }
+        rage_rpf::Gta4EntryKind::File { .. } if e.name.to_ascii_lowercase().ends_with(".wpl") => {
+            let game = openrage_app::gta4::game_folder(a.path());
+            let converted = a
+                .read(i)
+                .map_err(anyhow::Error::from)
+                .and_then(|d| openrage_app::gta4::wpl_to_text(game.as_deref(), &d));
+            let (more, text) = wpl_preview(table_text_preview("GTA IV placement file", converted));
+            meta.extend(more);
+            (meta, text)
+        }
+        rage_rpf::Gta4EntryKind::File { .. } if e.name.to_ascii_lowercase().ends_with(".sco") => {
+            match a.read(i).ok().and_then(|d| openrage_app::gta4::sco_rows(&d)) {
+                Some(rows) => {
+                    meta.extend(rows.into_iter().map(|(k, v)| kv(&k, v)));
+                    meta.push(note("GTA IV scripts cannot be disassembled yet."));
+                }
+                None => meta.push(kv("Error", "not a GTA IV script")),
+            }
+            (meta, String::new())
         }
         rage_rpf::Gta4EntryKind::File { stored, compressed, .. } => {
             if compressed {

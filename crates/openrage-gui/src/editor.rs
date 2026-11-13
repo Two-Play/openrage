@@ -161,7 +161,12 @@ impl Document {
             crlf: false,
             bom: false,
             tab_mark,
-            locked_reason: String::new(),
+            // GTA IV has no mods folder a changed table could go to.
+            locked_reason: if kind == Kind::Gxt {
+                "GTA IV text tables are read-only for now.".into()
+            } else {
+                String::new()
+            },
             converted: None,
             table: Some(kind),
         })
