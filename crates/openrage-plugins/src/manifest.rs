@@ -263,7 +263,7 @@ fn check_extensions(exts: &[String], wildcard: bool) -> Result<()> {
 }
 
 /// A relative path that stays inside its folder.
-pub(crate) fn safe_relative(rel: &str) -> Option<std::path::PathBuf> {
+pub fn safe_relative(rel: &str) -> Option<std::path::PathBuf> {
     let mut out = std::path::PathBuf::new();
     for part in rel.split(['/', '\\']) {
         if part.is_empty() || part == "." || part == ".." || part.contains(':') || part.chars().any(char::is_control) {

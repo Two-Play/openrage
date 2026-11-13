@@ -17,8 +17,8 @@ memory and a time limit. The same `.wasm` runs on Linux and Windows.
 > The plugin API is at version **0.3** and may still change: plugins name the version they were built for and
 > OpenRAGE only loads plugins for its own version (older plugins need `api = "0.3"` and a rebuild with the new SDK).
 > Plugins work in the explorer (file list, preview pane, context menu, **Settings → Plugins**) and from the
-> [command line](@/cli.md#plugins). Next: openFormats export, importers into game formats and installable plugin
-> packages.
+> [command line](@/cli.md#plugins). Plugins are shared as packages (`.orp`). Next: openFormats export and importers
+> into game formats.
 
 ## What plugins can do
 
@@ -92,6 +92,32 @@ openrage plugin enable strings
 openrage plugin preview --file some.bin
 openrage plugin run strings export x64a.rpf/data/x.dat --out exported/
 ```
+
+## Sharing your plugin
+
+Pack it into a plugin package (`.orp`), a ZIP file with `plugin.toml`, the component and the files you ship with it
+(`README*`, `LICENSE*`, `CHANGELOG*`, `NOTICE*`, `COPYING*` from the plugin folder):
+
+```sh
+openrage plugin pack plugins/examples/strings --wasm plugins/target/wasm32-wasip2/release/strings.wasm
+# Packed Strings 0.1.0 into strings-0.1.0.orp (…)
+# SHA-256: …
+```
+
+Packing is reproducible (the same files give the same package) and checks the package the way installing does.
+Publish the `.orp` together with its SHA-256: OpenRAGE shows the checksum before installing, so users can compare
+it with yours. There are no signatures yet.
+
+Users install it with **Settings → Plugins → Install plugin…**, by opening the `.orp` with `openrage-gui`, or with
+`openrage plugin install`. Before anything is written they see the name, version, authors, licence, games,
+permissions, what it adds, which installed version it replaces and the checksum. The package goes into the user's
+plugin folder. A new plugin stays off until the user turns it on; an update keeps the user's choice, unless it asks
+for more permissions. **Uninstall** (or `openrage plugin uninstall`) removes it again.
+
+Packages are checked before installing: at most 1000 files and 256 MB unpacked, no paths outside the plugin folder,
+a valid `plugin.toml` for this OpenRAGE, and a component that exports the plugin interface and imports nothing
+OpenRAGE does not offer. An installation is written in full first and swapped in at the end; if it fails, the
+installed version stays as it was.
 
 ## Where plugins are found
 

@@ -4050,10 +4050,13 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "flate2",
  "serde",
+ "sha2",
  "toml",
  "wasmtime",
  "wasmtime-wasi",
+ "zip",
 ]
 
 [[package]]

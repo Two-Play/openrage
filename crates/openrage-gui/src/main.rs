@@ -97,6 +97,8 @@ struct App {
     /// Models for `suggest_ycd` are still being looked for.
     suggest_pending: bool,
     index_running: bool,
+    /// Plugin package shown in the install dialog.
+    plugin_package: Option<Arc<openrage_plugins::package::Package>>,
 }
 
 thread_local! {
@@ -160,6 +162,7 @@ fn main() -> anyhow::Result<()> {
             suggest_awc: String::new(),
             suggest_pending: false,
             index_running: false,
+            plugin_package: None,
         })
     });
 
@@ -242,6 +245,10 @@ fn debug_snapshot(ui: &AppWindow) {
         if let Ok(i) = std::env::var("OPENRAGE_PICK_GAME") {
             ui.set_game_chooser_visible(false);
             ui.invoke_game_chosen(i.parse().unwrap_or(0), false);
+        }
+        // `OPENRAGE_CONFIRM_PLUGIN=1`: press Install in the plugin package dialog.
+        if std::env::var("OPENRAGE_CONFIRM_PLUGIN").is_ok() && ui.get_plugin_pkg_visible() {
+            ui.invoke_plugin_pkg_confirm();
         }
         if let Ok(page) = std::env::var("OPENRAGE_SETTINGS") {
             ui.set_settings_scroll_end(page == "plugins");
@@ -794,6 +801,54 @@ fn wire_callbacks(ui: &AppWindow) {
         });
     });
     let w = ui.as_weak();
+    ui.on_pick_plugin_package(move || {
+        let w = w.clone();
+        std::thread::spawn(move || {
+            let Some(path) = rfd::FileDialog::new()
+                .set_title("Install a plugin")
+                .add_filter("OpenRAGE plugin", &["orp"])
+                .pick_file()
+            else {
+                return;
+            };
+            let _ = w.upgrade_in_event_loop(move |ui| offer_plugin_package(&ui, path));
+        });
+    });
+    let w = ui.as_weak();
+    ui.on_plugin_pkg_confirm(move || {
+        with_ui(&w, |ui| {
+            ui.set_plugin_pkg_visible(false);
+            let Some(package) = with_app(|a| a.plugin_package.take()) else { return };
+            let name = format!("{} {}", package.manifest.name, package.manifest.version);
+            let result = with_app(|a| plugins::install(&a.cfg, &package));
+            after_plugins_change(ui);
+            ui.set_status(
+                match result {
+                    Ok(_) if plugins::is_enabled(&package.manifest.id) => {
+                        format!("Installed {name}; it is on.")
+                    }
+                    Ok(_) => format!("Installed {name}. Turn it on in Settings → Plugins."),
+                    Err(e) => format!("Installing {name} failed: {e:#}"),
+                }
+                .into(),
+            );
+        });
+    });
+    let w = ui.as_weak();
+    ui.on_uninstall_plugin(move |id| {
+        with_ui(&w, |ui| {
+            let result = with_app(|a| plugins::uninstall(&mut a.cfg, &id));
+            after_plugins_change(ui);
+            ui.set_status(
+                match result {
+                    Ok(()) => format!("Uninstalled {id}."),
+                    Err(e) => format!("Cannot uninstall {id}: {e:#}"),
+                }
+                .into(),
+            );
+        });
+    });
+    let w = ui.as_weak();
     ui.on_open_plugin_folder(move || {
         with_ui(&w, |ui| {
             let Some(dir) = plugins::user_folder() else { return };
@@ -1246,6 +1301,9 @@ fn start_browsing(ui: &AppWindow) {
         if arg.to_ascii_lowercase().ends_with(".oiv") && Path::new(&arg).is_file() {
             // `openrage-gui package.oiv` (e.g. opened from a file manager): show the install dialog.
             open_package(ui, PathBuf::from(arg));
+        } else if arg.to_ascii_lowercase().ends_with(".orp") && Path::new(&arg).is_file() {
+            // `openrage-gui plugin.orp`: the plugin install dialog.
+            offer_plugin_package(ui, PathBuf::from(arg));
         } else {
             navigate(ui, &arg, true);
         }
@@ -1932,6 +1990,26 @@ fn select_row(ui: &AppWindow, row: usize) {
     });
 }
 
+/// Checks a plugin package (in the background) and shows the install dialog.
+fn offer_plugin_package(ui: &AppWindow, path: PathBuf) {
+    ui.set_status(format!("Checking {}…", path.display()).into());
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let offer = plugins::open_package(&path);
+        let _ = weak.upgrade_in_event_loop(move |ui| match offer {
+            Ok(o) => {
+                ui.set_plugin_pkg_title(o.title.into());
+                ui.set_plugin_pkg_subtitle(o.subtitle.into());
+                ui.set_plugin_pkg_details(o.details.into());
+                with_app(|a| a.plugin_package = Some(Arc::new(o.package)));
+                ui.set_plugin_pkg_visible(true);
+                ui.set_status(SharedString::new());
+            }
+            Err(e) => ui.set_status(format!("Cannot install {}: {e}", path.display()).into()),
+        });
+    });
+}
+
 /// Shows the installed plugins on the settings page.
 fn refresh_plugin_rows(ui: &AppWindow) {
     let rows: Vec<PluginRow> = plugins::rows()
@@ -1944,6 +2022,7 @@ fn refresh_plugin_rows(ui: &AppWindow) {
             permissions: r.permissions.into(),
             enabled: r.enabled,
             broken: r.broken,
+            removable: r.removable,
         })
         .collect();
     ui.set_plugins(ModelRc::new(VecModel::from(rows)));

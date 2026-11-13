@@ -16,6 +16,7 @@ The interface itself is [`crates/openrage-plugins/wit/plugin.wit`](../crates/ope
 ```sh
 rustup target add wasm32-wasip2
 cargo build --release --target wasm32-wasip2   # in this folder
+openrage plugin pack examples/strings --wasm target/wasm32-wasip2/release/strings.wasm   # → strings-0.1.0.orp
 ```
 
 Everything in this folder and `plugin.wit` are licensed under MIT OR Apache-2.0

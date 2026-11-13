@@ -293,6 +293,8 @@ pub struct Row {
     pub permissions: String,
     pub enabled: bool,
     pub broken: bool,
+    /// In the user's plugin folder: can be uninstalled from the settings.
+    pub removable: bool,
 }
 
 /// Every installed plugin, and the folders that could not be read.
@@ -343,6 +345,7 @@ pub fn rows() -> Vec<Row> {
                 permissions,
                 enabled: p.enabled(),
                 broken: false,
+                removable: user_folder().is_some_and(|u| p.dir.starts_with(u)),
             }
         })
         .collect();
@@ -354,8 +357,14 @@ pub fn rows() -> Vec<Row> {
         permissions: b.error.clone(),
         enabled: false,
         broken: true,
+        removable: false,
     }));
     rows
+}
+
+/// Whether a plugin is installed and on.
+pub fn is_enabled(id: &str) -> bool {
+    state().is_some_and(|s| s.registry.get(id).is_some_and(Plugin::enabled))
 }
 
 /// Turns a plugin on (granting what it asks for) or off, and saves the choice.
@@ -369,6 +378,94 @@ pub fn set_enabled(cfg: &mut Config, id: &str, on: bool) -> anyhow::Result<()> {
         openrage_app::plugins::disable(cfg, id);
     }
     cfg.save()?;
+    reload(cfg);
+    Ok(())
+}
+
+/// A plugin package, checked and ready to install, with what the install
+/// dialog shows about it.
+pub struct PackageOffer {
+    pub package: openrage_plugins::package::Package,
+    pub title: String,
+    pub subtitle: String,
+    pub details: String,
+}
+
+/// Reads a package and checks that this OpenRAGE can run its plugin (call
+/// it from a worker thread: compiling takes a moment).
+pub fn open_package(path: &Path) -> Result<PackageOffer, String> {
+    let package = openrage_plugins::package::Package::open(path).map_err(|e| format!("{e:#}"))?;
+    let m = &package.manifest;
+    let wasm = &package.files.iter().find(|(n, _)| n.eq_ignore_ascii_case(&m.wasm)).ok_or("component missing")?.1;
+    let host = Host::new(Limits::default()).map_err(|e| format!("cannot start plugins: {e:#}"))?;
+    host.validate(wasm).map_err(|e| format!("{} cannot run in this OpenRAGE: {e:#}", m.name))?;
+    let mut details = String::new();
+    if !m.description.is_empty() {
+        details.push_str(&format!("{}\n\n", m.description));
+    }
+    if !m.authors.is_empty() {
+        details.push_str(&format!("Authors: {}\n", m.authors.join(", ")));
+    }
+    details.push_str(&format!("Licence: {}\n", if m.license.is_empty() { "not stated" } else { &m.license }));
+    if !m.homepage.is_empty() {
+        details.push_str(&format!("Homepage: {}\n", m.homepage));
+    }
+    let games: Vec<_> = m.games.iter().map(|g| g.as_str()).collect();
+    details.push_str(&format!("Games: {}\n\n", if games.is_empty() { "all".to_owned() } else { games.join(", ") }));
+    if m.permissions.is_empty() {
+        details.push_str("Permissions: none (it sees only the files you open with it)\n");
+    }
+    for p in &m.permissions {
+        details.push_str(&format!("Permission {p}: {}\n", p.description()));
+    }
+    let adds: Vec<String> = m
+        .file_types
+        .iter()
+        .map(|t| format!("file type {} (.{})", t.name, t.extensions.join(", .")))
+        .chain(m.preview.iter().map(|p| format!("preview of .{}", p.extensions.join(", ."))))
+        .chain(m.actions.iter().map(|a| format!("action \"{}\"", a.title)))
+        .collect();
+    if !adds.is_empty() {
+        details.push_str(&format!("Adds: {}\n", adds.join("; ")));
+    }
+    if let Some(old) = state().and_then(|s| s.registry.get(&m.id).map(|p| (p.manifest.version.clone(), p.dir.clone())))
+    {
+        details.push_str(&format!("\nReplaces version {} in {}\n", old.0, old.1.display()));
+    }
+    details.push_str(&format!(
+        "\nPackage: {} files, {} bytes\nSHA-256: {}",
+        package.files.len(),
+        package.size,
+        package.sha256
+    ));
+    Ok(PackageOffer {
+        title: format!("Install {} {}?", m.name, m.version),
+        subtitle: format!(
+            "{} · SHA-256 {}",
+            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            package.sha256
+        ),
+        details,
+        package,
+    })
+}
+
+/// Installs a package into the user's plugin folder and reloads the plugins.
+pub fn install(cfg: &Config, package: &openrage_plugins::package::Package) -> anyhow::Result<PathBuf> {
+    let root = user_folder().ok_or_else(|| anyhow::anyhow!("no per-user config folder"))?;
+    let dir = package.install(&root)?;
+    reload(cfg);
+    Ok(dir)
+}
+
+/// Removes a plugin from the user's plugin folder, forgets its permissions
+/// and reloads the plugins.
+pub fn uninstall(cfg: &mut Config, id: &str) -> anyhow::Result<()> {
+    let root = user_folder().ok_or_else(|| anyhow::anyhow!("no per-user config folder"))?;
+    openrage_plugins::package::uninstall(&root, id)?;
+    if openrage_app::plugins::disable(cfg, id) {
+        cfg.save()?;
+    }
     reload(cfg);
     Ok(())
 }
