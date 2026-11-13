@@ -120,7 +120,7 @@ pub(crate) fn open_package(ui: &AppWindow, file: PathBuf) {
                 ui.set_status(SharedString::new());
                 with_app(|a| a.package = Some(Arc::new(pkg)));
             }
-            Err(e) => ui.set_status(format!("Could not read the package: {e:#}").into()),
+            Err(e) => show_error(&ui, format!("Could not read the package: {e:#}")),
         });
     });
 }

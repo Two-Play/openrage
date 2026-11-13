@@ -17,7 +17,7 @@ pub(crate) fn offer_plugin_package(ui: &AppWindow, path: PathBuf) {
                 ui.set_plugin_pkg_visible(true);
                 ui.set_status(SharedString::new());
             }
-            Err(e) => ui.set_status(format!("Cannot install {}: {e}", path.display()).into()),
+            Err(e) => show_error(&ui, format!("Cannot install {}: {e}", path.display())),
         });
     });
 }

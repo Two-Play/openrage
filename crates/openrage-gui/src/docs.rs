@@ -40,7 +40,7 @@ pub(crate) fn open_text_file(ui: &AppWindow, vpath: String) {
     ui.set_status(format!("Opening {vpath} …").into());
     let data = match read_file(ui, &vpath) {
         Ok(d) => d,
-        Err(e) => return ui.set_status(format!("Cannot open {vpath}: {e:#}").into()),
+        Err(e) => return show_error(ui, format!("Cannot open {vpath}: {e:#}")),
     };
     if let Ok(xml) = openrage_app::metadata::from_bytes(&data)
         && xml.encoding == openrage_app::metadata::Encoding::Text
@@ -59,7 +59,7 @@ pub(crate) fn open_text_data(ui: &AppWindow, vpath: String, data: &[u8]) {
             editor::open(ui, doc);
             ui.set_status(SharedString::new());
         }
-        Err(e) => ui.set_status(format!("Cannot open {vpath} as text ({e}); use Extract… instead.").into()),
+        Err(e) => show_error(ui, format!("Cannot open {vpath} as text ({e}); use Extract… instead.")),
     }
 }
 
@@ -74,7 +74,7 @@ pub(crate) fn open_editor(ui: &AppWindow, vpath: String) {
                 editor::open(ui, editor::Document::rdr2_text_table(vpath, text));
                 ui.set_status(SharedString::new());
             }
-            Err(e) => ui.set_status(format!("Cannot read {vpath}: {e:#}").into()),
+            Err(e) => show_error(ui, format!("Cannot read {vpath}: {e:#}")),
         }
         return;
     }
@@ -89,13 +89,13 @@ pub(crate) fn open_editor(ui: &AppWindow, vpath: String) {
                 editor::open(ui, editor::Document::placement(vpath, text, data));
                 ui.set_status(SharedString::new());
             }
-            Err(e) => ui.set_status(format!("Cannot open {vpath}: {e:#}").into()),
+            Err(e) => show_error(ui, format!("Cannot open {vpath}: {e:#}")),
         }
         return;
     }
     match read_file(ui, &vpath) {
         Ok(data) => open_text_data(ui, vpath, &data),
-        Err(e) => ui.set_status(format!("Cannot open {vpath}: {e:#}").into()),
+        Err(e) => show_error(ui, format!("Cannot open {vpath}: {e:#}")),
     }
 }
 
@@ -140,7 +140,7 @@ pub(crate) fn open_script_view(ui: &AppWindow, vpath: String) {
             editor::open(ui, editor::Document::script(vpath, text));
             ui.set_status(SharedString::new());
         }
-        Err(e) => ui.set_status(format!("Cannot disassemble {vpath}: {e:#}").into()),
+        Err(e) => show_error(ui, format!("Cannot disassemble {vpath}: {e:#}")),
     }
 }
 
@@ -164,7 +164,7 @@ pub(crate) fn open_xml_view(ui: &AppWindow, vpath: String) {
             xmlview::open(ui, vpath, xml);
             ui.set_status(SharedString::new());
         }
-        Err(e) => ui.set_status(format!("Cannot convert {vpath}: {e:#}").into()),
+        Err(e) => show_error(ui, format!("Cannot convert {vpath}: {e:#}")),
     }
 }
 
@@ -172,7 +172,7 @@ pub(crate) fn open_xml_view(ui: &AppWindow, vpath: String) {
 pub(crate) fn export_swf(ui: &AppWindow, vpath: String) {
     let swf = match read_file(ui, &vpath).and_then(|d| Ok(rage_formats::media::gfx_to_swf(&d)?)) {
         Ok(s) => s,
-        Err(e) => return ui.set_status(format!("Cannot convert {vpath}: {e:#}").into()),
+        Err(e) => return show_error(ui, format!("Cannot convert {vpath}: {e:#}")),
     };
     let name = vpath.rsplit('/').next().unwrap_or(&vpath);
     let stem = name.rsplit_once('.').map_or(name, |(s, _)| s).to_owned();
@@ -200,7 +200,7 @@ pub(crate) fn export_text_table(ui: &AppWindow, vpath: String) {
     let Some(kind) = Kind::of(&vpath) else { return };
     let text = match read_file(ui, &vpath).and_then(|d| texttable::to_text(kind, &d)) {
         Ok((t, _)) => t,
-        Err(e) => return ui.set_status(format!("Cannot convert {vpath}: {e:#}").into()),
+        Err(e) => return show_error(ui, format!("Cannot convert {vpath}: {e:#}")),
     };
     let name = vpath.rsplit('/').next().unwrap_or(&vpath);
     let stem = name.rsplit_once('.').map_or(name, |(s, _)| s).to_owned();
@@ -227,7 +227,7 @@ pub(crate) fn export_text_table(ui: &AppWindow, vpath: String) {
 pub(crate) fn export_xml(ui: &AppWindow, vpath: String) {
     let xml = match read_xml(ui, &vpath) {
         Ok(x) => x,
-        Err(e) => return ui.set_status(format!("Cannot convert {vpath}: {e:#}").into()),
+        Err(e) => return show_error(ui, format!("Cannot convert {vpath}: {e:#}")),
     };
     let name = vpath.rsplit('/').next().unwrap_or(&vpath).to_owned();
     let weak = ui.as_weak();
@@ -301,7 +301,7 @@ pub(crate) fn open_with_system(ui: &AppWindow, vpath: String) {
     let data = match read_file(ui, &vpath) {
         Ok(d) => d,
         Err(e) => {
-            ui.set_status(format!("Cannot open {vpath}: {e:#}").into());
+            show_error(ui, format!("Cannot open {vpath}: {e:#}"));
             return;
         }
     };
@@ -331,7 +331,7 @@ pub(crate) fn open_with_system(ui: &AppWindow, vpath: String) {
     let path = match result {
         Ok(p) => p,
         Err(e) => {
-            ui.set_status(format!("Cannot write a copy: {e}").into());
+            show_error(ui, format!("Cannot write a copy: {e}"));
             return;
         }
     };

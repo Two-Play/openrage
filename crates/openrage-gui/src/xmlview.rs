@@ -144,7 +144,7 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
     let tree = match xmltree::parse(&xml.text) {
         Ok(t) => t,
         Err(e) => {
-            ui.set_status(format!("Cannot read the XML of {vpath}: {e}").into());
+            crate::show_error(ui, format!("Cannot read the XML of {vpath}: {e}"));
             return;
         }
     };

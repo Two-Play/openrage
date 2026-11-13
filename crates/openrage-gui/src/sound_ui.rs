@@ -180,7 +180,7 @@ pub(crate) fn toggle_sound(ui: &AppWindow) {
         match audio::Output::play(Arc::clone(&pcm), Duration::from_secs_f32(start)) {
             Ok(out) => with_app(|a| a.output = Some(out)),
             Err(e) => {
-                ui.set_status(format!("Cannot play audio: {e}").into());
+                show_error(ui, format!("Cannot play audio: {e}"));
                 return;
             }
         }

@@ -50,7 +50,7 @@ pub(crate) fn open_game(ui: &AppWindow, index: usize, remember: bool) {
         show_setup(ui, true);
     }
     if let Err(e) = saved {
-        ui.set_status(format!("Could not save the settings: {e}").into());
+        show_error(ui, format!("Could not save the settings: {e}"));
     }
 }
 
@@ -116,7 +116,7 @@ pub(crate) fn run_setup(ui: &AppWindow) {
                         refresh_games(&ui);
                         start_browsing(&ui);
                         if let Err(e) = saved {
-                            ui.set_status(format!("Could not save the settings: {e}").into());
+                            show_error(&ui, format!("Could not save the settings: {e}"));
                         }
                     }
                     Err(e) => ui.set_setup_log(format!("Error: {e:#}").into()),
@@ -144,7 +144,7 @@ pub(crate) fn run_setup(ui: &AppWindow) {
         refresh_games(ui);
         start_browsing(ui);
         if let Err(e) = saved {
-            ui.set_status(format!("Could not save the settings: {e}").into());
+            show_error(ui, format!("Could not save the settings: {e}"));
         }
         return;
     }
@@ -209,6 +209,6 @@ pub(crate) fn finish_setup(ui: &AppWindow, game_dir: PathBuf, magic: Option<Path
     refresh_games(ui);
     start_browsing(ui);
     if let Err(e) = saved {
-        ui.set_status(format!("Could not save settings: {e:#}").into());
+        show_error(ui, format!("Could not save settings: {e:#}"));
     }
 }

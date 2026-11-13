@@ -61,10 +61,7 @@ fn wire_navigation(ui: &AppWindow) {
         with_ui(&w, |ui| {
             let Some(vpath) = with_app(|a| a.tree.nodes.get(i as usize).map(|n| n.vpath.clone())) else { return };
             match action.as_str() {
-                "extract" => {
-                    navigate(ui, &vpath, true);
-                    start_extract(ui);
-                }
+                "extract" => navigate_then(ui, &vpath, true, start_extract),
                 "copy-path" => {
                     let msg = match copy_to_clipboard(&vpath) {
                         Ok(()) => format!("Copied {vpath}"),
@@ -351,7 +348,7 @@ fn wire_plugins(ui: &AppWindow) {
         with_ui(&w, |ui| {
             let result = with_app(|a| plugins::set_enabled(&mut a.cfg, &id, on));
             if let Err(e) = result {
-                ui.set_status(format!("Cannot change plugin {id}: {e:#}").into());
+                show_error(ui, format!("Cannot change plugin {id}: {e:#}"));
             }
             after_plugins_change(ui);
         });
@@ -417,7 +414,7 @@ fn wire_plugins(ui: &AppWindow) {
         with_ui(&w, |ui| {
             let Some(dir) = plugins::user_folder() else { return };
             if let Err(e) = std::fs::create_dir_all(&dir) {
-                return ui.set_status(format!("Cannot create {}: {e}", dir.display()).into());
+                return show_error(ui, format!("Cannot create {}: {e}", dir.display()));
             }
             let opened = if cfg!(target_os = "windows") {
                 std::process::Command::new("explorer").arg(&dir).spawn()
@@ -427,7 +424,7 @@ fn wire_plugins(ui: &AppWindow) {
                 std::process::Command::new("xdg-open").arg(&dir).spawn()
             };
             if let Err(e) = opened {
-                ui.set_status(format!("Cannot open {}: {e}", dir.display()).into());
+                show_error(ui, format!("Cannot open {}: {e}", dir.display()));
             }
         });
     });
@@ -444,7 +441,7 @@ fn wire_settings(ui: &AppWindow) {
             });
             refresh_games(ui);
             if let Err(e) = saved {
-                ui.set_status(format!("Could not save the settings: {e}").into());
+                show_error(ui, format!("Could not save the settings: {e}"));
             }
         })
     });
@@ -569,7 +566,7 @@ fn wire_archive(ui: &AppWindow) {
                     }
                     .into(),
                 ),
-                Err(e) => ui.set_status(format!("{e:#}").into()),
+                Err(e) => show_error(ui, format!("{e:#}")),
             }
             show_write_target(ui);
         })
@@ -775,15 +772,18 @@ pub(crate) fn row_action(ui: &AppWindow, row: usize, action: &str) {
                 _ => {
                     if let Some(v) = vpath {
                         let folder = browser::parent(&v).unwrap_or_default();
-                        navigate(ui, &folder, true);
                         let file = v.rsplit('/').next().unwrap_or(&v).to_owned();
-                        let row = with_app(|a| {
-                            let l = a.listing.as_ref()?;
-                            a.visible.iter().position(|&i| l.items[i].name.eq_ignore_ascii_case(&file))
+                        navigate_then(ui, &folder, true, move |ui| {
+                            let row = with_app(|a| {
+                                let l = a.listing.as_ref()?;
+                                a.visible
+                                    .iter()
+                                    .position(|&i| l.items.get(i).is_some_and(|it| it.name.eq_ignore_ascii_case(&file)))
+                            });
+                            if let Some(row) = row {
+                                ui.invoke_select_row(row as i32);
+                            }
                         });
-                        if let Some(row) = row {
-                            ui.invoke_select_row(row as i32);
-                        }
                     }
                 }
             }

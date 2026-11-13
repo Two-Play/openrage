@@ -1015,6 +1015,9 @@ export component AppWindow inherits Window {
 
     // Status / background task
     in property <string> status;
+    // The last error shown; the status is highlighted while it still says that.
+    in property <string> status-error;
+    property <bool> status-is-error: root.status != "" && root.status == root.status-error;
     in property <bool> busy;
     // The running task stops when asked (extraction, plugin runs); others finish.
     in property <bool> cancellable;
@@ -2463,8 +2466,12 @@ export component AppWindow inherits Window {
                     font-size: Theme.font-small;
                     vertical-alignment: center;
                     overflow: elide;
-                    color: Theme.text-muted;
+                    color: root.status-is-error ? Theme.danger : Theme.text-muted;
                     accessible-role: text;
+                    accessible-label: root.status-is-error ? @tr("Error: {}", root.status) : root.status;
+                    Tooltip {
+                        text: @markdown("\{root.status}");
+                    }
                 }
                 Text {
                     text: root.index-status;
