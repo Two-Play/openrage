@@ -1733,6 +1733,8 @@ fn grouped(n: usize) -> String {
 }
 
 fn show_folder_info(ui: &AppWindow) {
+    // Read before `with_app` below: it would borrow the app state twice.
+    let overlay = overlay_name();
     let info = with_app(|a| {
         let l = a.listing.as_ref()?;
         let name = location_title(l);
@@ -1764,7 +1766,7 @@ fn show_folder_info(ui: &AppWindow) {
                     String::new(),
                     vec![note(format!(
                         "Every change OpenRAGE made to the {} folder. Select a package entry to uninstall the whole package.",
-                        overlay_name()
+                        overlay
                     ))],
                     ("history", badges::NEUTRAL),
                 ));
@@ -1840,7 +1842,7 @@ fn show_folder_info(ui: &AppWindow) {
         };
         let mut meta = place;
         match l.origin {
-            Origin::Mods => meta.push(kv("Source", format!("{} folder (replaces the game's version)", overlay_name()))),
+            Origin::Mods => meta.push(kv("Source", format!("{} folder (replaces the game's version)", overlay))),
             Origin::Merged => meta.push(kv("Source", "game folder merged with its mods counterpart")),
             Origin::Base => {}
         }
@@ -4402,7 +4404,11 @@ fn save_file(
                     let applied =
                         install::apply(&game_dir, keys, &t.archive, &[(t.inner, Op::Set(data))], &description)?;
                     Ok(if applied.created {
-                        format!("Saved into {}/{} (archive copied there first)", overlay_name(), t.archive)
+                        format!(
+                            "Saved into {}/{} (archive copied there first)",
+                            rage_mods::overlay::folder_name(&game_dir),
+                            t.archive
+                        )
                     } else {
                         format!("Saved into {}", applied.path.display())
                     })
