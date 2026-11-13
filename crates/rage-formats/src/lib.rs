@@ -26,6 +26,7 @@ pub mod rbf;
 pub mod sco;
 pub mod shaders;
 pub mod texture;
+pub mod wad;
 pub mod wbn;
 pub mod wdr;
 pub mod wpl;

@@ -477,6 +477,41 @@ pub fn load_map(game: &Path, vpath: &str, progress: &(dyn Fn(usize, usize) + Syn
     Ok(crate::world::MapScene { models, objects, missing })
 }
 
+/// Ped models an animation can be played on: the drawable dictionaries of
+/// `componentpeds.img` (base game first, then the episodes'), when the
+/// animation moves bones of the ped skeleton; empty for other animations.
+pub fn animation_models(game: &Path, tags: &std::collections::HashSet<u16>) -> Vec<String> {
+    static SKELETON: OnceLock<Option<std::collections::HashSet<u16>>> = OnceLock::new();
+    let mut archives = Vec::new();
+    for dir in ["pc/models/cdimages", "TLAD/pc/models/cdimages", "TBoGT/pc/models/cdimages"] {
+        if let Some(p) = vfs::find_case_insensitive(game, &format!("{dir}/componentpeds.img")) {
+            archives.push((dir, p));
+        }
+    }
+    let mut models: Vec<String> = Vec::new();
+    for (dir, path) in &archives {
+        let Ok(a) = Gta4Archive::open_default(path) else { continue };
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut found: Vec<String> = a
+            .children(Gta4Archive::ROOT)
+            .map(|i| a.entry(i).name.clone())
+            .filter(|n| n.to_ascii_lowercase().ends_with(".wdd"))
+            .map(|n| format!("{dir}/{name}/{n}"))
+            .collect();
+        found.sort();
+        models.extend(found);
+    }
+    let skeleton = SKELETON.get_or_init(|| {
+        let first = models.first()?;
+        let model = crate::models::load(game, None, first).ok()?;
+        Some(model.skeleton?.bones.iter().map(|b| b.tag).collect())
+    });
+    let Some(skeleton) = skeleton else { return Vec::new() };
+    let bones: Vec<&u16> = tags.iter().filter(|t| **t != 0).collect();
+    let fits = !bones.is_empty() && bones.iter().filter(|t| skeleton.contains(t)).count() * 2 >= bones.len();
+    if fits { models } else { Vec::new() }
+}
+
 /// A placement file (`.wpl`) as IPL-style text, with model names from the
 /// game's `.ide` files when `game` is given; also returns the number of records.
 pub fn wpl_to_text(game: Option<&Path>, data: &[u8]) -> Result<(String, usize)> {

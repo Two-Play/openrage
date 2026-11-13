@@ -6,7 +6,7 @@ use rage_formats::math::{self, Mat4};
 
 use crate::expr::Local;
 
-/// Reads a clip dictionary (`.ycd`, GTA V or RDR2) or a cutscene's
+/// Reads a clip dictionary (`.ycd`, GTA V or RDR2; GTA IV `.wad`) or a cutscene's
 /// animation (`.cut`, its sections joined), mods included.
 pub fn load_clips(
     game_dir: &std::path::Path,
@@ -19,12 +19,40 @@ pub fn load_clips(
             crate::cutscene::animation(&rpf, id)
         }
         Node::ArchiveFile(rpf, id) => Ok(rage_formats::clip::parse_ycd(&rpf.read_resource(id)?)?),
+        Node::Gta4File(archive, id) => Ok(rage_formats::wad::parse_wad(&archive.read_resource(id)?)?),
         Node::Rpf8File(rpf, i) => {
             let entry =
                 rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| anyhow::anyhow!("archive table not readable"))?;
             Ok(rage_formats::clip::parse_ycd(&rpf.read_resource(entry)?)?)
         }
         _ => anyhow::bail!("{vpath} is not a file inside an archive"),
+    }
+}
+
+/// GTA IV's twist and roll helpers (`Char_L_ForeTwist`, `L_ArmRoll`, …) are
+/// moved by the game, not by animations: each rests where an animated sibling
+/// bone rests (the forearm, the upper arm). Without a track of their own they
+/// turn with that sibling, so skin weighted to them follows the limb. Only
+/// for GTA IV skeletons (`Char_…` bones); GTA V's helpers have expressions.
+fn follow_twist_bones(skeleton: &Skeleton, tracks: &mut [[Option<usize>; 3]]) {
+    if skeleton.find_name("Char_Pelvis").is_none() {
+        return;
+    }
+    let bones = &skeleton.bones;
+    for (i, b) in bones.iter().enumerate() {
+        if tracks[i][1].is_some() {
+            continue;
+        }
+        let near = |o: &rage_formats::drawable::Bone| {
+            let dt: f32 = (0..3).map(|k| (b.translation[k] - o.translation[k]).powi(2)).sum();
+            let dot: f32 = (0..4).map(|k| b.rotation[k] * o.rotation[k]).sum();
+            dt < 0.03 * 0.03 && dot.abs() > 0.999
+        };
+        let sibling = (0..bones.len())
+            .find(|&j| j != i && bones[j].parent == b.parent && tracks[j][1].is_some() && near(&bones[j]));
+        if let Some(j) = sibling {
+            tracks[i][1] = tracks[j][1];
+        }
     }
 }
 
@@ -52,6 +80,7 @@ impl Binding {
             };
             tracks[b][slot] = Some(i);
         }
+        follow_twist_bones(skeleton, &mut tracks);
         let inverse_bind = skeleton.world_transforms().iter().map(math::inverse_affine).collect();
         let parents =
             skeleton.bones.iter().enumerate().map(|(i, b)| usize::try_from(b.parent).ok().filter(|&p| p < i)).collect();

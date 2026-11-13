@@ -279,7 +279,7 @@ enum Command {
         #[arg(long)]
         outfit: Option<usize>,
     },
-    /// List the clips of a clip dictionary (.ycd).
+    /// List the clips of a clip dictionary (.ycd; GTA IV .wad).
     Clips {
         /// Virtual path of the .ycd file.
         path: String,
@@ -489,6 +489,7 @@ fn run() -> Result<()> {
         Command::Verify { path, text: true, .. } => cmd_verify_text(&game_dir, &path, keys),
         Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
         Command::Rdr2Ped { name, outfit, check, load } => cmd_rdr2_ped(&game_dir, name.as_deref(), outfit, check, load),
+        Command::Verify { path, animations: true, .. } if gta4 => cmd_verify_gta4_animations(&game_dir, &path),
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
         Command::Verify { path, textures: false, .. } if gta4 => cmd_verify_gta4(&game_dir, &path),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
@@ -2989,6 +2990,83 @@ fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
     );
     if !total.errors.is_empty() {
         bail!("verification found {} errors", total.errors.len());
+    }
+    Ok(())
+}
+
+/// Reads every GTA IV animation dictionary (`.wad`) and evaluates every frame of every track.
+fn cmd_verify_gta4_animations(game_dir: &Path, within: &str) -> Result<()> {
+    #[derive(Default)]
+    struct Stats {
+        files: usize,
+        animations: usize,
+        tracks: usize,
+        frames: usize,
+        bad_values: usize,
+        errors: Vec<String>,
+    }
+    let (starts, open_errors) = gta4_starts(game_dir, within)?;
+    let started = Instant::now();
+    let all: Vec<Stats> = starts
+        .par_iter()
+        .map(|(prefix, a, dir)| {
+            let mut s = Stats::default();
+            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
+                let e = a.entry(id);
+                if e.resource_type().is_none() || !e.name.to_ascii_lowercase().ends_with(".wad") {
+                    return;
+                }
+                s.files += 1;
+                match a
+                    .read_resource(id)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| Ok(rage_formats::wad::parse_wad(&r)?))
+                {
+                    Ok(dict) => {
+                        for anim in &dict.animations {
+                            s.animations += 1;
+                            s.tracks += anim.tracks.len();
+                            s.frames += anim.frames;
+                            for t in 0..anim.tracks.len() {
+                                for f in 0..anim.frames {
+                                    let ok = anim.value(t, f as f32).is_some_and(|v| v.iter().all(|c| c.is_finite()));
+                                    if !ok {
+                                        s.bad_values += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => s.errors.push(format!("{p}: {err:#}")),
+                }
+            });
+            s
+        })
+        .collect();
+    let mut total = Stats { errors: open_errors, ..Default::default() };
+    for s in all {
+        total.files += s.files;
+        total.animations += s.animations;
+        total.tracks += s.tracks;
+        total.frames += s.frames;
+        total.bad_values += s.bad_values;
+        total.errors.extend(s.errors);
+    }
+    for e in total.errors.iter().take(50) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} animation dictionaries, {} animations ({} frames), {} bone tracks, {} values not finite, {} errors ({:.1}s)",
+        total.files,
+        total.animations,
+        total.frames,
+        total.tracks,
+        total.bad_values,
+        total.errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !total.errors.is_empty() || total.bad_values > 0 {
+        bail!("{} errors, {} bad values", total.errors.len(), total.bad_values);
     }
     Ok(())
 }

@@ -58,6 +58,14 @@ impl Animation {
     pub fn empty() -> Animation {
         Animation { flags: 0, frames: 1, frames_per_block: 1, duration: 0.0, tracks: Vec::new(), blocks: Vec::new() }
     }
+
+    /// An animation from decoded values: `values[track][frame]` (vectors as
+    /// `x, y, z, 0`, quaternions as `x, y, z, w`), all tracks `frames` long.
+    pub fn from_frames(frames: usize, duration: f32, tracks: Vec<BoneTrack>, values: Vec<Vec<[f32; 4]>>) -> Animation {
+        let frames = frames.max(1);
+        let blocks = vec![Block { frames, values }];
+        Animation { flags: 0, frames, frames_per_block: frames, duration, tracks, blocks }
+    }
 }
 
 #[derive(Debug, Clone)]

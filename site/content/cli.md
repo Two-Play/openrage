@@ -48,6 +48,9 @@ openrage map pc/data/maps/manhat/manhat03.img/manhat03_stream0.wpl              
 openrage map --check                           # every placement file: how many objects have a model
 openrage model pc/data/maps/manhat/manhat03.img/manhat03_1.wbn --render col.png   # collision as a mesh
 openrage verify --collisions                   # every .wbn and .wbd
+openrage clips pc/anim/anim.img/move_m@generic.wad                    # the animations of a .wad
+openrage model pc/models/cdimages/componentpeds.img/m_y_gmaf_hi_01.wdd --anim "pc/anim/anim.img/move_m@generic.wad:sprint@0.2" --render sprint.png
+openrage verify --animations                   # every .wad, every frame of every bone track
 ```
 
 ## Formats: textures, models, audio, animations, metadata, text
