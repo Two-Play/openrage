@@ -975,6 +975,50 @@ pub fn to_glb(model: &LoadedModel, name: &str, look: &Look) -> Option<Vec<u8>> {
     ))
 }
 
+/// Writes several models, each placed one or more times, as one `.glb`
+/// scene (a map file, a cutscene's surroundings). Positions are moved so the
+/// scene's centre is at the origin; `center` says where that was.
+pub fn scene_to_glb(name: &str, items: &[(&LoadedModel, &Look, &[Mat4])], center: [f32; 3]) -> Option<Vec<u8>> {
+    let mut meshes: Vec<(&str, &Drawable)> = Vec::new();
+    // For every scene drawable: its model and its index there.
+    let mut owner: Vec<(usize, usize)> = Vec::new();
+    let mut nodes = Vec::new();
+    let recentre = math::from_trs([-center[0], -center[1], -center[2]], [0.0, 0.0, 0.0, 1.0], [1.0; 3]);
+    for (m, (model, look, placements)) in items.iter().enumerate() {
+        let first = meshes.len();
+        for (k, (n, d)) in model.drawables.iter().enumerate() {
+            meshes.push((n.as_str(), d));
+            owner.push((m, k));
+        }
+        for t in placements.iter() {
+            let placed = math::mul(&recentre, t);
+            for (part, _) in model.shown(&look.parts) {
+                nodes.push(rage_formats::gltf::Node {
+                    name: part.name.clone(),
+                    mesh: first + part.drawable,
+                    transform: math::mul(&placed, &part.transform),
+                });
+            }
+        }
+    }
+    if nodes.is_empty() {
+        return None;
+    }
+    Some(rage_formats::gltf::write_glb_scene(
+        name,
+        &meshes,
+        &nodes,
+        &|d, t| {
+            let (m, k) = owner[d];
+            items[m].0.texture(&items[m].0.drawables[k].1, t)
+        },
+        &|d, sh| {
+            let (m, k) = owner[d];
+            items[m].0.tint(items[m].1, k, sh as u16)
+        },
+    ))
+}
+
 /// Loads a Red Dead Redemption 2 model (`.ydr`, `.ydd`). Map objects take
 /// their textures from shared dictionaries in the same archive folder, so
 /// those are loaded too (the largest few by name match first).

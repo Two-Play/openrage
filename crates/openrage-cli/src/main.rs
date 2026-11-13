@@ -125,6 +125,24 @@ enum Command {
         #[arg(long, conflicts_with = "out")]
         tree: bool,
     },
+    /// Put a map file (.ymap) together: its objects with their models and textures
+    /// (builds the world cache on first use).
+    Map {
+        /// Virtual path of the .ymap (none with --check).
+        path: Option<String>,
+        /// Render a picture of the whole map file (PNG).
+        #[arg(long)]
+        render: Option<PathBuf>,
+        /// Camera angle around the map for --render, in degrees.
+        #[arg(long, default_value_t = -130.0, allow_hyphen_values = true)]
+        yaw: f32,
+        /// Write the map file's objects as one glTF scene (.glb), centred on the origin.
+        #[arg(long)]
+        export: Option<PathBuf>,
+        /// Check every map file of the game: how many of its objects have a model.
+        #[arg(long, conflicts_with_all = ["path", "render", "export"])]
+        check: bool,
+    },
     /// List the map objects near a point of the world (builds the world cache on first use).
     World {
         x: f32,
@@ -471,6 +489,9 @@ fn run() -> Result<()> {
                 outln!("  {n:>4} × {a}");
             }
             Ok(())
+        }
+        Command::Map { path, render, yaw, export, check } => {
+            cmd_map(&game_dir, path.as_deref(), render.as_deref(), yaw, export.as_deref(), check, keys)
         }
         Command::Natives { file } => {
             let n = openrage_app::natives::import(&file)?;
@@ -1229,6 +1250,139 @@ fn cmd_model(
         fs::write(out, rage_formats::png(960, 600, &rgba)?)?;
         outln!("Rendered {} in {ms} ms", out.display());
     }
+    Ok(())
+}
+
+fn cmd_map(
+    game_dir: &Path,
+    path: Option<&str>,
+    render: Option<&Path>,
+    yaw: f32,
+    export: Option<&Path>,
+    check: bool,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
+    use openrage_app::world;
+    let started = Instant::now();
+    let w = world::load(game_dir, keys.clone())?;
+    let files = world::files(game_dir)?;
+    if check {
+        return check_maps(game_dir, &w, &files, keys, started);
+    }
+    let path = path.context("which map file? (or --check for all)")?;
+    let scene = world::load_map(&w, &files, game_dir, keys, path, &|done, total| {
+        if done % 25 == 0 || done == total {
+            eprint!("\rloading models: {done}/{total}");
+        }
+    })?;
+    eprintln!();
+    let placed: usize = scene.models.iter().map(|(_, _, t)| t.len()).sum();
+    outln!(
+        "{}: {} objects, {} models loaded ({placed} placed), {} archetypes without a model ({:.1}s)",
+        path,
+        scene.objects,
+        scene.models.len(),
+        scene.missing.len(),
+        started.elapsed().as_secs_f32()
+    );
+    for (name, n) in scene.missing.iter().take(10) {
+        outln!("  no model: {n:>3} × {name}");
+    }
+    let looks: Vec<openrage_app::models::Look> = scene.models.iter().map(|(_, m, _)| m.default_look()).collect();
+    let items: Vec<(&openrage_app::models::LoadedModel, &openrage_app::models::Look, &[rage_formats::math::Mat4])> =
+        scene.models.iter().zip(&looks).map(|((_, m, t), l)| (m, l, t.as_slice())).collect();
+    let (lo, hi) = world::scene_bounds(&items).context("nothing to show")?;
+    let center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, lo[2]];
+    outln!(
+        "extent {:.0} × {:.0} × {:.0} m around ({:.0}, {:.0}, {:.0})",
+        hi[0] - lo[0],
+        hi[1] - lo[1],
+        hi[2] - lo[2],
+        center[0],
+        center[1],
+        center[2]
+    );
+    let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("map");
+    if let Some(out) = export {
+        let glb = openrage_app::models::scene_to_glb(stem, &items, center).context("nothing to export")?;
+        fs::write(out, &glb)?;
+        outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
+    }
+    if let Some(out) = render {
+        use openrage_app::render;
+        let materials: Vec<render::Materials> =
+            scene.models.iter().map(|(_, m, _)| render::Materials::new(m)).collect();
+        let mut soft = Vec::new();
+        for (((_, m, ts), l), mat) in scene.models.iter().zip(&looks).zip(&materials) {
+            for t in ts {
+                soft.push(render::SceneItem { model: m, look: l, materials: mat, transform: *t, skin: None });
+            }
+        }
+        let camera = render::orbit_camera(lo, hi, render::View { yaw: yaw.to_radians(), ..Default::default() });
+        let rgba = render::render_scene(&soft, &camera, 1280, 800);
+        fs::write(out, rage_formats::png(1280, 800, &rgba)?)?;
+        outln!("Rendered {}", out.display());
+    }
+    Ok(())
+}
+
+/// Every map file: how many of its objects have a model.
+fn check_maps(
+    game_dir: &Path,
+    w: &openrage_app::world::World,
+    files: &openrage_app::world::Files,
+    keys: Option<Arc<GtaVKeys>>,
+    started: Instant,
+) -> Result<()> {
+    use rayon::prelude::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let done = AtomicUsize::new(0);
+    let total = w.maps.len();
+    let results: Vec<Option<(usize, Vec<String>)>> = w
+        .maps
+        .par_iter()
+        .map(|(vpath, _, _)| {
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(500) || n == total {
+                eprint!("\r{n}/{total} map files");
+            }
+            let xml = openrage_app::world::read_map(game_dir, keys.clone(), vpath)?;
+            let placed = openrage_app::world::scene_entities(w, &xml);
+            let missing = placed
+                .iter()
+                .filter(|p| !files.models.contains_key(&p.archetype))
+                .map(|p| p.archetype.clone())
+                .collect();
+            Some((placed.len(), missing))
+        })
+        .collect();
+    eprintln!();
+    let unreadable = results.iter().filter(|r| r.is_none()).count();
+    let (mut objects, mut missing_n) = (0usize, 0usize);
+    let mut missing: HashMap<String, usize> = HashMap::new();
+    let mut empty = 0;
+    for (n, m) in results.into_iter().flatten() {
+        objects += n;
+        if n == 0 {
+            empty += 1;
+        }
+        missing_n += m.len();
+        for a in m {
+            *missing.entry(a).or_default() += 1;
+        }
+    }
+    outln!(
+        "{total} map files ({unreadable} unreadable, {empty} without objects to show), {objects} objects; \
+         {missing_n} objects ({} archetypes) without a model",
+        missing.len()
+    );
+    let mut top: Vec<(String, usize)> = missing.into_iter().collect();
+    top.sort_by_key(|t| std::cmp::Reverse(t.1));
+    for (name, n) in top.iter().take(15) {
+        outln!("  {n:>5} × {name}");
+    }
+    eprintln!("{:.1} s", started.elapsed().as_secs_f32());
     Ok(())
 }
 

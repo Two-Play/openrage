@@ -60,6 +60,8 @@ openrage --game <RDR2> rdr2-ped --check        # resolve every part of every ped
 openrage --game <RDR2> rdr2-ped --check --load # … and put every ped together as the viewer does
 openrage --game <RDR2> model …/metapeds.rpf/cs_johnmarston.ymt --outfit 5 --render john.png   # a ped from its parts
 openrage world --radius 40 -- 350 4870 -60     # map objects near a point (builds the world cache)
+openrage map …/hei_dt1_03_strm_0.ymap --render map.png --export map.glb   # a map file's objects in 3D
+openrage map --check                           # every map file: objects and missing models
 ```
 
 ## Editing, packages and the mods folder

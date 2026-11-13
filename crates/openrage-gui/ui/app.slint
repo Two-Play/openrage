@@ -3810,6 +3810,9 @@ export component XmlWindow inherits Window {
     in property <[CastRow]> cast;
     callback play-actor(int);
     callback play-scene();
+    // Map files (.ymap): show their objects in a 3D scene.
+    in property <bool> is-map;
+    callback show-map();
     in-out property <string> filter;
     property <length> tree-width: 380px;
 
@@ -3865,6 +3868,13 @@ export component XmlWindow inherits Window {
                         overflow: elide;
                         color: Theme.text-muted;
                     }
+                }
+                if root.is-map: Button {
+                    text: @tr("Show in 3D");
+                    icon: @image-url("icons/map.svg");
+                    colorize-icon: true;
+                    primary: true;
+                    clicked => { root.show-map(); }
                 }
                 Button {
                     text: @tr("Open as text");
@@ -4147,6 +4157,13 @@ export component SceneWindow inherits Window {
     in property <bool> has-lights;
     in property <bool> lights-on;
     callback toggle-lights();
+    // Cutscenes have a timeline; a map scene has none but a list of its objects.
+    in property <bool> timeline: true;
+    in property <[PartRow]> objects;
+    callback object-toggled(int, bool);
+    callback all-objects(bool);
+    in property <bool> can-export;
+    callback export-gltf();
     out property <length> area-width: area.width;
     out property <length> area-height: area.height;
 
@@ -4177,7 +4194,7 @@ export component SceneWindow inherits Window {
                     y: (parent.height - self.height) / 2;
                     width: 20px;
                     height: 20px;
-                    source: @image-url("icons/anim.svg");
+                    source: root.timeline ? @image-url("icons/anim.svg") : @image-url("icons/map.svg");
                     colorize: Theme.accent;
                 }
                 VerticalLayout {
@@ -4209,87 +4226,155 @@ export component SceneWindow inherits Window {
                     text: root.cut-camera ? @tr("Free camera") : @tr("Cutscene camera");
                     clicked => { root.toggle-camera(); }
                 }
+                if root.can-export: Button {
+                    text: @tr("Export glTF…");
+                    icon: @image-url("icons/export.svg");
+                    colorize-icon: true;
+                    clicked => { root.export-gltf(); }
+                }
             }
         }
-        area := Rectangle {
+        HorizontalLayout {
             vertical-stretch: 1;
-            background: #000000;
-            clip: true;
-            Image {
-                width: parent.width;
-                height: parent.height;
-                source: root.frame;
-                image-fit: contain;
-            }
-            if root.loading: VerticalLayout {
-                alignment: center;
-                spacing: Theme.space-s;
-                HorizontalLayout {
+            area := Rectangle {
+                vertical-stretch: 1;
+                background: #000000;
+                clip: true;
+                Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: root.frame;
+                    image-fit: contain;
+                }
+                if root.loading: VerticalLayout {
                     alignment: center;
-                    Spinner {
-                        width: 40px;
-                        height: 40px;
-                        indeterminate: root.load-progress < 0;
-                        progress: max(root.load-progress, 0);
-                    }
-                }
-                Text {
-                    horizontal-alignment: center;
-                    text: root.load-text != "" ? root.load-text : @tr("Loading the cast …");
-                    color: #ffffff;
-                }
-            }
-            // The surroundings load while the scene already plays.
-            if !root.loading && root.load-text != "": Rectangle {
-                x: Theme.space-m;
-                y: parent.height - self.height - Theme.space-m;
-                width: row.preferred-width + 2 * Theme.space-s;
-                height: row.preferred-height + 2 * Theme.space-xs;
-                border-radius: 6px;
-                background: #000000b0;
-                row := HorizontalLayout {
-                    padding-left: Theme.space-s;
-                    padding-right: Theme.space-s;
-                    padding-top: Theme.space-xs;
-                    padding-bottom: Theme.space-xs;
                     spacing: Theme.space-s;
-                    Spinner {
-                        width: 18px;
-                        height: 18px;
-                        indeterminate: root.load-progress < 0;
-                        progress: max(root.load-progress, 0);
+                    HorizontalLayout {
+                        alignment: center;
+                        Spinner {
+                            width: 40px;
+                            height: 40px;
+                            indeterminate: root.load-progress < 0;
+                            progress: max(root.load-progress, 0);
+                        }
                     }
                     Text {
-                        vertical-alignment: center;
-                        text: root.load-text;
+                        horizontal-alignment: center;
+                        text: root.load-text != "" ? root.load-text : @tr("Loading the cast …");
                         color: #ffffff;
-                        font-size: Theme.font-small;
+                    }
+                }
+                // The surroundings load while the scene already plays.
+                if !root.loading && root.load-text != "": Rectangle {
+                    x: Theme.space-m;
+                    y: parent.height - self.height - Theme.space-m;
+                    width: row.preferred-width + 2 * Theme.space-s;
+                    height: row.preferred-height + 2 * Theme.space-xs;
+                    border-radius: 6px;
+                    background: #000000b0;
+                    row := HorizontalLayout {
+                        padding-left: Theme.space-s;
+                        padding-right: Theme.space-s;
+                        padding-top: Theme.space-xs;
+                        padding-bottom: Theme.space-xs;
+                        spacing: Theme.space-s;
+                        Spinner {
+                            width: 18px;
+                            height: 18px;
+                            indeterminate: root.load-progress < 0;
+                            progress: max(root.load-progress, 0);
+                        }
+                        Text {
+                            vertical-alignment: center;
+                            text: root.load-text;
+                            color: #ffffff;
+                            font-size: Theme.font-small;
+                        }
+                    }
+                }
+                ta := TouchArea {
+                    property <length> last-x;
+                    property <length> last-y;
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down) {
+                            self.last-x = self.mouse-x;
+                            self.last-y = self.mouse-y;
+                        }
+                    }
+                    moved => {
+                        if (self.pressed) {
+                            root.rotate(self.mouse-x - self.last-x, self.mouse-y - self.last-y);
+                            self.last-x = self.mouse-x;
+                            self.last-y = self.mouse-y;
+                        }
+                    }
+                    scroll-event(e) => {
+                        root.zoom(e.delta-y / 1px);
+                        return EventResult.accept;
                     }
                 }
             }
-            ta := TouchArea {
-                property <length> last-x;
-                property <length> last-y;
-                pointer-event(e) => {
-                    if (e.kind == PointerEventKind.down) {
-                        self.last-x = self.mouse-x;
-                        self.last-y = self.mouse-y;
+            if root.objects.length > 0: Rectangle {
+                width: 300px;
+                background: Theme.surface;
+                VerticalLayout {
+                    padding: Theme.space-m;
+                    spacing: Theme.space-s;
+                    HorizontalLayout {
+                        spacing: Theme.space-s;
+                        Text {
+                            horizontal-stretch: 1;
+                            text: @tr("Objects");
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            color: Theme.text;
+                        }
+                        Button {
+                            text: @tr("Show all");
+                            clicked => { root.all-objects(true); }
+                        }
+                        Button {
+                            text: @tr("Hide all");
+                            clicked => { root.all-objects(false); }
+                        }
                     }
-                }
-                moved => {
-                    if (self.pressed) {
-                        root.rotate(self.mouse-x - self.last-x, self.mouse-y - self.last-y);
-                        self.last-x = self.mouse-x;
-                        self.last-y = self.mouse-y;
+                    ListView {
+                        vertical-stretch: 1;
+                        for o[i] in root.objects: Rectangle {
+                            height: 28px;
+                            border-radius: Theme.radius-s;
+                            background: obj-ta.has-hover ? Theme.hover : transparent;
+                            obj-ta := TouchArea {
+                                clicked => { root.object-toggled(i, !o.visible); }
+                            }
+                            HorizontalLayout {
+                                padding-left: Theme.space-s;
+                                padding-right: Theme.space-s;
+                                spacing: Theme.space-s;
+                                CheckBox {
+                                    checked: o.visible;
+                                    toggled => { root.object-toggled(i, self.checked); }
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: o.name;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    color: Theme.text;
+                                }
+                                Text {
+                                    text: o.count > 1 ? "× " + o.count : "";
+                                    vertical-alignment: center;
+                                    font-size: Theme.font-small;
+                                    color: Theme.text-faint;
+                                }
+                            }
+                        }
                     }
-                }
-                scroll-event(e) => {
-                    root.zoom(e.delta-y / 1px);
-                    return EventResult.accept;
                 }
             }
         }
-        Rectangle {
+        if root.timeline: Rectangle {
             background: Theme.surface;
             HorizontalLayout {
                 padding: Theme.space-s;

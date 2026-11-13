@@ -286,55 +286,140 @@ pub fn objects_near(
     radius: f32,
 ) -> Vec<Placed> {
     let within = |p: [f32; 3], r: f32| (0..3).map(|k| (p[k] - center[k]).powi(2)).sum::<f32>() <= r * r;
-    let near = |p: [f32; 3]| within(p, radius);
     let mut out = Vec::new();
     for (vpath, lo, hi) in &world.maps {
         if (0..3).any(|k| center[k] + radius < lo[k] || center[k] - radius > hi[k]) {
             continue;
         }
-        let Ok((Node::ArchiveFile(rpf, id), _)) = rage_mods::resolve(game_dir, vpath, keys.clone()) else { continue };
-        let Ok(xml) = rpf.read(id).map_err(anyhow::Error::from).and_then(|d| crate::metadata::from_bytes(&d)) else {
-            continue;
-        };
-        let Some(doc) = parse_doc(&xml.text) else { continue };
-        let Some(entities) = child(doc.root_element(), "entities") else { continue };
-        for e in entities.children().filter(|c| c.has_tag_name("Item")) {
-            let lod = text(e, "lodLevel").unwrap_or_default();
-            if !(lod.ends_with("_hd") || lod.ends_with("orphanhd")) {
+        let Some(xml) = read_map(game_dir, keys.clone(), vpath) else { continue };
+        for e in map_entities(world, &xml) {
+            if !e.high_detail {
                 continue;
             }
-            let (Some(arch), Some(p), Some(r)) =
-                (text(e, "archetypeName"), child(e, "position").and_then(vec3), child(e, "rotation").and_then(quat))
-            else {
-                continue;
-            };
-            let interior = world.archetypes.get(&arch).map(|a| a.interior.as_slice()).unwrap_or_default();
-            if e.attribute("type") == Some("CMloInstanceDef") || !interior.is_empty() {
-                // An interior: its objects, placed relative to the instance.
-                let place = math::from_trs(p, conjugate(r), [1.0; 3]);
-                for o in interior {
-                    let local = math::from_trs(o.position, conjugate(o.rotation), [1.0; 3]);
-                    let t = math::mul(&place, &local);
-                    // Room shells are large and placed by a corner: a wider reach.
-                    let reach = if o.archetype.contains("shell") { radius * 2.5 } else { radius };
-                    if within([t[12], t[13], t[14]], reach) {
-                        out.push(Placed { archetype: o.archetype.clone(), transform: t });
-                    }
-                }
-                continue;
+            // Room shells are large and placed by a corner: a wider reach.
+            let reach = if e.in_interior && e.placed.archetype.contains("shell") { radius * 2.5 } else { radius };
+            let t = e.placed.transform;
+            if within([t[12], t[13], t[14]], reach) {
+                out.push(e.placed);
             }
-            if !near(p) {
-                continue;
-            }
-            let scale_xy = child(e, "scaleXY").and_then(|n| n.attribute("value")?.parse().ok()).unwrap_or(1.0);
-            let scale_z = child(e, "scaleZ").and_then(|n| n.attribute("value")?.parse().ok()).unwrap_or(1.0);
-            out.push(Placed {
-                archetype: arch,
-                transform: math::from_trs(p, conjugate(r), [scale_xy, scale_xy, scale_z]),
-            });
         }
     }
     out
+}
+
+/// An entity of a map file.
+#[derive(Debug, Clone)]
+pub struct MapEntity {
+    pub placed: Placed,
+    /// A high-detail entity (`LODTYPES_DEPTH_HD` / `ORPHANHD`), not a
+    /// lower-detail stand-in for distant views.
+    pub high_detail: bool,
+    /// Placed inside an interior (relative to the interior instance).
+    pub in_interior: bool,
+}
+
+/// Reads a map file (`.ymap`) as XML.
+pub fn read_map(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Option<String> {
+    crate::metadata::load(game_dir, keys, vpath).ok().map(|x| x.text)
+}
+
+/// Every entity of a map file (as XML) in world coordinates; interiors are
+/// expanded into the objects inside them.
+pub fn map_entities(world: &World, xml: &str) -> Vec<MapEntity> {
+    let mut out = Vec::new();
+    let Some(doc) = parse_doc(xml) else { return out };
+    let Some(entities) = child(doc.root_element(), "entities") else { return out };
+    for e in entities.children().filter(|c| c.has_tag_name("Item")) {
+        let lod = text(e, "lodLevel").unwrap_or_default();
+        let high_detail = lod.ends_with("_hd") || lod.ends_with("orphanhd");
+        let (Some(arch), Some(p), Some(r)) =
+            (text(e, "archetypeName"), child(e, "position").and_then(vec3), child(e, "rotation").and_then(quat))
+        else {
+            continue;
+        };
+        let interior = world.archetypes.get(&arch).map(|a| a.interior.as_slice()).unwrap_or_default();
+        if e.attribute("type") == Some("CMloInstanceDef") || !interior.is_empty() {
+            // An interior: its objects, placed relative to the instance.
+            let place = math::from_trs(p, conjugate(r), [1.0; 3]);
+            for o in interior {
+                let local = math::from_trs(o.position, conjugate(o.rotation), [1.0; 3]);
+                out.push(MapEntity {
+                    placed: Placed { archetype: o.archetype.clone(), transform: math::mul(&place, &local) },
+                    high_detail,
+                    in_interior: true,
+                });
+            }
+            continue;
+        }
+        let scale_xy = child(e, "scaleXY").and_then(|n| n.attribute("value")?.parse().ok()).unwrap_or(1.0);
+        let scale_z = child(e, "scaleZ").and_then(|n| n.attribute("value")?.parse().ok()).unwrap_or(1.0);
+        out.push(MapEntity {
+            placed: Placed {
+                archetype: arch,
+                transform: math::from_trs(p, conjugate(r), [scale_xy, scale_xy, scale_z]),
+            },
+            high_detail,
+            in_interior: false,
+        });
+    }
+    out
+}
+
+/// A map file put together: its models with their placements.
+pub struct MapScene {
+    pub models: Vec<(String, crate::models::LoadedModel, Vec<Mat4>)>,
+    /// Objects placed in the file (interiors expanded).
+    pub objects: usize,
+    /// Archetypes whose model was not found, with how often they are placed.
+    pub missing: Vec<(String, usize)>,
+}
+
+/// The entities of a map file that a scene of it shows: its high-detail
+/// objects, or, in a file that only holds low-detail stand-ins (`…_lod`),
+/// those.
+pub fn scene_entities(world: &World, xml: &str) -> Vec<Placed> {
+    let all = map_entities(world, xml);
+    let detailed = all.iter().any(|e| e.high_detail);
+    all.into_iter()
+        .filter(|e| {
+            if detailed {
+                e.high_detail && shown_in_scenes(&e.placed.archetype)
+            } else {
+                !e.placed.archetype.starts_with("hash_")
+            }
+        })
+        .map(|e| e.placed)
+        .collect()
+}
+
+/// Loads every object of a map file with its textures (in parallel).
+pub fn load_map(
+    world: &World,
+    files: &Files,
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    vpath: &str,
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<MapScene> {
+    let xml = read_map(game_dir, keys.clone(), vpath).with_context(|| format!("cannot read {vpath}"))?;
+    let placed = scene_entities(world, &xml);
+    let mut missing: HashMap<String, usize> = HashMap::new();
+    for p in &placed {
+        if !files.models.contains_key(&p.archetype) {
+            *missing.entry(p.archetype.clone()).or_default() += 1;
+        }
+    }
+    let objects = placed.len();
+    let models = load_placed(world, files, game_dir, keys, &placed, progress);
+    let mut missing: Vec<(String, usize)> = missing.into_iter().collect();
+    missing.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    Ok(MapScene { models, objects, missing })
+}
+
+/// Whether a map object is shown in scenes: proxies, low-detail stand-ins and
+/// unnamed archetypes are left out.
+pub fn shown_in_scenes(archetype: &str) -> bool {
+    !(archetype.contains("proxy") || archetype.contains("_lod") || archetype.starts_with("hash_"))
 }
 
 /// Model and texture files by name (from the search index): updates and DLC win.
@@ -373,11 +458,21 @@ pub fn load_models(
     placed: &[Placed],
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Vec<(String, crate::models::LoadedModel, Vec<Mat4>)> {
+    let shown: Vec<Placed> = placed.iter().filter(|p| shown_in_scenes(&p.archetype)).cloned().collect();
+    load_placed(world, files, game_dir, keys, &shown, progress)
+}
+
+/// Loads every archetype of `placed` once, with its texture dictionary.
+fn load_placed(
+    world: &World,
+    files: &Files,
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    placed: &[Placed],
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Vec<(String, crate::models::LoadedModel, Vec<Mat4>)> {
     let mut by_archetype: HashMap<&str, Vec<Mat4>> = HashMap::new();
     for p in placed {
-        if p.archetype.contains("proxy") || p.archetype.contains("_lod") || p.archetype.starts_with("hash_") {
-            continue;
-        }
         by_archetype.entry(p.archetype.as_str()).or_default().push(p.transform);
     }
     let list: Vec<(&str, Vec<Mat4>)> = by_archetype.into_iter().collect();
@@ -402,6 +497,31 @@ pub fn load_models(
         .collect()
 }
 
+/// The box around a scene's placed models (their shown parts).
+pub fn scene_bounds(
+    items: &[(&crate::models::LoadedModel, &crate::models::Look, &[Mat4])],
+) -> Option<([f32; 3], [f32; 3])> {
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for (model, look, placements) in items {
+        let Some((a, b)) = crate::render::bounds(model, &look.parts) else { continue };
+        for t in placements.iter() {
+            for corner in 0..8 {
+                let c = [
+                    if corner & 1 == 0 { a[0] } else { b[0] },
+                    if corner & 2 == 0 { a[1] } else { b[1] },
+                    if corner & 4 == 0 { a[2] } else { b[2] },
+                ];
+                let p = math::transform_point(t, c);
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+        }
+    }
+    (lo[0] <= hi[0]).then_some((lo, hi))
+}
+
 /// Map files store entity rotations inverted.
 fn conjugate(q: [f32; 4]) -> [f32; 4] {
     [-q[0], -q[1], -q[2], q[3]]
@@ -410,6 +530,45 @@ fn conjugate(q: [f32; 4]) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_scenes_show_high_detail_objects() {
+        let mut world = World::default();
+        let int = Archetype {
+            textures: None,
+            interior: vec![InteriorObject {
+                archetype: "wall_01".into(),
+                position: [1.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            }],
+        };
+        world.archetypes.insert("int_room".into(), int);
+        let item = |kind: &str, name: &str, lod: &str, x: f32| {
+            format!(
+                r#"<Item type="{kind}"><archetypeName>{name}</archetypeName><lodLevel>{lod}</lodLevel><position x="{x}" y="0" z="0" /><rotation x="0" y="0" z="0" w="1" /></Item>"#
+            )
+        };
+        let xml = format!(
+            "<CMapData><entities>{}{}{}{}</entities></CMapData>",
+            item("CEntityDef", "dt1_build", "LODTYPES_DEPTH_HD", 10.0),
+            item("CEntityDef", "dt1_build_lod", "LODTYPES_DEPTH_LOD", 10.0),
+            item("CEntityDef", "dt1_proxy", "LODTYPES_DEPTH_ORPHANHD", 0.0),
+            item("CMloInstanceDef", "int_room", "LODTYPES_DEPTH_HD", 100.0),
+        );
+        let all = map_entities(&world, &xml);
+        assert_eq!(all.len(), 4);
+        assert!(
+            all.iter().any(|e| e.in_interior && e.placed.archetype == "wall_01" && e.placed.transform[12] == 101.0)
+        );
+        let shown: Vec<String> = scene_entities(&world, &xml).into_iter().map(|p| p.archetype).collect();
+        assert_eq!(shown, vec!["dt1_build", "wall_01"], "high detail only, no proxies");
+        // A file of stand-ins only shows them.
+        let lod_only = format!(
+            "<CMapData><entities>{}</entities></CMapData>",
+            item("CEntityDef", "dt1_build_lod", "LODTYPES_DEPTH_LOD", 0.0)
+        );
+        assert_eq!(scene_entities(&world, &lod_only).len(), 1);
+    }
 
     #[test]
     fn reads_archetypes_and_interiors() {

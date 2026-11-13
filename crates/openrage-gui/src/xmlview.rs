@@ -165,6 +165,18 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
     }
     let state = Rc::new(RefCell::new(State { entries, expanded, shown: Vec::new(), filter: String::new() }));
 
+    // Map files of GTA V: their objects in a 3D scene.
+    if vpath.to_ascii_lowercase().ends_with(".ymap")
+        && !crate::with_app(|a| a.game_dir.as_deref().is_some_and(crate::is_rdr2_dir))
+    {
+        win.set_is_map(true);
+        let (main, path) = (ui.as_weak(), vpath.clone());
+        win.on_show_map(move || {
+            if let Some(ui) = main.upgrade() {
+                crate::scene::open_map(&ui, path.clone());
+            }
+        });
+    }
     if vpath.to_ascii_lowercase().ends_with(".cut")
         && let Ok(cut) = openrage_app::cutscene::from_xml(&xml.text)
     {

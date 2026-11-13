@@ -750,7 +750,11 @@ fn refresh_lists(win: &ViewerWindow, model: &ModelPreview, entries: &[(String, i
 }
 
 /// Updates rows in place (keeps the list's scroll position) or replaces the model.
-fn update_model<T: Clone + PartialEq + 'static>(current: ModelRc<T>, rows: Vec<T>, set: impl FnOnce(ModelRc<T>)) {
+pub(crate) fn update_model<T: Clone + PartialEq + 'static>(
+    current: ModelRc<T>,
+    rows: Vec<T>,
+    set: impl FnOnce(ModelRc<T>),
+) {
     if current.row_count() == rows.len() {
         for (i, row) in rows.into_iter().enumerate() {
             if current.row_data(i).as_ref() != Some(&row) {
