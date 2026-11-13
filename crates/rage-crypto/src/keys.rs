@@ -155,7 +155,7 @@ impl GtaVKeys {
 }
 
 /// Key material is the user's own, but keep it out of other users' reach.
-fn restrict_permissions(path: &Path) {
+pub(crate) fn restrict_permissions(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

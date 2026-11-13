@@ -1,6 +1,6 @@
 [package]
 name = "rage-crypto"
-description = "GTA V archive cryptography (AES, NG) and user-side key extraction"
+description = "RAGE archive cryptography (GTA V AES/NG, GTA IV AES) and user-side key extraction"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

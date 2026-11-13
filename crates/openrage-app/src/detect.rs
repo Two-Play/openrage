@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::setup::EXECUTABLES;
 
 /// Steam install folder names of supported games.
-const GAME_FOLDERS: [&str; 2] = ["Grand Theft Auto V Enhanced", "Grand Theft Auto V"];
+/// GTA IV keeps its files in a `GTAIV` subfolder.
+const GAME_FOLDERS: [&str; 3] = ["Grand Theft Auto V Enhanced", "Grand Theft Auto V", "Grand Theft Auto IV/GTAIV"];
 
 /// Candidate Steam root directories for this platform.
 fn steam_roots() -> Vec<PathBuf> {
@@ -36,8 +37,8 @@ fn library_paths(vdf: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// All GTA V installations found in Steam libraries, deduplicated.
-pub fn find_gta5_installs() -> Vec<PathBuf> {
+/// All GTA V and GTA IV installations found in Steam libraries, deduplicated.
+pub fn find_installs() -> Vec<PathBuf> {
     let mut libraries: Vec<PathBuf> = Vec::new();
     for root in steam_roots() {
         let vdf = root.join("steamapps/libraryfolders.vdf");
@@ -50,7 +51,7 @@ pub fn find_gta5_installs() -> Vec<PathBuf> {
     for lib in libraries {
         for folder in GAME_FOLDERS {
             let dir = lib.join("steamapps/common").join(folder);
-            if is_gta5_dir(&dir) {
+            if is_gta5_dir(&dir) || crate::gta4::is_gta4_dir(&dir) {
                 let canonical = dir.canonicalize().unwrap_or(dir);
                 if !found.contains(&canonical) {
                     found.push(canonical);
@@ -66,7 +67,7 @@ pub fn is_gta5_dir(dir: &Path) -> bool {
 }
 
 /// Short name of the game installed in `dir`: "GTA V Enhanced", "GTA V",
-/// "RDR2", or `None` when no known executable is there.
+/// "GTA IV", "RDR2", or `None` when no known executable is there.
 pub fn game_name(dir: &Path) -> Option<&'static str> {
     if dir.join("RDR2.exe").is_file() {
         Some("RDR2")
@@ -74,6 +75,8 @@ pub fn game_name(dir: &Path) -> Option<&'static str> {
         Some("GTA V Enhanced")
     } else if dir.join("GTA5.exe").is_file() {
         Some("GTA V")
+    } else if crate::gta4::is_gta4_dir(dir) {
+        Some("GTA IV")
     } else {
         None
     }

@@ -402,6 +402,14 @@ fn run() -> Result<()> {
 
     if let Command::Keys { exe, magic } = &cli.command {
         let game_dir = game_dir.context("no game directory given; pass --game <DIR>")?;
+        let game_dir = openrage_app::gta4::normalize_dir(&game_dir);
+        if openrage_app::gta4::is_gta4_dir(&game_dir) {
+            cmd_gta4_keys(&game_dir)?;
+            cfg.remember_game(&game_dir);
+            cfg.game_dir = Some(game_dir);
+            cfg.save()?;
+            return Ok(());
+        }
         let magic = magic.clone().or_else(|| cfg.magic_path.clone());
         cmd_keys(&game_dir, exe.as_deref(), magic.as_deref())?;
         cfg.game_dir = Some(game_dir);
@@ -425,6 +433,11 @@ fn run() -> Result<()> {
     }
 
     let game_dir = game_dir.context("no game directory configured; run `openrage --game <DIR> keys` first")?;
+    let game_dir = openrage_app::gta4::normalize_dir(&game_dir);
+    let gta4 = openrage_app::gta4::is_gta4_dir(&game_dir);
+    if gta4 && let Err(e) = openrage_app::gta4::register(&game_dir) {
+        eprintln!("warning: GTA IV archive key: {e:#}");
+    }
     if game_dir.join("RDR2.exe").is_file() {
         let names = rage_rpf::rpf8_names::NameIndex::default_path(&game_dir)
             .and_then(|p| rage_rpf::rpf8_names::NameIndex::load(&p).ok().flatten())
@@ -458,6 +471,7 @@ fn run() -> Result<()> {
         Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
         Command::Rdr2Ped { name, outfit, check, load } => cmd_rdr2_ped(&game_dir, name.as_deref(), outfit, check, load),
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
+        Command::Verify { path, textures: false, .. } if gta4 => cmd_verify_gta4(&game_dir, &path),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
         Command::Verify { path, textures: true, rebuild, .. } => cmd_verify_textures(&game_dir, &path, rebuild, keys),
         Command::Textures { path, sets, removes, .. } if !sets.is_empty() || !removes.is_empty() => {
@@ -524,6 +538,24 @@ fn run() -> Result<()> {
     }
 }
 
+fn cmd_gta4_keys(game_dir: &Path) -> Result<()> {
+    let (_, report) = openrage_app::gta4::derive_key(game_dir)?;
+    outln!("GTA IV archive key found in {} ({:.1}s).", report.exe.display(), report.scan_seconds);
+    if let Some(n) = report.verified_entries {
+        outln!("Verified: vehicles.img decrypts ({n} entries).");
+    }
+    outln!("Key cached at {} (local only, never distribute this file).", report.cache_path.display());
+    Ok(())
+}
+
+fn print_gta4_entry(archive: &rage_rpf::Gta4Archive, id: rage_rpf::Gta4EntryId, path: &str) {
+    let e = archive.entry(id);
+    let kind = openrage_app::gta4::kind_label(archive, id);
+    let ty = e.resource_type().map(|t| format!("t{t}")).unwrap_or_default();
+    let slash = if e.is_dir() { "/" } else { "" };
+    outln!("{kind:<8} {:>8} {ty:>4}  {path}{slash}", human(e.size()));
+}
+
 fn cmd_keys(game_dir: &Path, exe: Option<&Path>, magic: Option<&Path>) -> Result<()> {
     let (_, report) = setup::derive_keys(game_dir, exe, magic, &mut |msg| outln!("{msg}"))?;
     outln!(
@@ -558,10 +590,13 @@ fn cmd_ls(game_dir: &Path, path: &str, recursive: bool, keys: Option<Arc<GtaVKey
             for item in items {
                 let meta = item.metadata()?;
                 let name = item.file_name().to_string_lossy().into_owned();
+                let lower = name.to_ascii_lowercase();
                 let kind = if meta.is_dir() {
                     "dir"
-                } else if name.to_ascii_lowercase().ends_with(".rpf") {
+                } else if lower.ends_with(".rpf") {
                     "rpf"
+                } else if lower.ends_with(".img") && rage_rpf::Gta4Archive::file_is_gta4(&item.path()) {
+                    "img"
                 } else {
                     "file"
                 };
@@ -580,6 +615,16 @@ fn cmd_ls(game_dir: &Path, path: &str, recursive: bool, keys: Option<Arc<GtaVKey
             for i in files {
                 let name = rpf.entry_name(i);
                 print_rpf8_entry(&rpf, i, name.rsplit('/').next().unwrap_or(&name));
+            }
+        }
+        Node::Gta4File(a, id) => print_gta4_entry(&a, id, &a.entry_path(id)),
+        Node::Gta4Dir(a, dir) => {
+            if recursive {
+                vfs::walk_gta4(&a, dir, "", &mut |id, p| print_gta4_entry(&a, id, p));
+            } else {
+                for id in a.children(dir) {
+                    print_gta4_entry(&a, id, &a.entry(id).name);
+                }
             }
         }
         Node::ArchiveDir(rpf, dir) => {
@@ -657,6 +702,46 @@ fn cmd_info(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
                 );
             }
         }
+        Node::Gta4Dir(a, dir) if dir == rage_rpf::Gta4Archive::ROOT => {
+            let size = fs::metadata(a.path())?.len();
+            let ids = 1..a.len();
+            let dirs = ids.clone().filter(|&i| a.entry(i).is_dir()).count();
+            let resources = ids.clone().filter(|&i| a.entry(i).resource_type().is_some()).count();
+            outln!("Archive:     {}", a.display_name());
+            outln!("Format:      {} (GTA IV)", a.format().name());
+            outln!("Size:        {} ({size} bytes)", human(size));
+            outln!("Table:       {}", if a.is_encrypted() { "encrypted (AES)" } else { "plaintext" });
+            outln!(
+                "Entries:     {} ({dirs} dirs, {} files, {resources} resources)",
+                a.len() - 1,
+                a.len() - 1 - dirs - resources
+            );
+        }
+        Node::Gta4Dir(a, id) | Node::Gta4File(a, id) => {
+            let e = a.entry(id);
+            outln!("Path:        {}/{}", a.display_name(), a.entry_path(id));
+            outln!("Kind:        {}", openrage_app::gta4::kind_label(&a, id));
+            match e.kind {
+                rage_rpf::Gta4EntryKind::Dir { ref children } => outln!("Entries:     {}", children.len()),
+                rage_rpf::Gta4EntryKind::File { stored, size, compressed, .. } => {
+                    outln!(
+                        "Size:        {} ({} stored{})",
+                        human(size),
+                        human(stored),
+                        if compressed { ", zlib" } else { "" }
+                    )
+                }
+                rage_rpf::Gta4EntryKind::Resource { stored, resource_type, .. } => {
+                    let (sys, gfx) = e.resource_sizes().unwrap_or_default();
+                    outln!("Size:        {} (RSC5, zlib)", human(stored));
+                    outln!(
+                        "Resource:    type {resource_type} ({})",
+                        openrage_app::gta4::resource_type_name(resource_type)
+                    );
+                    outln!("Memory:      {} system, {} graphics", human(sys as u64), human(gfx as u64));
+                }
+            }
+        }
         Node::Dir(p) | Node::PlainFile(p) => outln!("{} is not inside an archive", p.display()),
     }
     Ok(())
@@ -689,6 +774,20 @@ fn cmd_extract(game_dir: &Path, path: &str, out: &Path, expand: bool, keys: Opti
         Node::ArchiveFile(rpf, id) | Node::ArchiveDir(rpf, id) => (rpf, id),
         Node::Rpf8File(rpf, i) => return report_rpf8_extract(&rpf, "", Some(i), out),
         Node::Rpf8Dir(rpf, dir) => return report_rpf8_extract(&rpf, &dir, None, out),
+        Node::Gta4Dir(a, id) | Node::Gta4File(a, id) => {
+            let s = openrage_app::gta4::extract(&a, id, out, &AtomicBool::new(false), &mut |_, _| {})?;
+            for f in &s.failures {
+                eprintln!("warning: {f}");
+            }
+            outln!(
+                "Extracted {} files ({}) to {}, {} failed",
+                s.files,
+                human(s.bytes),
+                s.target.display(),
+                s.failures.len()
+            );
+            return Ok(());
+        }
         Node::Dir(_) | Node::PlainFile(_) => bail!("{path} is not inside an archive"),
     };
     let summary = extract_entry(&rpf, id, out, expand, &AtomicBool::new(false), &mut |_, _| {})?;
@@ -2460,7 +2559,10 @@ type Start = (String, Arc<Rpf7>, EntryId);
 fn archive_roots(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<Vec<Start>> {
     Ok(match vfs::resolve(game_dir, within, keys.clone())? {
         Node::ArchiveDir(rpf, dir) => vec![(within.trim_end_matches('/').to_owned(), rpf, dir)],
-        Node::ArchiveFile(..) | Node::PlainFile(_) | Node::Rpf8File(..) => bail!("{within} is not a directory"),
+        Node::ArchiveFile(..) | Node::PlainFile(_) | Node::Rpf8File(..) | Node::Gta4File(..) => {
+            bail!("{within} is not a directory")
+        }
+        Node::Gta4Dir(..) => bail!("{within}: this command does not support GTA IV archives yet"),
         Node::Rpf8Dir(..) => bail!("{within}: for Red Dead Redemption 2 archives use `openrage rpf8` for now"),
         Node::Dir(dir) => {
             let mut found = Vec::new();
@@ -2557,17 +2659,99 @@ fn cmd_verify(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Res
     Ok(())
 }
 
-fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Reads every entry of every GTA IV archive below `within` (or of the one
+/// archive it names) and inflates every resource.
+fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
+    use rage_rpf::{Gta4Archive, Gta4EntryId};
+    let mut open_errors = Vec::new();
+    let starts: Vec<(String, Arc<Gta4Archive>, Gta4EntryId)> = match vfs::resolve(game_dir, within, None)? {
+        Node::Gta4Dir(a, id) => vec![(within.trim_end_matches('/').to_owned(), a, id)],
+        Node::Dir(dir) => {
+            let mut found = Vec::new();
+            collect_archives(&dir, &["rpf", "img"], &mut found);
+            found
+                .into_iter()
+                .filter(|p| Gta4Archive::file_is_gta4(p))
+                .filter_map(|p| {
+                    let rel = p.strip_prefix(game_dir).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                    match Gta4Archive::open_default(&p) {
+                        Ok(a) => Some((rel, Arc::new(a), Gta4Archive::ROOT)),
+                        Err(e) => {
+                            open_errors.push(format!("{rel}: {e}"));
+                            None
+                        }
+                    }
+                })
+                .collect()
+        }
+        _ => bail!("{within} is not a folder or archive"),
+    };
+    let started = Instant::now();
+    let stats: Vec<VerifyStats> = starts
+        .par_iter()
+        .map(|(prefix, a, dir)| {
+            let mut s = VerifyStats { archives: 1, ..Default::default() };
+            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
+                let e = a.entry(id);
+                let result = if e.is_dir() {
+                    return;
+                } else if e.resource_type().is_some() {
+                    s.resources += 1;
+                    a.read_resource(id).map(|r| r.system.len() + r.graphics.len())
+                } else {
+                    s.files += 1;
+                    a.read(id).map(|d| d.len())
+                };
+                match result {
+                    Ok(n) => s.bytes += n as u64,
+                    Err(err) => s.errors.push(format!("{p}: {err}")),
+                }
+            });
+            eprintln!("  checked {prefix}");
+            s
+        })
+        .collect();
+    let mut total = VerifyStats { archives: open_errors.len(), errors: open_errors, ..Default::default() };
+    for s in stats {
+        total.archives += s.archives;
+        total.files += s.files;
+        total.resources += s.resources;
+        total.bytes += s.bytes;
+        total.errors.extend(s.errors);
+    }
+    for e in &total.errors {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} archives, {} files, {} resources, {} decoded, {} errors ({:.1}s)",
+        total.archives,
+        total.files,
+        total.resources,
+        human(total.bytes),
+        total.errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !total.errors.is_empty() {
+        bail!("verification found {} errors", total.errors.len());
+    }
+    Ok(())
+}
+
+fn collect_archives(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     let mut items: Vec<_> = rd.flatten().map(|e| e.path()).collect();
     items.sort();
     for p in items {
         if p.is_dir() {
-            collect_rpfs(&p, out);
-        } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rpf")) {
+            collect_archives(&p, extensions, out);
+        } else if p.extension().is_some_and(|e| extensions.iter().any(|x| e.eq_ignore_ascii_case(x))) {
             out.push(p);
         }
     }
+}
+
+fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
+    collect_archives(dir, &["rpf"], out);
 }
 
 /// Which files `openrage rpf8` parses instead of only reading them.

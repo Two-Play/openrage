@@ -8,6 +8,7 @@ pub mod cutscene;
 pub mod detect;
 pub mod expr;
 pub mod extract;
+pub mod gta4;
 pub mod install;
 pub mod journal;
 pub mod media;

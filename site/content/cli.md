@@ -26,6 +26,17 @@ openrage search 0xB779A091                     # hash lookup
 openrage search Pegassi --lang american        # game text in another language (or `all`)
 ```
 
+GTA IV works with the same commands: point `--game` at its folder (the Steam folder `Grand Theft Auto IV` or the `GTAIV`
+folder inside it) and run `keys` once, which takes the archive key from your `GTAIV.exe`.
+
+```
+openrage --game "/path/to/Grand Theft Auto IV" keys
+openrage ls pc/models/cdimages/vehicles.img     # .img archives open like folders
+openrage info pc/models/cdimages/vehicles.img/admiral.wft
+openrage extract pc/data/maps/manhat/manhat01.img -o out/
+openrage verify                                # read every entry of every .img and .rpf
+```
+
 ## Formats: textures, models, audio, animations, metadata, text
 
 ```
