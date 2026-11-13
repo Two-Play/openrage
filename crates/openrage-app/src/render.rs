@@ -52,11 +52,16 @@ impl Materials {
     pub fn new(model: &LoadedModel) -> Self {
         let mut by_name: HashMap<String, Option<usize>> = HashMap::new();
         let mut images: Vec<Image> = Vec::new();
-        let mut decode = |d: &rage_formats::drawable::Drawable, name: Option<&str>| {
+        // `opaque`: the shader's alpha channel holds other data (skin shaders).
+        let mut decode = |d: &rage_formats::drawable::Drawable, name: Option<&str>, opaque: bool| {
             let name = name?;
-            *by_name.entry(name.to_ascii_lowercase()).or_insert_with(|| {
+            let key = format!("{}{}", name.to_ascii_lowercase(), if opaque { "#opaque" } else { "" });
+            *by_name.entry(key).or_insert_with(|| {
                 let t = model.texture(d, name)?;
-                let rgba = t.to_rgba()?;
+                let mut rgba = t.to_rgba()?;
+                if opaque {
+                    rgba.iter_mut().skip(3).step_by(4).for_each(|a| *a = 255);
+                }
                 images.push(Image { w: t.width.max(1) as usize, h: t.height.max(1) as usize, rgba });
                 Some(images.len() - 1)
             })
@@ -65,7 +70,13 @@ impl Materials {
             .drawables
             .iter()
             .map(|(_, d)| {
-                d.shaders.iter().map(|s| (decode(d, s.base_texture()), decode(d, s.overlay_texture()))).collect()
+                d.shaders
+                    .iter()
+                    .map(|s| {
+                        let opaque = rage_formats::shaders::alpha_is_not_opacity(s.name_hash);
+                        (decode(d, s.base_texture(), opaque), decode(d, s.overlay_texture(), false))
+                    })
+                    .collect()
             })
             .collect();
         Self { images, per_shader }
