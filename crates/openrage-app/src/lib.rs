@@ -17,6 +17,7 @@ pub mod metadata;
 pub mod metaped;
 pub mod models;
 pub mod natives;
+pub mod obj;
 pub mod oiv;
 pub mod plugins;
 pub mod progress;

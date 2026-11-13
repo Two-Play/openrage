@@ -111,6 +111,8 @@ enum Command {
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths", "scripts"])]
         media: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
+        /// With --models: write every GTA V Enhanced drawable (.ydr) anew with its own meshes and
+        /// check that it reads back identically.
         /// GTA IV without --textures: rebuild the table of every .rpf package in memory and
         /// check that it matches the stored one byte for byte (nothing is written).
         #[arg(long)]
@@ -260,6 +262,23 @@ enum Command {
         /// Write the text to this file instead of printing it.
         #[arg(short, long)]
         out: Option<PathBuf>,
+    },
+    /// Replace the meshes of a GTA V Enhanced drawable (.ydr) with a Wavefront OBJ model. The
+    /// drawable's shaders and textures stay; OBJ materials go to its shaders in order.
+    ReplaceModel {
+        /// The drawable in the game, e.g. `x64i.rpf/levels/gta5/props/…/prop_x.ydr`.
+        path: String,
+        /// The OBJ file.
+        obj: PathBuf,
+        /// Write the new drawable to this file.
+        #[arg(short, long, required_unless_present = "mods")]
+        out: Option<PathBuf>,
+        /// Put the new drawable into the mods folder in place of the original (can be undone).
+        #[arg(long, conflicts_with = "out")]
+        mods: bool,
+        /// Put every OBJ material on this shader of the drawable.
+        #[arg(long)]
+        shader: Option<u16>,
     },
     /// Show a model (.ydr, .yft, .ydd; GTA IV .wdr, .wft, .wdd) and optionally export it as glTF (.glb).
     Model {
@@ -587,6 +606,7 @@ fn run() -> Result<()> {
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path, models: true, .. } if gta4 => cmd_verify_gta4_models(&game_dir, &path),
+        Command::Verify { path, models: true, rebuild: true, .. } => cmd_verify_model_writer(&game_dir, &path, keys),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
         Command::Verify { path, media: true, .. } => cmd_verify_media(&game_dir, &path, keys),
@@ -606,7 +626,7 @@ fn run() -> Result<()> {
             cmd_verify_gta4_tables(&game_dir, &path)
         }
         Command::Verify { textures: false, rebuild: true, .. } => {
-            bail!("--rebuild needs --textures (or a GTA IV game)")
+            bail!("--rebuild needs --textures or --models (or a GTA IV game)")
         }
         Command::Verify { path, textures: false, .. } if gta4 => cmd_verify_gta4(&game_dir, &path),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
@@ -624,6 +644,9 @@ fn run() -> Result<()> {
             cmd_model(&game_dir, &path, outfit, view, keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
+        Command::ReplaceModel { path, obj, out, mods, shader } => {
+            cmd_replace_model(&game_dir, &path, &obj, out.as_deref(), mods, shader, keys)
+        }
         Command::World { x, y, z, radius } => {
             let started = Instant::now();
             let world = openrage_app::world::load(&game_dir, keys.clone())?;
@@ -1366,6 +1389,46 @@ fn cmd_edit(game_dir: &Path, path: &str, op: Op, description: &str, keys: Option
     }
     let applied = install::apply_at(game_dir, keys, path, op, description)?;
     report(&applied, started);
+    Ok(())
+}
+
+fn cmd_replace_model(
+    game_dir: &Path,
+    vpath: &str,
+    obj: &Path,
+    out: Option<&Path>,
+    mods: bool,
+    shader: Option<u16>,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
+    use rage_formats::{drawable, ydr_write};
+    let Node::ArchiveFile(rpf, id) = rage_mods::resolve(game_dir, vpath, keys.clone())?.0 else {
+        bail!("{vpath} is not a file inside an archive")
+    };
+    if !vpath.to_ascii_lowercase().ends_with(".ydr") {
+        bail!("{vpath} is not a drawable (.ydr)");
+    }
+    let template = rpf.read_resource(id)?;
+    let shaders = ydr_write::usable_shaders(&template)?;
+    let text = fs::read_to_string(obj).with_context(|| format!("reading {}", obj.display()))?;
+    let (meshes, mapping) = openrage_app::obj::fit(openrage_app::obj::read(&text)?, &shaders, shader)?;
+    for (material, s) in &mapping {
+        outln!("material {material:<24} → shader {s}");
+    }
+    let file = ydr_write::replace_meshes(&template, &meshes)?;
+    // What the game will read: check it reads back.
+    let check = drawable::parse_ydr(&rage_resource::Resource::from_rsc7(&file)?)?;
+    let vertices: usize = check.meshes.iter().map(|m| m.positions.len()).sum();
+    let triangles: usize = check.meshes.iter().map(|m| m.indices.len() / 3).sum();
+    outln!("{} meshes, {vertices} vertices, {triangles} triangles ({})", check.meshes.len(), human(file.len() as u64));
+    if let Some(out) = out {
+        fs::write(out, &file).with_context(|| format!("writing {}", out.display()))?;
+        outln!("Saved {}", out.display());
+    }
+    if mods {
+        let name = obj.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        cmd_edit(game_dir, vpath, Op::Set(file), &format!("Replaced the meshes of {vpath} with {name}"), keys)?;
+    }
     Ok(())
 }
 
@@ -2991,6 +3054,103 @@ fn cmd_verify_text(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -
         bail!("{} errors", errors.len());
     }
     Ok(())
+}
+
+/// Writes every Enhanced `.ydr` anew with its own meshes (through the model
+/// writer) and compares what the reader gets back.
+fn cmd_verify_model_writer(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    use rage_formats::{drawable, ydr_write};
+    let starts = archive_roots(game_dir, within, keys)?;
+    let started = Instant::now();
+    let check = |res: &rage_resource::Resource| -> Result<bool> {
+        if res.version != drawable::VERSION_YDR_ENHANCED {
+            return Ok(false);
+        }
+        let before = drawable::parse_ydr(res)?;
+        let usable = ydr_write::usable_shaders(res)?;
+        let meshes: Vec<ydr_write::NewMesh> = before
+            .meshes
+            .iter()
+            .filter(|m| usable.contains(&m.shader) && !m.indices.is_empty() && m.bone_indices.is_empty())
+            .map(|m| ydr_write::NewMesh {
+                shader: m.shader,
+                positions: m.positions.clone(),
+                normals: m.normals.clone(),
+                uvs: m.uvs.clone(),
+                colors: m.colors.clone(),
+                indices: m.indices.clone(),
+            })
+            .collect();
+        if meshes.is_empty() {
+            return Ok(false);
+        }
+        let file = ydr_write::replace_meshes(res, &meshes)?;
+        let after = drawable::parse_ydr(&rage_resource::Resource::from_rsc7(&file)?)?;
+        if after.meshes.len() != meshes.len() {
+            bail!("{} meshes written, {} read back", meshes.len(), after.meshes.len());
+        }
+        for (i, (a, m)) in after.meshes.iter().zip(&meshes).enumerate() {
+            // Bit for bit: some of the game's vertices hold NaN, which never equals itself.
+            let same =
+                |x: &[f32], y: &[f32]| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits());
+            if !same(a.positions.as_flattened(), m.positions.as_flattened())
+                || a.indices != m.indices
+                || a.shader != m.shader
+            {
+                bail!("mesh {i}: geometry differs after writing");
+            }
+            if !m.uvs.is_empty() && !same(a.uvs.as_flattened(), m.uvs.as_flattened()) {
+                bail!("mesh {i}: texture coordinates differ after writing");
+            }
+            let close = |x: &[[f32; 3]], y: &[[f32; 3]]| {
+                x.len() == y.len() && x.iter().zip(y).all(|(p, q)| (0..3).all(|k| (p[k] - q[k]).abs() < 0.01))
+            };
+            if !m.normals.is_empty() && !close(&a.normals, &m.normals) {
+                bail!("mesh {i}: normals differ after writing");
+            }
+            if !m.colors.is_empty() && a.colors.first() != m.colors.first() {
+                bail!("mesh {i}: colours differ after writing");
+            }
+        }
+        Ok(true)
+    };
+    let results: Vec<(usize, usize, Vec<String>)> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let (mut seen, mut written, mut errors, mut nested) = (0, 0, Vec::new(), Vec::new());
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    if !a.entry(id).name.to_ascii_lowercase().ends_with(".ydr") {
+                        return;
+                    }
+                    seen += 1;
+                    match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| check(&r)) {
+                        Ok(true) => written += 1,
+                        Ok(false) => {}
+                        Err(e) => errors.push(format!("{p}: {e:#}")),
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (seen, written, errors)
+        })
+        .collect();
+    let (seen, written) = results.iter().fold((0, 0), |(s, w), r| (s + r.0, w + r.1));
+    let errors: Vec<&String> = results.iter().flat_map(|r| &r.2).collect();
+    outln!(
+        "{seen} drawables, {written} written anew and read back identically, {} errors ({:.1}s)",
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    for e in errors.iter().take(30) {
+        outln!("  {e}");
+    }
+    if errors.is_empty() { Ok(()) } else { bail!("{} drawables failed", errors.len()) }
 }
 
 fn cmd_verify_meta(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {

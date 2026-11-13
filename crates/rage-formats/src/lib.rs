@@ -33,6 +33,7 @@ pub mod wpl;
 pub mod wtd_write;
 pub mod xml;
 pub mod ybn;
+pub mod ydr_write;
 pub mod ypt;
 pub mod ysc;
 pub mod ytd;

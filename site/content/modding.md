@@ -37,6 +37,26 @@ In a texture dictionary, **Replace…**, **Add…** and **Remove** change textur
 - Anything else rebuilds the dictionary from its original structures.
 - Archives are streamed while they are rewritten, so even multi-gigabyte archives need little memory.
 
+## Models (preview)
+
+A drawable of GTA V Enhanced (`.ydr`) can get new geometry from a Wavefront OBJ file. For now from the
+[command line](@/cli.md#editing-packages-and-the-mods-folder):
+
+```
+openrage replace-model x64i.rpf/levels/gta5/props/…/prop_x.ydr model.obj --mods
+```
+
+- The drawable keeps its shaders and textures: OpenRAGE copies them, with the vertex layout each shader expects,
+  from the original file and writes only the new geometry. The OBJ materials go to the drawable's shaders in order
+  (`--shader N` puts everything on one); the output lists which went where.
+- The model gets one detail level, visible as far as the original's furthest. Meshes over 65,535 vertices are split.
+- OBJ is converted from Y-up to the game's Z-up; missing normals are computed, tangents always.
+- `--mods` puts it into the `mods` folder in place of the original (undo with **Undo** / `openrage undo`), `--out`
+  writes the file elsewhere.
+- Not yet: GTA V Legacy, `.yft`/`.ydd`, skinned models, new textures and collisions (the original collision stays).
+  The written drawables read back identically in OpenRAGE (`openrage verify --models --rebuild` writes every drawable
+  of the game anew and compares); please report how they behave in the game.
+
 ## Text files and game text
 
 - Text files open in the text editor. After unlocking, **Save** (Ctrl+S) writes them into `mods`, keeping encoding,
