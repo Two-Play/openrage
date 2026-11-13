@@ -460,6 +460,7 @@ fn run() -> Result<()> {
         Command::Info { path } => cmd_info(&game_dir, &path, keys),
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
+        Command::Verify { path, models: true, .. } if gta4 => cmd_verify_gta4_models(&game_dir, &path),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
         Command::Verify { path, media: true, .. } => cmd_verify_media(&game_dir, &path, keys),
@@ -2746,6 +2747,87 @@ fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
     );
     if !total.errors.is_empty() {
         bail!("verification found {} errors", total.errors.len());
+    }
+    Ok(())
+}
+
+/// Parses every GTA IV model (`.wdr`, `.wdd`, `.wft`).
+fn cmd_verify_gta4_models(game_dir: &Path, within: &str) -> Result<()> {
+    #[derive(Default)]
+    struct Stats {
+        files: usize,
+        drawables: usize,
+        meshes: usize,
+        triangles: usize,
+        textured: usize,
+        shaders: usize,
+        errors: Vec<String>,
+    }
+    let (starts, open_errors) = gta4_starts(game_dir, within)?;
+    let started = Instant::now();
+    let all: Vec<Stats> = starts
+        .par_iter()
+        .map(|(prefix, a, dir)| {
+            let mut s = Stats::default();
+            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
+                let e = a.entry(id);
+                let lower = e.name.to_ascii_lowercase();
+                let kind = ["wdr", "wdd", "wft"].into_iter().find(|x| lower.ends_with(&format!(".{x}")));
+                let (Some(kind), Some(_)) = (kind, e.resource_type()) else { return };
+                s.files += 1;
+                let parsed = a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| {
+                    use rage_formats::wdr;
+                    Ok(match kind {
+                        "wdr" => vec![wdr::parse_wdr(&r)?],
+                        "wdd" => wdr::parse_wdd(&r)?.into_iter().map(|(_, d)| d).collect(),
+                        _ => {
+                            let f = wdr::parse_wft(&r)?;
+                            std::iter::once(f.drawable).chain(f.children.into_iter().map(|c| c.drawable)).collect()
+                        }
+                    })
+                });
+                match parsed {
+                    Ok(ds) => {
+                        for d in ds {
+                            s.drawables += 1;
+                            s.meshes += d.meshes.len();
+                            s.triangles += d.triangle_count();
+                            s.shaders += d.shaders.len();
+                            s.textured += d.shaders.iter().filter(|sh| sh.base_texture().is_some()).count();
+                        }
+                    }
+                    Err(err) => s.errors.push(format!("{p}: {err:#}")),
+                }
+            });
+            s
+        })
+        .collect();
+    let mut total = Stats { errors: open_errors, ..Default::default() };
+    for s in all {
+        total.files += s.files;
+        total.drawables += s.drawables;
+        total.meshes += s.meshes;
+        total.triangles += s.triangles;
+        total.shaders += s.shaders;
+        total.textured += s.textured;
+        total.errors.extend(s.errors);
+    }
+    for e in total.errors.iter().take(50) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} model files, {} drawables, {} meshes, {} triangles, {}/{} shaders with a colour texture, {} errors ({:.1}s)",
+        total.files,
+        total.drawables,
+        total.meshes,
+        total.triangles,
+        total.textured,
+        total.shaders,
+        total.errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !total.errors.is_empty() {
+        bail!("{} errors", total.errors.len());
     }
     Ok(())
 }

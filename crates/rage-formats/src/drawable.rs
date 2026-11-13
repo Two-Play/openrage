@@ -122,8 +122,11 @@ pub mod param {
     pub const SPEC_SAMPLER: u32 = 0x608799c6;
     pub const BUMP_SAMPLER: u32 = 0x46b7c64f;
 
+    /// `TextureSampler`: the base colour (GTA IV).
+    pub const TEXTURE_SAMPLER: u32 = 0x2b5170fd;
+
     /// Parameters that hold the base colour.
-    pub const BASE: [u32; 2] = [DIFFUSE_TEX, DIFFUSE_SAMPLER];
+    pub const BASE: [u32; 3] = [DIFFUSE_TEX, DIFFUSE_SAMPLER, TEXTURE_SAMPLER];
     /// Parameters that never hold the base colour.
     pub const NOT_BASE: [u32; 9] = [
         DIFFUSE_TEX2,
@@ -253,7 +256,7 @@ impl Gen {
     }
 }
 
-fn bad(msg: impl Into<String>) -> ResourceError {
+pub(crate) fn bad(msg: impl Into<String>) -> ResourceError {
     ResourceError::Format(msg.into())
 }
 
@@ -278,14 +281,14 @@ fn f32_at(d: &[u8], o: usize) -> f32 {
     f32::from_le_bytes(d[o..o + 4].try_into().unwrap())
 }
 
-fn vec3(res: &Resource, ptr: u64) -> Result<[f32; 3], ResourceError> {
+pub(crate) fn vec3(res: &Resource, ptr: u64) -> Result<[f32; 3], ResourceError> {
     let b = res.bytes(ptr, 12)?;
     Ok([f32_at(b, 0), f32_at(b, 4), f32_at(b, 8)])
 }
 
 /// How a vertex attribute is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Encoding {
+pub(crate) enum Encoding {
     Float2,
     Float3,
     Float4,
@@ -302,7 +305,7 @@ enum Encoding {
 }
 
 impl Encoding {
-    fn decode(self, d: &[u8]) -> [f32; 4] {
+    pub(crate) fn decode(self, d: &[u8]) -> [f32; 4] {
         let h = |i: usize| f16(u16::from_le_bytes([d[i], d[i + 1]]));
         match self {
             Encoding::Float2 => [f32_at(d, 0), f32_at(d, 4), 0.0, 0.0],
@@ -330,7 +333,7 @@ impl Encoding {
         }
     }
 
-    fn size(self) -> usize {
+    pub(crate) fn size(self) -> usize {
         match self {
             Encoding::Float2 | Encoding::Half4 => 8,
             Encoding::Float3 => 12,
@@ -347,18 +350,18 @@ impl Encoding {
 
 /// Byte offsets and encodings of the attributes we use.
 #[derive(Debug, Default)]
-struct VertexLayout {
-    stride: usize,
+pub(crate) struct VertexLayout {
+    pub(crate) stride: usize,
     /// Attributes are stored as separate streams (RDR2): attribute `a` of
     /// vertex `i` is at `offset + i × size` instead of `i × stride + offset`.
-    streamed: bool,
-    position: Option<(usize, Encoding)>,
-    normal: Option<(usize, Encoding)>,
-    uv: Option<(usize, Encoding)>,
-    uv1: Option<(usize, Encoding)>,
-    color: Option<(usize, Encoding)>,
-    weights: Option<(usize, Encoding)>,
-    indices: Option<(usize, Encoding)>,
+    pub(crate) streamed: bool,
+    pub(crate) position: Option<(usize, Encoding)>,
+    pub(crate) normal: Option<(usize, Encoding)>,
+    pub(crate) uv: Option<(usize, Encoding)>,
+    pub(crate) uv1: Option<(usize, Encoding)>,
+    pub(crate) color: Option<(usize, Encoding)>,
+    pub(crate) weights: Option<(usize, Encoding)>,
+    pub(crate) indices: Option<(usize, Encoding)>,
 }
 
 fn legacy_encoding(t: u64) -> Option<(usize, Option<Encoding>)> {
@@ -378,7 +381,7 @@ fn legacy_encoding(t: u64) -> Option<(usize, Option<Encoding>)> {
     })
 }
 
-fn legacy_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayout, ResourceError> {
+pub(crate) fn legacy_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayout, ResourceError> {
     let flags = res.u32(decl)?;
     let types = res.u64(decl + 8)?;
     let mut layout = VertexLayout { stride, ..Default::default() };

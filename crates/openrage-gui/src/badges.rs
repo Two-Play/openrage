@@ -27,8 +27,8 @@ pub fn icon(name: &str, kind: ItemKind) -> (&'static str, Color) {
         _ => {}
     }
     match extension(name).as_str() {
-        "ytd" | "dds" | "png" | "jpg" | "bmp" | "tga" => ("texture", rgb(0x9061D8)),
-        "ydr" | "ydd" | "yft" | "yld" => ("model", rgb(0x3B82F6)),
+        "ytd" | "wtd" | "dds" | "png" | "jpg" | "bmp" | "tga" => ("texture", rgb(0x9061D8)),
+        "ydr" | "ydd" | "yft" | "yld" | "wdr" | "wdd" | "wft" => ("model", rgb(0x3B82F6)),
         "ypt" => ("particles", rgb(0xE0679B)),
         "ybn" => ("collision", rgb(0x14A08F)),
         "ynv" | "ynd" | "yvr" | "ywr" | "nod" => ("path", rgb(0x14A08F)),
@@ -53,10 +53,10 @@ pub fn type_name(name: &str, kind: ItemKind) -> String {
         _ if kind == ItemKind::Archive => "Archive",
         _ if kind == ItemKind::Texture => "Texture",
         _ if kind == ItemKind::Sound => "Sound",
-        "ytd" => "Texture dictionary",
-        "ydr" => "Drawable",
-        "ydd" => "Drawable dict",
-        "yft" => "Fragment",
+        "ytd" | "wtd" => "Texture dictionary",
+        "ydr" | "wdr" => "Drawable",
+        "ydd" | "wdd" => "Drawable dict",
+        "yft" | "wft" => "Fragment",
         "ypt" => "Particles",
         "ybn" => "Bounds",
         "ynv" => "Nav mesh",
