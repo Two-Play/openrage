@@ -3071,7 +3071,8 @@ fn cmd_verify_gta4_animations(game_dir: &Path, within: &str) -> Result<()> {
     Ok(())
 }
 
-/// Reads every GTA IV collision file (`.wbn`, `.wbd`) and builds its meshes.
+/// Reads every GTA IV collision file (`.wbn`, `.wbd`) and the collision of
+/// every fragment (`.wft`) and builds their meshes.
 fn cmd_verify_gta4_collisions(game_dir: &Path, within: &str) -> Result<()> {
     #[derive(Default)]
     struct Stats {
@@ -3091,18 +3092,27 @@ fn cmd_verify_gta4_collisions(game_dir: &Path, within: &str) -> Result<()> {
             vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
                 let e = a.entry(id);
                 let lower = e.name.to_ascii_lowercase();
-                if e.resource_type().is_none() || !(lower.ends_with(".wbn") || lower.ends_with(".wbd")) {
+                let fragment = lower.ends_with(".wft");
+                if e.resource_type().is_none() || !(lower.ends_with(".wbn") || lower.ends_with(".wbd") || fragment) {
                     return;
                 }
-                s.files += 1;
                 let parsed = a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| {
                     use rage_formats::wbn;
-                    Ok(if lower.ends_with(".wbn") {
+                    Ok(if fragment {
+                        // The collision a fragment keeps for itself, if it has one.
+                        match rage_formats::wdr::fragment_bound(&r) {
+                            Some(at) => vec![wbn::parse_bound(&r, at)?.1],
+                            None => Vec::new(),
+                        }
+                    } else if lower.ends_with(".wbn") {
                         vec![wbn::parse_wbn(&r)?.1]
                     } else {
                         wbn::parse_wbd(&r)?.into_iter().map(|(_, _, st)| st).collect()
                     })
                 });
+                if !matches!(&parsed, Ok(list) if list.is_empty()) {
+                    s.files += 1;
+                }
                 match parsed {
                     Ok(list) => {
                         for st in list {
