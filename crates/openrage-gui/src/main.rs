@@ -265,6 +265,22 @@ fn debug_snapshot(ui: &AppWindow) {
                 }
             }
         }
+        // `OPENRAGE_CLICK=x,y[,right]` clicks there, e.g. to capture a context menu.
+        if let Ok(at) = std::env::var("OPENRAGE_CLICK") {
+            let parts: Vec<&str> = at.split(',').map(str::trim).collect();
+            if let [x, y, rest @ ..] = parts.as_slice()
+                && let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>())
+            {
+                use slint::platform::{PointerEventButton, WindowEvent};
+                let button =
+                    if rest.first() == Some(&"right") { PointerEventButton::Right } else { PointerEventButton::Left };
+                let position = slint::LogicalPosition::new(x, y);
+                let w = ui.window();
+                w.dispatch_event(WindowEvent::PointerMoved { position });
+                w.dispatch_event(WindowEvent::PointerPressed { position, button });
+                w.dispatch_event(WindowEvent::PointerReleased { position, button });
+            }
+        }
         // Wait (up to a minute) until the models for a clip dictionary are found.
         let waiting = std::rc::Rc::new(slint::Timer::default());
         let started = Instant::now();
