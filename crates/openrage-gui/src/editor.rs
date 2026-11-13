@@ -208,6 +208,7 @@ pub fn open(ui: &AppWindow, doc: Document) {
     }
     let Ok(win) = EditorWindow::new() else { return };
     win.set_overlay_folder(crate::overlay_name().into());
+    win.set_write_in_game(crate::writes_in_game());
     win.set_theme_mode(ui.get_theme_mode());
     crate::accent::apply(&win);
     win.set_mono_font(ui.get_mono_font());
@@ -237,7 +238,7 @@ pub fn open(ui: &AppWindow, doc: Document) {
             }
         };
         win.set_saving(true);
-        win.set_status(format!("Saving into the {} folder…", crate::overlay_name()).into());
+        win.set_status(format!("Saving into the {} folder…", crate::write_folder()).into());
         let w2 = w.clone();
         crate::save_file(&ui, doc.vpath.clone(), bytes, format!("Edited {}", doc.name), move |result| {
             let Some(win) = w2.upgrade() else { return };
@@ -381,6 +382,11 @@ fn forget(id: u64) {
 /// Follows the main window's edit mode.
 pub fn set_editable(editable: bool) {
     OPEN.with(|o| o.borrow().iter().for_each(|(_, w)| w.set_editable(editable)));
+}
+
+/// Follows the chosen write target (GTA IV: update folder or game files).
+pub fn set_write_in_game(on: bool) {
+    OPEN.with(|o| o.borrow().iter().for_each(|(_, w)| w.set_write_in_game(on)));
 }
 
 pub fn set_theme(mode: i32) {

@@ -4,7 +4,7 @@ description = "GTA IV and its episodes in OpenRAGE: setup, archives, textures, m
 
 [extra]
 docs = true
-lead = "The Complete Edition on Steam, including *The Lost and Damned* and *The Ballad of Gay Tony*. Changes go into the `update` folder and can be undone."
+lead = "The Complete Edition on Steam, including *The Lost and Damned* and *The Ballad of Gay Tony*. Changes go into the `update` folder, or into the game files with the originals kept, and can be undone."
 toc = true
 +++
 
@@ -174,4 +174,27 @@ openrage put handling.dat common/data/                          # a loose file, 
 openrage mods --changes                                         # everything that differs from the game
 openrage history
 openrage undo
+```
+
+### Writing into the game files
+
+Without FusionFix, or if you prefer it, changes can go into the game's own files instead. Tick **Write directly into
+the game files** in the **Unlock editing** dialog, or run `openrage write-target game`; `openrage write-target update`
+switches back. The choice is remembered per game.
+
+- Before a game file is changed for the first time, OpenRAGE keeps its original in `update/.openrage/originals/` (the
+  game does not load anything from there). Make sure there is room for a copy of each archive you change.
+- Every change is still recorded in **History** and can be undone step by step. **Changes** lists them as
+  "in the game".
+- **History → Restore game files** (or `openrage originals --restore-all`) puts every kept original back; the
+  changes made to those files then leave the history.
+- If the `update` folder already holds a copy of a file, OpenRAGE refuses to change the game's own file: the game
+  would load the copy, not your change. Change the copy, or remove it first.
+
+```
+openrage write-target game                                      # changes go into the game files from now on
+openrage put admiral.wtd pc/models/cdimages/vehicles.img/       # edits pc/models/cdimages/vehicles.img itself
+openrage originals                                              # files whose originals are kept
+openrage originals --restore pc/models/cdimages/vehicles.img    # put one original back (or --restore-all)
+openrage write-target update                                    # back to the update folder
 ```

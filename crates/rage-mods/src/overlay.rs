@@ -24,6 +24,9 @@ pub fn folder_name(game_dir: &Path) -> &'static str {
 /// OpenRAGE's own data inside the mods folder (journal, temporary files); never part of a mod.
 pub const OPENRAGE_FOLDER: &str = ".openrage";
 
+/// Inside [`OPENRAGE_FOLDER`]: originals of game files changed in place (GTA IV).
+pub const ORIGINALS_FOLDER: &str = "originals";
+
 /// The `mods` folder of a game installation (GTA IV: the `update` folder), if present.
 pub fn mods_dir(game_dir: &Path) -> Option<PathBuf> {
     vfs::match_case_insensitive(game_dir, folder_name(game_dir)).filter(|p| p.is_dir())

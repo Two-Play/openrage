@@ -273,8 +273,18 @@ fn apply_img(
             })
         })
         .collect::<Result<_>>()?;
-    let (path, rel, created) = ensure_in_mods(game_dir, mods, archive, journal)?;
     let key = rage_rpf::gta4::default_key();
+    if write_target(game_dir) == WriteTarget::Game {
+        let (path, rel) = prepare_game_file(game_dir, mods, archive)?;
+        let stats = commit_img_with(&path, key.as_deref(), &edits, &mut |backup| {
+            journal
+                .record_game_edit(&rel, description, backup)
+                .map(|_| ())
+                .map_err(|e| rage_rpf::RpfError::Io(std::io::Error::other(e.to_string())))
+        })?;
+        return Ok(Applied { path, created: false, stats });
+    }
+    let (path, rel, created) = ensure_in_mods(game_dir, mods, archive, journal)?;
     let stats = commit_img_with(&path, key.as_deref(), &edits, &mut |backup| {
         journal
             .record_edit(&rel, description, backup)
@@ -282,6 +292,154 @@ fn apply_img(
             .map_err(|e| rage_rpf::RpfError::Io(std::io::Error::other(e.to_string())))
     })?;
     Ok(Applied { path, created, stats })
+}
+
+/// Where changes go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteTarget {
+    /// The overlay folder (`mods`, GTA IV: `update`); the game folder stays untouched.
+    Overlay,
+    /// The game's own files (GTA IV only, when chosen). The original of every
+    /// changed file is kept first in `<overlay>/.openrage/originals/<same path>`.
+    Game,
+}
+
+fn same_game(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| {
+        let p = crate::gta4::normalize_dir(p);
+        p.canonicalize().unwrap_or(p)
+    };
+    norm(a) == norm(b)
+}
+
+/// The write target chosen for a game (`settings.conf`: `write_in_game=`).
+/// Always [`WriteTarget::Overlay`] except for GTA IV.
+pub fn write_target(game_dir: &Path) -> WriteTarget {
+    if !crate::gta4::is_gta4_dir(game_dir) {
+        return WriteTarget::Overlay;
+    }
+    let cfg = crate::config::Config::load();
+    if cfg.write_in_game.iter().any(|g| same_game(g, game_dir)) { WriteTarget::Game } else { WriteTarget::Overlay }
+}
+
+/// Chooses the write target for a game and saves it.
+pub fn set_write_target(game_dir: &Path, target: WriteTarget) -> Result<()> {
+    if target == WriteTarget::Game && !crate::gta4::is_gta4_dir(game_dir) {
+        bail!("writing into the game folder is only offered for GTA IV");
+    }
+    let mut cfg = crate::config::Config::load();
+    cfg.write_in_game.retain(|g| !same_game(g, game_dir));
+    if target == WriteTarget::Game {
+        cfg.write_in_game.push(game_dir.to_owned());
+    }
+    cfg.save()
+}
+
+fn originals_dir(mods: &Path) -> PathBuf {
+    mods.join(rage_mods::overlay::OPENRAGE_FOLDER).join(rage_mods::overlay::ORIGINALS_FOLDER)
+}
+
+/// Before a game file is changed in place: refuses if the overlay folder
+/// holds a copy (the game would load that one, not the change), and keeps the
+/// original once. Returns the file and its path relative to the game folder.
+fn prepare_game_file(game_dir: &Path, mods: &Path, rel: &str) -> Result<(PathBuf, String)> {
+    let folder = rage_mods::overlay::folder_name(game_dir);
+    if vfs::find_case_insensitive(mods, rel).is_some_and(|p| p.is_file()) {
+        bail!(
+            "{folder}/{rel} replaces this file in the game: change that copy (write into the {folder} folder) or \
+             remove it first"
+        );
+    }
+    let path = vfs::find_case_insensitive(game_dir, rel)
+        .filter(|p| p.is_file())
+        .with_context(|| format!("{rel} not found in the game folder"))?;
+    let rel = path.strip_prefix(game_dir).unwrap_or(Path::new(rel)).to_string_lossy().replace('\\', "/");
+    keep_original(mods, &path, &rel)?;
+    Ok((path, rel))
+}
+
+/// Copies a game file into the originals folder unless it is there already.
+fn keep_original(mods: &Path, path: &Path, rel: &str) -> Result<()> {
+    let dest = originals_dir(mods).join(rel);
+    if dest.is_file() {
+        return Ok(());
+    }
+    if let Some(dir) = dest.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = dest.with_extension("openrage-tmp");
+    fs::copy(path, &tmp).with_context(|| format!("keeping the original of {rel}"))?;
+    fs::rename(&tmp, &dest)?;
+    Ok(())
+}
+
+/// Game files changed in place whose originals are kept (paths relative to
+/// the game folder).
+pub fn originals(game_dir: &Path) -> Result<Vec<String>> {
+    let Some(mods) = rage_mods::mods_dir(game_dir) else { return Ok(Vec::new()) };
+    let root = originals_dir(&mods);
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_none_or(|x| x != "openrage-tmp") {
+                out.push(p.strip_prefix(&root).unwrap_or(&p).to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Whether the game's file differs from its kept original (reads both).
+pub fn differs_from_original(game_dir: &Path, rel: &str) -> bool {
+    let Some(mods) = rage_mods::mods_dir(game_dir) else { return false };
+    !same_content(&originals_dir(&mods).join(rel), &game_dir.join(rel))
+}
+
+fn same_content(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    let (Ok(fa), Ok(fb)) = (fs::File::open(a), fs::File::open(b)) else { return false };
+    if fa.metadata().map(|m| m.len()).ok() != fb.metadata().map(|m| m.len()).ok() {
+        return false;
+    }
+    let (mut ra, mut rb) = (std::io::BufReader::new(fa), std::io::BufReader::new(fb));
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = match ra.read(&mut ba) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if n == 0 {
+            return rb.read(&mut bb[..1]).is_ok_and(|m| m == 0);
+        }
+        if rb.read_exact(&mut bb[..n]).is_err() || ba[..n] != bb[..n] {
+            return false;
+        }
+    }
+}
+
+/// Puts the kept original of a game file back and forgets the changes made
+/// to it (they can no longer be undone one by one). Returns the restored path.
+pub fn restore_original(game_dir: &Path, rel: &str) -> Result<PathBuf> {
+    let mods = rage_mods::mods_dir(game_dir).context("no originals are kept for this game")?;
+    let root = originals_dir(&mods);
+    let rel = rel.trim_start_matches('/');
+    let src = vfs::find_case_insensitive(&root, rel)
+        .filter(|p| p.is_file())
+        .with_context(|| format!("no original of {rel} is kept"))?;
+    let rel = src.strip_prefix(&root).unwrap_or(Path::new(rel)).to_string_lossy().replace('\\', "/");
+    let dest = game_dir.join(&rel);
+    let tmp = dest.with_extension("openrage-tmp");
+    fs::copy(&src, &tmp).with_context(|| format!("restoring {rel}"))?;
+    fs::rename(&tmp, &dest).with_context(|| format!("restoring {rel}"))?;
+    Journal::new(&mods).forget_game_file(&rel)?;
+    fs::remove_file(&src)?;
+    Ok(dest)
 }
 
 /// Applies one change to a virtual path (e.g. `x64e.rpf/levels/…/adder.ytd`).
@@ -309,6 +467,14 @@ pub fn put_loose(game_dir: &Path, vpath: &str, data: &[u8], description: &str) -
     let rel = vfs::find_case_insensitive(game_dir, rel)
         .and_then(|p| p.strip_prefix(game_dir).ok().map(|r| r.to_string_lossy().replace('\\', "/")))
         .unwrap_or_else(|| safe.to_string_lossy().replace('\\', "/"));
+    if write_target(game_dir) == WriteTarget::Game {
+        if vfs::find_case_insensitive(game_dir, &rel).is_some_and(|p| p.is_file()) {
+            prepare_game_file(game_dir, &mods, &rel)?;
+        } else if vfs::find_case_insensitive(&mods, &rel).is_some_and(|p| p.is_file()) {
+            bail!("{folder}/{rel} would replace the new file in the game: change that copy or remove it first");
+        }
+        return Journal::new(&mods).write_file(true, &rel, data, description);
+    }
     Journal::new(&mods).write_file(false, &rel, data, description)
 }
 

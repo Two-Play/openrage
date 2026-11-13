@@ -359,6 +359,18 @@ enum Command {
     History,
     /// Undo the newest change to the mods folder.
     Undo,
+    /// GTA IV: where changes go, `update` (the update folder, default) or
+    /// `game` (the game's own files, originals kept). Without a value: show it.
+    WriteTarget { target: Option<String> },
+    /// GTA IV: game files changed in place whose originals are kept.
+    Originals {
+        /// Put the original of this file back (path relative to the game folder).
+        #[arg(long, value_name = "PATH")]
+        restore: Option<String>,
+        /// Put every kept original back.
+        #[arg(long, conflicts_with = "restore")]
+        restore_all: bool,
+    },
     /// Rewrite an archive with replaced/added/removed entries, OpenIV style (experimental).
     #[command(hide = true)]
     Repack {
@@ -625,6 +637,8 @@ fn run() -> Result<()> {
             cmd_plugin(&mut cfg, Some((&game_dir, keys, game)), &cmd)
         }
         Command::Undo => cmd_undo(&game_dir),
+        Command::WriteTarget { target } => cmd_write_target(&game_dir, target.as_deref()),
+        Command::Originals { restore, restore_all } => cmd_originals(&game_dir, restore.as_deref(), restore_all),
         Command::Mods { changes, deep } => cmd_mods(&game_dir, changes, deep, keys),
         Command::Repack { archive, out, sets, removes } => cmd_repack(&game_dir, &archive, &out, &sets, &removes, keys),
         Command::Search { query, limit, lang } => {
@@ -1000,7 +1014,14 @@ fn cmd_mods(game_dir: &Path, changes: bool, deep: bool, keys: Option<Arc<GtaVKey
         let slash = if c.is_dir { "/" } else { "" };
         outln!("{:<15} {:>8}  {}{slash}", c.kind.label(), human(c.size), c.vpath);
     }
-    eprintln!("{} changes ({:.1}s)", list.len(), started.elapsed().as_secs_f32());
+    let in_game = rage_mods::list_game_changes(game_dir);
+    if !in_game.is_empty() {
+        outln!("\nIn the game folder itself (originals kept, `openrage originals`):");
+        for c in &in_game {
+            outln!("{:<15} {:>8}  {}", c.kind.label(), human(c.size), c.vpath);
+        }
+    }
+    eprintln!("{} changes ({:.1}s)", list.len() + in_game.len(), started.elapsed().as_secs_f32());
     Ok(())
 }
 
@@ -1280,12 +1301,15 @@ fn report(applied: &install::Applied, started: Instant) {
 
 fn cmd_edit(game_dir: &Path, path: &str, op: Op, description: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     let started = Instant::now();
-    if let Some(note) = openrage_app::gta4::update_folder_note(game_dir) {
+    let in_game = install::write_target(game_dir) == install::WriteTarget::Game;
+    if in_game {
+        eprintln!("note: writing into the game folder itself (`openrage write-target update` to change that).");
+    } else if let Some(note) = openrage_app::gta4::update_folder_note(game_dir) {
         eprintln!("note: {note}");
     }
     // Loose files (not inside an archive) go into the overlay folder.
     if install::split(game_dir, path).is_none() {
-        let folder = rage_mods::overlay::folder_name(game_dir);
+        let folder = if in_game { "game" } else { rage_mods::overlay::folder_name(game_dir) };
         match op {
             Op::Set(data) => {
                 let written = install::put_loose(game_dir, path, &data, description)?;
@@ -1718,7 +1742,62 @@ fn cmd_history(game_dir: &Path) -> Result<()> {
         outln!("No recorded changes.");
     }
     for e in entries {
-        outln!("#{:<4} {}  {}", e.id, e.archive, e.description);
+        use openrage_app::journal::Kind;
+        let place = match e.kind {
+            Kind::Edited { in_game: true, .. } | Kind::FileWritten { in_game: true, .. } => " (game folder)",
+            _ => "",
+        };
+        outln!("#{:<4} {}{place}  {}", e.id, e.archive, e.description);
+    }
+    Ok(())
+}
+
+fn cmd_write_target(game_dir: &Path, target: Option<&str>) -> Result<()> {
+    let folder = rage_mods::overlay::folder_name(game_dir);
+    let target = match target {
+        None => install::write_target(game_dir),
+        Some(t) if t.eq_ignore_ascii_case("game") => {
+            install::set_write_target(game_dir, install::WriteTarget::Game)?;
+            install::WriteTarget::Game
+        }
+        Some(t) if t.eq_ignore_ascii_case(folder) || t.eq_ignore_ascii_case("update") => {
+            install::set_write_target(game_dir, install::WriteTarget::Overlay)?;
+            install::WriteTarget::Overlay
+        }
+        Some(t) => bail!("unknown write target {t:?}: use `{folder}` or `game`"),
+    };
+    match target {
+        install::WriteTarget::Overlay => {
+            outln!("Changes go into the {folder} folder; the game folder stays untouched.")
+        }
+        install::WriteTarget::Game => outln!(
+            "Changes go into the game's own files. The original of every changed file is kept first \
+             (`openrage originals` lists them, `--restore` puts one back)."
+        ),
+    }
+    Ok(())
+}
+
+fn cmd_originals(game_dir: &Path, restore: Option<&str>, restore_all: bool) -> Result<()> {
+    let kept = install::originals(game_dir)?;
+    if let Some(rel) = restore {
+        let path = install::restore_original(game_dir, rel)?;
+        outln!("Restored {} (its changes are no longer in the history).", path.display());
+        return Ok(());
+    }
+    if restore_all {
+        for rel in &kept {
+            install::restore_original(game_dir, rel)?;
+            outln!("Restored {rel}");
+        }
+        return Ok(());
+    }
+    if kept.is_empty() {
+        outln!("No game files were changed in place.");
+    }
+    for rel in kept {
+        let changed = install::differs_from_original(game_dir, &rel);
+        outln!("{rel}  {}", if changed { "changed" } else { "same as the original" });
     }
     Ok(())
 }
@@ -3838,6 +3917,10 @@ fn collect_archives(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
     let mut items: Vec<_> = rd.flatten().map(|e| e.path()).collect();
     items.sort();
     for p in items {
+        // OpenRAGE's own data (journal, kept originals) is not part of the game.
+        if p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(rage_mods::overlay::OPENRAGE_FOLDER)) {
+            continue;
+        }
         if p.is_dir() {
             collect_archives(&p, extensions, out);
         } else if p.extension().is_some_and(|e| extensions.iter().any(|x| e.eq_ignore_ascii_case(x))) {

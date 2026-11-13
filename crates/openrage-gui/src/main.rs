@@ -926,6 +926,26 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_undo(move || with_ui(&w, start_undo));
     let w = ui.as_weak();
+    ui.on_write_target_changed(move |on| {
+        with_ui(&w, |ui| {
+            let Some(game_dir) = with_app(|a| a.game_dir.clone()) else { return };
+            let target = if on { install::WriteTarget::Game } else { install::WriteTarget::Overlay };
+            match install::set_write_target(&game_dir, target) {
+                Ok(()) => ui.set_status(
+                    if on {
+                        "Changes now go into the game files; originals are kept and can be restored in History."
+                            .to_owned()
+                    } else {
+                        format!("Changes now go into the {} folder.", overlay_name())
+                    }
+                    .into(),
+                ),
+                Err(e) => ui.set_status(format!("{e:#}").into()),
+            }
+            show_write_target(ui);
+        })
+    });
+    let w = ui.as_weak();
     ui.on_show_history(move || {
         with_ui(&w, |ui| {
             if ui.get_history_in_window() {
@@ -1205,6 +1225,7 @@ fn start_browsing(ui: &AppWindow) {
         with_app(|a| a.game_dir.as_ref().map(|d| d.display().to_string())).unwrap_or_default().into(),
     );
     ui.set_overlay_folder(overlay_name().into());
+    show_write_target(ui);
     let mods = with_app(|a| a.game_dir.as_deref().and_then(rage_mods::mods_dir).is_some());
     with_app(|a| a.overlay = mods);
     ui.set_mods_available(mods);
@@ -2902,13 +2923,18 @@ fn start_changes(ui: &AppWindow, record: bool) {
     std::thread::spawn(move || {
         let started = Instant::now();
         let mut last = Instant::now();
-        let changes = rage_mods::list_changes(&game_dir, keys, CompareMode::Quick, &mut |i, n, p| {
+        let mut changes = rage_mods::list_changes(&game_dir, keys, CompareMode::Quick, &mut |i, n, p| {
             if last.elapsed() > Duration::from_millis(150) {
                 last = Instant::now();
                 let msg = format!("Comparing {}/{n}: {p}", i + 1);
                 let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
             }
         });
+        // GTA IV: changes made to the game's own files, marked by a leading `!`.
+        changes.extend(rage_mods::list_game_changes(&game_dir).into_iter().map(|mut c| {
+            c.vpath.insert(0, '!');
+            c
+        }));
         let ms = started.elapsed().as_millis();
         let _ = weak.upgrade_in_event_loop(move |ui| show_changes(&ui, changes, ms, record));
     });
@@ -2918,19 +2944,24 @@ fn show_changes(ui: &AppWindow, changes: Vec<rage_mods::Change>, ms: u128, recor
     let files = with_app(|a| a.game_dir.as_deref().map(rage_mods::scan).unwrap_or_default());
     let items: Vec<Item> = changes
         .iter()
-        .map(|c| Item {
-            name: c.vpath.rsplit('/').next().unwrap_or_default().to_owned(),
+        .map(|c| {
+            let in_game = c.vpath.strip_prefix('!');
+            (c, in_game.unwrap_or(&c.vpath), in_game.is_some())
+        })
+        .map(|(c, vpath, in_game)| Item {
+            name: vpath.rsplit('/').next().unwrap_or_default().to_owned(),
             kind: if c.is_dir {
                 ItemKind::Dir
-            } else if c.vpath.to_ascii_lowercase().ends_with(".rpf") {
+            } else if vpath.to_ascii_lowercase().ends_with(".rpf") {
                 ItemKind::Archive
             } else {
                 ItemKind::File
             },
             size: c.size,
-            info: c.kind.label().into(),
+            // The mark shows the kind; the info says where the change is.
+            info: if in_game { "in the game".into() } else { c.kind.label().into() },
             entry: None,
-            vpath: Some(c.vpath.clone()),
+            vpath: Some(vpath.to_owned()),
             mark: Some(match c.kind {
                 ChangeKind::Added => Mark::Added,
                 ChangeKind::NewFile => Mark::New,
@@ -2942,8 +2973,16 @@ fn show_changes(ui: &AppWindow, changes: Vec<rage_mods::Change>, ms: u128, recor
         })
         .collect();
     let identical = changes.iter().filter(|c| c.kind == ChangeKind::IdenticalCopy).count();
-    let mut summary =
-        format!("{} changes from {} files in the {} folder · {ms} ms", items.len(), files.len(), overlay_name());
+    let in_game = changes.iter().filter(|c| c.vpath.starts_with('!')).count();
+    let mut summary = format!(
+        "{} changes from {} files in the {} folder · {ms} ms",
+        items.len() - in_game,
+        files.len(),
+        overlay_name()
+    );
+    if in_game > 0 {
+        summary.push_str(&format!(" · {in_game} in the game files"));
+    }
     if identical > 0 {
         let noun = if identical == 1 { "copy" } else { "copies" };
         summary.push_str(&format!(" · {identical} unchanged {noun} of game files (can be deleted)"));
@@ -3064,6 +3103,60 @@ pub(crate) fn overlay_name() -> &'static str {
     with_app(|a| a.game_dir.as_deref().map(rage_mods::overlay::folder_name)).unwrap_or("mods")
 }
 
+/// Whether changes go into the game's own files (GTA IV, when chosen).
+pub(crate) fn writes_in_game() -> bool {
+    with_app(|a| a.game_dir.clone()).is_some_and(|d| install::write_target(&d) == install::WriteTarget::Game)
+}
+
+/// Where changes go, for status texts: the overlay folder's name, or `game`.
+pub(crate) fn write_folder() -> &'static str {
+    if writes_in_game() { "game" } else { overlay_name() }
+}
+
+/// The FusionFix note, when changes go into the update folder without it.
+fn overlay_note() -> Option<&'static str> {
+    if writes_in_game() {
+        return None;
+    }
+    with_app(|a| a.game_dir.clone()).and_then(|d| openrage_app::gta4::update_folder_note(&d))
+}
+
+/// Shows the current write target in every window.
+pub(crate) fn show_write_target(ui: &AppWindow) {
+    let game = with_app(|a| a.game_dir.clone());
+    ui.set_can_write_in_game(game.as_deref().is_some_and(openrage_app::gta4::is_gta4_dir));
+    ui.set_write_in_game(writes_in_game());
+    editor::set_write_in_game(writes_in_game());
+    history::refresh(ui);
+}
+
+/// Game files changed in place whose originals are kept.
+pub(crate) fn kept_originals() -> Vec<String> {
+    with_app(|a| a.game_dir.clone()).and_then(|d| install::originals(&d).ok()).unwrap_or_default()
+}
+
+/// Puts every kept original back (History → Restore game files).
+pub(crate) fn restore_originals(ui: &AppWindow) {
+    let Some(game_dir) = with_app(|a| a.game_dir.clone()) else { return };
+    let mut done = 0;
+    let mut failed = Vec::new();
+    for rel in kept_originals() {
+        match install::restore_original(&game_dir, &rel) {
+            Ok(_) => done += 1,
+            Err(e) => failed.push(format!("{rel}: {e:#}")),
+        }
+    }
+    let current = with_app(|a| a.listing.as_ref().map(|l| l.vpath.clone())).unwrap_or_default();
+    after_mods_change(ui, &current);
+    let msg = if failed.is_empty() {
+        format!("Restored {done} game files to their originals")
+    } else {
+        format!("Restored {done} game files; failed: {}", failed.join("; "))
+    };
+    ui.set_status(msg.into());
+    history::refresh(ui);
+}
+
 fn open_prompt(ui: &AppWindow, prompt: Prompt, title: &str, value: &str) {
     with_app(|a| a.prompt = Some(prompt));
     ui.set_prompt_title(title.into());
@@ -3113,7 +3206,7 @@ fn run_archive_ops(ui: &AppWindow, ops: Vec<(String, OpTarget)>, description: St
     else {
         return;
     };
-    set_busy(ui, true, format!("Writing into the {} folder…", overlay_name()));
+    set_busy(ui, true, format!("Writing into the {} folder…", write_folder()));
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let started = Instant::now();
@@ -3162,9 +3255,7 @@ fn run_archive_ops(ui: &AppWindow, ops: Vec<(String, OpTarget)>, description: St
                     if applied.created {
                         msg.push_str(&format!(" (archive copied into the {} folder first)", overlay_name()));
                     }
-                    if let Some(note) =
-                        with_app(|a| a.game_dir.clone()).and_then(|d| openrage_app::gta4::update_folder_note(&d))
-                    {
+                    if let Some(note) = overlay_note() {
                         msg.push_str(&format!(" — {note}"));
                     }
                     ui.set_status(msg.into());
@@ -4112,18 +4203,13 @@ fn save_file(
                     let applied =
                         install::apply(&game_dir, keys, &t.archive, &[(t.inner, Op::Set(data))], &description)?;
                     Ok(if applied.created {
-                        format!("Saved into mods/{} (archive copied there first)", t.archive)
+                        format!("Saved into {}/{} (archive copied there first)", overlay_name(), t.archive)
                     } else {
-                        format!("Saved into mods/{}", t.archive)
+                        format!("Saved into {}", applied.path.display())
                     })
                 }
                 None => {
-                    let rel = vpath.strip_prefix("mods/").unwrap_or(&vpath).to_owned();
-                    let mods = rage_mods::mods_dir(&game_dir)
-                        .unwrap_or_else(|| game_dir.join(rage_mods::overlay::folder_name(&game_dir)));
-                    std::fs::create_dir_all(&mods)?;
-                    let path =
-                        openrage_app::journal::Journal::new(&mods).write_file(false, &rel, &data, &description)?;
+                    let path = install::put_loose(&game_dir, &vpath, &data, &description)?;
                     Ok(format!("Saved {}", path.display()))
                 }
             }
@@ -4461,8 +4547,10 @@ fn show_history(ui: &AppWindow, record: bool) {
         .map(|e| {
             use openrage_app::journal::Kind;
             let place = match e.kind {
-                Kind::FileWritten { in_game: true, .. } => format!("game folder: {}", e.archive),
-                _ => format!("mods/{}", e.archive),
+                Kind::FileWritten { in_game: true, .. } | Kind::Edited { in_game: true, .. } => {
+                    format!("game folder: {}", e.archive)
+                }
+                _ => format!("{}/{}", overlay_name(), e.archive),
             };
             Item {
                 name: e.description.clone(),
