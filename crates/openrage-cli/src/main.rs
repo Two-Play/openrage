@@ -1089,6 +1089,10 @@ fn load_ytd(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
             let entry = &rpf.entries().context("no entries")?[i];
             Ok(rage_formats::ytd::parse_rdr2(&rpf.read_resource(entry)?)?)
         }
+        Node::Gta4File(a, id) if openrage_app::textures::is_gta4_model(path) => {
+            openrage_app::textures::gta4_model_textures(&a.read_resource(id)?)
+                .with_context(|| format!("{path} has no textures of its own"))
+        }
         Node::Gta4File(a, id) => Ok(rage_formats::ytd::parse_gta4(&a.read_resource(id)?)?),
         _ => bail!("{path} is not a file inside an archive"),
     }
@@ -3976,6 +3980,8 @@ fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: bool) -> Res
         textures: usize,
         decoded: usize,
         rebuilt: usize,
+        models: usize,
+        identical: usize,
         formats: std::collections::BTreeMap<String, usize>,
         errors: Vec<String>,
     }
@@ -3987,26 +3993,49 @@ fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: bool) -> Res
             let mut s = Stats::default();
             vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
                 let e = a.entry(id);
-                if e.resource_type().is_none() || !e.name.to_ascii_lowercase().ends_with(".wtd") {
+                let lower = e.name.to_ascii_lowercase();
+                // Texture dictionaries, and models (.wdr) with textures of their own.
+                let model = lower.ends_with(".wdr");
+                if e.resource_type().is_none() || !(lower.ends_with(".wtd") || model) {
                     return;
                 }
-                s.dicts += 1;
                 let read = a.read(id).map_err(anyhow::Error::from).and_then(|raw| {
                     let header = rage_resource::rsc5_header(&raw).context("no RSC5 header")?;
                     let res = rage_resource::Resource::from_rsc5(&raw)?;
-                    let dict = rage_formats::ytd::parse_gta4(&res)?;
-                    Ok((header, res, dict))
+                    let root = match model {
+                        true => {
+                            rage_formats::wdr::embedded_textures(&res, rage_resource::Resource::ROOT).map(|e| e.root)
+                        }
+                        false => Some(rage_resource::Resource::ROOT),
+                    };
+                    let dict = root.map(|r| rage_formats::ytd::parse_gta4_at(&res, r)).transpose()?;
+                    Ok((header, res, root.zip(dict)))
                 });
-                let ((kind, flags), res, dict) = match read {
-                    Ok(d) => d,
+                let ((kind, flags), res, (root, dict)) = match read {
+                    Ok((h, r, Some(d))) => (h, r, d),
+                    Ok((_, _, None)) => return,
                     Err(err) => return s.errors.push(format!("{p}: {err:#}")),
                 };
+                s.dicts += 1;
+                s.models += model as usize;
                 s.errors.extend(dict.errors.iter().map(|err| format!("{p}: {err}")));
                 if rebuild && dict.errors.is_empty() {
                     // The writer's rebuild must read back to the same textures.
-                    let check = rage_formats::wtd_write::rebuild(&res, kind, flags, &dict)
-                        .and_then(|file| rage_resource::Resource::from_rsc5(&file))
-                        .and_then(|r| rage_formats::ytd::parse_gta4(&r));
+                    let mut same_memory = false;
+                    let check = if model {
+                        rage_formats::wtd_write::rebuild_embedded(&res, kind, flags, root, &dict)
+                            .and_then(|file| rage_resource::Resource::from_rsc5(&file))
+                            .and_then(|r| {
+                                // Nothing changed: the model must come out byte for byte.
+                                same_memory = r.system == res.system && r.graphics == res.graphics;
+                                rage_formats::ytd::parse_gta4_at(&r, root)
+                            })
+                    } else {
+                        rage_formats::wtd_write::rebuild(&res, kind, flags, &dict)
+                            .and_then(|file| rage_resource::Resource::from_rsc5(&file))
+                            .and_then(|r| rage_formats::ytd::parse_gta4(&r))
+                    };
+                    s.identical += same_memory as usize;
                     let key = |d: &rage_formats::ytd::TextureDictionary| {
                         let mut v: Vec<_> = d
                             .textures
@@ -4040,6 +4069,8 @@ fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: bool) -> Res
         total.textures += s.textures;
         total.decoded += s.decoded;
         total.rebuilt += s.rebuilt;
+        total.models += s.models;
+        total.identical += s.identical;
         total.errors.extend(s.errors);
         for (k, v) in s.formats {
             *total.formats.entry(k).or_default() += v;
@@ -4052,10 +4083,16 @@ fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: bool) -> Res
     outln!("formats: {}", formats.join(", "));
     if rebuild {
         outln!("{} dictionaries rebuilt and read back identically", total.rebuilt);
+        outln!(
+            "{} of {} models with textures rebuilt byte for byte (unchanged textures keep their place)",
+            total.identical,
+            total.models
+        );
     }
     outln!(
-        "{} texture dictionaries, {} textures, {} decoded, {} errors ({:.1}s)",
+        "{} texture dictionaries ({} in models), {} textures, {} decoded, {} errors ({:.1}s)",
         total.dicts,
+        total.models,
         total.textures,
         total.decoded,
         total.errors.len(),

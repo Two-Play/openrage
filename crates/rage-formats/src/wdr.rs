@@ -242,6 +242,38 @@ pub fn read_drawable(res: &Resource, p: u64) -> Result<Drawable, ResourceError> 
     Ok(d)
 }
 
+/// The texture dictionary embedded in a drawable and the texture structures
+/// its shaders point at.
+#[derive(Debug, Clone)]
+pub struct EmbeddedTextures {
+    /// Address of the dictionary.
+    pub root: u64,
+    /// Texture structures in use, with the name of the shader using them.
+    pub in_use: Vec<(u64, String)>,
+}
+
+/// The textures embedded in the drawable at `p` (a `.wdr` file's root), if any.
+pub fn embedded_textures(res: &Resource, p: u64) -> Option<EmbeddedTextures> {
+    let group = ptr(res, p + 0x08).ok().filter(|&g| valid(res, g))?;
+    let root = ptr(res, group + 0x04).ok().filter(|&t| valid(res, t))?;
+    let mut in_use = Vec::new();
+    for s in pointer_list(res, group + 0x08).unwrap_or_default() {
+        let (Ok(params), Ok(count), Ok(types)) = (ptr(res, s + 0x14), res.u32(s + 0x1C), ptr(res, s + 0x24)) else {
+            continue;
+        };
+        let name = shader_name(res, s).unwrap_or_else(|| format!("{:08X}", res.u32(s + 0x28).unwrap_or(0)));
+        for i in 0..count.min(128) as u64 {
+            if res.u8(types + i).ok() == Some(0)
+                && let Ok(data) = ptr(res, params + i * 4)
+                && valid(res, data)
+            {
+                in_use.push((data, name.clone()));
+            }
+        }
+    }
+    Some(EmbeddedTextures { root, in_use })
+}
+
 /// A `.wdr` file.
 pub fn parse_wdr(res: &Resource) -> Result<Drawable, ResourceError> {
     read_drawable(res, Resource::ROOT)

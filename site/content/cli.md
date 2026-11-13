@@ -40,6 +40,7 @@ openrage verify                                # read every entry of every .img 
 openrage textures pc/models/cdimages/vehicles.img/admiral.wtd --export out/ --png
 openrage verify --textures                     # parse every .wtd and decode every texture
 openrage textures pc/models/cdimages/vehicles.img/admiral.wtd --set name=new.dds [--remove name]   # change textures
+openrage textures pc/anim/cutsprops.img/csak47.wdr [--set name=new.dds]   # textures inside a model (.wdr)
 openrage model pc/models/cdimages/vehicles.img/admiral.wft --export admiral.glb --render admiral.png
 openrage verify --models                       # parse every .wdr, .wdd and .wft
 openrage text common/text/german.gxt -o german.txt   # text table as [TABLE] sections of 0xHASH = text

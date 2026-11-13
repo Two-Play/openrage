@@ -81,6 +81,8 @@ struct App {
     model_view: openrage_app::render::View,
     /// Open a viewer window as soon as the current preview has loaded.
     pending_viewer: bool,
+    /// The selected GTA IV model whose own textures the Textures button opens.
+    model_textures_path: Option<String>,
     /// The selected sound, decoded, and the audio output playing it.
     sound: Option<Arc<rage_formats::awc::Pcm>>,
     output: Option<audio::Output>,
@@ -152,6 +154,7 @@ fn main() -> anyhow::Result<()> {
             model: None,
             model_view: openrage_app::render::View::default(),
             pending_viewer: false,
+            model_textures_path: None,
             sound: None,
             output: None,
             sound_start: 0.0,
@@ -780,6 +783,14 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_export_gltf(move || with_ui(&w, export_gltf));
     let w = ui.as_weak();
     ui.on_open_viewer(move || with_ui(&w, open_viewer));
+    let w = ui.as_weak();
+    ui.on_open_model_textures(move || {
+        with_ui(&w, |ui| {
+            if let Some(model) = with_app(|a| a.model_textures_path.clone()) {
+                navigate(ui, &format!("{model}/{}", browser::MODEL_TEXTURES), true);
+            }
+        })
+    });
     let w = ui.as_weak();
     ui.on_row_action(move |i, action| with_ui(&w, |ui| row_action(ui, i as usize, &action)));
     let w = ui.as_weak();
@@ -1725,6 +1736,23 @@ fn show_folder_info(ui: &AppWindow) {
                 ));
             }
             Location::Textures { dict, .. } => {
+                // `…/x.wdr/textures`: the textures inside a GTA IV model.
+                if let Some(model) = browser::model_of_textures(&l.vpath) {
+                    let model_name = model.rsplit('/').next().unwrap_or(model);
+                    return Some((
+                        format!("{model_name} — textures"),
+                        l.vpath.clone(),
+                        vec![
+                            kv("Type", "Textures inside a model"),
+                            kv("Textures", dict.textures.len()),
+                            note(
+                                "Replace a texture to change the model's look. Textures its shaders use \
+                                 cannot be removed.",
+                            ),
+                        ],
+                        badges::icon(&name, ItemKind::Resource),
+                    ));
+                }
                 return Some((
                     name.clone(),
                     l.vpath.clone(),
@@ -1791,6 +1819,7 @@ fn show_folder_info(ui: &AppWindow) {
     ui.set_preview_text(SharedString::new());
     ui.set_has_image(false);
     ui.set_model_mode(false);
+    ui.set_model_textures(0);
     ui.set_preview_loading(false);
 }
 
@@ -1897,6 +1926,7 @@ fn select_row(ui: &AppWindow, row: usize) {
     ui.set_preview_text(SharedString::new());
     ui.set_has_image(false);
     ui.set_model_mode(false);
+    ui.set_model_textures(0);
     with_app(|a| a.model = None);
     stop_sound(ui);
     ui.set_audio_mode(false);
@@ -3515,6 +3545,18 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
 /// Shows a loaded model in the preview pane, with its counts in the info panel.
 fn show_model_preview(ui: &AppWindow, m: ModelPreview, mut meta: Meta) {
     let l = &m.loaded;
+    // A GTA IV model (.wdr) with textures of its own: offer to open them.
+    let selected_wdr = with_app(|a| {
+        let l = a.listing.as_ref()?;
+        let item = &l.items[a.selected?];
+        openrage_app::textures::is_gta4_model(&item.name).then(|| browser::join(&l.vpath, &item.name))
+    });
+    let own = match (&selected_wdr, l.drawables.first()) {
+        (Some(_), Some((_, d))) => d.textures.as_ref().map_or(0, |t| t.textures.len()),
+        _ => 0,
+    };
+    ui.set_model_textures(own as i32);
+    with_app(|a| a.model_textures_path = selected_wdr.filter(|_| own > 0));
     let (mut meshes, mut shaders, mut textured) = (0, 0, 0);
     let vis = l.default_visibility();
     for (_, d) in l.shown(&vis) {
@@ -4897,7 +4939,7 @@ fn edit_texture(ui: &AppWindow, action: TextureAction) {
             set_busy(&ui, true, format!("Writing the changed dictionary into the {} folder…", write_folder()))
         });
         let started = Instant::now();
-        let result = openrage_app::textures::edit_textures(&game_dir, keys, &ytd, &[edit]);
+        let result = openrage_app::textures::edit_textures(&game_dir, keys, browser::texture_owner(&ytd), &[edit]);
         let _ = weak.upgrade_in_event_loop(move |ui| {
             let msg = match &result {
                 Ok((r, path)) => format!(
