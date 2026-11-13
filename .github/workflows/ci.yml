@@ -53,7 +53,7 @@ jobs:
             plugins -> target
       - run: cargo fmt --check
         if: runner.os == 'Linux'
-      - run: cargo fmt --check --manifest-path plugins/Cargo.toml
+      - run: cargo fmt --all --check --manifest-path plugins/Cargo.toml
         if: runner.os == 'Linux'
       # Lints are the same on both systems; checking them once saves a full build on Windows.
       - run: cargo clippy --all-targets -- -D warnings
