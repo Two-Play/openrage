@@ -36,8 +36,12 @@ With several games set up, OpenRAGE asks which one to open, unless one is ticked
 - **Double-click** opens folders, archives and texture dictionaries.
 - Models and textures open in their own **viewer window** (also Ctrl+Enter). Several can be open at once, for example
   to compare models.
-- Text files (`.xml`, `.meta`, `.dat`, `.ini`, …) open in the **text editor**. Right-click → *Open with system app*
-  opens a read-only copy in your default program.
+- XML files open in the **XML window**, whether they are text (`.xml`, `.meta`, XML in a `.dat`, …) or binary
+  metadata (`.ymt`, `.ymap`, …): a tree of the structures, named by their name field (e.g. `CHandlingData #2 ·
+  ADDER`), the values of the selected one, and the XML with syntax colours. *Edit as text* opens a text file in the
+  editor.
+- Other text files (`.dat`, `.ini`, `.ide`, …) open in the **text editor**; right-click → *Edit* opens XML there
+  directly. Right-click → *Open with system app* opens a read-only copy in your default program.
 
 What each format looks like is described in [Viewing files](@/viewers.md).
 

@@ -256,11 +256,18 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
             crate::export_xml(&ui, p.clone());
         }
     });
+    // XML stored as text is edited as the file itself; converted XML is read-only.
+    let plain = xml.encoding == openrage_app::metadata::Encoding::Text;
+    win.set_plain_text(plain);
     let (main, text) = (ui.as_weak(), xml.text.clone());
     let format = xml.encoding.name();
     win.on_open_text(move || {
         if let Some(ui) = main.upgrade() {
-            crate::editor::open(&ui, crate::editor::Document::converted(vpath.clone(), text.clone(), format));
+            if plain {
+                crate::open_editor(&ui, vpath.clone());
+            } else {
+                crate::editor::open(&ui, crate::editor::Document::converted(vpath.clone(), text.clone(), format));
+            }
         }
     });
     let id = NEXT_ID.with(|n| {

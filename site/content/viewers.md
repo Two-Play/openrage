@@ -93,17 +93,19 @@ audio encryption. The audio key comes from the key blob used during setup.
 
 Map placements (`.ymap`), archetypes (`.ytyp`), `.ymt`, manifests (`.ymf`), cutscenes (`.cut`) and `.pso` files show
 as XML, formatted like CodeWalker's export. Double-click (or **Show as XML**) opens a window with two views.
+Files that are XML text already (`handling.meta`, `vehicles.meta`, `.xml`, …) open in the same window.
 
 ### Structure
 
 The file as a tree — entities, archetypes, cutscene objects — labelled with type and name
-(`CEntityDef #3 · dt1_tc_ufocore`). The selected node's values show as a table with readable names
+(`CEntityDef #3 · dt1_tc_ufocore`, `CHandlingData #2 · ADDER`). The selected node's values show as a table with readable names
 (`fTotalDuration` → *Total duration*). A filter finds names and values anywhere in the file.
 
 ### XML
 
-The XML with syntax colours and line numbers. **Open as text** shows it in the text editor for copying;
-**Export XML…** saves `name.ymap.xml`.
+The XML with syntax colours and line numbers. **Open as text** shows converted XML in the text editor for copying;
+for XML text files the button reads **Edit as text** and opens the file itself for editing. **Export XML…** saves
+`name.ymap.xml`.
 
 ### Names and encodings
 
