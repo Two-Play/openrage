@@ -3,15 +3,59 @@ title = "Development"
 description = "Building OpenRAGE, the reproducible build environment, releases and the crates the project is made of."
 
 [extra]
+docs = true
 lead = "For contributors: build environment, releases and the project layout."
 toc = true
 +++
 
-## Build
+## Build from source
 
-See [Build from source](@/getting-started.md#build-from-source) for Linux and Windows. In short: install Rust with
-rustup (the version is pinned in `rust-toolchain.toml`), on Linux the development packages of fontconfig,
-xkbcommon, Wayland and ALSA, then `cargo build --release`.
+You need a recent stable [Rust toolchain](https://rustup.rs) and [Git](https://git-scm.com/downloads).
+The exact Rust version is pinned in `rust-toolchain.toml`; rustup picks it up automatically.
+
+<div class="os-tabs">
+<div class="os-panel" data-os="linux">
+
+### Linux
+
+The GUI needs the development packages of fontconfig, xkbcommon, Wayland and ALSA:
+
+```
+# Fedora
+sudo dnf install fontconfig-devel libxkbcommon-devel wayland-devel alsa-lib-devel
+# Debian / Ubuntu
+sudo apt install libfontconfig1-dev libxkbcommon-dev libwayland-dev libasound2-dev
+```
+
+Then clone and build:
+
+```
+git clone https://github.com/Two-Play/openrage.git
+cd openrage
+cargo build --release
+./target/release/openrage-gui
+```
+
+For a reproducible environment, see the [container image](#reproducible-build-environment) below.
+
+</div>
+<div class="os-panel" data-os="windows">
+
+### Windows
+
+Rust on Windows needs the [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+with *Desktop development with C++*; `rustup-init.exe` offers to install them. No other libraries are needed.
+Then, in PowerShell:
+
+```
+git clone https://github.com/Two-Play/openrage.git
+cd openrage
+cargo build --release
+.\target\release\openrage-gui.exe
+```
+
+</div>
+</div>
 
 ## Reproducible build environment
 

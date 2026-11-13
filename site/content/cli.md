@@ -3,6 +3,7 @@ title = "Command line"
 description = "The openrage command-line tool: browse, search and extract archives, convert formats, edit archives, install .oiv packages, run plugins and verify the whole game."
 
 [extra]
+docs = true
 lead = "`openrage` comes in the same download as the GUI: for scripts, automation and everyone who prefers a terminal."
 toc = true
 +++
