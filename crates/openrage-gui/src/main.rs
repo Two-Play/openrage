@@ -276,21 +276,7 @@ fn debug_snapshot(ui: &AppWindow) {
             }
         }
         // `OPENRAGE_CLICK=x,y[,right]` clicks there, e.g. to capture a context menu.
-        if let Ok(at) = std::env::var("OPENRAGE_CLICK") {
-            let parts: Vec<&str> = at.split(',').map(str::trim).collect();
-            if let [x, y, rest @ ..] = parts.as_slice()
-                && let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>())
-            {
-                use slint::platform::{PointerEventButton, WindowEvent};
-                let button =
-                    if rest.first() == Some(&"right") { PointerEventButton::Right } else { PointerEventButton::Left };
-                let position = slint::LogicalPosition::new(x, y);
-                let w = ui.window();
-                w.dispatch_event(WindowEvent::PointerMoved { position });
-                w.dispatch_event(WindowEvent::PointerPressed { position, button });
-                w.dispatch_event(WindowEvent::PointerReleased { position, button });
-            }
-        }
+        debug_click(ui.window(), "OPENRAGE_CLICK");
         // Wait (up to a minute) until the models for a clip dictionary are found.
         let waiting = std::rc::Rc::new(slint::Timer::default());
         let started = Instant::now();
@@ -479,9 +465,24 @@ fn debug_snapshot_rest(ui: &AppWindow, path: String) {
                     x.set_filter(filter.clone().into());
                     x.invoke_filter_edited(filter.into());
                 }
+                // `OPENRAGE_NODE_ACTION=row,action` runs a tree row's menu action.
+                if let Ok(spec) = std::env::var("OPENRAGE_NODE_ACTION")
+                    && let Some((row, action)) = spec.split_once(',')
+                {
+                    if action == "select" {
+                        x.invoke_select(row.parse().unwrap_or(0));
+                    } else {
+                        x.invoke_node_action(row.parse().unwrap_or(0), action.into());
+                    }
+                }
+                // `OPENRAGE_WINDOW_CLICK=x,y[,right]` clicks into this window first.
+                debug_click(x.window(), "OPENRAGE_WINDOW_CLICK");
                 x.window().take_snapshot()
             }
-            (Some(v), ..) => v.window().take_snapshot(),
+            (Some(v), ..) => {
+                debug_click(v.window(), "OPENRAGE_WINDOW_CLICK");
+                v.window().take_snapshot()
+            }
             (None, Some(e), _) => e.window().take_snapshot(),
             (None, None, Some(h)) => h.window().take_snapshot(),
             (None, None, None) => ui.window().take_snapshot(),
@@ -495,6 +496,23 @@ fn debug_snapshot_rest(ui: &AppWindow, path: String) {
         }
         let _ = slint::quit_event_loop();
     });
+}
+
+/// Clicks into a window at `x,y[,right]` read from the environment variable `var`.
+#[cfg(debug_assertions)]
+fn debug_click(w: &slint::Window, var: &str) {
+    let Ok(at) = std::env::var(var) else { return };
+    let parts: Vec<&str> = at.split(',').map(str::trim).collect();
+    if let [x, y, rest @ ..] = parts.as_slice()
+        && let (Ok(x), Ok(y)) = (x.parse::<f32>(), y.parse::<f32>())
+    {
+        use slint::platform::{PointerEventButton, WindowEvent};
+        let button = if rest.first() == Some(&"right") { PointerEventButton::Right } else { PointerEventButton::Left };
+        let position = slint::LogicalPosition::new(x, y);
+        w.dispatch_event(WindowEvent::PointerMoved { position });
+        w.dispatch_event(WindowEvent::PointerPressed { position, button });
+        w.dispatch_event(WindowEvent::PointerReleased { position, button });
+    }
 }
 
 fn wire_callbacks(ui: &AppWindow) {
@@ -1259,7 +1277,7 @@ thread_local! {
     static CLIPBOARD: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
 }
 
-fn copy_to_clipboard(text: &str) -> Result<(), arboard::Error> {
+pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), arboard::Error> {
     CLIPBOARD.with(|c| {
         let mut c = c.borrow_mut();
         if c.is_none() {

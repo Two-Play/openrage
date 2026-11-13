@@ -13,6 +13,8 @@ pub struct Node {
     /// Simple values: (readable name, value).
     pub fields: Vec<(String, String)>,
     pub children: Vec<Node>,
+    /// Where the element is in the XML text (bytes).
+    pub range: std::ops::Range<usize>,
 }
 
 impl Node {
@@ -41,7 +43,7 @@ fn is_simple(e: roxmltree::Node) -> bool {
 
 fn node(e: roxmltree::Node, index: Option<usize>) -> Node {
     let tag = e.tag_name().name().to_owned();
-    let mut out = Node { tag: tag.clone(), ..Default::default() };
+    let mut out = Node { tag: tag.clone(), range: e.range(), ..Default::default() };
     let mut items = 0;
     for c in e.children().filter(|c| c.is_element()) {
         if is_simple(c) && c.tag_name().name() != "Item" {

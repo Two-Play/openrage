@@ -3395,6 +3395,7 @@ export component ViewerWindow inherits Window {
     callback export-gltf();
     callback save-png();
     callback close-viewer();
+    callback copy-path();
     callback toggle-fly();
     callback key-down(string, bool);
     callback key-up(string, bool);
@@ -3556,6 +3557,60 @@ export component ViewerWindow inherits Window {
                             : @tr("Drag to rotate · scroll to zoom · F flies · R or double-click resets · Esc closes");
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
+                    }
+                    // Last, so it is on top; left clicks and drags pass through to the controls.
+                    ContextMenuArea {
+                        Menu {
+                            if root.model-mode: MenuItem {
+                                title: @tr("Reset view");
+                                icon: @image-url("icons/menu/expand.svg");
+                                activated => { root.reset-view(); }
+                            }
+                            if root.model-mode: MenuItem {
+                                title: @tr("View from the front");
+                                activated => { root.look-along(0); }
+                            }
+                            if root.model-mode: MenuItem {
+                                title: @tr("View from the side");
+                                activated => { root.look-along(1); }
+                            }
+                            if root.model-mode: MenuItem {
+                                title: @tr("View from above");
+                                activated => { root.look-along(2); }
+                            }
+                            if root.model-mode: MenuItem {
+                                title: root.fly-mode ? @tr("Orbit camera") : @tr("Fly camera");
+                                activated => {
+                                    root.toggle-fly();
+                                    scope.focus();
+                                }
+                            }
+                            if root.model-mode: MenuSeparator { }
+                            if root.model-mode: MenuItem {
+                                title: @tr("Export glTF…");
+                                icon: @image-url("icons/menu/export.svg");
+                                activated => { root.export-gltf(); }
+                            }
+                            if !root.model-mode: MenuItem {
+                                title: @tr("Save PNG…");
+                                icon: @image-url("icons/menu/image.svg");
+                                activated => { root.save-png(); }
+                            }
+                            MenuItem {
+                                title: root.show-info ? @tr("Hide details") : @tr("Show details");
+                                activated => { root.show-info = !root.show-info; }
+                            }
+                            MenuSeparator { }
+                            MenuItem {
+                                title: @tr("Copy path");
+                                icon: @image-url("icons/menu/copy.svg");
+                                activated => { root.copy-path(); }
+                            }
+                            MenuItem {
+                                title: @tr("Close");
+                                activated => { root.close-viewer(); }
+                            }
+                        }
                     }
                 }
                 if root.show-info: Rectangle {
@@ -4224,6 +4279,19 @@ export component XmlWindow inherits Window {
     // The file is XML text (editable as such), not converted from a binary format.
     in property <bool> plain-text;
     callback expand-all(bool);
+    // Context menus: copy text, act on a tree row or an XML line.
+    callback copy-text(string);
+    callback node-action(int, string);
+    callback line-action(int, string);
+    // An XML line marked by "Show in XML" (0-based), or -1.
+    in-out property <int> marked-line: -1;
+
+    // Switches to the XML tab and scrolls so that `line` (0-based) is near the top.
+    public function show-line(line: int) {
+        root.tab = 1;
+        root.marked-line = line;
+        xml-list.viewport-y = -max(0px, (line - 3) * 18px);
+    }
 
     changed theme-mode => { root.apply-theme(); }
     init => { root.apply-theme(); }
@@ -4362,6 +4430,47 @@ export component XmlWindow inherits Window {
                                         color: i == root.selected-node ? Theme.selection-text : Theme.text;
                                     }
                                 }
+                                // Last, so it is on top: a TouchArea inside would take the right click too.
+                                ContextMenuArea {
+                                    Menu {
+                                        if n.expandable: MenuItem {
+                                            title: n.expanded ? @tr("Collapse") : @tr("Expand");
+                                            icon: @image-url("icons/menu/chevrons.svg");
+                                            activated => { root.toggle(i); }
+                                        }
+                                        MenuItem {
+                                            title: @tr("Expand all");
+                                            icon: @image-url("icons/menu/expand.svg");
+                                            activated => { root.expand-all(true); }
+                                        }
+                                        MenuItem {
+                                            title: @tr("Collapse all");
+                                            icon: @image-url("icons/menu/chevrons.svg");
+                                            activated => { root.expand-all(false); }
+                                        }
+                                        MenuSeparator { }
+                                        MenuItem {
+                                            title: @tr("Copy name");
+                                            icon: @image-url("icons/menu/copy.svg");
+                                            activated => { root.copy-text(n.label); }
+                                        }
+                                        MenuItem {
+                                            title: @tr("Copy values");
+                                            icon: @image-url("icons/menu/copy.svg");
+                                            activated => { root.node-action(i, "copy-values"); }
+                                        }
+                                        MenuItem {
+                                            title: @tr("Copy as XML");
+                                            icon: @image-url("icons/menu/copy.svg");
+                                            activated => { root.node-action(i, "copy-xml"); }
+                                        }
+                                        MenuItem {
+                                            title: @tr("Show in XML");
+                                            icon: @image-url("icons/menu/text.svg");
+                                            activated => { root.node-action(i, "show-xml"); }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -4408,6 +4517,25 @@ export component XmlWindow inherits Window {
                                         color: Theme.text;
                                     }
                                 }
+                                ContextMenuArea {
+                                    Menu {
+                                        MenuItem {
+                                            title: @tr("Copy value");
+                                            icon: @image-url("icons/menu/copy.svg");
+                                            activated => { root.copy-text(f.value); }
+                                        }
+                                        MenuItem {
+                                            title: @tr("Copy name");
+                                            icon: @image-url("icons/menu/copy.svg");
+                                            activated => { root.copy-text(f.key); }
+                                        }
+                                        MenuItem {
+                                            title: @tr("Copy name and value");
+                                            icon: @image-url("icons/menu/copy.svg");
+                                            activated => { root.copy-text(f.key + ": " + f.value); }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -4415,28 +4543,56 @@ export component XmlWindow inherits Window {
             }
             Tab {
                 title: @tr("XML");
-                ListView {
-                    for l in root.lines: HorizontalLayout {
+                xml-list := ListView {
+                    for l[i] in root.lines: Rectangle {
                         height: 18px;
-                        spacing: Theme.space-m;
-                        Text {
-                            width: 56px;
-                            text: l.number;
-                            horizontal-alignment: right;
-                            vertical-alignment: center;
-                            font-family: root.mono-font;
-                            font-size: 12px;
-                            color: Theme.text-faint;
-                        }
+                        background: i == root.marked-line ? Theme.accent-subtle : transparent;
                         HorizontalLayout {
-                            horizontal-stretch: 1;
-                            alignment: start;
-                            for s in l.spans: Text {
-                                text: s.text;
+                            spacing: Theme.space-m;
+                            Text {
+                                width: 56px;
+                                text: l.number;
+                                horizontal-alignment: right;
                                 vertical-alignment: center;
                                 font-family: root.mono-font;
                                 font-size: 12px;
-                                color: root.span-color(s.kind);
+                                color: Theme.text-faint;
+                            }
+                            HorizontalLayout {
+                                horizontal-stretch: 1;
+                                alignment: start;
+                                for s in l.spans: Text {
+                                    text: s.text;
+                                    vertical-alignment: center;
+                                    font-family: root.mono-font;
+                                    font-size: 12px;
+                                    color: root.span-color(s.kind);
+                                }
+                            }
+                        }
+                        ContextMenuArea {
+                            Menu {
+                                MenuItem {
+                                    title: @tr("Copy line");
+                                    icon: @image-url("icons/menu/copy.svg");
+                                    activated => { root.line-action(i, "copy"); }
+                                }
+                                MenuItem {
+                                    title: @tr("Copy all XML");
+                                    icon: @image-url("icons/menu/copy.svg");
+                                    activated => { root.line-action(i, "copy-all"); }
+                                }
+                                MenuSeparator { }
+                                MenuItem {
+                                    title: root.plain-text ? @tr("Edit as text") : @tr("Open as text");
+                                    icon: @image-url("icons/menu/text.svg");
+                                    activated => { root.open-text(); }
+                                }
+                                MenuItem {
+                                    title: @tr("Export XML…");
+                                    icon: @image-url("icons/menu/export.svg");
+                                    activated => { root.export-xml(); }
+                                }
                             }
                         }
                     }
