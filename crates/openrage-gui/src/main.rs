@@ -1784,10 +1784,13 @@ fn show_folder_info(ui: &AppWindow) {
                         vec![
                             kv("Type", "Textures inside a model"),
                             kv("Textures", dict.textures.len()),
-                            note(
+                            note(if openrage_app::textures::is_gta4_model(model) {
                                 "Replace a texture to change the model's look. Textures its shaders use \
-                                 cannot be removed.",
-                            ),
+                                 cannot be removed."
+                            } else {
+                                "Replace a texture to change the model's look. The same size (or smaller) \
+                                 always fits; a larger one only if the model has room for it."
+                            }),
                         ],
                         badges::icon(&name, ItemKind::Resource),
                     ));
@@ -3584,16 +3587,22 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
 /// Shows a loaded model in the preview pane, with its counts in the info panel.
 fn show_model_preview(ui: &AppWindow, m: ModelPreview, mut meta: Meta) {
     let l = &m.loaded;
-    // A GTA IV model (.wdr) with textures of its own: offer to open them.
+    // A model with textures of its own (GTA IV .wdr, GTA V .ydr/.yft/.ydd): offer to open them.
     let selected_wdr = with_app(|a| {
         let l = a.listing.as_ref()?;
         let item = &l.items[a.selected?];
-        openrage_app::textures::is_gta4_model(&item.name).then(|| browser::join(&l.vpath, &item.name))
+        openrage_app::textures::is_model(&item.name).then(|| browser::join(&l.vpath, &item.name))
     });
-    let own = match (&selected_wdr, l.drawables.first()) {
-        (Some(_), Some((_, d))) => d.textures.as_ref().map_or(0, |t| t.textures.len()),
-        _ => 0,
-    };
+    // Textures of all its drawables (a .ydd has a list per drawable), each name once.
+    let mut names: Vec<String> = l
+        .drawables
+        .iter()
+        .filter_map(|(_, d)| d.textures.as_ref())
+        .flat_map(|t| t.textures.iter().map(|x| x.name.to_ascii_lowercase()))
+        .collect();
+    names.sort();
+    names.dedup();
+    let own = if selected_wdr.is_some() { names.len() } else { 0 };
     ui.set_model_textures(own as i32);
     with_app(|a| a.model_textures_path = selected_wdr.filter(|_| own > 0));
     let (mut meshes, mut shaders, mut textured) = (0, 0, 0);

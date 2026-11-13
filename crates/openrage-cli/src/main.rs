@@ -1122,6 +1122,10 @@ fn cmd_repack(
 
 fn load_ytd(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<rage_formats::ytd::TextureDictionary> {
     match vfs::resolve(game_dir, path, keys)? {
+        Node::ArchiveFile(rpf, id) if openrage_app::textures::gta5_model_ext(path).is_some() => {
+            openrage_app::textures::gta5_model_textures(&rpf.read_resource(id)?, path)
+                .with_context(|| format!("{path} has no textures of its own"))
+        }
         Node::ArchiveFile(rpf, id) => Ok(rage_formats::ytd::parse(&rpf.read_resource(id)?)?),
         Node::Rpf8File(rpf, i) => {
             let entry = &rpf.entries().context("no entries")?[i];
@@ -1205,7 +1209,12 @@ fn cmd_edit_textures(
         result.replaced + result.added,
         result.added,
         result.removed,
-        if result.in_place { "pixel data replaced in place" } else { "dictionary rebuilt" }
+        match (openrage_app::textures::gta5_model_ext(path).is_some(), result.in_place) {
+            (true, true) => "written where the model had it",
+            (true, false) => "written into pages added to the model",
+            (false, true) => "pixel data replaced in place",
+            (false, false) => "dictionary rebuilt",
+        }
     );
     outln!("Written to {} ({:.1}s)", written.display(), started.elapsed().as_secs_f32());
     Ok(())
@@ -1219,6 +1228,9 @@ fn cmd_verify_textures(game_dir: &Path, within: &str, rebuild: bool, keys: Optio
         decoded: usize,
         undecodable: std::collections::BTreeMap<String, usize>,
         errors: Vec<String>,
+        models: usize,
+        grown: usize,
+        unreadable: Vec<String>,
     }
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
@@ -1233,6 +1245,27 @@ fn cmd_verify_textures(game_dir: &Path, within: &str, rebuild: bool, keys: Optio
                 prefix,
                 true,
                 &mut |a, id, p| {
+                    // Models with textures of their own: check the writer in memory.
+                    if rebuild
+                        && openrage_app::textures::gta5_model_ext(p).is_some()
+                        && let rage_rpf::EntryKind::Resource { system_flags, graphics_flags, .. } = a.entry(id).kind
+                    {
+                        let check = a.read_resource(id).map_err(anyhow::Error::from).and_then(|res| {
+                            openrage_app::textures::check_model_textures(&res, p, system_flags, graphics_flags)
+                        });
+                        match check {
+                            Ok(openrage_app::textures::ModelCheck::Ok { grown }) => {
+                                s.models += 1;
+                                s.grown += grown as usize;
+                            }
+                            Ok(openrage_app::textures::ModelCheck::NoTextures) => {}
+                            Ok(openrage_app::textures::ModelCheck::Unreadable(why)) => {
+                                s.unreadable.push(format!("{p}: {why}"))
+                            }
+                            Err(e) => s.errors.push(format!("{p}: model textures: {e:#}")),
+                        }
+                        return;
+                    }
                     if !a.entry(id).name.to_ascii_lowercase().ends_with(".ytd")
                         || a.entry(id).resource_version().is_none()
                     {
@@ -1327,6 +1360,9 @@ fn cmd_verify_textures(game_dir: &Path, within: &str, rebuild: bool, keys: Optio
         total.dicts += s.dicts;
         total.textures += s.textures;
         total.decoded += s.decoded;
+        total.models += s.models;
+        total.grown += s.grown;
+        total.unreadable.extend(s.unreadable);
         total.errors.extend(s.errors);
         for (k, v) in s.undecodable {
             *total.undecodable.entry(k).or_default() += v;
@@ -1337,6 +1373,16 @@ fn cmd_verify_textures(game_dir: &Path, within: &str, rebuild: bool, keys: Optio
     }
     for (format, n) in &total.undecodable {
         outln!("no preview decoder: {n} textures in {format}");
+    }
+    if rebuild {
+        outln!(
+            "{} models with textures of their own checked; a texture twice the size fitted into {} of them",
+            total.models,
+            total.grown
+        );
+        for u in &total.unreadable {
+            outln!("skipped (a texture cannot be read, so it cannot be changed): {u}");
+        }
     }
     outln!(
         "{} texture dictionaries, {} textures, {} decoded, {} errors ({:.1}s)",

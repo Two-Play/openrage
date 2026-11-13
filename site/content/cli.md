@@ -69,6 +69,7 @@ openrage originals [--restore PATH | --restore-all]   # GTA IV: kept originals, 
 openrage textures x64e.rpf/levels/gta5/vehicles.rpf/adder.ytd                 # list textures
 openrage textures …/adder.ytd --export out/ [--png]                            # DDS (default) or PNG
 openrage textures …/blips.ytd --set radar_darts=new.dds --remove radar_taco_van   # written into mods/
+openrage textures …/prop_x.ydr [--set name=new.dds]          # a model's own textures (.ydr, .yft, .ydd)
 openrage model …/vehicles.rpf/adder.yft                       # meshes, shaders, textures
 openrage model …/adder.yft --export adder.glb                  # glTF with embedded textures
 openrage model …/adder.yft --render adder.png [--yaw 1.2]      # software-rendered image

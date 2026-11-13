@@ -37,6 +37,30 @@ In a texture dictionary, **Replace…**, **Add…** and **Remove** change textur
 - Anything else rebuilds the dictionary from its original structures.
 - Archives are streamed while they are rewritten, so even multi-gigabyte archives need little memory.
 
+### Textures inside models
+
+Many models (`.ydr`, `.yft`, `.ydd`) carry textures of their own; about 60,000 in GTA V Enhanced. Selecting one shows
+a **Textures (N)** button that opens them as a list, changed like a dictionary:
+
+- A replacement whose pixel data is the same size or smaller (the original's resolution and format, or less) is
+  written where the old texture was. This always works.
+- Anything that needs more room — a larger texture, an added one — goes into memory pages added at the end of the
+  model; nothing that is already there moves. A model can only grow by pages no larger than its smallest one, so a
+  much larger texture may not fit. OpenRAGE then says how much room there is.
+- Shaders find textures by name, so replacing, adding and removing need no other change. A `.ydd` has a list per
+  drawable: a replacement or removal applies to every list with that name; new textures can only be added to models
+  with one list.
+
+```
+openrage textures x64b.rpf/levels/gta5/generic/icons.rpf/prop_mk_bike_logo_1.ydr                       # list
+openrage textures …/prop_mk_bike_logo_1.ydr --set prop_bike_logo_1prop_bike_1_a=logo.dds                 # replace
+openrage verify --textures --rebuild           # also edits every model's textures in memory and reads them back
+```
+
+**Checked** on GTA V Enhanced: in each of 60,257 models with textures, a texture written over itself leaves the file
+byte for byte, and a texture four times as large (fitting in 10,170 models) and an added one read back with every
+other texture, mesh, shader and bone unchanged. GTA V Legacy uses the same structures and is covered by tests only.
+
 ## Models (preview)
 
 A drawable of GTA V Enhanced (`.ydr`) can get new geometry and textures from a Wavefront OBJ file:

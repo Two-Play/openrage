@@ -39,6 +39,7 @@ pub fn page_size_from_flags(flags: u32) -> usize {
 }
 
 pub mod builder;
+pub mod pages;
 
 /// Type and flags of an RSC5 (GTA IV) resource header, if `file` starts with one.
 pub fn rsc5_header(file: &[u8]) -> Option<(u32, u32)> {

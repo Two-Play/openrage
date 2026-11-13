@@ -51,7 +51,7 @@ use rage_resource::{Resource, ResourceError};
 use crate::drawable::{Gen, VERSION_YDR_ENHANCED, param};
 use crate::texture::{Dimension, Format, Texture};
 use crate::ytd::Layout as DictLayout;
-use crate::ytd_write::{guess_usage, name_hash, patch_enhanced_texture};
+use crate::ytd_write::{guess_usage, name_hash, write_fields};
 
 const SYS: u64 = 0x5000_0000;
 const GFX: u64 = 0x6000_0000;
@@ -839,9 +839,7 @@ fn add_textures(
     for ((tex, name), hash) in textures.into_iter().zip(new_hashes) {
         let size = tex.expected_size().ok_or_else(|| bad(format!("{}: unsupported format", tex.name)))?;
         let mut t = texture_template.clone();
-        patch_enhanced_texture(&mut t, &tex);
-        let usage = u32::from_le_bytes(t[0x40..0x44].try_into().unwrap());
-        t[0x40..0x44].copy_from_slice(&((usage & !0x1F) | (u32::from(tex.usage) & 0x1F)).to_le_bytes());
+        write_fields(DictLayout::Enhanced, &mut t, &tex, true)?;
         let block = b.add(Segment::System, t);
         let data = b.add(Segment::Graphics, tex.data[..size].to_vec());
         b.pointer(block, 0x28, name, 0);
@@ -931,7 +929,7 @@ pub(crate) mod tests {
         if embedded {
             let old = texture_from_rgba("old_tex", 2, 2, &[9u8; 16]).unwrap();
             let mut t = vec![0u8; DictLayout::Enhanced.texture_size()];
-            patch_enhanced_texture(&mut t, &old);
+            write_fields(DictLayout::Enhanced, &mut t, &old, true).unwrap();
             let t = b.add(Segment::System, t);
             let name = b.add(Segment::System, b"old_tex\0".to_vec());
             let data = b.add(Segment::Graphics, old.data.clone());
