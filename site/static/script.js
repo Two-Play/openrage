@@ -216,6 +216,15 @@
     selectOS(stored || userOS || "linux", false);
   }
 
+  // Documentation sidebar: open on wide screens, a collapsible menu on phones.
+  var docsNav = document.querySelector("[data-docs-nav]");
+  if (docsNav && window.matchMedia) {
+    var wide = window.matchMedia("(min-width: 960px)");
+    var syncNav = function () { docsNav.open = wide.matches; };
+    syncNav();
+    if (wide.addEventListener) wide.addEventListener("change", syncNav);
+  }
+
   // Fade sections in as they scroll into view (skipped for reduced motion).
   var reveals = document.querySelectorAll(".reveal");
   var calm = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;

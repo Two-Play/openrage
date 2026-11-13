@@ -23,3 +23,30 @@ external_level = "warn"
 [extra]
 repo = "https://github.com/Two-Play/openrage"
 releases = "https://github.com/Two-Play/openrage/releases"
+
+# Documentation sidebar: groups of pages, in order.
+[[extra.docs]]
+title = "Start"
+pages = [["getting-started.md", "Getting started"]]
+
+[[extra.docs]]
+title = "Using OpenRAGE"
+pages = [
+  ["guide.md", "Explorer and search"],
+  ["viewers.md", "Viewing files"],
+  ["modding.md", "Modding"],
+  ["cli.md", "Command line"],
+]
+
+[[extra.docs]]
+title = "Games"
+pages = [["gta-iv.md", "GTA IV"], ["rdr2.md", "Red Dead Redemption 2"]]
+
+[[extra.docs]]
+title = "Develop"
+pages = [
+  ["plugins.md", "Writing plugins"],
+  ["development.md", "Development"],
+  ["licenses.md", "Licenses"],
+]
+
