@@ -61,6 +61,7 @@ The other windows have right-click menus too:
   its line); on a value, copy the value or the name; on an XML line, copy the line or the whole XML.
 - **Viewer:** reset the view, look from the front, side or above, switch to the fly camera, export glTF (models) or
   save PNG (textures), show or hide the details, copy the path, close.
+- **Text editor:** cut, copy, paste, select all, save, reload, unlock editing, wrap lines, show tabs, copy the path.
 
 | Keys | Action |
 |---|---|

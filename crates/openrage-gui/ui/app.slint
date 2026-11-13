@@ -4035,6 +4035,7 @@ export component EditorWindow inherits Window {
     callback discard-and-close();
     callback reload();
     callback toggle-tabs();
+    callback copy-path();
 
     changed theme-mode => { root.apply-theme(); }
 
@@ -4147,13 +4148,75 @@ export component EditorWindow inherits Window {
                 height: 1px;
                 background: Theme.border;
             }
-            editor := TextEdit {
+            Rectangle {
                 vertical-stretch: 1;
-                text <=> root.text;
-                read-only: !root.editable || root.locked-reason != "" || root.saving;
-                font-size: 13px;
-                wrap: root.wrap ? TextWrap.word-wrap : TextWrap.no-wrap;
-                edited => { root.modified = true; }
+                editor := TextEdit {
+                    width: 100%;
+                    height: 100%;
+                    text <=> root.text;
+                    read-only: !root.editable || root.locked-reason != "" || root.saving;
+                    font-size: 13px;
+                    wrap: root.wrap ? TextWrap.word-wrap : TextWrap.no-wrap;
+                    edited => { root.modified = true; }
+                }
+                // On top of the TextEdit, replacing its own menu (cut, copy, paste,
+                // select all) with one that also has the editor's actions.
+                ContextMenuArea {
+                    Menu {
+                        MenuItem {
+                            title: @tr("Cut");
+                            enabled: !editor.read-only;
+                            activated => { editor.cut(); }
+                        }
+                        MenuItem {
+                            title: @tr("Copy");
+                            icon: @image-url("icons/menu/copy.svg");
+                            activated => { editor.copy(); }
+                        }
+                        MenuItem {
+                            title: @tr("Paste");
+                            enabled: !editor.read-only;
+                            activated => { editor.paste(); }
+                        }
+                        MenuItem {
+                            title: @tr("Select all");
+                            activated => { editor.select-all(); }
+                        }
+                        MenuSeparator { }
+                        MenuItem {
+                            title: @tr("Save");
+                            icon: @image-url("icons/menu/import.svg");
+                            enabled: root.can-save;
+                            activated => { root.save(); }
+                        }
+                        MenuItem {
+                            title: @tr("Reload");
+                            icon: @image-url("icons/menu/undo.svg");
+                            enabled: !root.saving;
+                            activated => { root.reload(); }
+                        }
+                        if !root.editable && root.locked-reason == "": MenuItem {
+                            title: @tr("Unlock editing…");
+                            icon: @image-url("icons/menu/unlock.svg");
+                            activated => { root.unlock-visible = true; }
+                        }
+                        MenuSeparator { }
+                        MenuItem {
+                            title: root.wrap ? @tr("No wrap") : @tr("Wrap lines");
+                            activated => { root.wrap = !root.wrap; }
+                        }
+                        if root.has-tabs: MenuItem {
+                            title: root.tabs-shown ? @tr("Hide tabs") : @tr("Show tabs");
+                            activated => { root.toggle-tabs(); }
+                        }
+                        MenuSeparator { }
+                        MenuItem {
+                            title: @tr("Copy path");
+                            icon: @image-url("icons/menu/copy.svg");
+                            activated => { root.copy-path(); }
+                        }
+                    }
+                }
             }
             Rectangle {
                 height: 1px;
