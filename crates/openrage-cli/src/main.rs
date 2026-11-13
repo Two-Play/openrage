@@ -482,6 +482,7 @@ fn run() -> Result<()> {
         Command::Verify { path, media: true, .. } => cmd_verify_media(&game_dir, &path, keys),
         Command::Verify { path, scripts: true, .. } => cmd_verify_scripts(&game_dir, &path, keys),
         Command::Verify { path, paths: true, .. } => cmd_verify_paths(&game_dir, &path, keys),
+        Command::Verify { path, collisions: true, .. } if gta4 => cmd_verify_gta4_collisions(&game_dir, &path),
         Command::Verify { path, collisions: true, .. } => cmd_verify_collisions(&game_dir, &path, keys),
         Command::Verify { path, particles: true, .. } => cmd_verify_particles(&game_dir, &path, keys),
         Command::Verify { path, text: true, .. } if gta4 => cmd_verify_gta4_text(&game_dir, &path),
@@ -2988,6 +2989,81 @@ fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
     );
     if !total.errors.is_empty() {
         bail!("verification found {} errors", total.errors.len());
+    }
+    Ok(())
+}
+
+/// Reads every GTA IV collision file (`.wbn`, `.wbd`) and builds its meshes.
+fn cmd_verify_gta4_collisions(game_dir: &Path, within: &str) -> Result<()> {
+    #[derive(Default)]
+    struct Stats {
+        files: usize,
+        bounds: usize,
+        triangles: usize,
+        primitives: usize,
+        materials: std::collections::BTreeSet<u8>,
+        errors: Vec<String>,
+    }
+    let (starts, open_errors) = gta4_starts(game_dir, within)?;
+    let started = Instant::now();
+    let all: Vec<Stats> = starts
+        .par_iter()
+        .map(|(prefix, a, dir)| {
+            let mut s = Stats::default();
+            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
+                let e = a.entry(id);
+                let lower = e.name.to_ascii_lowercase();
+                if e.resource_type().is_none() || !(lower.ends_with(".wbn") || lower.ends_with(".wbd")) {
+                    return;
+                }
+                s.files += 1;
+                let parsed = a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| {
+                    use rage_formats::wbn;
+                    Ok(if lower.ends_with(".wbn") {
+                        vec![wbn::parse_wbn(&r)?.1]
+                    } else {
+                        wbn::parse_wbd(&r)?.into_iter().map(|(_, _, st)| st).collect()
+                    })
+                });
+                match parsed {
+                    Ok(list) => {
+                        for st in list {
+                            s.bounds += st.bounds;
+                            s.triangles += st.triangles;
+                            s.primitives += st.primitives;
+                            s.materials.extend(st.materials);
+                        }
+                    }
+                    Err(err) => s.errors.push(format!("{p}: {err:#}")),
+                }
+            });
+            s
+        })
+        .collect();
+    let mut total = Stats { errors: open_errors, ..Default::default() };
+    for s in all {
+        total.files += s.files;
+        total.bounds += s.bounds;
+        total.triangles += s.triangles;
+        total.primitives += s.primitives;
+        total.materials.extend(s.materials);
+        total.errors.extend(s.errors);
+    }
+    for e in total.errors.iter().take(50) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} collision files, {} bounds, {} triangles, {} spheres/capsules, {} material types, {} errors ({:.1}s)",
+        total.files,
+        total.bounds,
+        total.triangles,
+        total.primitives,
+        total.materials.len(),
+        total.errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !total.errors.is_empty() {
+        bail!("{} errors", total.errors.len());
     }
     Ok(())
 }

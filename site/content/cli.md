@@ -46,6 +46,8 @@ openrage verify --text                         # every .gxt (to text and back), 
 openrage map pc/data/maps/manhat/manhat03.img --render manhat03.png --export manhat03.glb   # a map archive in 3D
 openrage map pc/data/maps/manhat/manhat03.img/manhat03_stream0.wpl                      # one placement file
 openrage map --check                           # every placement file: how many objects have a model
+openrage model pc/data/maps/manhat/manhat03.img/manhat03_1.wbn --render col.png   # collision as a mesh
+openrage verify --collisions                   # every .wbn and .wbd
 ```
 
 ## Formats: textures, models, audio, animations, metadata, text

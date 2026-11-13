@@ -363,6 +363,8 @@ pub fn is_model(name: &str) -> bool {
         || n.ends_with(".wdr")
         || n.ends_with(".wdd")
         || n.ends_with(".wft")
+        || n.ends_with(".wbn")
+        || n.ends_with(".wbd")
         || rage_formats::paths::is_path_file(&n)
 }
 
@@ -398,6 +400,26 @@ fn material_color(name: &str, index: u8) -> [f32; 4] {
 fn hue(h: f32) -> (f32, f32, f32) {
     let x = |o: f32| ((h * 6.0 + o) % 6.0 - 3.0).abs() - 1.0;
     (x(0.0).clamp(0.0, 1.0), x(4.0).clamp(0.0, 1.0), x(2.0).clamp(0.0, 1.0))
+}
+
+/// Names and colours for the GTA IV collision materials `bounds` use, from
+/// `common/data/materials/materials.dat` of the game the archive belongs to.
+fn register_gta4_materials(archive: &rage_rpf::Gta4Archive, bounds: &[(String, Drawable, rage_formats::ybn::Stats)]) {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        crate::gta4::game_folder(archive.path())
+            .and_then(|g| rage_rpf::vfs::find_case_insensitive(&g, "common/data/materials/materials.dat"))
+            .and_then(|p| std::fs::read(p).ok())
+            .map(|d| rage_formats::ybn::material_names(&String::from_utf8_lossy(&d)))
+            .unwrap_or_default()
+    });
+    for (_, _, stats) in bounds {
+        for &m in &stats.materials {
+            let label = names.get(m as usize).cloned().unwrap_or_else(|| format!("Material {m}"));
+            let color = material_color(&label, m);
+            rage_formats::shaders::register(rage_formats::wbn::MATERIAL_BASE + m as u32, label, color);
+        }
+    }
 }
 
 /// Names of the collision materials, read once from the game's `materials.dat`.
@@ -1080,14 +1102,47 @@ fn load_gta4(archive: &Arc<rage_rpf::Gta4Archive>, id: rage_rpf::Gta4EntryId) ->
             })
             .collect();
         (drawables, parts)
+    } else if lower.ends_with(".wbn") || lower.ends_with(".wbd") {
+        let bounds: Vec<(String, Drawable, rage_formats::ybn::Stats)> = if lower.ends_with(".wbn") {
+            let (d, s) = rage_formats::wbn::parse_wbn(&res)?;
+            vec![(stem.clone(), d, s)]
+        } else {
+            // A map area's dictionary names its bounds after the models they belong to.
+            let index = crate::gta4::game_folder(archive.path()).map(|g| crate::gta4::texture_index(&g));
+            rage_formats::wbn::parse_wbd(&res)?
+                .into_iter()
+                .map(|(hash, d, s)| {
+                    let label =
+                        index.as_ref().and_then(|i| i.model_name(hash)).unwrap_or_else(|| format!("{hash:08x}"));
+                    (label, d, s)
+                })
+                .collect()
+        };
+        register_gta4_materials(archive, &bounds);
+        let drawables: Vec<(String, Drawable)> = bounds.into_iter().map(|(n, d, _)| (n, d)).collect();
+        let layout = if drawables.len() > 1 { grid_layout(&drawables) } else { vec![math::IDENTITY] };
+        let parts = drawables
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| Part {
+                name: n.clone(),
+                group: String::new(),
+                drawable: i,
+                transform: layout[i],
+                visible: i < SHOWN_AT_FIRST,
+                bone: None,
+            })
+            .collect();
+        (drawables, parts)
     } else {
-        bail!("{name} is not a GTA IV model (.wdr, .wdd, .wft)");
+        bail!("{name} is not a GTA IV model (.wdr, .wdd, .wft) or collision file (.wbn, .wbd)");
     };
     crate::progress::set("Loading textures", 0, 0);
     let used: Vec<String> =
         drawables.iter().flat_map(|(_, d)| d.shaders.iter().flat_map(|s| s.textures.iter().cloned())).collect();
     let vehicle = lower.ends_with(".wft") && archive.display_name().eq_ignore_ascii_case("vehicles.img");
-    let external = crate::gta4::model_textures(archive, &stem, &used, vehicle);
+    let collision = lower.ends_with(".wbn") || lower.ends_with(".wbd");
+    let external = if collision { Vec::new() } else { crate::gta4::model_textures(archive, &stem, &used, vehicle) };
     // Peds: the skeleton of the fragment next to the dictionary.
     let skeleton = drawables.iter().find_map(|(_, d)| d.skeleton.clone()).or_else(|| {
         let tid = archive.find_child(rage_rpf::Gta4Archive::ROOT, &format!("{stem}.wft"))?;

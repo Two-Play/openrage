@@ -188,7 +188,15 @@ files preferred for TLAD and TBoGT); many small objects are kept in drawable dic
 indexes once per session. Low-detail stand-ins (`lod…`, `slod…`) are left out unless a file holds nothing else.
 Placement files store the inverse of each object's rotation, as GTA San Andreas and GTA V do. `openrage map --check`
 counts, over all 1,151 placement files, how many of the 435,116 objects have a model: all but the 1,434 whose model
-name no `.ide` file gives. Collision files and animations follow; the search index is GTA V only for now.
+name no `.ide` file gives.
+
+**Collisions** — `.wbn` (one bound, usually a piece of a map area) and `.wbd` (a dictionary of bounds, named after the
+models they belong to) — open in the preview and the viewer like GTA V's `.ybn`, coloured by material with the names
+from GTA IV's own `common/data/materials/materials.dat`, and export as glTF. They are the 32-bit ancestors of GTA V's
+bounds: spheres, capsules, boxes, geometry with and without a BVH, and composites of these; polygons are quads or
+triangles of quantised vertices, each with its material. `openrage verify --collisions` reads every collision file of
+the game (1,079 files, 9,102 bounds, 26 million triangles, no errors). The collisions inside fragments (`.wft`) and
+animations follow; the search index is GTA V only for now.
 
 ## Red Dead Redemption 2
 
