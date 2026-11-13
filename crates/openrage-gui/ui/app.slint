@@ -267,34 +267,9 @@ component TreeItem inherits Rectangle {
     background: selected ? Theme.selection : area.has-hover ? Theme.hover : transparent;
     accessible-role: list-item;
     accessible-label: item.name;
-    ContextMenuArea {
-        Menu {
-            MenuItem {
-                title: @tr("Open");
-                icon: @image-url("icons/menu/open.svg");
-                activated => { root.activate(); }
-            }
-            if item.expandable: MenuItem {
-                title: item.expanded ? @tr("Collapse") : @tr("Expand");
-                icon: @image-url("icons/menu/chevrons.svg");
-                activated => { root.toggle(); }
-            }
-            MenuItem {
-                title: @tr("Extract…");
-                icon: @image-url("icons/menu/extract.svg");
-                activated => { root.action("extract"); }
-            }
-            MenuSeparator { }
-            MenuItem {
-                title: @tr("Copy path");
-                icon: @image-url("icons/menu/copy.svg");
-                activated => { root.action("copy-path"); }
-            }
-        }
-        area := TouchArea {
-            clicked => { root.activate(); }
-            double-clicked => { root.toggle(); }
-        }
+    area := TouchArea {
+        clicked => { root.activate(); }
+        double-clicked => { root.toggle(); }
     }
     HorizontalLayout {
         padding-left: Theme.space-xs + item.depth * 14px;
@@ -323,6 +298,32 @@ component TreeItem inherits Rectangle {
             vertical-alignment: center;
             overflow: elide;
             color: selected ? Theme.selection-text : Theme.text;
+        }
+    }
+    // Last, so it is on top: a TouchArea inside would take the right click too.
+    ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: @tr("Open");
+                icon: @image-url("icons/menu/open.svg");
+                activated => { root.activate(); }
+            }
+            if item.expandable: MenuItem {
+                title: item.expanded ? @tr("Collapse") : @tr("Expand");
+                icon: @image-url("icons/menu/chevrons.svg");
+                activated => { root.toggle(); }
+            }
+            MenuItem {
+                title: @tr("Extract…");
+                icon: @image-url("icons/menu/extract.svg");
+                activated => { root.action("extract"); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: @tr("Copy path");
+                icon: @image-url("icons/menu/copy.svg");
+                activated => { root.action("copy-path"); }
+            }
         }
     }
 }
@@ -354,6 +355,70 @@ component FileItem inherits Rectangle {
     accessible-label: item.name + ", " + item.kind;
     accessible-item-selected: root.selected;
 
+    area := TouchArea {
+        clicked => { root.select(); }
+        double-clicked => { root.open(); }
+    }
+    // Mod status stripe (added/new green, changed orange, has mods blue, removed red).
+    Rectangle {
+        x: 0;
+        width: 3px;
+        background: Theme.mark-color(item.mark);
+    }
+    HorizontalLayout {
+        padding-left: Theme.space-s;
+        padding-right: Theme.space-s;
+        spacing: Theme.space-s;
+        FormatIcon {
+            y: (parent.height - self.height) / 2;
+            name: item.icon;
+            tint: selected && focused ? Theme.selection-text : item.tint;
+            container: item.can-open && item.icon != "folder" && item.icon != "archive";
+            Tooltip {
+                text: @markdown("\{item.can-open && item.icon != "folder" && item.icon != "archive" ? @tr("Contains files — double-click to open") : item.kind}");
+            }
+        }
+        HorizontalLayout {
+            horizontal-stretch: 1;
+            min-width: 80px;
+            preferred-width: 100px;
+            max-width: 100000px;
+            spacing: Theme.space-xs;
+            Text {
+                horizontal-stretch: 1;
+                text: item.name;
+                vertical-alignment: center;
+                overflow: elide;
+                color: root.fg;
+            }
+        }
+        Rectangle {
+            // Type column, or the location column for search results.
+            width: root.kind-width;
+            Text {
+                width: 100%;
+                text: item.kind;
+                vertical-alignment: center;
+                overflow: elide;
+                color: selected && focused ? Theme.selection-text : Theme.text-muted;
+            }
+        }
+        Text {
+            width: root.size-width;
+            text: item.size;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            color: root.fg;
+        }
+        Text {
+            width: root.info-width;
+            text: item.info;
+            vertical-alignment: center;
+            overflow: elide;
+            color: selected && focused ? Theme.selection-text : Theme.text-muted;
+        }
+    }
+    // Last, so it is on top: a TouchArea inside would take the right click too.
     ContextMenuArea {
         Menu {
             if item.can-open: MenuItem {
@@ -468,70 +533,6 @@ component FileItem inherits Rectangle {
                 title: @tr("Copy hash");
                 icon: @image-url("icons/menu/copy.svg");
                 activated => { root.action("copy-hash"); }
-            }
-        }
-
-        area := TouchArea {
-            clicked => { root.select(); }
-            double-clicked => { root.open(); }
-        }
-        // Mod status stripe (added/new green, changed orange, has mods blue, removed red).
-        Rectangle {
-            x: 0;
-            width: 3px;
-            background: Theme.mark-color(item.mark);
-        }
-        HorizontalLayout {
-            padding-left: Theme.space-s;
-            padding-right: Theme.space-s;
-            spacing: Theme.space-s;
-            FormatIcon {
-                y: (parent.height - self.height) / 2;
-                name: item.icon;
-                tint: selected && focused ? Theme.selection-text : item.tint;
-                container: item.can-open && item.icon != "folder" && item.icon != "archive";
-                Tooltip {
-                    text: @markdown("\{item.can-open && item.icon != "folder" && item.icon != "archive" ? @tr("Contains files — double-click to open") : item.kind}");
-                }
-            }
-            HorizontalLayout {
-                horizontal-stretch: 1;
-                min-width: 80px;
-                preferred-width: 100px;
-                max-width: 100000px;
-                spacing: Theme.space-xs;
-                Text {
-                    horizontal-stretch: 1;
-                    text: item.name;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    color: root.fg;
-                }
-            }
-            Rectangle {
-                // Type column, or the location column for search results.
-                width: root.kind-width;
-                Text {
-                    width: 100%;
-                    text: item.kind;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    color: selected && focused ? Theme.selection-text : Theme.text-muted;
-                }
-            }
-            Text {
-                width: root.size-width;
-                text: item.size;
-                vertical-alignment: center;
-                horizontal-alignment: right;
-                color: root.fg;
-            }
-            Text {
-                width: root.info-width;
-                text: item.info;
-                vertical-alignment: center;
-                overflow: elide;
-                color: selected && focused ? Theme.selection-text : Theme.text-muted;
             }
         }
     }
