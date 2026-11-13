@@ -2,7 +2,7 @@
 id = "strings"
 name = "Strings"
 version = "0.1.0"
-api = "0.2"
+api = "0.3"
 description = "Shows the readable text in files OpenRAGE cannot display otherwise, and exports it."
 authors = ["OpenRAGE contributors"]
 license = "MIT OR Apache-2.0"

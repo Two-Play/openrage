@@ -14,22 +14,24 @@ grants that (read-only). It has no access to other files, the network or the env
 memory and a time limit. The same `.wasm` runs on Linux and Windows.
 
 > [!NOTE]
-> The plugin API is at version **0.2** and may still change: plugins name the version they were built for and
-> OpenRAGE only loads plugins for its own version (0.1 plugins need `api = "0.2"` and a rebuild with the new SDK).
+> The plugin API is at version **0.3** and may still change: plugins name the version they were built for and
+> OpenRAGE only loads plugins for its own version (older plugins need `api = "0.3"` and a rebuild with the new SDK).
 > Plugins work in the explorer (file list, preview pane, context menu, **Settings → Plugins**) and from the
-> [command line](@/cli.md#plugins). Next: 3D models, importers and installable plugin packages.
+> [command line](@/cli.md#plugins). Next: openFormats export, importers into game formats and installable plugin
+> packages.
 
 ## What plugins can do
 
-| | API 0.2 |
+| | API 0.3 |
 |---|---|
-| **Preview** files of the types they register: text, a tree, a table or an image | ✅ |
+| **Preview** files of the types they register: text, a tree, a table, an image or a **3D model** | ✅ |
+| **Models of the game** for exporters: meshes, materials and textures of `.ydr`/`.yft`/`.ydd` (all games) | ✅ (`load-model`, `load-texture`) |
 | **Actions** on the files the user picks (export, convert, reports), producing files the user saves | ✅ |
 | **Batch** actions on whole folders and archives, with progress and cancel | ✅ (`batch = true`) |
 | **Ask for files** from disk for an action, e.g. a patch to apply | ✅ (`pick`) |
 | **Read** any file of the game (archives included, with the changes in `mods/`) | ✅ with the `read-game` permission |
 | **Change** game files: into the `mods` folder, as one step the user can undo | ✅ with `write-mods`, in `modify` actions |
-| 3D previews, importers (e.g. openFormats) | planned |
+| openFormats export, importers into game formats | planned |
 
 ## Quick start (Rust)
 
@@ -159,8 +161,8 @@ The interface is described in [WIT](https://component-model.bytecodealliance.org
 A plugin exports:
 
 - `preview(vpath, data) -> result<preview, string>`: info lines and an optional view: `text`, `tree` (nodes listed
-  parents first, each with the index of its parent), `table` (columns and rows) or `image` (8-bit RGBA, rows from the
-  top).
+  parents first, each with the index of its parent), `table` (columns and rows), `image` (8-bit RGBA, rows from the
+  top) or `model` (shown in the 3D view, exportable as glTF there).
 - `run-action(action, inputs) -> result<list<output-file>, string>`: each input has its `vpath` (its path in the game,
   or its file name for files from disk), its data and `picked` (true for files the user chose because of `pick`).
   Output names may contain `/` for sub-folders but never `..`.
@@ -169,7 +171,14 @@ OpenRAGE offers:
 
 - `current-game()`: `gta5`, `rdr2`, `gta4` or `other`.
 - `read-file(vpath)` and `list-dir(vpath)`: paths relative to the game folder, through archives
-  (`x64a.rpf/levels/gta5/x.ytd`), with the changes in `mods/`. Absolute paths and `..` are refused.
+  (`x64a.rpf/levels/gta5/x.ytd`), with the changes in `mods/`. Absolute paths and `..` are refused. The files the
+  user handed to a call can always be read; everything else needs `read-game`.
+- `load-model(vpath)`: a model as the explorer shows it (`.ydr`, `.yft`, `.ydd` of every game, also GTA IV's `.wdr`,
+  `.wdd`, `.wft`): the parts shown by default (a vehicle's wheels included), placed in model space. Each mesh has
+  positions, normals, texture coordinates, triangles and a material; materials have a name, the name of their colour
+  texture and a colour. Same permission rule as `read-file`.
+- `load-texture(vpath, name)`: a texture as RGBA pixels: from a texture dictionary (`.ytd`, `.wtd`), or a texture of a
+  model (embedded, or in the dictionaries next to it that the explorer uses, such as `vehshare.ytd`).
 - `log(level, message)`: shown by `openrage plugin`, and in the explorer's info panel next to a preview (the last
   lines) or in the status bar when an action fails. Whatever the plugin prints to stdout
   or stderr ends up there too, panics included.
@@ -210,6 +219,28 @@ Never put Rockstar's files or keys into a plugin. Read what you need from the us
   nothing). One output file is saved with a save dialog, several into a folder the user picks; batch outputs keep
   the folder structure. `pick` actions first ask for the files.
 - **Modify** actions only run while editing is unlocked (the **Read-only** button), like every change in OpenRAGE.
+
+## Models and coordinates
+
+Models are in metres, **Z up**, with DirectX texture coordinates (**v grows downwards**), as in the game. Formats with
+Y up (OBJ, glTF) need `(x, y, z) → (x, z, −y)` and `v → 1 − v` on the way out, and the reverse on the way in.
+
+## Example: models in and out
+
+[`plugins/examples/obj-tools`](https://github.com/Two-Play/openrage/tree/main/plugins/examples/obj-tools):
+
+- **Export as OBJ…** on `.ydr`, `.yft`, `.ydd`, `.wdr`, `.wdd`, `.wft` (also on whole folders): writes `name.obj`,
+  `name.mtl` and one PNG per texture. It only calls `load-model` and `load-texture`, so it works for every game
+  OpenRAGE reads, and needs no permission.
+- **Preview** of `.obj` files in the 3D view: the plugin returns a `model` view.
+
+```rust
+let model = load_model(vpath)?;                       // the file the user right-clicked
+for m in &model.materials {
+    let pixels = load_texture(vpath, &m.texture)?;    // RGBA
+    // … write PNG …
+}
+```
 
 ## Example: changing game files
 

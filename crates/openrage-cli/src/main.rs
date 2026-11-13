@@ -423,6 +423,9 @@ enum PluginCommand {
         /// Save an image preview as PNG.
         #[arg(long)]
         png: Option<PathBuf>,
+        /// Save a 3D model preview as glTF (.glb).
+        #[arg(long)]
+        glb: Option<PathBuf>,
     },
     /// Run a plugin's action on files (or, for batch actions, folders and
     /// archives), save what it produces and apply its changes to the mods folder.
@@ -1491,7 +1494,7 @@ fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) 
             }
             Ok(())
         }
-        PluginCommand::Preview { path, plugin, file, png } => {
+        PluginCommand::Preview { path, plugin, file, png, glb } => {
             let (vpath, data) = read(path, *file)?;
             let p = match plugin {
                 Some(id) => find(id)?,
@@ -1526,6 +1529,23 @@ fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) 
                     outln!("\n{}", t.columns.join("\t"));
                     for row in &t.rows {
                         outln!("{}", row.join("\t"));
+                    }
+                }
+                Some(openrage_plugins::View::Model(model)) => {
+                    let vertices: usize = model.meshes.iter().map(|m| m.positions.len() / 3).sum();
+                    let triangles: usize = model.meshes.iter().map(|m| m.indices.len() / 3).sum();
+                    outln!(
+                        "Model: {} meshes, {vertices} vertices, {triangles} triangles, {} materials",
+                        model.meshes.len(),
+                        model.materials.len()
+                    );
+                    if let Some(out) = glb {
+                        let stem = vpath.rsplit('/').next().unwrap_or(&vpath).split('.').next().unwrap_or("model");
+                        let loaded = openrage_app::plugins::from_plugin_model(&model, stem);
+                        let data = openrage_app::models::to_glb(&loaded, stem, &loaded.default_look())
+                            .context("the model has nothing to export")?;
+                        fs::write(out, data)?;
+                        outln!("Saved {}", out.display());
                     }
                 }
                 Some(openrage_plugins::View::Image(img)) => {

@@ -8,7 +8,7 @@
 // The API is not stable before 1.0: a plugin names the version it was built
 // for (`api` in plugin.toml) and OpenRAGE refuses plugins for another one.
 
-package openrage:plugin@0.2.0;
+package openrage:plugin@0.3.0;
 
 interface types {
     /// The game that is open.
@@ -57,12 +57,47 @@ interface types {
         rgba: list<u8>,
     }
 
+    /// A material of a 3D model.
+    record material {
+        name: string,
+        /// Name of its colour texture, "" if it has none.
+        texture: string,
+        /// Colour (RGBA, 0–1) where there is no texture.
+        color: tuple<f32, f32, f32, f32>,
+        /// The texture's pixels, for models a plugin builds itself.
+        /// `load-model` leaves it empty: get textures with `load-texture`.
+        image: option<image>,
+    }
+
+    /// Triangles of one material, in model space (metres, Z up).
+    record mesh {
+        /// The part of the model it belongs to (e.g. a wheel); may be empty.
+        part: string,
+        /// x, y, z per vertex.
+        positions: list<f32>,
+        /// x, y, z per vertex, or empty.
+        normals: list<f32>,
+        /// u, v per vertex (v grows downwards, as in DirectX), or empty.
+        uvs: list<f32>,
+        /// Three vertex indices per triangle.
+        indices: list<u32>,
+        /// Index into the model's materials.
+        material: u32,
+    }
+
+    record model {
+        meshes: list<mesh>,
+        materials: list<material>,
+    }
+
     /// How a file is shown in the preview pane.
     variant view {
         text(string),
         tree(list<tree-node>),
         table(table),
         image(image),
+        /// Shown in the 3D view (and exportable as glTF from there).
+        model(model),
     }
 
     record preview {
@@ -99,14 +134,15 @@ interface types {
 
 /// What OpenRAGE offers a plugin.
 interface host {
-    use types.{game, dir-entry, level};
+    use types.{game, dir-entry, level, model, image};
 
     /// The game that is open.
     current-game: func() -> game;
 
     /// Reads a file of the game (with the changes in `mods/`), by its path
     /// relative to the game folder, e.g. `x64a.rpf/levels/gta5/x.ytd`.
-    /// Needs the `read-game` permission.
+    /// Needs the `read-game` permission, except for the files the user
+    /// handed to this call.
     read-file: func(vpath: string) -> result<list<u8>, string>;
 
     /// Lists a folder of the game ("" for the game folder itself).
@@ -115,6 +151,17 @@ interface host {
 
     /// Writes a line to OpenRAGE's log (shown by `openrage plugin`).
     log: func(level: level, message: string);
+
+    /// A model of the game (`.ydr`, `.yft`, `.ydd` of every game OpenRAGE
+    /// reads, also `.wdr`, `.wdd`, `.wft`) as the explorer shows it: the
+    /// parts shown by default, placed in model space. Same permission rule
+    /// as `read-file`.
+    load-model: func(vpath: string) -> result<model, string>;
+
+    /// A texture by name: from a texture dictionary (`.ytd`, `.wtd`), or one
+    /// of a model's textures (embedded or next to it, as the explorer finds
+    /// them). Same permission rule as `read-file`.
+    load-texture: func(vpath: string, name: string) -> result<image, string>;
 
     /// Changes a file of the game, e.g. `x64a.rpf/data/lang/x.gxt2`. The
     /// change goes into the `mods` folder (archives are copied there first),

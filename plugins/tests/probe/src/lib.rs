@@ -16,6 +16,24 @@ impl Plugin for Probe {
             "table" => Preview::table(vec!["a".into(), "b".into()], vec![vec!["1".into(), "2".into()]]),
             "image" => Preview::image(2, 2, vec![255; 16]),
             "badimage" => Preview::image(2, 2, vec![255; 3]),
+            // A triangle pointing at a vertex that does not exist.
+            "badmodel" => {
+                use openrage_plugin_sdk::bindings::openrage::plugin::types::{Material, Mesh, Model};
+                let material =
+                    Material { name: "m".into(), texture: String::new(), color: (1.0, 1.0, 1.0, 1.0), image: None };
+                let mesh = Mesh {
+                    part: String::new(),
+                    positions: vec![0.0; 6],
+                    normals: Vec::new(),
+                    uvs: Vec::new(),
+                    indices: vec![0, 1, 2],
+                    material: 0,
+                };
+                Preview {
+                    info: Vec::new(),
+                    view: Some(View::Model(Model { meshes: vec![mesh], materials: vec![material] })),
+                }
+            }
             _ => Preview::text(format!("{} bytes", data.len())).with("Size", data.len()),
         })
     }
@@ -34,6 +52,16 @@ impl Plugin for Probe {
                     out.push(OutputFile::new("list.txt", names.join("\n")));
                 }
                 "game" => out.push(OutputFile::new("game.txt", format!("{:?}", host::current_game()))),
+                // Loads the model it was handed, then the one named in the argument.
+                "model.ydr" => {
+                    let own = host::load_model(&input.vpath)?;
+                    let mut text = format!("own: {} meshes", own.meshes.len());
+                    if !arg.is_empty() {
+                        let other = host::load_model(arg.trim())?;
+                        text.push_str(&format!(", other: {} meshes", other.meshes.len()));
+                    }
+                    out.push(OutputFile::new("model.txt", text));
+                }
                 "escape" => out.push(OutputFile::new("../escape.txt", "x")),
                 // Writes the argument into a game file, twice (the last one counts).
                 "write" => {

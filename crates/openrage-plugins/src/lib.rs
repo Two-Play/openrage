@@ -15,8 +15,8 @@ mod runtime;
 pub use manifest::{API_VERSION, Action, ActionKind, GameId, Manifest, Permission};
 pub use registry::{Broken, Plugin, Registry, Status, parse_grants, search_dirs, user_dir};
 pub use runtime::{
-    DirEntry, Game, GameFiles, Host, ImageView, Info, Input, Level, Limits, LogLine, ModWrite, NoGame, Outcome,
-    OutputFile, Preview, Table, TreeNode, View, level_name,
+    DirEntry, Game, GameFiles, Host, ImageView, Info, Input, Level, Limits, LogLine, Material, Mesh, ModWrite, Model,
+    NoGame, Outcome, OutputFile, Preview, Table, TreeNode, View, level_name,
 };
 /// A compiled plugin (see [`Host::compile`]).
 pub use wasmtime::component::Component;

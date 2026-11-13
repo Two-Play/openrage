@@ -1886,7 +1886,20 @@ fn select_row(ui: &AppWindow, row: usize) {
         .flatten();
     let game = plugins::GameContext { dir: with_app(|a| a.game_dir.clone()), keys: keys.clone() };
     std::thread::spawn(move || {
-        let from_plugin = plugin.and_then(|(id, specific)| plugin_preview(&id, specific, &game, &vpath));
+        let mut from_plugin = plugin.and_then(|(id, specific)| plugin_preview(&id, specific, &game, &vpath));
+        // A plugin's 3D model goes to the model view.
+        if let Some(model) = from_plugin.as_mut().and_then(|p| p.model.take()) {
+            let extra = from_plugin.map(|p| p.info).unwrap_or_default();
+            let preview = model_preview(model);
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if counter.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                ui.set_preview_loading(false);
+                show_model_preview(&ui, preview, info.iter().cloned().chain(extra).collect());
+            });
+            return;
+        }
         let (extra, body, image) = match from_plugin {
             Some(p) => (p.info, p.text, p.image),
             None => load_preview(source, keys),
@@ -3400,36 +3413,7 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
                 Ok(m) => {
                     let mut meta = info.clone();
                     meta.extend(extra.iter().cloned());
-                    let l = &m.loaded;
-                    let (mut meshes, mut shaders, mut textured) = (0, 0, 0);
-                    let vis = l.default_visibility();
-                    for (_, d) in l.shown(&vis) {
-                        meshes += d.meshes.len();
-                        shaders += d.shaders.len();
-                        textured += d
-                            .shaders
-                            .iter()
-                            .filter(|s| s.base_texture().is_some_and(|t| l.texture(d, t).is_some()))
-                            .count();
-                    }
-                    let shown = vis.iter().filter(|v| **v).count();
-                    if l.parts.len() > 1 {
-                        meta.push(kv("Parts", format!("{shown} shown of {}", l.parts.len())));
-                    }
-                    meta.push(kv("Meshes", meshes));
-                    meta.push(kv("Vertices", grouped(l.vertex_count(&vis))));
-                    meta.push(kv("Triangles", grouped(l.triangle_count(&vis))));
-                    meta.push(kv("Textured", format!("{textured} of {shaders} shaders")));
-                    set_meta(&ui, &meta);
-                    with_app(|a| {
-                        a.model = Some(Arc::new(m));
-                        a.model_view = openrage_app::render::View::default();
-                    });
-                    ui.set_model_mode(true);
-                    render_model(&ui);
-                    if with_app(|a| std::mem::take(&mut a.pending_viewer)) {
-                        open_viewer(&ui);
-                    }
+                    show_model_preview(&ui, m, meta);
                 }
                 Err(e) => {
                     let mut meta = info.clone();
@@ -3444,6 +3428,36 @@ fn start_model_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u6
             }
         });
     });
+}
+
+/// Shows a loaded model in the preview pane, with its counts in the info panel.
+fn show_model_preview(ui: &AppWindow, m: ModelPreview, mut meta: Meta) {
+    let l = &m.loaded;
+    let (mut meshes, mut shaders, mut textured) = (0, 0, 0);
+    let vis = l.default_visibility();
+    for (_, d) in l.shown(&vis) {
+        meshes += d.meshes.len();
+        shaders += d.shaders.len();
+        textured += d.shaders.iter().filter(|s| s.base_texture().is_some_and(|t| l.texture(d, t).is_some())).count();
+    }
+    let shown = vis.iter().filter(|v| **v).count();
+    if l.parts.len() > 1 {
+        meta.push(kv("Parts", format!("{shown} shown of {}", l.parts.len())));
+    }
+    meta.push(kv("Meshes", meshes));
+    meta.push(kv("Vertices", grouped(l.vertex_count(&vis))));
+    meta.push(kv("Triangles", grouped(l.triangle_count(&vis))));
+    meta.push(kv("Textured", format!("{textured} of {shaders} shaders")));
+    set_meta(ui, &meta);
+    with_app(|a| {
+        a.model = Some(Arc::new(m));
+        a.model_view = openrage_app::render::View::default();
+    });
+    ui.set_model_mode(true);
+    render_model(ui);
+    if with_app(|a| std::mem::take(&mut a.pending_viewer)) {
+        open_viewer(ui);
+    }
 }
 
 /// Summary rows of a particle dictionary: counts and the first effect names.
