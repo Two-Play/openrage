@@ -22,6 +22,9 @@ pub struct Config {
     pub accent: Option<String>,
     /// Show the change history in its own window (default) instead of the file list.
     pub history_window: Option<bool>,
+    /// Enabled plugins with the permissions the user granted them:
+    /// `(id, "perm+perm")` (see `crate::plugins`).
+    pub plugins: Vec<(String, String)>,
 }
 
 fn dir() -> Option<PathBuf> {
@@ -47,6 +50,10 @@ impl Config {
                 "theme" => cfg.theme = Some(v.to_owned()),
                 "accent" => cfg.accent = Some(v.to_owned()),
                 "history_window" => cfg.history_window = Some(v == "true"),
+                "plugin" => {
+                    let (id, grants) = v.split_once(':').unwrap_or((v, ""));
+                    cfg.plugins.push((id.trim().to_owned(), grants.trim().to_owned()));
+                }
                 _ => {}
             }
         }
@@ -77,6 +84,9 @@ impl Config {
         }
         if let Some(h) = self.history_window {
             text.push_str(&format!("history_window={h}\n"));
+        }
+        for (id, grants) in &self.plugins {
+            text.push_str(&format!("plugin={id}:{grants}\n"));
         }
         let path = dir.join("settings.conf");
         fs::write(&path, text).with_context(|| format!("writing {}", path.display()))

@@ -1,0 +1,23 @@
+# OpenRAGE example plugin. Copy this folder to start your own.
+id = "strings"
+name = "Strings"
+version = "0.1.0"
+api = "0.1"
+description = "Shows the readable text in files OpenRAGE cannot display otherwise, and exports it."
+authors = ["OpenRAGE contributors"]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/Two-Play/openrage"
+wasm = "strings.wasm"
+
+# Works with every game and needs no permissions: it only looks at the file
+# it is given.
+
+# The fallback preview for files no viewer handles.
+[[preview]]
+extensions = ["*"]
+
+[[actions]]
+id = "export"
+title = "Export strings…"
+kind = "export"
+extensions = ["*"]

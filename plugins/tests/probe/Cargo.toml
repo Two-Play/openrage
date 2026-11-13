@@ -1,0 +1,13 @@
+[package]
+name = "probe"
+description = "Test plugin for OpenRAGE's plugin host (sandbox limits, permissions, views); not shipped"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+openrage-plugin-sdk.workspace = true

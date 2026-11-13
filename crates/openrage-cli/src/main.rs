@@ -352,6 +352,9 @@ enum Command {
     /// OpenIV packages (.oiv): show, install into the mods folder, uninstall.
     #[command(subcommand)]
     Oiv(OivCommand),
+    /// Plugins: list, enable or disable them, preview files and run their actions.
+    #[command(subcommand)]
+    Plugin(PluginCommand),
     /// Show the changes made to the mods folder, newest first.
     History,
     /// Undo the newest change to the mods folder.
@@ -377,6 +380,53 @@ enum Command {
         /// Limit the search to this virtual path.
         #[arg(long, default_value = "")]
         r#in: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCommand {
+    /// List the installed plugins and where they are looked for.
+    List,
+    /// Show what a plugin adds and which permissions it asks for.
+    Info { id: String },
+    /// Enable a plugin, granting the permissions it asks for.
+    Enable {
+        id: String,
+        /// Grant without asking.
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// Disable a plugin.
+    Disable { id: String },
+    /// Show a file the way a plugin previews it.
+    Preview {
+        /// Virtual path in the game (or a file on disk with --file).
+        path: String,
+        /// The plugin to use (default: the one that previews this file type).
+        #[arg(long)]
+        plugin: Option<String>,
+        /// Read PATH from disk instead of from the game.
+        #[arg(long)]
+        file: bool,
+        /// Save an image preview as PNG.
+        #[arg(long)]
+        png: Option<PathBuf>,
+    },
+    /// Run a plugin's action on files and save what it produces.
+    Run {
+        /// The plugin.
+        id: String,
+        /// The action (as listed by `openrage plugin info`).
+        action: String,
+        /// Virtual paths in the game (or files on disk with --file).
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Read the PATHS from disk instead of from the game.
+        #[arg(long)]
+        file: bool,
+        /// Folder to save the results in.
+        #[arg(short, long)]
+        out: PathBuf,
     },
 }
 
@@ -433,6 +483,19 @@ fn run() -> Result<()> {
             *list,
             Checks { textures: *textures, models: *models, texts: *text, meta: *meta, audio: *audio, anims: *anims },
         );
+    }
+    // Managing plugins needs no game; previews and actions use it when there is one.
+    if let Command::Plugin(cmd) = &cli.command
+        && (game_dir.is_none()
+            || matches!(
+                cmd,
+                PluginCommand::List
+                    | PluginCommand::Info { .. }
+                    | PluginCommand::Enable { .. }
+                    | PluginCommand::Disable { .. }
+            ))
+    {
+        return cmd_plugin(&mut cfg, None, cmd);
     }
     if let Command::Licenses { text, all } = &cli.command {
         return cmd_licenses(text.as_deref(), *all);
@@ -548,6 +611,11 @@ fn run() -> Result<()> {
         Command::Mkdir { path } => cmd_edit(&game_dir, &path, Op::CreateDir, &format!("Created folder {path}"), keys),
         Command::History => cmd_history(&game_dir),
         Command::Oiv(cmd) => cmd_oiv(&game_dir, cmd, keys),
+        Command::Plugin(cmd) => {
+            let game: Arc<dyn openrage_plugins::GameFiles> =
+                Arc::new(openrage_app::plugins::GameDir::new(&game_dir, keys.clone()));
+            cmd_plugin(&mut cfg, Some((&game_dir, game)), &cmd)
+        }
         Command::Undo => cmd_undo(&game_dir),
         Command::Mods { changes, deep } => cmd_mods(&game_dir, changes, deep, keys),
         Command::Repack { archive, out, sets, removes } => cmd_repack(&game_dir, &archive, &out, &sets, &removes, keys),
@@ -1246,6 +1314,214 @@ fn print_report(report: &openrage_app::oiv::install::Report) {
     }
     for b in &report.blockers {
         outln!("  BLOCKED: {b}");
+    }
+}
+
+type GameContext<'a> = (&'a Path, Arc<dyn openrage_plugins::GameFiles>);
+
+fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &PluginCommand) -> Result<()> {
+    use openrage_plugins::{Host, Limits};
+    let registry = openrage_app::plugins::registry(cfg);
+    let find = |id: &str| {
+        registry.get(id).with_context(|| format!("no plugin {id:?} is installed (see `openrage plugin list`)"))
+    };
+    let files: Arc<dyn openrage_plugins::GameFiles> =
+        game.as_ref().map_or_else(|| Arc::new(openrage_plugins::NoGame) as _, |g| Arc::clone(&g.1));
+    let game_id = files.game();
+    // Reads a picked file, from the game or from disk.
+    let read = |path: &str, from_disk: bool| -> Result<(String, Vec<u8>)> {
+        if from_disk {
+            let name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            return Ok((name, fs::read(path).with_context(|| format!("reading {path}"))?));
+        }
+        if game.is_none() {
+            bail!("no game directory configured; pass --game <DIR>, or --file to read a file on disk")
+        }
+        Ok((path.replace('\\', "/"), files.read(path)?))
+    };
+    let print_log = |log: &[openrage_plugins::LogLine]| {
+        for line in log {
+            eprintln!("[plugin] {:?}: {}", line.level, line.message);
+        }
+    };
+
+    match cmd {
+        PluginCommand::List => {
+            outln!("Plugin folders:");
+            for d in openrage_plugins::search_dirs() {
+                outln!("  {}", d.display());
+            }
+            if registry.plugins.is_empty() && registry.broken.is_empty() {
+                outln!("No plugins installed.");
+            }
+            for p in &registry.plugins {
+                let m = &p.manifest;
+                outln!("{:<20} {:<10} {:<28} {}", m.id, m.version, status_text(&p.status), m.name);
+            }
+            for b in &registry.broken {
+                outln!("broken: {}: {}", b.dir.display(), b.error);
+            }
+            Ok(())
+        }
+        PluginCommand::Info { id } => {
+            let p = find(id)?;
+            let m = &p.manifest;
+            outln!("{} {} ({})", m.name, m.version, m.id);
+            if !m.description.is_empty() {
+                outln!("{}", m.description);
+            }
+            outln!("Folder:      {}", p.dir.display());
+            outln!("Status:      {}", status_text(&p.status));
+            if !m.authors.is_empty() {
+                outln!("Authors:     {}", m.authors.join(", "));
+            }
+            if !m.license.is_empty() {
+                outln!("Licence:     {}", m.license);
+            }
+            if !m.homepage.is_empty() {
+                outln!("Homepage:    {}", m.homepage);
+            }
+            let games: Vec<_> = m.games.iter().map(|g| g.as_str()).collect();
+            outln!("Games:       {}", if games.is_empty() { "all".to_owned() } else { games.join(", ") });
+            if m.permissions.is_empty() {
+                outln!("Permissions: none");
+            }
+            for perm in &m.permissions {
+                outln!("Permission:  {perm} — {}", perm.description());
+            }
+            for t in &m.file_types {
+                outln!("File type:   {} ({}) — {}", t.extensions.join(", "), t.category, t.name);
+            }
+            for v in &m.preview {
+                outln!("Preview:     {}", v.extensions.join(", "));
+            }
+            for a in &m.actions {
+                outln!("Action:      {} — {} [{}]", a.id, a.title, a.extensions.join(", "));
+            }
+            Ok(())
+        }
+        PluginCommand::Enable { id, yes } => {
+            let p = find(id)?;
+            let perms = &p.manifest.permissions;
+            if !perms.is_empty() {
+                outln!("{} asks for:", p.manifest.name);
+                for perm in perms {
+                    outln!("  {perm}: {}", perm.description());
+                }
+                if !yes {
+                    eprint!("Grant and enable it? [y/N] ");
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer)?;
+                    if !answer.trim().eq_ignore_ascii_case("y") {
+                        outln!("Cancelled.");
+                        return Ok(());
+                    }
+                }
+            }
+            openrage_app::plugins::enable(cfg, id, perms);
+            cfg.save()?;
+            outln!("Enabled {}.", p.manifest.name);
+            Ok(())
+        }
+        PluginCommand::Disable { id } => {
+            if openrage_app::plugins::disable(cfg, id) {
+                cfg.save()?;
+                outln!("Disabled {id}.");
+            } else {
+                outln!("{id} was not enabled.");
+            }
+            Ok(())
+        }
+        PluginCommand::Preview { path, plugin, file, png } => {
+            let (vpath, data) = read(path, *file)?;
+            let p = match plugin {
+                Some(id) => find(id)?,
+                None => registry
+                    .preview_for(&vpath, game_id)
+                    .with_context(|| format!("no enabled plugin previews {vpath}"))?,
+            };
+            if !p.enabled() {
+                bail!("{} is not enabled (`openrage plugin enable {}`)", p.manifest.name, p.manifest.id);
+            }
+            let host = Host::new(Limits::default())?;
+            let component = host.compile(p)?;
+            let outcome = host.preview(p, &component, files, &vpath, &data);
+            print_log(&outcome.log);
+            let preview = outcome.value.with_context(|| format!("{} could not preview {vpath}", p.manifest.name))?;
+            for i in &preview.info {
+                outln!("{}: {}", i.key, i.value);
+            }
+            match preview.view {
+                None => {}
+                Some(openrage_plugins::View::Text(text)) => outln!("\n{text}"),
+                Some(openrage_plugins::View::Tree(nodes)) => {
+                    let mut depth = vec![0usize; nodes.len()];
+                    outln!();
+                    for (i, n) in nodes.iter().enumerate() {
+                        depth[i] = n.parent.map_or(0, |p| depth[p as usize] + 1);
+                        let value = if n.value.is_empty() { String::new() } else { format!(": {}", n.value) };
+                        outln!("{}{}{value}", "  ".repeat(depth[i]), n.label);
+                    }
+                }
+                Some(openrage_plugins::View::Table(t)) => {
+                    outln!("\n{}", t.columns.join("\t"));
+                    for row in &t.rows {
+                        outln!("{}", row.join("\t"));
+                    }
+                }
+                Some(openrage_plugins::View::Image(img)) => {
+                    outln!("Image: {}×{}", img.width, img.height);
+                    if let Some(out) = png {
+                        fs::write(out, rage_formats::png(img.width, img.height, &img.rgba)?)?;
+                        outln!("Saved {}", out.display());
+                    }
+                }
+            }
+            Ok(())
+        }
+        PluginCommand::Run { id, action, paths, file, out } => {
+            let p = find(id)?;
+            if !p.enabled() {
+                bail!("{} is not enabled (`openrage plugin enable {id}`)", p.manifest.name);
+            }
+            if p.manifest.action(action).is_none() {
+                let ids: Vec<_> = p.manifest.actions.iter().map(|a| a.id.as_str()).collect();
+                bail!("{} has no action {action:?} (it has: {})", p.manifest.name, ids.join(", "));
+            }
+            let inputs = paths
+                .iter()
+                .map(|path| read(path, *file).map(|(vpath, data)| openrage_plugins::Input { vpath, data }))
+                .collect::<Result<Vec<_>>>()?;
+            let host = Host::new(Limits::default())?;
+            let component = host.compile(p)?;
+            let outcome = host.run_action(p, &component, files, action, &inputs);
+            print_log(&outcome.log);
+            let outputs = outcome.value.with_context(|| format!("{} failed", p.manifest.name))?;
+            for o in &outputs {
+                // The host has checked that names stay inside `out`.
+                let target = out.join(rage_rpf::vfs::safe_relative_path(&o.name).context("bad output name")?);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&target, &o.data).with_context(|| format!("writing {}", target.display()))?;
+                outln!("Saved {} ({})", target.display(), human(o.data.len() as u64));
+            }
+            if outputs.is_empty() {
+                outln!("The plugin produced no files.");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn status_text(status: &openrage_plugins::Status) -> String {
+    match status {
+        openrage_plugins::Status::Enabled => "enabled".to_owned(),
+        openrage_plugins::Status::Disabled => "disabled".to_owned(),
+        openrage_plugins::Status::NeedsApproval(missing) => {
+            let names: Vec<_> = missing.iter().map(|p| p.as_str()).collect();
+            format!("needs approval ({})", names.join(", "))
+        }
     }
 }
 

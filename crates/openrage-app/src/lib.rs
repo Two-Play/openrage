@@ -18,6 +18,7 @@ pub mod metaped;
 pub mod models;
 pub mod natives;
 pub mod oiv;
+pub mod plugins;
 pub mod progress;
 pub mod rdr2;
 pub mod render;

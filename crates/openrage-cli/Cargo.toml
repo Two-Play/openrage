@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 rage-crypto.workspace = true
+openrage-plugins = { path = "../openrage-plugins" }
 openrage-app = { path = "../openrage-app" }
 rage-rpf.workspace = true
 rage-index.workspace = true

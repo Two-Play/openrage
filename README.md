@@ -63,6 +63,8 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 | **GTA VI** | 🔜 next: as fast as possible once it comes to PC | – |
 | **GTA IV** (Complete Edition) | ✅ read (IMG3, RPF2, RPF3), key from your own `GTAIV.exe` | ◐ textures · models · collisions · animations · text · maps in 3D (read-only) |
 
+**Plugins** (API 0.1, preview): sandboxed WebAssembly plugins add file previews (text, tree, table, image) and export actions, for every game. ✅ command line (`openrage plugin`) · 🔜 explorer integration, writing into `mods`, batch tools, 3D, importers (openFormats), plugin packages. [Writing plugins](https://two-play.github.io/openrage/plugins/)
+
 ## Installation
 
 Download the [latest release](https://github.com/Two-Play/openrage/releases/latest) for Linux (AppImage or `.tar.gz`) or Windows (`.zip`) and start `openrage-gui`. On first start it finds your game and sets up the keys. Step by step, including RDR2: **[Getting started](https://two-play.github.io/openrage/getting-started/)**.
@@ -79,12 +81,13 @@ cargo build --release      # target/release/openrage-gui and target/release/open
 - [Getting started](https://two-play.github.io/openrage/getting-started/): download, setup of GTA V and RDR2, building
 - [User guide](https://two-play.github.io/openrage/guide/): everything the GUI can do, format by format
 - [Command line](https://two-play.github.io/openrage/cli/): every `openrage` command
+- [Writing plugins](https://two-play.github.io/openrage/plugins/): sandboxed WebAssembly plugins, SDK and API
 - [Development](https://two-play.github.io/openrage/development/): build environment, releases, project layout
 
 The website lives in [`site/`](site/) and is built from Markdown.
 
 ## License
 
-GPL-3.0-only, except `crates/rage-tfit2` (the RDR2 archive cipher, ported from an AGPL-3.0 project), which is AGPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for third-party attributions, and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for the licenses of all third-party crates in the programs (generated from `Cargo.lock`, checked in CI). The same is in the app under **Help → About OpenRAGE**, via `openrage licenses` and on the [licenses page](https://two-play.github.io/openrage/licenses/).
+GPL-3.0-only, except `crates/rage-tfit2` (the RDR2 archive cipher, ported from an AGPL-3.0 project), which is AGPL-3.0-only, and the plugin interface and SDK (`crates/openrage-plugins/wit`, `plugins/`), which are MIT OR Apache-2.0 so that plugins may use any licence. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for third-party attributions, and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for the licenses of all third-party crates in the programs (generated from `Cargo.lock`, checked in CI). The same is in the app under **Help → About OpenRAGE**, via `openrage licenses` and on the [licenses page](https://two-play.github.io/openrage/licenses/).
 
 Grand Theft Auto, Red Dead Redemption, RAGE and Rockstar Games are trademarks of Take-Two Interactive Software, Inc. The screenshots show OpenRAGE displaying files from the author's own copy of the game.
