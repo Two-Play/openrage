@@ -130,7 +130,7 @@ pub const MODEL_TEXTURES: &str = "textures";
 /// The model whose own textures `vpath` lists (`…/x.wdr/textures` → `…/x.wdr`).
 pub fn model_of_textures(vpath: &str) -> Option<&str> {
     let model = vpath.strip_suffix(MODEL_TEXTURES)?.strip_suffix('/')?;
-    openrage_app::textures::is_gta4_model(model).then_some(model)
+    openrage_app::textures::is_model(model).then_some(model)
 }
 
 /// The file texture edits go to: the model for its textures, else the dictionary itself.
@@ -244,14 +244,21 @@ pub fn list(
             let (listing, _) = list(game_dir, &dict_path, keys, overlay)?;
             return Ok((listing, Some(last_segment(&vpath))));
         }
-        // `…/x.wdr/textures`: the textures inside a GTA IV model.
+        // `…/model/textures`: the textures inside a model (GTA IV .wdr, GTA V .ydr/.yft/.ydd).
         Err(RpfError::NotFound(_)) if model_of_textures(&vpath).is_some() => {
             let model = model_of_textures(&vpath).unwrap_or_default();
-            let (Node::Gta4File(a, i), origin) = resolve(model)? else {
-                return Err(RpfError::NotFound(vpath.clone()));
+            let no_textures = || RpfError::NotFound(format!("{model} has no textures of its own"));
+            let (dict, origin) = match resolve(model)? {
+                (Node::Gta4File(a, i), origin) => {
+                    (openrage_app::textures::gta4_model_textures(&a.read_resource(i)?).ok_or_else(no_textures)?, origin)
+                }
+                (Node::ArchiveFile(rpf, i), origin) => (
+                    openrage_app::textures::gta5_model_textures(&rpf.read_resource(i)?, model)
+                        .ok_or_else(no_textures)?,
+                    origin,
+                ),
+                _ => return Err(RpfError::NotFound(vpath.clone())),
             };
-            let dict = openrage_app::textures::gta4_model_textures(&a.read_resource(i)?)
-                .ok_or_else(|| RpfError::NotFound(format!("{model} has no textures of its own")))?;
             return Ok((texture_listing(vpath, dict, origin, false), None));
         }
         Err(e) => return Err(e),
@@ -364,7 +371,7 @@ fn list_textures(vpath: String, rpf: Arc<Rpf7>, id: EntryId, origin: Origin) -> 
     Ok(Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict), read_only }, items })
 }
 
-/// The textures of a GTA IV or RDR2 dictionary.
+/// The textures of a GTA IV or RDR2 dictionary, or of a model.
 fn texture_listing(
     vpath: String,
     dict: rage_formats::ytd::TextureDictionary,

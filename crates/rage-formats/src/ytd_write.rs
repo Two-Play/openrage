@@ -180,39 +180,7 @@ fn apply_inner(
         let mut t = template.clone();
         t.resize(dict.layout.texture_size(), 0);
         let size = tex.expected_size().ok_or_else(|| bad(format!("{}: unsupported format", tex.name)))?;
-        match dict.layout {
-            Layout::Legacy => {
-                let code = tex.format.to_d3d9().ok_or_else(|| {
-                    bad(format!("{}: {} is not available in GTA V Legacy", tex.name, tex.format.name()))
-                })?;
-                let slice = tex.level_size(0).unwrap_or(0);
-                let stride = (slice / tex.height.max(1) as usize) as u16;
-                t[0x50..0x52].copy_from_slice(&(tex.width as u16).to_le_bytes());
-                t[0x52..0x54].copy_from_slice(&(tex.height as u16).to_le_bytes());
-                t[0x54..0x56].copy_from_slice(&(tex.depth as u16).to_le_bytes());
-                t[0x56..0x58].copy_from_slice(&stride.to_le_bytes());
-                t[0x58..0x5C].copy_from_slice(&code.to_le_bytes());
-                t[0x5D] = tex.levels as u8;
-            }
-            Layout::Rdr2 => return Err(bad("Red Dead Redemption 2 texture dictionaries cannot be written yet")),
-            Layout::Gta4 => return Err(bad("GTA IV texture dictionaries cannot be written yet")),
-            Layout::Enhanced => {
-                let blocks = gen9_block_count(tex);
-                t[0x08..0x0C].copy_from_slice(&blocks.to_le_bytes());
-                t[0x0C..0x10].copy_from_slice(&tex.format.block_or_pixel_bytes().to_le_bytes());
-                t[0x18..0x1A].copy_from_slice(&(tex.width as u16).to_le_bytes());
-                t[0x1A..0x1C].copy_from_slice(&(tex.height as u16).to_le_bytes());
-                t[0x1C..0x1E].copy_from_slice(&(tex.depth as u16).to_le_bytes());
-                t[0x1F] = tex.format.0 as u8;
-                t[0x22] = tex.levels as u8;
-            }
-        }
-        if *is_new || tex.usage != 0 {
-            let usage_at = 0x40;
-            let old = u32::from_le_bytes(t[usage_at..usage_at + 4].try_into().unwrap());
-            let new = (old & !0x1F) | (tex.usage as u32 & 0x1F);
-            t[usage_at..usage_at + 4].copy_from_slice(&new.to_le_bytes());
-        }
+        write_fields(dict.layout, &mut t, tex, *is_new)?;
         let tex_block = b.add(Segment::System, t);
         let mut name = tex.name.clone().into_bytes();
         name.push(0);
@@ -231,6 +199,46 @@ fn apply_inner(
     }
     let file = b.build(dict.version)?;
     Ok(EditResult { file, in_place: false, replaced, added, removed })
+}
+
+/// Writes a texture's shape (size, format, levels, usage) into its structure
+/// `t` (a GTA V Legacy or Enhanced `grcTexture`); pointers are left alone.
+pub(crate) fn write_fields(layout: Layout, t: &mut [u8], tex: &Texture, is_new: bool) -> Result<(), ResourceError> {
+    match layout {
+        Layout::Legacy => {
+            let code = tex
+                .format
+                .to_d3d9()
+                .ok_or_else(|| bad(format!("{}: {} is not available in GTA V Legacy", tex.name, tex.format.name())))?;
+            let slice = tex.level_size(0).unwrap_or(0);
+            let stride = (slice / tex.height.max(1) as usize) as u16;
+            t[0x50..0x52].copy_from_slice(&(tex.width as u16).to_le_bytes());
+            t[0x52..0x54].copy_from_slice(&(tex.height as u16).to_le_bytes());
+            t[0x54..0x56].copy_from_slice(&(tex.depth as u16).to_le_bytes());
+            t[0x56..0x58].copy_from_slice(&stride.to_le_bytes());
+            t[0x58..0x5C].copy_from_slice(&code.to_le_bytes());
+            t[0x5D] = tex.levels as u8;
+        }
+        Layout::Rdr2 => return Err(bad("Red Dead Redemption 2 texture dictionaries cannot be written yet")),
+        Layout::Gta4 => return Err(bad("GTA IV texture dictionaries cannot be written yet")),
+        Layout::Enhanced => {
+            let blocks = gen9_block_count(tex);
+            t[0x08..0x0C].copy_from_slice(&blocks.to_le_bytes());
+            t[0x0C..0x10].copy_from_slice(&tex.format.block_or_pixel_bytes().to_le_bytes());
+            t[0x18..0x1A].copy_from_slice(&(tex.width as u16).to_le_bytes());
+            t[0x1A..0x1C].copy_from_slice(&(tex.height as u16).to_le_bytes());
+            t[0x1C..0x1E].copy_from_slice(&(tex.depth as u16).to_le_bytes());
+            t[0x1F] = tex.format.0 as u8;
+            t[0x22] = tex.levels as u8;
+        }
+    }
+    if is_new || tex.usage != 0 {
+        let usage_at = 0x40;
+        let old = u32::from_le_bytes(t[usage_at..usage_at + 4].try_into().unwrap());
+        let new = (old & !0x1F) | (tex.usage as u32 & 0x1F);
+        t[usage_at..usage_at + 4].copy_from_slice(&new.to_le_bytes());
+    }
+    Ok(())
 }
 
 /// Number of format blocks (or pixels) over all mips, as GTA V Enhanced stores it.
