@@ -6,7 +6,9 @@
 //!   bounds (pointer, u16 count).
 //! * Every bound: type at `0x04`, radius `0x08`, box max `0x10`, box min
 //!   `0x20`, centre `0x30`. Types: 0 sphere, 1 capsule, 3 box, 4 geometry,
-//!   10 geometry with BVH, 12 composite.
+//!   5 curved geometry (wheels, drawn as a cylinder filling the box along its
+//!   shortest side; material from the list at `0xD0`), 10 geometry with BVH,
+//!   12 composite.
 //! * Sphere: centre `0x30`, radius `0x08`. Capsule (along Y): centre `0x30`,
 //!   radius `0x80`, length of the straight part `0x90`.
 //! * Box, geometry, BVH (polyhedra): polygons `0x8C` (32 bytes: normal,
@@ -32,6 +34,8 @@ pub mod kind {
     pub const CAPSULE: u8 = 1;
     pub const BOX: u8 = 3;
     pub const GEOMETRY: u8 = 4;
+    /// Curved geometry: vehicle wheels.
+    pub const CURVED: u8 = 5;
     pub const BVH: u8 = 10;
     pub const COMPOSITE: u8 = 12;
 }
@@ -90,6 +94,18 @@ fn bound(
             }
         }
         kind::BOX | kind::GEOMETRY | kind::BVH => polyhedron(res, at, m, b, stats)?,
+        kind::CURVED => {
+            let (hi, lo) = (vec3(res, at + 0x10)?, vec3(res, at + 0x20)?);
+            let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+            let half = [(hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0, (hi[2] - lo[2]) / 2.0];
+            let axis = (0..3).min_by(|&i, &j| half[i].total_cmp(&half[j])).unwrap_or(0);
+            let radius = (0..3).filter(|&i| i != axis).map(|i| half[i]).fold(0.0, f32::max);
+            let mut d = [0.0; 3];
+            d[axis] = half[axis];
+            let list = ptr(res, at + 0xD0)?;
+            let material = if list != 0 { res.u8(list)? } else { 0 };
+            b.round(material, m, sub(c, d), add(c, d), radius, false);
+        }
         kind::SPHERE => {
             let c = vec3(res, at + 0x30)?;
             b.round(0, m, c, c, f32_at(res, at + 0x08)?, true);
@@ -245,6 +261,25 @@ mod tests {
             d[0x220 + 16 + k * 2..0x220 + 18 + k * 2].copy_from_slice(&i.to_le_bytes());
         }
         Resource { version: 32, system: d, graphics: Vec::new() }
+    }
+
+    #[test]
+    fn curved_bounds_become_cylinders_along_their_short_side() {
+        let s = 0x5000_0000u32;
+        let mut d = vec![0u8; 0x200];
+        put(&mut d, 0x08, s + 0x40);
+        let b = 0x40;
+        d[b + 4] = kind::CURVED;
+        for (o, v) in [(0x10, [0.1f32, 0.4, 0.4]), (0x20, [-0.1, -0.4, -0.4])] {
+            for (k, c) in v.iter().enumerate() {
+                put(&mut d, b + o + k * 4, c.to_bits());
+            }
+        }
+        let (dr, stats) = parse_wbn(&Resource { version: 32, system: d, graphics: Vec::new() }).unwrap();
+        assert_eq!(stats.primitives, 1);
+        let (lo, hi) = (dr.bounds_min, dr.bounds_max);
+        assert!((hi[0] - 0.1).abs() < 1e-4 && (lo[0] + 0.1).abs() < 1e-4, "{lo:?} {hi:?}");
+        assert!((hi[1] - 0.4).abs() < 0.02 && (hi[2] - 0.4).abs() < 0.02, "{hi:?}");
     }
 
     #[test]

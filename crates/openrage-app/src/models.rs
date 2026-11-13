@@ -1072,7 +1072,26 @@ fn load_gta4(archive: &Arc<rage_rpf::Gta4Archive>, id: rage_rpf::Gta4EntryId) ->
         };
         (vec![(stem.clone(), wdr::parse_wdr(&res)?)], vec![part])
     } else if lower.ends_with(".wft") {
-        fragment_parts(wdr::parse_wft(&res)?, &stem)
+        let (mut drawables, mut parts) = fragment_parts(wdr::parse_wft(&res)?, &stem);
+        // The collision, hidden at first (switch it on under Parts).
+        if let Some(at) = wdr::fragment_bound(&res)
+            && let Ok((collision, stats)) = rage_formats::wbn::parse_bound(&res, at)
+            && !collision.meshes.is_empty()
+        {
+            let bounds = vec![("collision".to_owned(), collision, stats)];
+            register_gta4_materials(archive, &bounds);
+            let (name, d, _) = bounds.into_iter().next().expect("one bound");
+            parts.push(Part {
+                name: name.clone(),
+                group: "Collision".into(),
+                drawable: drawables.len(),
+                transform: math::IDENTITY,
+                visible: false,
+                bone: None,
+            });
+            drawables.push((name, d));
+        }
+        (drawables, parts)
     } else if lower.ends_with(".wdd") {
         let drawables: Vec<(String, Drawable)> = wdr::parse_wdd(&res)?
             .into_iter()

@@ -195,8 +195,10 @@ models they belong to) — open in the preview and the viewer like GTA V's `.ybn
 from GTA IV's own `common/data/materials/materials.dat`, and export as glTF. They are the 32-bit ancestors of GTA V's
 bounds: spheres, capsules, boxes, geometry with and without a BVH, and composites of these; polygons are quads or
 triangles of quantised vertices, each with its material. `openrage verify --collisions` reads every collision file of
-the game (1,079 files, 9,102 bounds, 26 million triangles, no errors). The collisions inside fragments (`.wft`) are
-not read yet.
+the game and the collision of every fragment (2,907 files, 36,857 bounds, 26 million triangles, no errors).
+Fragments (`.wft`: vehicles, peds, breakable props) carry their collision with them: it is a hidden part *Collision*
+of the model — switch it on under *Parts* to see it over the model, e.g. a vehicle's body and glass panels with its
+wheels (curved bounds, drawn as cylinders) or a ped's ragdoll of capsules.
 
 **Animations** (`.wad`, in `pc/anim/anim.img`, the cutscenes' in `cuts.img`) open like GTA V's clip dictionaries: one
 clip per animation, with the ped models (`componentpeds.img`) to play it on — every GTA IV ped shares one skeleton —

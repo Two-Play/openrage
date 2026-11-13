@@ -20,8 +20,8 @@
 //!   `0x40`), count at `0x14`;
 //! * drawable dictionary: `0x10` name hashes, `0x18` drawables;
 //! * fragment: `0xB0` name, `0xB4` main drawable, `0xD4` children (each with
-//!   its skeleton bone index at `0x0E` and its drawable at `0x90`), child count
-//!   at `0x1F2`.
+//!   its skeleton bone index at `0x0E` and its drawable at `0x90`), collision
+//!   bound at `0xEC`, child count at `0x1F2`.
 
 use rage_resource::{Resource, ResourceError};
 
@@ -264,6 +264,13 @@ pub fn parse_wdd(res: &Resource) -> Result<Vec<(u32, Drawable)>, ResourceError> 
 pub fn fragment_name(res: &Resource) -> Option<String> {
     let n = name_at(res, ptr(res, Resource::ROOT + 0xB0).ok()?)?;
     Some(n.strip_prefix("pack:/").unwrap_or(&n).to_owned())
+}
+
+/// The collision bound of a fragment (`0xEC`, usually a composite with one
+/// part per breakable or moving piece), read with [`crate::wbn::parse_bound`].
+pub fn fragment_bound(res: &Resource) -> Option<u64> {
+    let at = ptr(res, Resource::ROOT + 0xEC).ok()?;
+    (valid(res, at) && matches!(res.u8(at + 0x04).ok()?, 0 | 1 | 3 | 4 | 10 | 12)).then_some(at)
 }
 
 /// A `.wft` file: the main drawable and the children that have meshes of
