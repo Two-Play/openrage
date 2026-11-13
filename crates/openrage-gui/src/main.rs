@@ -938,11 +938,9 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_accent_chosen(move |mode, color| {
         accent::set(mode, color);
-        with_app(|a| {
-            a.cfg.accent = Some(accent::to_setting(mode, color));
-            let _ = a.cfg.save();
-        });
+        with_app(|a| a.cfg.accent = Some(accent::to_setting(mode, color)));
         if let Some(ui) = w.upgrade() {
+            save_settings(&ui);
             accent::apply(&ui);
         }
         viewer::set_accent();
@@ -952,11 +950,10 @@ fn wire_callbacks(ui: &AppWindow) {
     });
     ui.on_color_hex(accent::hex_string);
     ui.on_parse_hex(|s| accent::parse_hex(&s).unwrap_or(slint::Color::from_argb_u8(0, 0, 0, 0)));
-    ui.on_theme_changed(|mode| {
-        with_app(|a| {
-            a.cfg.theme = Some(theme_name(mode).to_owned());
-            let _ = a.cfg.save();
-        });
+    let w = ui.as_weak();
+    ui.on_theme_changed(move |mode| {
+        with_app(|a| a.cfg.theme = Some(theme_name(mode).to_owned()));
+        with_ui(&w, save_settings);
         viewer::set_theme(mode);
         editor::set_theme(mode);
         xmlview::set_theme(mode);
@@ -1065,11 +1062,10 @@ fn wire_callbacks(ui: &AppWindow) {
             }
         })
     });
-    ui.on_history_window_changed(|on| {
-        with_app(|a| {
-            a.cfg.history_window = Some(on);
-            let _ = a.cfg.save();
-        })
+    let w = ui.as_weak();
+    ui.on_history_window_changed(move |on| {
+        with_app(|a| a.cfg.history_window = Some(on));
+        with_ui(&w, save_settings);
     });
     let w = ui.as_weak();
     ui.on_install_oiv(move || with_ui(&w, pick_package));
@@ -1145,7 +1141,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
     if let Some(index) = action.strip_prefix("plugin:").and_then(|i| i.parse::<usize>().ok()) {
         let target = with_app(|a| {
             let listing = a.listing.as_ref()?;
-            let item = &listing.items[*a.visible.get(row)?];
+            let item = listing.items.get(*a.visible.get(row)?)?;
             let vpath = item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name));
             Some((item.name.clone(), vpath, plugin_target(item)?))
         });
@@ -1163,7 +1159,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "edit" | "system" => {
             let vpath = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = vpath {
@@ -1177,7 +1173,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "swf" => {
             let vpath = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = vpath {
@@ -1187,7 +1183,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "text-export" => {
             let vpath = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = vpath {
@@ -1197,7 +1193,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "xml-view" | "xml" => {
             let vpath = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = vpath {
@@ -1226,7 +1222,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "copy-hash" | "search-name" | "show-in-folder" => {
             let item = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some((item.name.clone(), item.vpath.clone()))
             });
             let Some((name, vpath)) = item else { return };
@@ -1260,7 +1256,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "copy-name" | "copy-path" => {
             let text = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some(if action == "copy-name" {
                     item.name.clone()
                 } else {
@@ -1899,7 +1895,7 @@ fn select_row(ui: &AppWindow, row: usize) {
         let listing = a.listing.as_ref()?;
         let idx = *a.visible.get(row)?;
         a.selected = Some(idx);
-        let item = listing.items[idx].clone();
+        let item = listing.items.get(idx)?.clone();
         let source = match (&listing.location, item.entry) {
             (Location::History, _) => None,
             (_, None) if item.mark == Some(Mark::Removed) => {
@@ -2200,7 +2196,7 @@ fn run_plugin_action(ui: &AppWindow, action: plugins::ActionRef, vpath: String) 
             }
         }
         let start = format!("{title}…");
-        let _ = weak.upgrade_in_event_loop(move |ui| set_busy(&ui, true, start));
+        let _ = weak.upgrade_in_event_loop(move |ui| set_busy_cancellable(&ui, start));
         let mut last = Instant::now();
         let result = plugins::run(&action, &game, &vpath, &picked, &mut |done, total, path| {
             if last.elapsed() > Duration::from_millis(100) {
@@ -5143,7 +5139,7 @@ fn start_extract(ui: &AppWindow) {
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let Some(out) = rfd::FileDialog::new().set_title("Extract to folder").pick_folder() else { return };
-        let _ = weak.upgrade_in_event_loop(|ui| set_busy(&ui, true, "Extracting…".into()));
+        let _ = weak.upgrade_in_event_loop(|ui| set_busy_cancellable(&ui, "Extracting…".into()));
         let mut last = Instant::now();
         let result = extract_entry(&rpf, id, &out, false, &cancel, &mut |s, path| {
             if last.elapsed() > Duration::from_millis(100) {
@@ -5184,7 +5180,7 @@ fn spawn_extract(
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let Some(out) = rfd::FileDialog::new().set_title("Extract to folder").pick_folder() else { return };
-        let _ = weak.upgrade_in_event_loop(|ui| set_busy(&ui, true, "Extracting…".into()));
+        let _ = weak.upgrade_in_event_loop(|ui| set_busy_cancellable(&ui, "Extracting…".into()));
         let mut last = Instant::now();
         let result = job(&out, &cancel, &mut |s, path| {
             if last.elapsed() > Duration::from_millis(100) {
@@ -5314,10 +5310,26 @@ fn filter_about(ui: &AppWindow, filter: &str) {
     }
 }
 
+/// Saves the settings; a failure shows in the status bar.
+fn save_settings(ui: &AppWindow) {
+    if let Err(e) = with_app(|a| a.cfg.save()) {
+        ui.set_status(format!("Could not save the settings: {e}").into());
+    }
+}
+
+/// Marks a task as running (or done) that cannot stop halfway: the status bar
+/// shows a spinner but no Cancel button.
 fn set_busy(ui: &AppWindow, busy: bool, status: String) {
     with_app(|a| a.busy = busy);
     ui.set_busy(busy);
+    ui.set_cancellable(false);
     ui.set_status(status.into());
+}
+
+/// Marks a task as running that watches `App::cancel`: the status bar offers Cancel.
+fn set_busy_cancellable(ui: &AppWindow, status: String) {
+    set_busy(ui, true, status);
+    ui.set_cancellable(true);
 }
 
 // ---------------------------------------------------------------------------
