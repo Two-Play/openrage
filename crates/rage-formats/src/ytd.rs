@@ -23,6 +23,12 @@
 //! Reading repacks the data tightly, so the rest of OpenRAGE sees the same
 //! layout as for GTA V. (Based on texfury by Hancapo, MIT, and checked
 //! against the block counts of every texture in the game.)
+//!
+//! GTA IV (`.wtd`, RSC5 type 8) uses 32-bit pointers. Root: `0x10` name-hash
+//! list (pointer, u16 count), `0x18` texture pointer list (pointer, u16 count).
+//! Textures (`grcTexturePC`, 0x50 bytes): `0x14` name (`pack:/<name>.dds`),
+//! `0x1C` width, height, `0x20` D3D9 format, `0x24` stride, `0x27` mip
+//! levels, `0x48` data pointer (`0x44` in a few dictionaries of older builds).
 
 use rage_resource::{Resource, ResourceError};
 
@@ -40,6 +46,8 @@ pub enum Layout {
     Enhanced,
     /// Red Dead Redemption 2 (`rage::sga::Texture`, 176-byte textures, padded mips).
     Rdr2,
+    /// GTA IV (`grcTexturePC`, 80-byte textures, D3D9 formats, 32-bit pointers).
+    Gta4,
 }
 
 impl Layout {
@@ -48,6 +56,7 @@ impl Layout {
             Self::Legacy => 144,
             Self::Enhanced => 128,
             Self::Rdr2 => 0xB0,
+            Self::Gta4 => 0x50,
         }
     }
 }
@@ -139,6 +148,75 @@ pub fn parse_rdr2_at(res: &Resource, root: u64) -> Result<TextureDictionary, Res
         }
     }
     Ok(dict)
+}
+
+/// Reads a GTA IV texture dictionary (`.wtd`).
+pub fn parse_gta4(res: &Resource) -> Result<TextureDictionary, ResourceError> {
+    parse_gta4_at(res, Resource::ROOT)
+}
+
+/// Reads a GTA IV texture dictionary located at `root` (e.g. one embedded in a drawable).
+pub fn parse_gta4_at(res: &Resource, root: u64) -> Result<TextureDictionary, ResourceError> {
+    let list = res.u32(root + 0x18)? as u64;
+    let count = res.u16(root + 0x1C)? as u64;
+    if count > 4096 {
+        return Err(bad(format!("implausible texture count {count}")));
+    }
+    let mut dict = TextureDictionary {
+        textures: Vec::with_capacity(count as usize),
+        errors: Vec::new(),
+        layout: Layout::Gta4,
+        version: res.version,
+        root: res.bytes(root, 32)?.to_vec(),
+        stored: Vec::with_capacity(count as usize),
+    };
+    for i in 0..count {
+        let result = res.u32(list + i * 4).and_then(|ptr| {
+            let ptr = ptr as u64;
+            let (tex, data_ptr) = read_gta4(res, ptr)?;
+            Ok((tex, Stored { template: res.bytes(ptr, Layout::Gta4.texture_size())?.to_vec(), data_ptr }))
+        });
+        match result {
+            Ok((t, s)) => {
+                dict.textures.push(t);
+                dict.stored.push(s);
+            }
+            Err(e) => dict.errors.push(format!("texture #{i}: {e}")),
+        }
+    }
+    Ok(dict)
+}
+
+/// The texture name without GTA IV's `pack:/` prefix and `.dds` suffix.
+pub fn gta4_texture_name(stored: &str) -> &str {
+    let name = stored.strip_prefix("pack:/").unwrap_or(stored);
+    let len = name.len();
+    if len > 4 && name[len - 4..].eq_ignore_ascii_case(".dds") { &name[..len - 4] } else { name }
+}
+
+fn read_gta4(res: &Resource, p: u64) -> Result<(Texture, u64), ResourceError> {
+    let name = gta4_texture_name(&res.string(res.u32(p + 0x14)? as u64)?).to_owned();
+    let code = res.u32(p + 0x20)?;
+    let format = Format::from_d3d9(code).ok_or_else(|| bad(format!("{name}: unknown D3D9 format {code:#x}")))?;
+    let mut tex = Texture {
+        width: res.u16(p + 0x1C)? as u32,
+        height: res.u16(p + 0x1E)? as u32,
+        depth: 1,
+        levels: res.u8(p + 0x27)?.max(1) as u32,
+        format,
+        dimension: Dimension::Texture2D,
+        usage: 0,
+        data: Vec::new(),
+        name,
+    };
+    // A few dictionaries from older builds keep the data pointer 4 bytes earlier.
+    let data_ptr = [0x48, 0x44]
+        .into_iter()
+        .map(|o| res.u32(p + o).map(u64::from))
+        .find(|v| v.as_ref().map_or(true, |&v| v >= 0x6000_0000))
+        .unwrap_or(Ok(0))?;
+    read_data(res, &mut tex, data_ptr)?;
+    Ok((tex, data_ptr))
 }
 
 /// Columns and rows of one mip level as stored in RDR2: blocks (pixels for
@@ -348,5 +426,46 @@ mod rdr2_tests {
         for (format, w, h, levels, blocks) in cases {
             assert_eq!(rdr2_block_count(format, w, h, levels), Some(blocks), "{} {w}×{h} {levels}", format.name());
         }
+    }
+}
+
+#[cfg(test)]
+mod gta4_tests {
+    use super::*;
+
+    /// A one-texture GTA IV dictionary: 4×4 DXT1, one level.
+    fn dictionary(data_offset: usize) -> Resource {
+        let mut sys = vec![0u8; 0x100];
+        let put = |b: &mut [u8], at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put(&mut sys, 0x18, 0x5000_0040); // texture list
+        sys[0x1C] = 1; // count
+        put(&mut sys, 0x40, 0x5000_0080); // list[0]
+        let t = 0x80;
+        put(&mut sys, t + 0x14, 0x5000_00E0); // name
+        sys[t + 0x1C] = 4; // width
+        sys[t + 0x1E] = 4; // height
+        put(&mut sys, t + 0x20, 0x3154_5844); // DXT1
+        sys[t + 0x27] = 1; // levels
+        put(&mut sys, t + data_offset, 0x6000_0000);
+        sys[0xE0..0xE0 + 15].copy_from_slice(b"pack:/stone.dds");
+        Resource { version: 8, system: sys, graphics: vec![0xAB; 8] }
+    }
+
+    #[test]
+    fn reads_gta4_textures() {
+        for offset in [0x48, 0x44] {
+            let dict = parse_gta4(&dictionary(offset)).unwrap();
+            assert!(dict.errors.is_empty(), "{:?}", dict.errors);
+            let t = &dict.textures[0];
+            assert_eq!((t.name.as_str(), t.width, t.height, t.levels), ("stone", 4, 4, 1));
+            assert_eq!(t.format, Format::BC1_UNORM);
+            assert_eq!(t.data, vec![0xAB; 8]);
+        }
+    }
+
+    #[test]
+    fn strips_pack_prefix_and_extension() {
+        assert_eq!(gta4_texture_name("pack:/a_b.DDS"), "a_b");
+        assert_eq!(gta4_texture_name("plain"), "plain");
     }
 }

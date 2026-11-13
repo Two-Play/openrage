@@ -473,6 +473,7 @@ fn run() -> Result<()> {
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
         Command::Verify { path, textures: false, .. } if gta4 => cmd_verify_gta4(&game_dir, &path),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
+        Command::Verify { path, textures: true, .. } if gta4 => cmd_verify_gta4_textures(&game_dir, &path),
         Command::Verify { path, textures: true, rebuild, .. } => cmd_verify_textures(&game_dir, &path, rebuild, keys),
         Command::Textures { path, sets, removes, .. } if !sets.is_empty() || !removes.is_empty() => {
             cmd_edit_textures(&game_dir, &path, &sets, &removes, keys)
@@ -870,6 +871,7 @@ fn load_ytd(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
             let entry = &rpf.entries().context("no entries")?[i];
             Ok(rage_formats::ytd::parse_rdr2(&rpf.read_resource(entry)?)?)
         }
+        Node::Gta4File(a, id) => Ok(rage_formats::ytd::parse_gta4(&a.read_resource(id)?)?),
         _ => bail!("{path} is not a file inside an archive"),
     }
 }
@@ -1013,6 +1015,7 @@ fn cmd_verify_textures(game_dir: &Path, within: &str, rebuild: bool, keys: Optio
                                     rage_formats::ytd::Layout::Enhanced | rage_formats::ytd::Layout::Rdr2 => {
                                         &[(0x28, 0x40)]
                                     }
+                                    rage_formats::ytd::Layout::Gta4 => &[(0x14, 0x18), (0x48, 0x4C)],
                                 };
                                 let masked = |t: &[u8]| {
                                     let mut t = t.to_vec();
@@ -2661,10 +2664,15 @@ fn cmd_verify(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Res
 
 /// Reads every entry of every GTA IV archive below `within` (or of the one
 /// archive it names) and inflates every resource.
-fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
-    use rage_rpf::{Gta4Archive, Gta4EntryId};
+type Gta4Start = (String, Arc<rage_rpf::Gta4Archive>, rage_rpf::Gta4EntryId);
+
+/// The GTA IV archives to process: the folder or archive `within` names, or
+/// every archive below a real folder. Archives that fail to open are returned
+/// as errors.
+fn gta4_starts(game_dir: &Path, within: &str) -> Result<(Vec<Gta4Start>, Vec<String>)> {
+    use rage_rpf::Gta4Archive;
     let mut open_errors = Vec::new();
-    let starts: Vec<(String, Arc<Gta4Archive>, Gta4EntryId)> = match vfs::resolve(game_dir, within, None)? {
+    let starts: Vec<Gta4Start> = match vfs::resolve(game_dir, within, None)? {
         Node::Gta4Dir(a, id) => vec![(within.trim_end_matches('/').to_owned(), a, id)],
         Node::Dir(dir) => {
             let mut found = Vec::new();
@@ -2686,6 +2694,11 @@ fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
         }
         _ => bail!("{within} is not a folder or archive"),
     };
+    Ok((starts, open_errors))
+}
+
+fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
+    let (starts, open_errors) = gta4_starts(game_dir, within)?;
     let started = Instant::now();
     let stats: Vec<VerifyStats> = starts
         .par_iter()
@@ -2733,6 +2746,78 @@ fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
     );
     if !total.errors.is_empty() {
         bail!("verification found {} errors", total.errors.len());
+    }
+    Ok(())
+}
+
+/// Parses every GTA IV texture dictionary (`.wtd`) and decodes every texture.
+fn cmd_verify_gta4_textures(game_dir: &Path, within: &str) -> Result<()> {
+    #[derive(Default)]
+    struct Stats {
+        dicts: usize,
+        textures: usize,
+        decoded: usize,
+        formats: std::collections::BTreeMap<String, usize>,
+        errors: Vec<String>,
+    }
+    let (starts, open_errors) = gta4_starts(game_dir, within)?;
+    let started = Instant::now();
+    let all: Vec<Stats> = starts
+        .par_iter()
+        .map(|(prefix, a, dir)| {
+            let mut s = Stats::default();
+            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
+                let e = a.entry(id);
+                if e.resource_type().is_none() || !e.name.to_ascii_lowercase().ends_with(".wtd") {
+                    return;
+                }
+                s.dicts += 1;
+                let dict = match a
+                    .read_resource(id)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| Ok(rage_formats::ytd::parse_gta4(&r)?))
+                {
+                    Ok(d) => d,
+                    Err(err) => return s.errors.push(format!("{p}: {err:#}")),
+                };
+                s.errors.extend(dict.errors.iter().map(|err| format!("{p}: {err}")));
+                for t in &dict.textures {
+                    s.textures += 1;
+                    *s.formats.entry(t.format.name()).or_default() += 1;
+                    match t.to_rgba() {
+                        Some(_) => s.decoded += 1,
+                        None => s.errors.push(format!("{p}/{}: cannot decode {}", t.name, t.format.name())),
+                    }
+                }
+            });
+            s
+        })
+        .collect();
+    let mut total = Stats { errors: open_errors, ..Default::default() };
+    for s in all {
+        total.dicts += s.dicts;
+        total.textures += s.textures;
+        total.decoded += s.decoded;
+        total.errors.extend(s.errors);
+        for (k, v) in s.formats {
+            *total.formats.entry(k).or_default() += v;
+        }
+    }
+    for e in total.errors.iter().take(50) {
+        outln!("FAIL {e}");
+    }
+    let formats: Vec<String> = total.formats.iter().map(|(f, n)| format!("{f} {n}")).collect();
+    outln!("formats: {}", formats.join(", "));
+    outln!(
+        "{} texture dictionaries, {} textures, {} decoded, {} errors ({:.1}s)",
+        total.dicts,
+        total.textures,
+        total.decoded,
+        total.errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !total.errors.is_empty() {
+        bail!("{} errors", total.errors.len());
     }
     Ok(())
 }

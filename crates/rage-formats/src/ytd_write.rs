@@ -195,6 +195,7 @@ fn apply_inner(
                 t[0x5D] = tex.levels as u8;
             }
             Layout::Rdr2 => return Err(bad("Red Dead Redemption 2 texture dictionaries cannot be written yet")),
+            Layout::Gta4 => return Err(bad("GTA IV texture dictionaries cannot be written yet")),
             Layout::Enhanced => {
                 let blocks = gen9_block_count(tex);
                 t[0x08..0x0C].copy_from_slice(&blocks.to_le_bytes());
@@ -221,7 +222,7 @@ fn apply_inner(
         b.pointer(tex_block, 0x28, name_block, 0);
         match dict.layout {
             Layout::Legacy => b.pointer(tex_block, 0x70, data_block, 0),
-            Layout::Rdr2 => unreachable!("rejected above"),
+            Layout::Rdr2 | Layout::Gta4 => unreachable!("rejected above"),
             Layout::Enhanced => {
                 b.pointer(tex_block, 0x30, tex_block, 0x58); // embedded shader resource view
                 b.pointer(tex_block, 0x38, data_block, 0);
