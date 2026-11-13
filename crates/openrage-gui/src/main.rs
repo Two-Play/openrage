@@ -358,11 +358,16 @@ fn debug_snapshot_rest(ui: &AppWindow, path: String) {
     // `OPENRAGE_SCENE=<cut>` (+ `OPENRAGE_SCENE_TIME`, `OPENRAGE_FREE`): the whole cutscene.
     // `OPENRAGE_SCENE_SNAP_AT=<ms>` takes the picture that soon (while loading);
     // `OPENRAGE_SCENE_PLAY=<s>` plays that long and quits without a picture.
-    // `OPENRAGE_MAP=<ymap>`: the map file's 3D scene, once its models have loaded.
+    // `OPENRAGE_MAP=<ymap>` (GTA IV: `.wpl` or a map `.img`): the map file's 3D scene, once its models have loaded.
     if let Ok(map) = std::env::var("OPENRAGE_MAP") {
-        open_xml_view(ui, map);
-        if let Some(x) = xmlview::newest() {
-            x.invoke_show_map();
+        let lower = map.to_ascii_lowercase();
+        if lower.ends_with(".wpl") || lower.ends_with(".img") {
+            scene::open_map(ui, map);
+        } else {
+            open_xml_view(ui, map);
+            if let Some(x) = xmlview::newest() {
+                x.invoke_show_map();
+            }
         }
         let waiting = std::rc::Rc::new(slint::Timer::default());
         let (started, timer) = (Instant::now(), std::rc::Rc::clone(&waiting));
@@ -579,6 +584,17 @@ fn wire_callbacks(ui: &AppWindow) {
             });
             if let Some(vpath) = script {
                 open_script_view(ui, vpath);
+                return;
+            }
+            // GTA IV placement files open as a 3D scene.
+            let placement = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(i as usize)?];
+                (item.kind == ItemKind::File && item.name.to_ascii_lowercase().ends_with(".wpl"))
+                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = placement {
+                scene::open_map(ui, vpath);
                 return;
             }
             let video = with_app(|a| {
@@ -2093,9 +2109,11 @@ fn text_table_preview(kind: openrage_app::texttable::Kind, data: &[u8]) -> (Meta
     table_text_preview(kind.name(), openrage_app::texttable::to_text(kind, data))
 }
 
-/// A placement file's preview: it cannot be opened in the editor.
+/// A placement file's preview: double-click shows it in 3D (not in the editor).
 fn wpl_preview((meta, text): (Meta, String)) -> (Meta, String) {
-    (meta.into_iter().filter(|(k, v)| !(k.is_empty() && v.contains("ouble-click"))).collect(), text)
+    let mut meta: Meta = meta.into_iter().filter(|(k, v)| !(k.is_empty() && v.contains("ouble-click"))).collect();
+    meta.push(note("Double-click to see its objects in 3D."));
+    (meta, text)
 }
 
 /// A text table already converted to text (with its entry count) for the preview.

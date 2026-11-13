@@ -564,7 +564,7 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
     win.set_time_text(format!("{:.1} / {:.1} s", st.time, st.duration).into());
 }
 
-/// Opens a map file (`.ymap`) as a scene: every object it places, with its
+/// Opens a map file (`.ymap`; GTA IV `.wpl` or a map archive) as a scene: every object it places, with its
 /// model and textures, an object list and glTF export.
 pub fn open_map(ui: &AppWindow, vpath: String) {
     let Ok(win) = SceneWindow::new() else { return };
@@ -594,12 +594,17 @@ pub fn open_map(ui: &AppWindow, vpath: String) {
     std::thread::spawn(move || {
         progress.set("Reading the world (once, a few seconds) …", 0, 0);
         let result = (|| -> anyhow::Result<MapLoaded> {
-            let world = openrage_app::world::load(&game_dir, keys.clone())?;
-            let files = openrage_app::world::files(&game_dir)?;
-            progress.set("Loading the map's models", 0, 0);
-            let scene = openrage_app::world::load_map(&world, &files, &game_dir, keys, &vpath, &|done, total| {
-                progress.step(done, total)
-            })?;
+            let scene = if openrage_app::gta4::is_gta4_dir(&game_dir) {
+                // GTA IV: a placement file (.wpl) or a map archive (.img).
+                openrage_app::gta4::load_map(&game_dir, &vpath, &|done, total| progress.step(done, total))?
+            } else {
+                let world = openrage_app::world::load(&game_dir, keys.clone())?;
+                let files = openrage_app::world::files(&game_dir)?;
+                progress.set("Loading the map's models", 0, 0);
+                openrage_app::world::load_map(&world, &files, &game_dir, keys, &vpath, &|done, total| {
+                    progress.step(done, total)
+                })?
+            };
             let models = scene
                 .models
                 .into_iter()

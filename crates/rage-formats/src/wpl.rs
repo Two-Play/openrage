@@ -40,7 +40,8 @@ const HEADER: usize = 17 * 4;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Instance {
     pub position: [f32; 3],
-    /// Quaternion `x, y, z, w`.
+    /// Quaternion `x, y, z, w` as stored: the inverse of the object's
+    /// rotation (conjugate it to place the object).
     pub rotation: [f32; 4],
     pub model_hash: u32,
     pub flags: u32,
