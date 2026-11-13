@@ -4143,6 +4143,8 @@ export component XmlWindow inherits Window {
     callback filter-edited(string);
     callback export-xml();
     callback open-text();
+    // The file is XML text (editable as such), not converted from a binary format.
+    in property <bool> plain-text;
     callback expand-all(bool);
 
     changed theme-mode => { root.apply-theme(); }
@@ -4199,7 +4201,7 @@ export component XmlWindow inherits Window {
                     clicked => { root.show-map(); }
                 }
                 Button {
-                    text: @tr("Open as text");
+                    text: root.plain-text ? @tr("Edit as text") : @tr("Open as text");
                     icon: @image-url("icons/text.svg");
                     colorize-icon: true;
                     clicked => { root.open-text(); }

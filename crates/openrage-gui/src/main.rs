@@ -341,6 +341,9 @@ fn debug_snapshot_rest(ui: &AppWindow, path: String) {
     if let Ok(path) = std::env::var("OPENRAGE_EDITOR") {
         open_editor(ui, path);
     }
+    if let Ok(path) = std::env::var("OPENRAGE_TEXT") {
+        open_text_file(ui, path);
+    }
     if let Ok(path) = std::env::var("OPENRAGE_XML") {
         open_xml_view(ui, path);
     }
@@ -570,7 +573,7 @@ fn wire_callbacks(ui: &AppWindow) {
                     .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = text {
-                open_editor(ui, vpath);
+                open_text_file(ui, vpath);
                 return;
             }
             let meta = with_app(|a| {
@@ -3996,7 +3999,40 @@ fn read_rdr2_text_table(vpath: &str) -> anyhow::Result<String> {
     }
 }
 
-fn open_editor(ui: &AppWindow, vpath: String) {
+/// Opens a text file: XML in the XML window (tree, fields, colored text),
+/// anything else in the text editor.
+fn open_text_file(ui: &AppWindow, vpath: String) {
+    let lower = vpath.to_ascii_lowercase();
+    if lower.ends_with(".ysc") || openrage_app::texttable::is_rdr2_text_table(&vpath) {
+        return open_editor(ui, vpath);
+    }
+    ui.set_status(format!("Opening {vpath} …").into());
+    let data = match read_file(ui, &vpath) {
+        Ok(d) => d,
+        Err(e) => return ui.set_status(format!("Cannot open {vpath}: {e:#}").into()),
+    };
+    if let Ok(xml) = openrage_app::metadata::from_bytes(&data)
+        && xml.encoding == openrage_app::metadata::Encoding::Text
+        && openrage_app::xmltree::parse(&xml.text).is_ok()
+    {
+        xmlview::open(ui, vpath, xml);
+        ui.set_status(SharedString::new());
+        return;
+    }
+    open_text_data(ui, vpath, &data);
+}
+
+fn open_text_data(ui: &AppWindow, vpath: String, data: &[u8]) {
+    match editor::Document::from_file(vpath.clone(), data) {
+        Ok(doc) => {
+            editor::open(ui, doc);
+            ui.set_status(SharedString::new());
+        }
+        Err(e) => ui.set_status(format!("Cannot open {vpath} as text ({e}); use Extract… instead.").into()),
+    }
+}
+
+pub(crate) fn open_editor(ui: &AppWindow, vpath: String) {
     if vpath.to_ascii_lowercase().ends_with(".ysc") {
         return open_script_view(ui, vpath);
     }
@@ -4013,13 +4049,7 @@ fn open_editor(ui: &AppWindow, vpath: String) {
     }
     ui.set_status(format!("Opening {vpath} …").into());
     match read_file(ui, &vpath) {
-        Ok(data) => match editor::Document::from_file(vpath.clone(), &data) {
-            Ok(doc) => {
-                editor::open(ui, doc);
-                ui.set_status(SharedString::new());
-            }
-            Err(e) => ui.set_status(format!("Cannot open {vpath} as text ({e}); use Extract… instead.").into()),
-        },
+        Ok(data) => open_text_data(ui, vpath, &data),
         Err(e) => ui.set_status(format!("Cannot open {vpath}: {e:#}").into()),
     }
 }

@@ -72,12 +72,25 @@ fn label(e: roxmltree::Node, tag: &str, index: Option<usize>, n: &Node) -> Strin
     // `rage__cutfCameraObject` is the C++ type `rage::cutfCameraObject`.
     let ty = e.attribute("type").map(|t| t.replace("__", "::"));
     let name = e.attribute("key").map(str::to_owned).or_else(|| {
-        NAME_FIELDS.iter().find_map(|f| {
-            e.children()
-                .find(|c| c.is_element() && c.tag_name().name() == *f && is_simple(*c))
-                .map(value)
-                .filter(|v| !v.is_empty() && v != "—")
-        })
+        NAME_FIELDS
+            .iter()
+            .find_map(|f| {
+                e.children()
+                    .find(|c| c.is_element() && c.tag_name().name() == *f && is_simple(*c))
+                    .map(value)
+                    .filter(|v| !v.is_empty() && v != "—")
+            })
+            .or_else(|| {
+                // Otherwise a field that says it is a name (`handlingName`, `weaponName`, …).
+                e.children()
+                    .filter(|c| c.is_element() && is_simple(*c))
+                    .find(|c| {
+                        let t = c.tag_name().name();
+                        t.len() > 4 && (t.ends_with("Name") || t.ends_with("_name"))
+                    })
+                    .map(value)
+                    .filter(|v| !v.is_empty() && v != "—")
+            })
     });
     let base = match (index, ty) {
         (Some(i), Some(t)) => format!("{t} #{i}"),
@@ -310,6 +323,17 @@ mod tests {
         assert_eq!(dicts.label, "Physics dictionaries (2)");
         assert_eq!(dicts.fields, vec![("#1".into(), "a".into()), ("#2".into(), "b".into())]);
         assert_eq!(root.count(), 5);
+    }
+
+    #[test]
+    fn items_named_by_a_name_field() {
+        let xml = r#"<CHandlingDataMgr><HandlingData>
+  <Item type="CHandlingData"><handlingName>ADDER</handlingName><fMass value="1300" /></Item>
+  <Item type="CHandlingData"><fMass value="1" /></Item>
+</HandlingData></CHandlingDataMgr>"#;
+        let data = &parse(xml).unwrap().children[0];
+        assert_eq!(data.children[0].label, "CHandlingData #1 · ADDER");
+        assert_eq!(data.children[1].label, "CHandlingData #2");
     }
 
     #[test]
