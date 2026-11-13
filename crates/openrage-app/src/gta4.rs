@@ -163,6 +163,8 @@ pub struct TextureIndex {
     model_txd: HashMap<String, String>,
     /// Texture dictionary → its parent (`txdp` sections), lower case.
     parent: HashMap<String, String>,
+    /// Model names by hash (joaat of the lower-case name), as the `.ide` files write them.
+    model_names: HashMap<u32, String>,
 }
 
 impl TextureIndex {
@@ -205,6 +207,11 @@ impl TextureIndex {
                 section = if line.eq_ignore_ascii_case("end") { String::new() } else { line.to_ascii_lowercase() };
                 continue;
             }
+            if matches!(section.as_str(), "objs" | "tobj" | "anim" | "cars" | "peds" | "weap")
+                && let Some(model) = line.split(',').next().map(str::trim).filter(|m| !m.is_empty())
+            {
+                self.model_names.entry(rage_core::hash::joaat(model)).or_insert_with(|| model.to_owned());
+            }
             let mut fields = line.split(',').map(|f| f.trim().to_ascii_lowercase());
             let (Some(a), Some(b)) = (fields.next(), fields.next()) else { continue };
             if a.is_empty() || b.is_empty() || b == "null" {
@@ -220,6 +227,11 @@ impl TextureIndex {
                 _ => {}
             }
         }
+    }
+
+    /// A model's name from its hash, if an `.ide` file defines it.
+    pub fn model_name(&self, hash: u32) -> Option<String> {
+        self.model_names.get(&hash).cloned()
     }
 
     /// The dictionaries a model's textures may come from, most specific first:
@@ -270,6 +282,28 @@ pub fn texture_index(game: &Path) -> Arc<TextureIndex> {
         c.insert(game.to_owned(), index.clone());
     }
     index
+}
+
+/// A placement file (`.wpl`) as IPL-style text, with model names from the
+/// game's `.ide` files when `game` is given; also returns the number of records.
+pub fn wpl_to_text(game: Option<&Path>, data: &[u8]) -> Result<(String, usize)> {
+    let wpl = rage_formats::wpl::parse(data)?;
+    let index = game.map(texture_index);
+    let text = rage_formats::wpl::to_text(&wpl, |h| index.as_ref().and_then(|i| i.model_name(h)));
+    Ok((text, rage_formats::wpl::record_count(&wpl)))
+}
+
+/// Header details of a compiled script (`.sco`) as (label, value) rows.
+pub fn sco_rows(data: &[u8]) -> Option<Vec<(String, String)>> {
+    let h = rage_formats::sco::header(data)?;
+    Some(vec![
+        ("Format".into(), format!("GTA IV script ({})", h.format_name())),
+        ("Code".into(), format!("{} bytes", h.code_size)),
+        ("Static variables".into(), h.statics.to_string()),
+        ("Global variables".into(), h.globals.to_string()),
+        ("Flags".into(), format!("0x{:08X}", h.flags)),
+        ("Signature".into(), format!("0x{:08X}", h.signature)),
+    ])
 }
 
 /// The GTA IV game folder an archive belongs to (the folder holding `GTAIV.exe`).
@@ -344,6 +378,7 @@ mod tests {
         assert_eq!(index.dictionaries_for("nge_det_mh1"), ["nge_mh1", "manhat_generic"]);
         assert_eq!(index.dictionaries_for("ADMIRAL"), ["admiral"]);
         assert!(index.dictionaries_for("unknown").is_empty());
+        assert_eq!(index.model_name(rage_core::hash::joaat("nge_det_mh1")).as_deref(), Some("NGE_Det_MH1"));
     }
 
     #[test]

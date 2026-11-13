@@ -3,7 +3,8 @@
 //! `.gxt2` becomes OpenIV's `.oxt` form (`0xHASH = text`, or the label's name
 //! when it is known); `.nametable` one name per line. Both convert back exactly.
 //! Red Dead Redemption 2's text tables (`.yldb`) use the same text form, for
-//! reading only.
+//! reading only. GTA IV's (`.gxt`) list their tables as `[NAME]` sections of
+//! the same lines.
 
 use anyhow::{Result, bail};
 use rage_core::hash::joaat;
@@ -15,6 +16,8 @@ pub enum Kind {
     Gxt2,
     /// `.nametable`: NUL-separated names.
     NameTable,
+    /// GTA IV `.gxt`: tables of strings.
+    Gxt,
 }
 
 impl Kind {
@@ -24,6 +27,8 @@ impl Kind {
             Some(Self::Gxt2)
         } else if lower.ends_with(".nametable") {
             Some(Self::NameTable)
+        } else if lower.ends_with(".gxt") {
+            Some(Self::Gxt)
         } else {
             None
         }
@@ -33,6 +38,7 @@ impl Kind {
         match self {
             Self::Gxt2 => "GXT2 text table",
             Self::NameTable => "name table",
+            Self::Gxt => "GTA IV text table",
         }
     }
 
@@ -41,6 +47,7 @@ impl Kind {
         match self {
             Self::Gxt2 => "oxt",
             Self::NameTable => "txt",
+            Self::Gxt => "txt",
         }
     }
 }
@@ -61,6 +68,11 @@ pub fn to_text(kind: Kind, data: &[u8]) -> Result<(String, usize)> {
         Kind::Gxt2 => {
             let entries = gxt2::parse(data)?;
             (gxt2::to_oxt(&entries, label_name), entries.len())
+        }
+        Kind::Gxt => {
+            let tables = rage_formats::gxt::parse(data)?;
+            let n = tables.iter().map(|t| t.entries.len()).sum();
+            (rage_formats::gxt::to_text(&tables, label_name), n)
         }
         Kind::NameTable if data.is_empty() => (String::new(), 0),
         Kind::NameTable => {
@@ -98,6 +110,7 @@ pub fn rdr2_entry_to_text(rpf: &rage_rpf::Rpf8, i: usize) -> Result<(String, usi
 pub fn from_text(kind: Kind, text: &str) -> Result<Vec<u8>> {
     Ok(match kind {
         Kind::Gxt2 => gxt2::write(&gxt2::from_oxt(text)?),
+        Kind::Gxt => rage_formats::gxt::write(&rage_formats::gxt::from_text(text)?),
         Kind::NameTable => {
             let mut out = Vec::new();
             for line in text.lines() {

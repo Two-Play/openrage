@@ -161,7 +161,18 @@ dictionary embedded in the model, the `.wtd` named after it, the dictionary the 
 its parent dictionaries from `txdp` sections) and, for vehicles, `vehshare.wtd`; OpenRAGE indexes the `.ide` files and
 the `.wtd` files of all archives once per session (a second or two), preferring an episode's own files for TLAD and TBoGT
 models. `openrage verify --models` reads every model of the game (26,711 files, 46,658 drawables, 61 million triangles,
-no errors). Collision files, animations, text and maps follow in the next steps. The search index is GTA V only for now.
+no errors).
+
+**Texts** (`common/text/<language>.gxt`, and the episodes' own in `TLAD/` and `TBoGT/`) show in the preview and open in
+a read-only window (double-click): every table as a `[NAME]` section of `0xHASH = text` lines, in the escapes of GTA V's
+`.oxt` form (`openrage text <path> [-o file]`). **Placement files** (`.wpl`, on disk and inside the map archives) show as
+IPL-style text: one line per object with position, rotation, model — by name, from the game's `.ide` files — flags and
+LOD, then the other sections (garages, cull zones, blocks, …) field by field, as far as their meaning is known. `.ide`
+and `.ipl` files are plain text already. **Scripts** (`.sco`) show their header (code size, variables, signature);
+they cannot be disassembled yet. `openrage verify --text` reads every text table and checks that its text form converts
+back identically (5,498 tables, 671,627 strings), every placement file (1,151 files, 458,048 records) and every script
+header (941), with no errors. Collision files, animations and maps follow in the next steps. The search index is GTA V
+only for now.
 
 ## Red Dead Redemption 2
 

@@ -39,6 +39,10 @@ openrage textures pc/models/cdimages/vehicles.img/admiral.wtd --export out/ --pn
 openrage verify --textures                     # parse every .wtd and decode every texture
 openrage model pc/models/cdimages/vehicles.img/admiral.wft --export admiral.glb --render admiral.png
 openrage verify --models                       # parse every .wdr, .wdd and .wft
+openrage text common/text/german.gxt -o german.txt   # text table as [TABLE] sections of 0xHASH = text
+openrage text pc/data/maps/manhat/manhat01.wpl # placement file as IPL-style text
+openrage script common/data/cdimages/script.img/main.sco   # script header
+openrage verify --text                         # every .gxt (to text and back), .wpl and .sco
 ```
 
 ## Formats: textures, models, audio, animations, metadata, text
