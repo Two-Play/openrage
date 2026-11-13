@@ -758,6 +758,54 @@ fn is_enhanced(version: u32) -> Result<bool, ResourceError> {
     }
 }
 
+/// The texture dictionaries a GTA V model carries (`ext`: `ydr`, `yft`
+/// with its parts, or `ydd`), each once, and whether the model is Enhanced.
+pub fn embedded_texture_dicts(res: &Resource, ext: &str) -> Result<(bool, Vec<u64>), ResourceError> {
+    let enhanced = is_enhanced(res.version)?;
+    let root = Resource::ROOT;
+    let mut drawables = Vec::new();
+    match ext.to_ascii_lowercase().as_str() {
+        "ydr" => drawables.push(root),
+        "yft" => {
+            drawables.push(res.u64(root + 0x30)?);
+            // Parts (wheels, doors, …) can carry their own.
+            if let Ok(group) = res.u64(root + 0xF0)
+                && group != 0
+                && let Some(lod) = (0..3).filter_map(|i| res.u64(group + 0x10 + i * 8).ok()).find(|&p| p != 0)
+                && let (Ok(list), Ok(count)) = (res.u64(lod + 0xD0), res.u8(lod + 0x11E))
+            {
+                for i in 0..count as u64 {
+                    if let Ok(child) = res.u64(list + i * 8)
+                        && child != 0
+                        && let Ok(d) = res.u64(child + 0xA0)
+                    {
+                        drawables.push(d);
+                    }
+                }
+            }
+        }
+        "ydd" => {
+            let list = res.u64(root + 0x30)?;
+            for i in 0..res.u16(root + 0x38)? as u64 {
+                drawables.push(res.u64(list + i * 8)?);
+            }
+        }
+        other => return Err(bad(format!("{other} files have no drawables"))),
+    }
+    let mut dicts = Vec::new();
+    for d in drawables.into_iter().filter(|&d| d != 0) {
+        let group = res.u64(d + 0x10)?;
+        if group == 0 {
+            continue;
+        }
+        let txd = res.u64(group + 0x08)?;
+        if txd != 0 && !dicts.contains(&txd) {
+            dicts.push(txd);
+        }
+    }
+    Ok((enhanced, dicts))
+}
+
 /// A `.ydr` file.
 pub fn parse_ydr(res: &Resource) -> Result<Drawable, ResourceError> {
     read_drawable(res, Resource::ROOT, is_enhanced(res.version)?)

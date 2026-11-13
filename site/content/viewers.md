@@ -29,7 +29,7 @@ Texture dictionaries (`.ytd`) open like folders: double-click one to list its te
 | GTA V Legacy | 13 | Direct3D 9 formats (DXT1/3/5, …) |
 | GTA V Enhanced | 5 | DXGI formats, including BC7 |
 
-Replacing, adding and removing textures: see [Modding](@/modding.md#textures).
+Replacing, adding and removing textures, also those inside models: see [Modding](@/modding.md#textures).
 
 ## Models
 

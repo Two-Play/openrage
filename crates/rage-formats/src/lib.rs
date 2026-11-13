@@ -19,6 +19,7 @@ pub mod ldb;
 pub mod math;
 pub mod media;
 pub mod meta;
+pub mod model_textures;
 pub mod names;
 pub mod paths;
 pub mod pso;
