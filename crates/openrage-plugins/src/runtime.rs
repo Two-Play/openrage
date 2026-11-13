@@ -59,6 +59,11 @@ pub trait GameFiles: Send + Sync {
     fn texture(&self, vpath: &str, name: &str) -> Result<ImageView> {
         bail!("{vpath}: textures of {name} cannot be read here")
     }
+    /// A model file built from `model` on top of `template` (see `build-model`).
+    fn build_model(&self, template: &str, model: &Model) -> Result<Vec<u8>> {
+        let _ = model;
+        bail!("{template}: models cannot be built here")
+    }
 }
 
 /// No game open: plugins can only see the files they are handed.
@@ -451,6 +456,12 @@ impl wit_host::Host for Ctx {
     fn load_texture(&mut self, vpath: String, name: String) -> Result<ImageView, String> {
         let vpath = self.readable(&vpath)?;
         self.files.texture(&vpath, &name).map_err(|e| format!("{e:#}"))
+    }
+
+    fn build_model(&mut self, template: String, model: Model) -> Result<Vec<u8>, String> {
+        let template = self.readable(&template)?;
+        check_model(&model).map_err(|e| format!("{e:#}"))?;
+        self.files.build_model(&template, &model).map_err(|e| format!("{e:#}"))
     }
 
     fn list_dir(&mut self, vpath: String) -> Result<Vec<DirEntry>, String> {

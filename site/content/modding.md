@@ -39,12 +39,14 @@ In a texture dictionary, **Replace…**, **Add…** and **Remove** change textur
 
 ## Models (preview)
 
-A drawable of GTA V Enhanced (`.ydr`) can get new geometry from a Wavefront OBJ file. For now from the
-[command line](@/cli.md#editing-packages-and-the-mods-folder):
+A drawable of GTA V Enhanced (`.ydr`) can get new geometry from a Wavefront OBJ file:
 
-```
-openrage replace-model x64i.rpf/levels/gta5/props/…/prop_x.ydr model.obj --mods
-```
+- **In the explorer:** turn on the *OBJ tools* plugin (it comes with OpenRAGE, **Settings → Plugins**), unlock
+  editing, right-click the `.ydr` → **Replace with OBJ…** and choose the OBJ. The change goes into the `mods` folder
+  and is one entry in **History**. *OBJ tools* also exports models as OBJ, so you can export, edit (e.g. in Blender)
+  and bring them back.
+- **From the command line:** `openrage replace-model x64i.rpf/levels/gta5/props/…/prop_x.ydr model.obj --mods`, or
+  `openrage plugin run obj-tools replace <path>.ydr --pick model.obj`.
 
 - The drawable keeps its shaders and textures: OpenRAGE copies them, with the vertex layout each shader expects,
   from the original file and writes only the new geometry. The OBJ materials go to the drawable's shaders in order

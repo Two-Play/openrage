@@ -321,7 +321,8 @@ fn models_follow_the_handed_file_rule() {
 #[test]
 fn plugin_models_are_checked_and_shown() {
     let host = host();
-    let reg = registry(&[("probe", &[Permission::ReadGame, Permission::WriteMods]), ("obj-tools", &[])]);
+    let reg =
+        registry(&[("probe", &[Permission::ReadGame, Permission::WriteMods]), ("obj-tools", &[Permission::WriteMods])]);
     let probe = reg.get("probe").unwrap();
     let component = host.compile(probe).unwrap();
     let bad = host.preview(probe, &component, Arc::new(NoGame), "a.badmodel", b"").value;

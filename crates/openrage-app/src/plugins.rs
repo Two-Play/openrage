@@ -117,6 +117,23 @@ impl GameFiles for GameDir {
         Ok(to_plugin_model(&*self.loaded_model(vpath)?))
     }
 
+    fn build_model(&self, template: &str, model: &Model) -> Result<Vec<u8>> {
+        use rage_formats::ydr_write;
+        let Node::ArchiveFile(rpf, id) = self.resolve(template)? else {
+            bail!("{template} is not a model inside an archive")
+        };
+        if !template.to_ascii_lowercase().ends_with(".ydr") {
+            bail!("{template}: only drawables (.ydr) can be built so far");
+        }
+        let res = rpf.read_resource(id)?;
+        let meshes = plugin_meshes(model, &ydr_write::usable_shaders(&res)?)?;
+        let file = ydr_write::replace_meshes(&res, &meshes)?;
+        // What the game gets must read back.
+        drawable::parse_ydr(&rage_resource::Resource::from_rsc7(&file)?)
+            .context("the built model does not read back")?;
+        Ok(file)
+    }
+
     fn texture(&self, vpath: &str, name: &str) -> Result<ImageView> {
         let lower = vpath.to_ascii_lowercase();
         let texture = if lower.ends_with(".ytd") || lower.ends_with(".wtd") {
@@ -206,6 +223,36 @@ impl GameFiles for GameDir {
         out.sort_by_key(|e| (!e.is_dir, e.name.to_ascii_lowercase()));
         Ok(out)
     }
+}
+
+/// Meshes for the model writer from a plugin's model: material `i` goes to
+/// the template's `i`-th usable shader (the last one takes the rest), a
+/// material named `#n` to shader `n`. Meshes too large for one geometry are
+/// split.
+pub fn plugin_meshes(model: &Model, shaders: &[u16]) -> Result<Vec<rage_formats::ydr_write::NewMesh>> {
+    let Some(&last) = shaders.last() else { bail!("the template has no shader meshes can use") };
+    let mut shader_of = Vec::new();
+    for (i, m) in model.materials.iter().enumerate() {
+        let s = match m.name.strip_prefix('#').map(str::parse::<u16>) {
+            Some(Ok(n)) if shaders.contains(&n) => n,
+            Some(_) => bail!("material {:?}: the template has the shaders {shaders:?}", m.name),
+            None => shaders.get(i).copied().unwrap_or(last),
+        };
+        shader_of.push(s);
+    }
+    let mut out = Vec::new();
+    for m in &model.meshes {
+        let shader = *shader_of.get(m.material as usize).context("mesh with an unknown material")?;
+        out.extend(crate::obj::split(rage_formats::ydr_write::NewMesh {
+            shader,
+            positions: m.positions.as_chunks::<3>().0.to_vec(),
+            normals: m.normals.as_chunks::<3>().0.to_vec(),
+            uvs: m.uvs.as_chunks::<2>().0.to_vec(),
+            colors: Vec::new(),
+            indices: m.indices.clone(),
+        }));
+    }
+    Ok(out)
 }
 
 /// Collision and path files count as models in the explorer, but plugins
@@ -689,6 +736,29 @@ mod tests {
         assert_eq!(wheel.shaders.len(), 1);
         assert_eq!(wheel.meshes[0].shader, 0);
         assert_eq!(wheel.meshes[0].positions[1], [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn maps_plugin_materials_to_shaders() {
+        let material = |name: &str| Material { name: name.into(), texture: String::new(), color: GREY, image: None };
+        let mesh = |material: u32| Mesh {
+            part: String::new(),
+            positions: vec![0.0; 9],
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            indices: vec![0, 1, 2],
+            material,
+        };
+        let model = Model {
+            meshes: vec![mesh(0), mesh(1), mesh(2), mesh(3)],
+            materials: vec![material("a"), material("#0"), material("b"), material("c")],
+        };
+        let meshes = plugin_meshes(&model, &[0, 3]).unwrap();
+        let shaders: Vec<u16> = meshes.iter().map(|m| m.shader).collect();
+        assert_eq!(shaders, [0, 0, 3, 3]);
+        assert_eq!(meshes[0].positions.len(), 3);
+        let pinned = Model { meshes: vec![mesh(0)], materials: vec![material("#7")] };
+        assert!(plugin_meshes(&pinned, &[0, 3]).is_err());
     }
 
     #[test]
