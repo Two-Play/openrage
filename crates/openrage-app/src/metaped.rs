@@ -188,9 +188,7 @@ pub struct AssetIndex {
 impl AssetIndex {
     /// Where the index for a game folder is cached.
     pub fn default_path(game: &Path) -> Option<PathBuf> {
-        let canonical = game.canonicalize().unwrap_or_else(|_| game.to_path_buf());
-        let id = rage_core::hash::jenkins_bytes(canonical.to_string_lossy().as_bytes());
-        Some(dirs::cache_dir()?.join("openrage").join(format!("rdr2-metapeds-{id:08x}.tsv")))
+        crate::paths::game_cache(game, "rdr2-metapeds", "tsv")
     }
 
     /// Reads the archives that hold peds (update, DLC and `packs_*.rpf`):

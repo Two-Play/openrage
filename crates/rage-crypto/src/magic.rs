@@ -11,7 +11,6 @@
 use std::io::Read;
 
 use flate2::read::DeflateDecoder;
-use rage_core::hash::jenkins_bytes;
 
 use crate::aes_ecb::decrypt_aes;
 use crate::dotnet_random::DotNetRandom;
@@ -22,6 +21,7 @@ pub const LUT_LEN: usize = 256;
 pub const AWC_LEN: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MagicError {
     #[error("key blob could not be decoded with this AES key (wrong file or wrong game version)")]
     Inflate(#[source] std::io::Error),
@@ -71,4 +71,19 @@ pub fn decode_codewalker_magic(blob: &[u8], aes_key: &[u8; 32]) -> Result<MagicC
         hash_lut: lut.try_into().expect("lut length"),
         awc_key: rest[..AWC_LEN].try_into().expect("awc length"),
     })
+}
+
+/// Jenkins one-at-a-time hash (the same as `rage_core::hash::jenkins_bytes`,
+/// kept here so this crate has no dependency on `rage-core`): seeds the
+/// generator that unscrambles the key blob.
+fn jenkins_bytes(data: &[u8]) -> u32 {
+    let mut h: u32 = 0;
+    for &b in data {
+        h = h.wrapping_add(b as u32);
+        h = h.wrapping_add(h << 10);
+        h ^= h >> 6;
+    }
+    h = h.wrapping_add(h << 3);
+    h ^= h >> 11;
+    h.wrapping_add(h << 15)
 }

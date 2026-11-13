@@ -12,6 +12,10 @@
 //! native hash, `SWITCH` a u8 count and (u32 value, u32 address) pairs,
 //! `STRING` a u8 length and the text. Opcodes from 80 push `opcode − 96`.
 
+use rage_core::bytes::LeRead;
+
+pub use crate::ysc::ScriptError;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScoHeader {
     /// `SCR\x0D` or `scr\x0E`.
@@ -64,19 +68,19 @@ pub struct Instruction {
 /// Decrypts a block of an encrypted script in place.
 pub type Decrypt<'a> = &'a dyn Fn(&mut [u8]);
 
-pub fn parse(data: &[u8], decrypt: Option<Decrypt>) -> Result<Sco, String> {
-    let header = header(data).ok_or("not a GTA IV script")?;
+pub fn parse(data: &[u8], decrypt: Option<Decrypt>) -> Result<Sco, ScriptError> {
+    let header = header(data).ok_or(ScriptError::NotScript)?;
     let code_len = header.code_size as usize;
     let (statics, globals) = (header.statics as usize, header.globals as usize);
     let end = 24 + code_len + 4 * (statics + globals);
     if end > data.len() {
-        return Err(format!("script needs {end} bytes, the file has {}", data.len()));
+        return Err(ScriptError::Truncated { need: end, have: data.len() });
     }
     let encrypted = &header.magic == b"scr\x0E";
-    let block = |from: usize, len: usize| -> Result<Vec<u8>, String> {
+    let block = |from: usize, len: usize| -> Result<Vec<u8>, ScriptError> {
         let mut b = data[from..from + len].to_vec();
         if encrypted {
-            (decrypt.ok_or("the script is encrypted and no key is loaded")?)(&mut b);
+            (decrypt.ok_or(ScriptError::NoKey)?)(&mut b);
         }
         Ok(b)
     };
@@ -172,16 +176,16 @@ const NAMES: [&str; 80] = [
 
 impl Sco {
     /// Decodes every instruction.
-    pub fn disassemble(&self) -> Result<Vec<Instruction>, String> {
+    pub fn disassemble(&self) -> Result<Vec<Instruction>, ScriptError> {
         let c = &self.code;
         let mut out = Vec::new();
         let mut pc = 0;
         while pc < c.len() {
             let op = c[pc];
-            let need = |n: usize| -> Result<&[u8], String> {
-                c.get(pc + 1..pc + 1 + n).ok_or_else(|| format!("instruction at {pc:#x} runs past the end"))
+            let need = |n: usize| -> Result<&[u8], ScriptError> {
+                c.get(pc + 1..pc + 1 + n).ok_or_else(|| ScriptError::PastEnd { name: "instruction".into(), at: pc })
             };
-            let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            let u32_at = |b: &[u8], o: usize| b.u32_at(o).unwrap_or(0);
             let (name, operands, targets, len): (String, String, Vec<usize>, usize) = match op {
                 34..=36 | 46 => {
                     let b = need(4)?;
@@ -231,7 +235,7 @@ impl Sco {
     }
 
     /// The disassembly as text: functions (`ENTER`) and jump targets as labels.
-    pub fn listing(&self) -> Result<String, String> {
+    pub fn listing(&self) -> Result<String, ScriptError> {
         let code = self.disassemble()?;
         let mut labels: Vec<usize> = code.iter().flat_map(|i| i.targets.iter().copied()).collect();
         labels.sort_unstable();
@@ -254,13 +258,13 @@ impl Sco {
 
     /// Checks the disassembly: every jump, call and switch case lands on an
     /// instruction. Returns the number of instructions.
-    pub fn check(&self) -> Result<usize, String> {
+    pub fn check(&self) -> Result<usize, ScriptError> {
         let code = self.disassemble()?;
         let starts: Vec<usize> = code.iter().map(|i| i.offset).collect();
         for ins in &code {
             for t in &ins.targets {
                 if *t != self.code.len() && starts.binary_search(t).is_err() {
-                    return Err(format!("{} at {:#x} points into an instruction ({t:#x})", ins.name, ins.offset));
+                    return Err(ScriptError::BadTarget { name: ins.name.clone(), at: ins.offset, target: *t });
                 }
             }
         }

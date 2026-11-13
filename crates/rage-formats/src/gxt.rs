@@ -11,20 +11,17 @@
 //! escapes of [`crate::gxt2`].
 
 use crate::gxt2::{escape, unescape};
+use rage_core::bytes::LeRead;
 
-#[derive(Debug)]
-pub struct GxtError(pub String);
-
-impl std::fmt::Display for GxtError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum GxtError {
+    #[error("{0}")]
+    Invalid(String),
 }
 
-impl std::error::Error for GxtError {}
-
 fn err(msg: impl Into<String>) -> GxtError {
-    GxtError(msg.into())
+    GxtError::Invalid(msg.into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,9 +32,7 @@ pub struct Table {
 }
 
 fn u32_at(d: &[u8], o: usize) -> Result<u32, GxtError> {
-    d.get(o..o + 4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-        .ok_or_else(|| err(format!("truncated at {o:#x}")))
+    d.u32_at(o).ok_or_else(|| err(format!("truncated at {o:#x}")))
 }
 
 fn block(d: &[u8], o: usize, magic: &[u8; 4]) -> Result<(usize, usize), GxtError> {

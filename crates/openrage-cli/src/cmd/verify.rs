@@ -281,8 +281,10 @@ pub(crate) fn cmd_verify_scripts(game_dir: &Path, within: &str, keys: Option<Arc
                                 c.3 += s.check().unwrap_or(0);
                                 c.4 += s.code.len();
                             }
-                            None => errors
-                                .push(format!("{p}: no opcode table fits ({})", s.check().err().unwrap_or_default())),
+                            None => errors.push(format!(
+                                "{p}: no opcode table fits ({})",
+                                s.check().err().map(|e| e.to_string()).unwrap_or_default()
+                            )),
                         },
                         Err(e) => errors.push(format!("{p}: {e:#}")),
                     }
@@ -1050,6 +1052,7 @@ pub(crate) fn archive_roots(game_dir: &Path, within: &str, keys: Option<Arc<GtaV
                 })
                 .collect()
         }
+        _ => bail!("{within}: not supported"),
     })
 }
 

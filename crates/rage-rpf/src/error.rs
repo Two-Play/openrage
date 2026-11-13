@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RpfError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

@@ -4,6 +4,12 @@ description = "RSC7 resource pages and pointer-based reading"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["rage", "gta", "rsc7", "modding", "resource"]
+categories = ["parser-implementations", "game-development", "compression"]
 
 [dependencies]
 thiserror.workspace = true

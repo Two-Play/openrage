@@ -357,7 +357,7 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
 /// The stored RDR2 keys, if `openrage rdr2-keys` was run.
 pub(crate) fn cmd_rdr2_keys(game: &Path, dump: Option<&Path>, file: Option<&Path>) -> Result<()> {
     use rage_rpf::rpf8_exe::{keys_in_dump, tables_from_exe};
-    use rage_rpf::rpf8_keys::{Candidates, KeyStore, archives_under, identify, parse_secrets};
+    use rage_rpf::rpf8_keys::{Candidates, archives_under, identify, parse_secrets};
     let started = Instant::now();
     if dump.is_none() && file.is_none() {
         bail!("pass --dump <memory dump of the running game> or --file <key file>");
@@ -390,7 +390,7 @@ pub(crate) fn cmd_rdr2_keys(game: &Path, dump: Option<&Path>, file: Option<&Path
         bail!("no .rpf archives under {}", game.display());
     }
     let found = identify(&candidates, &archives)?;
-    let path = KeyStore::default_path().context("no config folder")?;
+    let path = openrage_app::paths::rdr2_keys().context("no config folder")?;
     found.store.save(&path)?;
     outln!(
         "{} keys recognised; {} of {} encrypted archive tables open; stored in {} ({:.1} s)",
@@ -640,7 +640,7 @@ pub(crate) fn cmd_rdr2_names(game: &Path, import: Option<&Path>) -> Result<()> {
         bail!("no .rpf archives under {}", game.display());
     }
     let wanted = entry_hashes(&files, &keys);
-    let path = NameIndex::default_path(game).context("no cache folder")?;
+    let path = openrage_app::paths::rdr2_names(game).context("no cache folder")?;
     let mut index = NameIndex::load(&path)?.unwrap_or_default();
     match import {
         Some(list) => {

@@ -9,9 +9,13 @@ use std::sync::Arc;
 
 use rage_crypto::GtaVKeys;
 
-use crate::{EntryId, Gta4Archive, Gta4EntryId, Rpf7, Rpf8, RpfError};
+#[cfg(feature = "rdr2")]
+use crate::Rpf8;
+use crate::{EntryId, Gta4Archive, Gta4EntryId, Rpf7, RpfError};
 
-/// What a virtual path points to.
+/// What a virtual path points to. More variants appear with crate features
+/// (`rdr2`), so matches need a fallback arm.
+#[non_exhaustive]
 pub enum Node {
     /// A real directory on disk.
     Dir(PathBuf),
@@ -23,8 +27,10 @@ pub enum Node {
     ArchiveFile(Arc<Rpf7>, EntryId),
     /// A folder inside an RDR2 archive ("" for its top): RPF8 archives have no
     /// directories of their own, folders come from the entries' paths.
+    #[cfg(feature = "rdr2")]
     Rpf8Dir(Arc<Rpf8>, String),
     /// A file inside an RDR2 archive (index into its entries).
+    #[cfg(feature = "rdr2")]
     Rpf8File(Arc<Rpf8>, usize),
     /// A folder inside a GTA IV archive (`.img`, RPF2/RPF3); the archive root
     /// is [`Gta4Archive::ROOT`].
@@ -58,6 +64,7 @@ pub fn resolve(root: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
             return resolve_gta4(Arc::new(Gta4Archive::open_default(&next)?), &rest, vpath);
         }
         if is_rpf(&comp) {
+            #[cfg(feature = "rdr2")]
             if Rpf8::file_is_rpf8(&next) {
                 let rest: Vec<String> = components.collect();
                 return resolve_rpf8(Arc::new(Rpf8::open_default(&next)?), &rest, vpath);
@@ -91,6 +98,7 @@ pub fn resolve(root: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
     Ok(Node::ArchiveDir(archive, cur))
 }
 
+#[cfg(feature = "rdr2")]
 /// Walks the rest of a path inside an RDR2 archive: folders come from entry
 /// paths, nested archives are entered.
 fn resolve_rpf8(mut archive: Arc<Rpf8>, rest: &[String], vpath: &str) -> Result<Node, RpfError> {

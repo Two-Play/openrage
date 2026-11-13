@@ -3,6 +3,8 @@
 //! Formats are expressed as DXGI format codes. GTA V Enhanced stores them
 //! directly; the Direct3D 9 codes of GTA V Legacy are mapped on load.
 
+use rage_core::bytes::f16_to_f32 as half;
+
 /// A DXGI pixel format code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Format(pub u32);
@@ -365,18 +367,6 @@ impl Texture {
 /// A value clamped to 0..1 as an 8-bit channel.
 fn unit(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
-}
-
-/// IEEE half-precision float.
-fn half(h: u16) -> f32 {
-    let sign = if h >> 15 == 1 { -1.0 } else { 1.0 };
-    let exp = (h >> 10) & 0x1F;
-    let man = (h & 0x3FF) as f32;
-    sign * match exp {
-        0 => man * 2f32.powi(-24),
-        31 => f32::INFINITY,
-        e => (1.0 + man / 1024.0) * 2f32.powi(e as i32 - 15),
-    }
 }
 
 /// An unsigned small float (R11G11B10): 5-bit exponent, `man_bits` mantissa bits.

@@ -4,6 +4,24 @@
 
 use crate::texture::{Dimension, Format, Texture};
 
+/// Why a DDS file could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum DdsError {
+    #[error("not a DDS file")]
+    NotDds,
+    #[error("truncated DX10 header")]
+    TruncatedHeader,
+    #[error("unsupported DDS FourCC {0:?}")]
+    UnsupportedFourCc(String),
+    #[error("unsupported DDS pixel format (flags {flags:#x}, {bits} bits)")]
+    UnsupportedPixelFormat { flags: u32, bits: u32 },
+    #[error("unsupported format {0}")]
+    UnsupportedFormat(String),
+    #[error("DDS data too short: {have} bytes, {need} expected")]
+    TooShort { have: usize, need: usize },
+}
+
 const DDSD_CAPS: u32 = 0x1;
 const DDSD_HEIGHT: u32 = 0x2;
 const DDSD_WIDTH: u32 = 0x4;
@@ -109,9 +127,9 @@ pub fn to_dds(tex: &Texture) -> Vec<u8> {
 }
 
 /// Reads a DDS file into a texture named `name`.
-pub fn from_dds(name: &str, file: &[u8]) -> Result<Texture, String> {
+pub fn from_dds(name: &str, file: &[u8]) -> Result<Texture, DdsError> {
     if file.len() < 128 || &file[0..4] != b"DDS " {
-        return Err("not a DDS file".into());
+        return Err(DdsError::NotDds);
     }
     let h = |i: usize| u32::from_le_bytes(file[4 + i * 4..8 + i * 4].try_into().unwrap());
     let (height, width) = (h(2), h(3));
@@ -137,7 +155,7 @@ pub fn from_dds(name: &str, file: &[u8]) -> Result<Texture, String> {
             b"ATI2" | b"BC5U" => Format::BC5_UNORM,
             b"DX10" => {
                 if file.len() < 148 {
-                    return Err("truncated DX10 header".into());
+                    return Err(DdsError::TruncatedHeader);
                 }
                 let x = |i: usize| u32::from_le_bytes(file[128 + i * 4..132 + i * 4].try_into().unwrap());
                 data_start = 148;
@@ -146,7 +164,7 @@ pub fn from_dds(name: &str, file: &[u8]) -> Result<Texture, String> {
                 }
                 Format(x(0))
             }
-            other => return Err(format!("unsupported DDS FourCC {:?}", String::from_utf8_lossy(other))),
+            other => return Err(DdsError::UnsupportedFourCc(String::from_utf8_lossy(other).into_owned())),
         }
     } else if pf_flags & DDPF_RGB != 0 && bits == 32 && masks[0] == 0x00FF_0000 {
         if pf_flags & DDPF_ALPHAPIXELS != 0 { Format::B8G8R8A8_UNORM } else { Format::B8G8R8X8_UNORM }
@@ -161,7 +179,7 @@ pub fn from_dds(name: &str, file: &[u8]) -> Result<Texture, String> {
     } else if pf_flags & DDPF_LUMINANCE != 0 && bits == 8 {
         Format::R8_UNORM
     } else {
-        return Err(format!("unsupported DDS pixel format (flags {pf_flags:#x}, {bits} bits)"));
+        return Err(DdsError::UnsupportedPixelFormat { flags: pf_flags, bits });
     };
     let depth = match dimension {
         Dimension::Cube => 6,
@@ -170,10 +188,10 @@ pub fn from_dds(name: &str, file: &[u8]) -> Result<Texture, String> {
     };
     let tex =
         Texture { name: name.to_owned(), width, height, depth, levels, format, dimension, usage: 0, data: Vec::new() };
-    let need = tex.expected_size().ok_or_else(|| format!("unsupported format {}", format.name()))?;
+    let need = tex.expected_size().ok_or_else(|| DdsError::UnsupportedFormat(format.name().to_string()))?;
     let body = file.get(data_start..).unwrap_or(&[]);
     if body.len() < need {
-        return Err(format!("DDS data too short: {} bytes, {need} expected", body.len()));
+        return Err(DdsError::TooShort { have: body.len(), need });
     }
     Ok(Texture { data: body[..need].to_vec(), ..tex })
 }

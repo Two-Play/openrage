@@ -4532,9 +4532,7 @@ name = "rage-crypto"
 version = "0.2.0"
 dependencies = [
  "aes",
- "dirs",
  "flate2",
- "rage-core",
  "rayon",
  "sha1",
  "thiserror 2.0.21",
@@ -4587,7 +4585,6 @@ dependencies = [
 name = "rage-rpf"
 version = "0.2.0"
 dependencies = [
- "dirs",
  "flate2",
  "memchr",
  "oozextract",

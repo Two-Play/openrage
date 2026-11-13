@@ -58,7 +58,7 @@ pub fn derive_key(game_dir: &Path) -> Result<(Arc<Gta4Key>, Gta4Setup)> {
         Some(p) => Some(Gta4Archive::open(&p, Some(key.clone()))?.len() - 1),
         None => None,
     };
-    let cache_path = Gta4Key::default_cache_path()?;
+    let cache_path = crate::paths::gta4_keys().context("no per-user config directory available")?;
     key.save(&cache_path)?;
     Ok((key, Gta4Setup { exe, scan_seconds, verified_entries, cache_path }))
 }
@@ -66,7 +66,7 @@ pub fn derive_key(game_dir: &Path) -> Result<(Arc<Gta4Key>, Gta4Setup)> {
 /// Makes the key available to archives opened through the virtual file
 /// system: from the cache, or found in `GTAIV.exe` and cached the first time.
 pub fn register(game_dir: &Path) -> Result<Arc<Gta4Key>> {
-    let cached = Gta4Key::default_cache_path().ok().filter(|p| p.is_file()).and_then(|p| Gta4Key::load(&p).ok());
+    let cached = crate::paths::gta4_keys().filter(|p| p.is_file()).and_then(|p| Gta4Key::load(&p).ok());
     let key = match cached {
         Some(k) => Arc::new(k),
         None => derive_key(game_dir)?.0,

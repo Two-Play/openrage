@@ -38,9 +38,7 @@ pub struct TextureIndex {
 impl TextureIndex {
     /// Where the index for a game folder is cached.
     pub fn default_path(game: &Path) -> Option<PathBuf> {
-        let canonical = game.canonicalize().unwrap_or_else(|_| game.to_path_buf());
-        let id = rage_core::hash::jenkins_bytes(canonical.to_string_lossy().as_bytes());
-        Some(dirs::cache_dir()?.join("openrage").join(format!("rdr2-textures-{id:08x}.tsv")))
+        crate::paths::game_cache(game, "rdr2-textures", "tsv")
     }
 
     /// Text form: `D\t<archive>\t<hash>/<hash>…` lines for dictionaries, then
@@ -242,7 +240,7 @@ pub fn game_folder(path: &Path) -> Option<PathBuf> {
 pub fn load_keys() -> anyhow::Result<Option<Arc<Rdr2Keys>>> {
     use anyhow::Context;
     use rage_rpf::rpf8_keys::KeyStore;
-    let Some(path) = KeyStore::default_path() else { return Ok(None) };
+    let Some(path) = crate::paths::rdr2_keys() else { return Ok(None) };
     let Some(store) = KeyStore::load(&path)? else { return Ok(None) };
     let keys =
         store.to_keys().with_context(|| format!("{} is damaged; run `openrage rdr2-keys` again", path.display()))?;
@@ -252,7 +250,7 @@ pub fn load_keys() -> anyhow::Result<Option<Arc<Rdr2Keys>>> {
 /// The cached file names of the game's archives, if they were collected.
 pub fn load_names(game_dir: &Path) -> Option<Arc<rage_rpf::rpf8_names::NameIndex>> {
     use rage_rpf::rpf8_names::NameIndex;
-    NameIndex::default_path(game_dir).and_then(|p| NameIndex::load(&p).ok().flatten()).map(Arc::new)
+    crate::paths::rdr2_names(game_dir).and_then(|p| NameIndex::load(&p).ok().flatten()).map(Arc::new)
 }
 
 /// Prepares archives of a game folder to be opened through the virtual file

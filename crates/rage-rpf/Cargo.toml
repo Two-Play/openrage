@@ -1,19 +1,30 @@
 [package]
 name = "rage-rpf"
-description = "Reader for RAGE archives (RPF7 GTA V, RPF8 RDR2, IMG3/RPF2/RPF3 GTA IV)"
+description = "Reader and writer for RAGE archives (RPF7 GTA V, IMG3/RPF2/RPF3 GTA IV; RPF8 RDR2 with the `rdr2` feature)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["rage", "gta", "rdr2", "rpf", "archive"]
+categories = ["parser-implementations", "game-development", "filesystem"]
 
 [dependencies]
 rage-core.workspace = true
 rage-crypto.workspace = true
 rage-resource.workspace = true
-rage-tfit2.workspace = true
-dirs.workspace = true
+rage-tfit2 = { workspace = true, optional = true }
 flate2.workspace = true
 rayon.workspace = true
 sha2.workspace = true
 memchr.workspace = true
 oozextract.workspace = true
 thiserror.workspace = true
+
+[features]
+default = []
+# RDR2 archives (RPF8). Pulls in `rage-tfit2`, which is AGPL-3.0-only: a
+# program built with this feature is covered by the AGPL as well.
+rdr2 = ["dep:rage-tfit2"]

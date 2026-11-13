@@ -4,7 +4,7 @@
 //! and cached in the user's config directory, like the GTA V keys.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use aes::Aes256;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
@@ -76,11 +76,6 @@ impl Gta4Key {
                 cipher.encrypt_block(b);
             }
         }
-    }
-
-    /// Default cache location: `<config dir>/openrage/gta4.keys`.
-    pub fn default_cache_path() -> Result<PathBuf, KeyCacheError> {
-        Ok(dirs::config_dir().ok_or(KeyCacheError::NoConfigDir)?.join("openrage").join("gta4.keys"))
     }
 
     pub fn save(&self, path: &Path) -> Result<(), KeyCacheError> {

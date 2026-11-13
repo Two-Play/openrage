@@ -18,16 +18,12 @@
 //! original records for lines that are unchanged, so leftover bytes after a
 //! NUL survive as well.
 
-#[derive(Debug)]
-pub struct WplError(pub String);
-
-impl std::fmt::Display for WplError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WplError {
+    #[error("{0}")]
+    Invalid(String),
 }
-
-impl std::error::Error for WplError {}
 
 /// Header slot, section name and record size of every section in file order.
 const SECTIONS: [(usize, &str, usize); 8] = [
@@ -66,8 +62,9 @@ pub struct Wpl {
     pub trailing: Vec<u8>,
 }
 
+/// The u32 at `o`; 0 past the end (record sizes are checked before reading).
 fn word(d: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes(d[o..o + 4].try_into().unwrap())
+    rage_core::bytes::LeRead::u32_at(d, o).unwrap_or(0)
 }
 
 fn float(d: &[u8], o: usize) -> f32 {
@@ -81,12 +78,12 @@ pub fn is_wpl(data: &[u8]) -> bool {
 
 pub fn parse(d: &[u8]) -> Result<Wpl, WplError> {
     if !is_wpl(d) {
-        return Err(WplError("not a GTA IV placement file (version 3)".into()));
+        return Err(WplError::Invalid("not a GTA IV placement file (version 3)".into()));
     }
     let counts: Vec<usize> = (0..17).map(|i| word(d, i * 4) as usize).collect();
     for (slot, &count) in counts.iter().enumerate().skip(1) {
         if count > 0 && !SECTIONS.iter().any(|(s, _, _)| *s == slot) {
-            return Err(WplError(format!("unknown section {slot} with {count} records")));
+            return Err(WplError::Invalid(format!("unknown section {slot} with {count} records")));
         }
     }
     let mut wpl = Wpl { version: counts[0] as u32, instances: Vec::new(), other: Vec::new(), trailing: Vec::new() };
@@ -95,7 +92,7 @@ pub fn parse(d: &[u8]) -> Result<Wpl, WplError> {
         let count = counts[slot];
         let end = count.checked_mul(size).and_then(|n| n.checked_add(o)).filter(|&e| e <= d.len());
         let Some(end) = end else {
-            return Err(WplError(format!("{name}: {count} records run past the end")));
+            return Err(WplError::Invalid(format!("{name}: {count} records run past the end")));
         };
         if slot == 1 {
             for r in (o..end).step_by(size) {
@@ -370,7 +367,7 @@ pub fn from_text(text: &str, hash: impl Fn(&str) -> u32, original: Option<&Wpl>)
     };
     let mut section: Option<(&'static str, usize)> = None;
     for (n, raw) in text.lines().enumerate() {
-        let err = |m: String| WplError(format!("line {}: {m}", n + 1));
+        let err = |m: String| WplError::Invalid(format!("line {}: {m}", n + 1));
         let line = raw.trim();
         if let Some(v) = line.strip_prefix("# GTA IV placement file, version ") {
             wpl.version = v.trim().parse().map_err(|_| err(format!("{v:?} is not a version number")))?;
@@ -431,7 +428,7 @@ pub fn from_text(text: &str, hash: impl Fn(&str) -> u32, original: Option<&Wpl>)
         wpl.other.last_mut().expect("section pushed").1.push(rec);
     }
     if let Some((name, _)) = section {
-        return Err(WplError(format!("section {name} has no end")));
+        return Err(WplError::Invalid(format!("section {name} has no end")));
     }
     // Sections in file order.
     wpl.other.sort_by_key(|(name, _)| SECTIONS.iter().position(|(_, n, _)| n == name));
@@ -505,6 +502,6 @@ mod tests {
         assert_eq!(back.other[0].1[0], blok);
         // Errors name the line.
         let bad = text.replace("200.5", "x").replace("123.456", "abc");
-        assert!(from_text(&bad, hash, None).unwrap_err().0.starts_with("line 6:"));
+        assert!(from_text(&bad, hash, None).unwrap_err().to_string().starts_with("line 6:"));
     }
 }

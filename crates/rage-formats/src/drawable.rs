@@ -25,6 +25,7 @@
 //! has its bone tag at `0x12` and its drawable at `0xA0`. Vehicle wheels are
 //! such children.
 
+use rage_core::bytes::LeRead;
 use rage_resource::{Resource, ResourceError};
 
 use crate::math::{self, Mat4};
@@ -260,25 +261,9 @@ pub(crate) fn bad(msg: impl Into<String>) -> ResourceError {
     ResourceError::Format(msg.into())
 }
 
-fn f16(bits: u16) -> f32 {
-    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((bits >> 10) & 0x1F) as i32;
-    let frac = (bits & 0x3FF) as f32;
-    match exp {
-        0 => sign * frac * 2f32.powi(-24),
-        31 => {
-            if frac == 0.0 {
-                sign * f32::INFINITY
-            } else {
-                f32::NAN
-            }
-        }
-        _ => sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
-    }
-}
-
+/// The float at `o`; 0 past the end (callers pass slices of the right size).
 fn f32_at(d: &[u8], o: usize) -> f32 {
-    f32::from_le_bytes(d[o..o + 4].try_into().unwrap())
+    d.f32_at(o).unwrap_or(0.0)
 }
 
 pub(crate) fn vec3(res: &Resource, ptr: u64) -> Result<[f32; 3], ResourceError> {
@@ -305,8 +290,13 @@ pub(crate) enum Encoding {
 }
 
 impl Encoding {
+    /// Decodes one value; bytes missing at the end of `d` read as zero.
     pub(crate) fn decode(self, d: &[u8]) -> [f32; 4] {
-        let h = |i: usize| f16(u16::from_le_bytes([d[i], d[i + 1]]));
+        let mut padded = [0u8; 16];
+        let n = d.len().min(16);
+        padded[..n].copy_from_slice(&d[..n]);
+        let d = &padded;
+        let h = |i: usize| d.f16_at(i).unwrap_or(0.0);
         match self {
             Encoding::Float2 => [f32_at(d, 0), f32_at(d, 4), 0.0, 0.0],
             Encoding::Float3 => [f32_at(d, 0), f32_at(d, 4), f32_at(d, 8), 0.0],
@@ -317,7 +307,7 @@ impl Encoding {
             Encoding::Uint8x4 => [d[0], d[1], d[2], d[3]].map(|v| v as f32),
             Encoding::Snorm8x4 => [d[0], d[1], d[2], d[3]].map(|v| (v as i8 as f32 / 127.0).max(-1.0)),
             Encoding::R10G10B10A2 => {
-                let v = u32::from_le_bytes(d[0..4].try_into().unwrap());
+                let v = d.u32_at(0).unwrap_or(0);
                 let s10 = |x: u32| {
                     let x = (x & 0x3FF) as i32;
                     let x = if x >= 512 { x - 1024 } else { x };
@@ -326,7 +316,7 @@ impl Encoding {
                 [s10(v), s10(v >> 10), s10(v >> 20), ((v >> 30) & 3) as f32 / 3.0]
             }
             Encoding::R10G10B10A2Unorm => {
-                let v = u32::from_le_bytes(d[0..4].try_into().unwrap());
+                let v = d.u32_at(0).unwrap_or(0);
                 let u10 = |x: u32| (x & 0x3FF) as f32 / 1023.0 * 2.0 - 1.0;
                 [u10(v), u10(v >> 10), u10(v >> 20), ((v >> 30) & 3) as f32 / 3.0]
             }
@@ -966,10 +956,13 @@ mod tests {
 
     #[test]
     fn half_floats() {
-        assert_eq!(f16(0x3C00), 1.0);
-        assert_eq!(f16(0xC000), -2.0);
-        assert_eq!(f16(0x0000), 0.0);
-        assert!((f16(0x3555) - 0.333_25).abs() < 1e-4);
+        let h = |bits: u16| Encoding::Half2.decode(&bits.to_le_bytes())[0];
+        assert_eq!(h(0x3C00), 1.0);
+        assert_eq!(h(0xC000), -2.0);
+        assert_eq!(h(0x0000), 0.0);
+        assert!((h(0x3555) - 0.333_25).abs() < 1e-4);
+        // A short slice must not panic.
+        assert_eq!(Encoding::Float4.decode(&[0, 0, 0x80, 0x3F]), [1.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]

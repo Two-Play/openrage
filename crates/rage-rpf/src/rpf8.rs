@@ -244,8 +244,11 @@ pub fn plausible_table(table: &[u8], archive_size: u64) -> bool {
 }
 
 /// Keys and names used when archives are opened without passing them, e.g.
-/// through the virtual file system. Set once at start-up by the application.
-/// The registered keys and names.
+/// through the virtual file system.
+///
+/// This is process-wide state: one set of keys and names for every archive
+/// the process opens with [`Rpf8::open_default`]. Set it once at start-up;
+/// code that knows its keys should call [`Rpf8::open_with_keys`] instead.
 type Defaults = (Option<Arc<Rdr2Keys>>, Option<Arc<crate::rpf8_names::NameIndex>>);
 
 fn defaults() -> &'static std::sync::RwLock<Defaults> {
@@ -253,7 +256,8 @@ fn defaults() -> &'static std::sync::RwLock<Defaults> {
     DEFAULTS.get_or_init(Default::default)
 }
 
-/// Registers the keys and names [`Rpf8::open_default`] uses.
+/// Registers the keys and names [`Rpf8::open_default`] uses, for the whole
+/// process. Set it once at start-up.
 pub fn set_defaults(keys: Option<Arc<Rdr2Keys>>, names: Option<Arc<crate::rpf8_names::NameIndex>>) {
     if let Ok(mut d) = defaults().write() {
         *d = (keys, names);
