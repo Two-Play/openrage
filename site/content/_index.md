@@ -24,7 +24,7 @@ features_intro = "What OpenRAGE can open, show and change today."
 screenshots_title = "Screenshots"
 screenshots_intro = "Click a picture to enlarge it, arrow keys browse. The screenshots show files from the author's own copy of the game."
 games_title = "Supported games"
-games_intro = "GTA V comes first and Red Dead Redemption 2 can be explored. **GTA VI is next:** support follows as fast as possible once it comes to PC. GTA IV's archives and textures can be browsed; its other formats follow."
+games_intro = "GTA V comes first and Red Dead Redemption 2 can be explored. **GTA VI is next:** support follows as fast as possible once it comes to PC. GTA IV's archives, textures and models can be browsed; its other formats follow."
 details_summary = "Checked against the whole game"
 download_intro = "Unpack the archive and run `openrage-gui` (or `openrage` for the command line). On first start the GUI detects your game and sets up the keys."
 why_title = "Why switch from OpenIV"
@@ -177,7 +177,7 @@ variant = "Complete Edition"
 archives_status = "ok"
 archives = "IMG3, RPF2 and RPF3 read: decryption with the key from your own GTAIV.exe, browsing and extracting in the GUI"
 formats_status = "partial"
-formats = "textures (viewer, DDS/PNG export, read-only); models, text and maps next"
+formats = "textures and models (viewer, DDS/PNG and glTF export, read-only); text and maps next"
 
 # ------------------------------------------------------------- Why OpenRAGE
 
@@ -245,7 +245,7 @@ edge = "openrage"
 [[extra.compare]]
 feature = "Other games"
 openiv = "GTA IV, EFLC, Max Payne 3"
-openrage = "RDR2 archives, textures, models, texts, metadata, audio and animations; GTA VI as soon as it is on PC; GTA IV planned"
+openrage = "RDR2 archives, textures, models, texts, metadata, audio and animations; GTA IV archives, textures and models; GTA VI as soon as it is on PC"
 edge = "openiv"
 
 [[extra.compare]]

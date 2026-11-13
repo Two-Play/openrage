@@ -197,7 +197,10 @@ fn ped_component_names() -> &'static HashMap<u32, String> {
     static NAMES: OnceLock<HashMap<u32, String>> = OnceLock::new();
     NAMES.get_or_init(|| {
         let mut map = HashMap::new();
-        for comp in ["head", "berd", "hair", "uppr", "lowr", "hand", "feet", "teef", "accs", "task", "decl", "jbib"] {
+        // `suse` (special) is a GTA IV component.
+        for comp in
+            ["head", "berd", "hair", "uppr", "lowr", "hand", "feet", "teef", "accs", "task", "decl", "jbib", "suse"]
+        {
             for n in 0..100 {
                 for suffix in ["u", "r", "m"] {
                     let name = format!("{comp}_{n:03}_{suffix}");
@@ -357,6 +360,9 @@ pub fn is_model(name: &str) -> bool {
         || n.ends_with(".ydd")
         || n.ends_with(".ypt")
         || n.ends_with(".ybn")
+        || n.ends_with(".wdr")
+        || n.ends_with(".wdd")
+        || n.ends_with(".wft")
         || rage_formats::paths::is_path_file(&n)
 }
 
@@ -474,6 +480,9 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
     let (node, _) = rage_mods::resolve(game_dir, vpath, keys.clone())?;
     if let Node::Rpf8File(rpf, i) = node {
         return load_rdr2(&rpf, i);
+    }
+    if let Node::Gta4File(archive, id) = node {
+        return load_gta4(&archive, id);
     }
     let Node::ArchiveFile(rpf, id) = node else { bail!("{vpath} is not a file inside an archive") };
     let name = rpf.entry(id).name.clone();
@@ -1022,6 +1031,87 @@ pub fn scene_to_glb(name: &str, items: &[(&LoadedModel, &Look, &[Mat4])], center
 /// Loads a Red Dead Redemption 2 model (`.ydr`, `.ydd`). Map objects take
 /// their textures from shared dictionaries in the same archive folder, so
 /// those are loaded too (the largest few by name match first).
+/// A GTA IV model (`.wdr`, `.wdd`, `.wft`), textured from its own
+/// dictionary, the one named after it and the ones the `.ide` files give it.
+fn load_gta4(archive: &Arc<rage_rpf::Gta4Archive>, id: rage_rpf::Gta4EntryId) -> Result<LoadedModel> {
+    use rage_formats::wdr;
+    let name = archive.entry(id).name.clone();
+    let lower = name.to_ascii_lowercase();
+    let stem = name.split('.').next().unwrap_or(&name).to_owned();
+    let res = archive.read_resource(id)?;
+    let (mut drawables, parts) = if lower.ends_with(".wdr") {
+        let part = Part {
+            name: stem.clone(),
+            group: String::new(),
+            drawable: 0,
+            transform: math::IDENTITY,
+            visible: true,
+            bone: None,
+        };
+        (vec![(stem.clone(), wdr::parse_wdr(&res)?)], vec![part])
+    } else if lower.ends_with(".wft") {
+        fragment_parts(wdr::parse_wft(&res)?, &stem)
+    } else if lower.ends_with(".wdd") {
+        let drawables: Vec<(String, Drawable)> = wdr::parse_wdd(&res)?
+            .into_iter()
+            .enumerate()
+            .map(|(i, (hash, d))| {
+                let name = match ped_component_names().get(&hash) {
+                    Some(n) => n.clone(),
+                    None if hash != 0 => format!("{stem}#{hash:08x}"),
+                    None => format!("{stem}#{i}"),
+                };
+                (name, d)
+            })
+            .collect();
+        let names: Vec<String> = drawables.iter().map(|(n, _)| n.clone()).collect();
+        let layout =
+            if is_ped_dictionary(&names) { vec![math::IDENTITY; drawables.len()] } else { grid_layout(&drawables) };
+        let parts = default_visibility(&names)
+            .into_iter()
+            .enumerate()
+            .map(|(i, visible)| Part {
+                name: names[i].clone(),
+                group: ped_group(&names[i]),
+                drawable: i,
+                transform: layout[i],
+                visible,
+                bone: None,
+            })
+            .collect();
+        (drawables, parts)
+    } else {
+        bail!("{name} is not a GTA IV model (.wdr, .wdd, .wft)");
+    };
+    crate::progress::set("Loading textures", 0, 0);
+    let used: Vec<String> =
+        drawables.iter().flat_map(|(_, d)| d.shaders.iter().flat_map(|s| s.textures.iter().cloned())).collect();
+    let vehicle = lower.ends_with(".wft") && archive.display_name().eq_ignore_ascii_case("vehicles.img");
+    let external = crate::gta4::model_textures(archive, &stem, &used, vehicle);
+    // Peds: the skeleton of the fragment next to the dictionary.
+    let skeleton = drawables.iter().find_map(|(_, d)| d.skeleton.clone()).or_else(|| {
+        let tid = archive.find_child(rage_rpf::Gta4Archive::ROOT, &format!("{stem}.wft"))?;
+        wdr::parse_wft(&archive.read_resource(tid).ok()?).ok()?.drawable.skeleton
+    });
+    if let Some(sk) = &skeleton
+        && lower.ends_with(".wdd")
+    {
+        fit_to_skeleton(&mut drawables, sk);
+    }
+    let mut model = LoadedModel {
+        drawables,
+        parts,
+        external,
+        materials: Vec::new(),
+        shader_material: Vec::new(),
+        skeleton,
+        expressions: Vec::new(),
+        ped: None,
+    };
+    model.collect_materials();
+    Ok(model)
+}
+
 fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
     let entries = rpf.entries().context("archive table not readable")?;
     let entry = &entries[i];

@@ -151,8 +151,17 @@ game (46,889 resources inflated, no errors).
 **Textures** (`.wtd`) open like GTA V's texture dictionaries, read-only: preview, viewer and export as DDS or PNG
 (`openrage textures <path> --export <dir> [--png]`). GTA IV stores DXT1/3/5 and uncompressed 32-bit textures; names
 drop the `pack:/` prefix and `.dds` suffix the game keeps. `openrage verify --textures` reads every dictionary of the game
-(6,400 dictionaries, 70,845 textures, all decoded). Textures embedded in models come with the models; models, text and
-maps follow in the next steps. The search index is GTA V only for now.
+(6,400 dictionaries, 70,845 textures, all decoded).
+
+**Models** — drawables (`.wdr`), drawable dictionaries (`.wdd`) and fragments (`.wft`) — open in the preview and the 3D
+viewer like GTA V's and export as glTF (`openrage model <path> [--export out.glb] [--render out.png]`). Vehicles show
+their wheels on every wheel bone; peds (`componentpeds.img`) are put together from the first variant of each component
+(head, upper body, legs, …) on their skeleton, the others can be switched on under *Parts*. Textures come from the
+dictionary embedded in the model, the `.wtd` named after it, the dictionary the game's `.ide` files give the model (and
+its parent dictionaries from `txdp` sections) and, for vehicles, `vehshare.wtd`; OpenRAGE indexes the `.ide` files and
+the `.wtd` files of all archives once per session (a second or two), preferring an episode's own files for TLAD and TBoGT
+models. `openrage verify --models` reads every model of the game (26,711 files, 46,658 drawables, 61 million triangles,
+no errors). Collision files, animations, text and maps follow in the next steps. The search index is GTA V only for now.
 
 ## Red Dead Redemption 2
 

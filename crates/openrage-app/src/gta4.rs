@@ -1,9 +1,10 @@
 //! GTA IV: key setup from the user's own `GTAIV.exe`, game detection and extraction.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -150,9 +151,200 @@ pub fn resource_type_name(t: u32) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Textures for models
+
+/// Where the game's texture dictionaries are and which dictionary a model uses.
+#[derive(Default)]
+pub struct TextureIndex {
+    /// `.wtd` name (lower case, without extension) → archives holding one.
+    dictionaries: HashMap<String, Vec<PathBuf>>,
+    /// Model name → texture dictionary name (from the `.ide` files), lower case.
+    model_txd: HashMap<String, String>,
+    /// Texture dictionary → its parent (`txdp` sections), lower case.
+    parent: HashMap<String, String>,
+}
+
+impl TextureIndex {
+    /// Scans a GTA IV game folder: every `.ide` file and the tables of every `.img`.
+    pub fn build(game: &Path) -> Self {
+        let mut index = TextureIndex::default();
+        let mut files = Vec::new();
+        collect_files(game, &mut files);
+        files.sort();
+        for path in files {
+            let ext = path.extension().map(|e| e.to_ascii_lowercase()).unwrap_or_default();
+            if ext == "ide" {
+                if let Ok(text) = fs::read(&path) {
+                    index.add_ide(&String::from_utf8_lossy(&text));
+                }
+            } else if ext == "img"
+                && Gta4Archive::file_is_gta4(&path)
+                && let Ok(a) = Gta4Archive::open_default(&path)
+            {
+                for id in a.children(Gta4Archive::ROOT) {
+                    let name = a.entry(id).name.to_ascii_lowercase();
+                    if let Some(stem) = name.strip_suffix(".wtd") {
+                        index.dictionaries.entry(stem.to_owned()).or_default().push(path.clone());
+                    }
+                }
+            }
+        }
+        index
+    }
+
+    /// Reads the model → dictionary lines of an `.ide` file.
+    pub fn add_ide(&mut self, text: &str) {
+        let mut section = String::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if !line.contains(',') {
+                section = if line.eq_ignore_ascii_case("end") { String::new() } else { line.to_ascii_lowercase() };
+                continue;
+            }
+            let mut fields = line.split(',').map(|f| f.trim().to_ascii_lowercase());
+            let (Some(a), Some(b)) = (fields.next(), fields.next()) else { continue };
+            if a.is_empty() || b.is_empty() || b == "null" {
+                continue;
+            }
+            match section.as_str() {
+                "objs" | "tobj" | "anim" | "cars" => {
+                    self.model_txd.entry(a).or_insert(b);
+                }
+                "txdp" => {
+                    self.parent.entry(a).or_insert(b);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The dictionaries a model's textures may come from, most specific first:
+    /// its own dictionary from the `.ide` files and that one's parents.
+    pub fn dictionaries_for(&self, model: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut next = self.model_txd.get(&model.to_ascii_lowercase()).cloned();
+        while let Some(name) = next.take() {
+            if out.contains(&name) || out.len() > 16 {
+                break;
+            }
+            next = self.parent.get(&name).cloned();
+            out.push(name);
+        }
+        out
+    }
+
+    /// Archives that hold `<name>.wtd`, those below `prefer` first (an
+    /// episode's own files before the base game's).
+    pub fn archives_of(&self, name: &str, prefer: &Path) -> Vec<PathBuf> {
+        let mut found = self.dictionaries.get(&name.to_ascii_lowercase()).cloned().unwrap_or_default();
+        found.sort_by_key(|p| !p.starts_with(prefer));
+        found
+    }
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_files(&p, out);
+        } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("ide") || e.eq_ignore_ascii_case("img")) {
+            out.push(p);
+        }
+    }
+}
+
+/// The texture index of a game folder, built once.
+pub fn texture_index(game: &Path) -> Arc<TextureIndex> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<TextureIndex>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(i) = cache.lock().ok().and_then(|c| c.get(game).cloned()) {
+        return i;
+    }
+    let index = Arc::new(TextureIndex::build(game));
+    if let Ok(mut c) = cache.lock() {
+        c.insert(game.to_owned(), index.clone());
+    }
+    index
+}
+
+/// The GTA IV game folder an archive belongs to (the folder holding `GTAIV.exe`).
+pub fn game_folder(archive: &Path) -> Option<PathBuf> {
+    archive.ancestors().skip(1).find(|d| is_gta4_dir(d)).map(Path::to_owned)
+}
+
+/// Reads `<name>.wtd` from one of the archives the index lists.
+fn load_dictionary(index: &TextureIndex, name: &str, prefer: &Path) -> Option<rage_formats::ytd::TextureDictionary> {
+    for path in index.archives_of(name, prefer) {
+        let Ok(a) = Gta4Archive::open_default(&path) else { continue };
+        let Some(id) = a.find_child(Gta4Archive::ROOT, &format!("{name}.wtd")) else { continue };
+        if let Some(dict) = a.read_resource(id).ok().and_then(|r| rage_formats::ytd::parse_gta4(&r).ok()) {
+            return Some(dict);
+        }
+    }
+    None
+}
+
+/// Texture dictionaries for a model of `archive` named `stem`: the one named
+/// after the model in the same archive, the ones the `.ide` files give it
+/// (with their parents), and for vehicles the shared `vehshare`. Dictionaries
+/// none of whose textures the model uses are left out.
+pub fn model_textures(
+    archive: &Gta4Archive,
+    stem: &str,
+    used: &[String],
+    vehicle: bool,
+) -> Vec<(String, rage_formats::ytd::TextureDictionary)> {
+    let mut out = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let wanted = |d: &rage_formats::ytd::TextureDictionary| {
+        used.is_empty() || d.textures.iter().any(|t| used.iter().any(|u| u.eq_ignore_ascii_case(&t.name)))
+    };
+    if let Some(id) = archive.find_child(Gta4Archive::ROOT, &format!("{stem}.wtd"))
+        && let Some(dict) = archive.read_resource(id).ok().and_then(|r| rage_formats::ytd::parse_gta4(&r).ok())
+    {
+        names.push(stem.to_ascii_lowercase());
+        out.push((format!("{stem}.wtd"), dict));
+    }
+    let Some(game) = game_folder(archive.path()) else { return out };
+    let index = texture_index(&game);
+    let prefer = archive.path().parent().unwrap_or(&game).to_owned();
+    // Episodes keep their own files in TLAD/ and TBoGT/: prefer those.
+    let prefer = prefer.ancestors().find(|p| p.parent() == Some(game.as_path())).map(Path::to_owned).unwrap_or(prefer);
+    let mut candidates = index.dictionaries_for(stem);
+    if vehicle {
+        candidates.push("vehshare".into());
+    }
+    for name in candidates {
+        if names.contains(&name) || out.len() >= 8 {
+            continue;
+        }
+        names.push(name.clone());
+        if let Some(dict) = load_dictionary(&index, &name, &prefer).filter(|d| wanted(d)) {
+            out.push((format!("{name}.wtd"), dict));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_model_dictionaries_from_ide_files() {
+        let mut index = TextureIndex::default();
+        index.add_ide(
+            "objs\nNGE_Det_MH1, NGE_MH1, 60, 0\nend\ncars\nadmiral, admiral, car, ADMIRAL\nend\ntxdp\nNGE_MH1, manhat_generic\nend\n",
+        );
+        assert_eq!(index.dictionaries_for("nge_det_mh1"), ["nge_mh1", "manhat_generic"]);
+        assert_eq!(index.dictionaries_for("ADMIRAL"), ["admiral"]);
+        assert!(index.dictionaries_for("unknown").is_empty());
+    }
 
     #[test]
     fn normalizes_the_steam_folder() {

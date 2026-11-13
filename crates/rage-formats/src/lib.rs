@@ -24,6 +24,7 @@ pub mod pso;
 pub mod rbf;
 pub mod shaders;
 pub mod texture;
+pub mod wdr;
 pub mod xml;
 pub mod ybn;
 pub mod ypt;
