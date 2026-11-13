@@ -3,6 +3,7 @@ title = "Writing plugins"
 description = "Extend OpenRAGE with sandboxed WebAssembly plugins: file previews and export actions, written in Rust or any language that builds WebAssembly components."
 
 [extra]
+docs = true
 lead = "Plugins add file previews and actions to OpenRAGE. They run in a sandbox, so users can try them without risk."
 toc = true
 +++

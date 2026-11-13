@@ -9,7 +9,7 @@
 Browse and search every archive, preview textures, models, sounds and animations, read metadata as XML,<br>
 edit game text and install `.oiv` packages — compatible with OpenIV's `mods` folder, with undo.
 
-**[Website](https://two-play.github.io/openrage/)** · **[Download](https://github.com/Two-Play/openrage/releases/latest)** · [Getting started](https://two-play.github.io/openrage/getting-started/) · [User guide](https://two-play.github.io/openrage/guide/) · [Command line](https://two-play.github.io/openrage/cli/)
+**[Website](https://two-play.github.io/openrage/)** · **[Download](https://github.com/Two-Play/openrage/releases/latest)** · [Getting started](https://two-play.github.io/openrage/getting-started/) · [Documentation](https://two-play.github.io/openrage/guide/) · [Command line](https://two-play.github.io/openrage/cli/)
 
 [![Website](https://img.shields.io/badge/website-two--play.github.io%2Fopenrage-c2410c.svg)](https://two-play.github.io/openrage/)
 [![CI](https://github.com/Two-Play/openrage/actions/workflows/ci.yml/badge.svg)](https://github.com/Two-Play/openrage/actions/workflows/ci.yml)
@@ -67,7 +67,7 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 
 ## Installation
 
-Download the [latest release](https://github.com/Two-Play/openrage/releases/latest) for Linux (AppImage or `.tar.gz`) or Windows (`.zip`) and start `openrage-gui`. On first start it finds your game and sets up the keys. Step by step, including RDR2: **[Getting started](https://two-play.github.io/openrage/getting-started/)**.
+Download the [latest release](https://github.com/Two-Play/openrage/releases/latest) for Linux (AppImage or `.tar.gz`) or Windows (`.zip`) and start `openrage-gui`. On first start it finds your game and sets up the keys. Step by step: **[Getting started](https://two-play.github.io/openrage/getting-started/)**.
 
 To build from source (Rust, pinned in `rust-toolchain.toml`; on Linux also the fontconfig, xkbcommon, Wayland and ALSA development packages):
 
@@ -78,11 +78,14 @@ cargo build --release      # target/release/openrage-gui and target/release/open
 
 ## Documentation
 
-- [Getting started](https://two-play.github.io/openrage/getting-started/): download, setup of GTA V and RDR2, building
-- [User guide](https://two-play.github.io/openrage/guide/): everything the GUI can do, format by format
+- [Getting started](https://two-play.github.io/openrage/getting-started/): download, setting up your game, coming from OpenIV
+- [Explorer and search](https://two-play.github.io/openrage/guide/): the window, keyboard, search, settings
+- [Viewing files](https://two-play.github.io/openrage/viewers/): what each format shows and exports
+- [Modding](https://two-play.github.io/openrage/modding/): edit mode, editing archives, undo, `.oiv` packages, the `mods` folder
+- [GTA IV](https://two-play.github.io/openrage/gta-iv/) and [Red Dead Redemption 2](https://two-play.github.io/openrage/rdr2/): setup and what works per game
 - [Command line](https://two-play.github.io/openrage/cli/): every `openrage` command
 - [Writing plugins](https://two-play.github.io/openrage/plugins/): sandboxed WebAssembly plugins, SDK and API
-- [Development](https://two-play.github.io/openrage/development/): build environment, releases, project layout
+- [Development](https://two-play.github.io/openrage/development/): building from source, build environment, releases, project layout
 
 The website lives in [`site/`](site/) and is built from Markdown.
 

@@ -11,8 +11,33 @@
       {%- endif %}
     </header>
 
-    <div class="doc-grid{% if page.extra?.toc and page.toc %} has-toc{% endif %}">
-      {%- if page.extra?.toc and page.toc %}
+    {%- set in_docs = page.extra?.docs or false %}
+    <div class="doc-grid{% if in_docs or (page.extra?.toc and page.toc) %} has-toc{% endif %}">
+      {%- if in_docs %}
+      <details class="docs-nav" data-docs-nav open>
+        <summary>Documentation <span class="muted">· {{ page.title }}</span></summary>
+        <nav aria-label="Documentation">
+          {%- for g in config.extra.docs %}
+          <p class="docs-group">{{ g.title }}</p>
+          <ul>
+            {%- for item in g.pages %}
+            {%- set here = item[0] == page.relative_path %}
+            <li>
+              <a href="{{ get_url(path='@/' ~ item[0]) }}"{% if here %} aria-current="page"{% endif %}>{{ item[1] }}</a>
+              {%- if here and page.toc %}
+              <ol class="docs-toc" aria-label="On this page">
+                {%- for h in page.toc %}
+                <li><a href="#{{ h.id }}">{{ h.title }}</a></li>
+                {%- endfor %}
+              </ol>
+              {%- endif %}
+            </li>
+            {%- endfor %}
+          </ul>
+          {%- endfor %}
+        </nav>
+      </details>
+      {%- elif page.extra?.toc and page.toc %}
       <nav class="toc" aria-label="On this page">
         <strong>On this page</strong>
         <ol>
