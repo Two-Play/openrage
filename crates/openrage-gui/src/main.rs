@@ -4785,7 +4785,7 @@ fn edit_texture(ui: &AppWindow, action: TextureAction) {
             }
         };
         let _ = weak.upgrade_in_event_loop(|ui| {
-            set_busy(&ui, true, "Writing the changed dictionary into the mods folder…".into())
+            set_busy(&ui, true, format!("Writing the changed dictionary into the {} folder…", write_folder()))
         });
         let started = Instant::now();
         let result = openrage_app::textures::edit_textures(&game_dir, keys, &ytd, &[edit]);

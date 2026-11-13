@@ -26,7 +26,7 @@ openrage ls pc/models/cdimages
 | What | Files | Status |
 |---|---|---|
 | Archives | `.img` (IMG3), `.rpf` (RPF2, RPF3) | browse and extract; change `.img` archives |
-| Textures | `.wtd` | view, export DDS/PNG |
+| Textures | `.wtd` | view, export DDS/PNG; replace, add and remove |
 | Models | `.wdr`, `.wdd`, `.wft` | view, export glTF |
 | Texts | `.gxt` | view and edit |
 | Placement files and maps | `.wpl`, map archives | view as text and in 3D, export glTF |
@@ -66,7 +66,20 @@ Most files are in `.img` archives, a few in `.rpf` archives (the audio archives 
 Texture dictionaries (`.wtd`) open like GTA V's: preview, viewer and export as DDS or PNG. GTA IV stores DXT1/3/5 and
 uncompressed 32-bit textures.
 
-**Checked:** 6,400 dictionaries, 70,845 textures, all decoded.
+In edit mode, textures can be replaced from a DDS file, added and removed, as in GTA V; the changed dictionary goes
+into the `update` folder (or the game files, see [Editing](#editing)) and can be undone. A replacement with the same
+format, size and mip count only swaps the pixel data. Anything else rebuilds the dictionary: its other data stays as
+it was, so fields OpenRAGE does not interpret are kept. Use DXT1, DXT3, DXT5 or 32-bit BGRA DDS files; textures that
+only exist in newer formats (BC7 and others) cannot go into GTA IV. Textures inside models (`.wdr`, `.wft`) cannot be
+changed yet.
+
+```
+openrage textures pc/models/cdimages/vehicles.img/admiral.wtd --set admiral_badges=badges.dds   # replace
+openrage textures pc/models/cdimages/vehicles.img/admiral.wtd --set my_decal=decal.dds --remove admiral_sign
+openrage verify --textures --rebuild           # rebuild every dictionary in memory and compare (writes nothing)
+```
+
+**Checked:** 6,400 dictionaries, 70,845 textures, all decoded; every dictionary rebuilt and read back identically.
 
 ## Models
 

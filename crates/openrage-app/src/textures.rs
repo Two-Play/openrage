@@ -11,8 +11,9 @@ use rage_rpf::vfs::Node;
 
 use crate::install::{Op, apply_at};
 
-/// Applies texture edits to the `.ytd` at `vpath` (as the game sees it, i.e.
-/// including mods) and writes the result into the mods folder.
+/// Applies texture edits to the `.ytd` (GTA IV: `.wtd`) at `vpath` (as the
+/// game sees it, i.e. including mods) and writes the result into the mods
+/// folder (GTA IV: the update folder or, when chosen, the game files).
 pub fn edit_textures(
     game_dir: &Path,
     keys: Option<Arc<GtaVKeys>>,
@@ -20,6 +21,17 @@ pub fn edit_textures(
     edits: &[Edit],
 ) -> Result<(EditResult, PathBuf)> {
     let (node, _) = rage_mods::resolve(game_dir, vpath, keys.clone())?;
+    if let Node::Gta4File(archive, id) = node {
+        // GTA IV (.wtd): an RSC5 resource inside an image archive.
+        let raw = archive.read(id)?;
+        let (kind, flags) = rage_resource::rsc5_header(&raw).with_context(|| format!("{vpath} is not a resource"))?;
+        let res = rage_resource::Resource::from_rsc5(&raw)?;
+        let dict = rage_formats::ytd::parse_gta4(&res).context("reading the texture dictionary")?;
+        let result = rage_formats::wtd_write::apply(&res, kind, flags, &dict, edits)?;
+        drop(archive);
+        let applied = apply_at(game_dir, keys, vpath, Op::Set(result.file.clone()), &describe(vpath, edits))?;
+        return Ok((result, applied.path));
+    }
     let Node::ArchiveFile(rpf, id) = node else { bail!("{vpath} is not a file inside an archive") };
     let EntryKind::Resource { system_flags, graphics_flags, .. } = rpf.entry(id).kind else {
         bail!("{vpath} is not a resource")
@@ -28,14 +40,18 @@ pub fn edit_textures(
     let dict = rage_formats::ytd::parse(&res).context("reading the texture dictionary")?;
     let result = ytd_write::apply(&res, system_flags, graphics_flags, &dict, edits)?;
     drop(rpf);
-    let name = vpath.rsplit('/').next().unwrap_or(vpath);
-    let what = match edits {
-        [ytd_write::Edit::Set(t)] => format!("Replaced texture {} in {name}", t.name),
-        [ytd_write::Edit::Remove(n)] => format!("Removed texture {n} from {name}"),
-        _ => format!("Changed {} textures in {name}", edits.len()),
-    };
-    let applied = apply_at(game_dir, keys, vpath, Op::Set(result.file.clone()), &what)?;
+    let applied = apply_at(game_dir, keys, vpath, Op::Set(result.file.clone()), &describe(vpath, edits))?;
     Ok((result, applied.path))
+}
+
+/// Journal text for a set of texture edits.
+fn describe(vpath: &str, edits: &[Edit]) -> String {
+    let name = vpath.rsplit('/').next().unwrap_or(vpath);
+    match edits {
+        [Edit::Set(t)] => format!("Replaced texture {} in {name}", t.name),
+        [Edit::Remove(n)] => format!("Removed texture {n} from {name}"),
+        _ => format!("Changed {} textures in {name}", edits.len()),
+    }
 }
 
 /// Reads a DDS file as a texture to put into a dictionary under `name`.

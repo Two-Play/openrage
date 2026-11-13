@@ -57,6 +57,50 @@ pub fn rsc5_sizes(flags: u32) -> (usize, usize) {
     (sys, gfx)
 }
 
+/// RSC5 flags for segments of the given sizes, and the padded sizes. Like
+/// the game's own files, each segment gets at least 16 pages of the largest
+/// size that allows it (so padding stays under a sixteenth). `top` keeps the
+/// two highest flag bits of the original.
+pub fn rsc5_flags_for(system_len: usize, graphics_len: usize, top: u32) -> (u32, usize, usize) {
+    fn part(len: usize) -> (u32, u32, usize) {
+        if len == 0 {
+            return (0, 0, 0);
+        }
+        let mut shift = 0u32;
+        while shift < 15 && (256usize << (shift + 1)) * 16 <= len {
+            shift += 1;
+        }
+        loop {
+            let page = 256usize << shift;
+            let count = len.div_ceil(page);
+            if count <= 0x7FF || shift == 15 {
+                return (count as u32, shift, count * page);
+            }
+            shift += 1;
+        }
+    }
+    let (sc, ss, sys) = part(system_len);
+    let (gc, gs, gfx) = part(graphics_len);
+    (sc | (ss << 11) | (gc << 15) | (gs << 26) | (top & 0xC000_0000), sys, gfx)
+}
+
+/// Writes a GTA IV RSC5 resource: header plus zlib stream of system then
+/// graphics memory. Segment lengths must match `flags` (see [`rsc5_flags_for`]).
+pub fn write_rsc5(kind: u32, flags: u32, system: &[u8], graphics: &[u8]) -> Result<Vec<u8>, ResourceError> {
+    use std::io::Write;
+    let (sys, gfx) = rsc5_sizes(flags);
+    if system.len() != sys || graphics.len() != gfx {
+        return Err(ResourceError::SizeMismatch { actual: system.len() + graphics.len(), expected: sys + gfx });
+    }
+    let mut out = Vec::with_capacity(12 + (sys + gfx) / 2);
+    out.extend_from_slice(b"RSC\x05");
+    out.extend_from_slice(&kind.to_le_bytes());
+    out.extend_from_slice(&flags.to_le_bytes());
+    let mut z = flate2::write::ZlibEncoder::new(out, flate2::Compression::default());
+    z.write_all(system).and_then(|_| z.write_all(graphics)).map_err(|e| ResourceError::Format(e.to_string()))?;
+    z.finish().map_err(|e| ResourceError::Format(e.to_string()))
+}
+
 /// An inflated resource, split into its memory segments.
 #[derive(Clone)]
 pub struct Resource {

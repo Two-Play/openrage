@@ -36,7 +36,7 @@ fn bad(msg: impl Into<String>) -> ResourceError {
 }
 
 /// joaat of the lowercase name, as used by the dictionary's hash list.
-fn name_hash(name: &str) -> u32 {
+pub(crate) fn name_hash(name: &str) -> u32 {
     let mut h: u32 = 0;
     for b in name.bytes().map(|b| b.to_ascii_lowercase()) {
         h = h.wrapping_add(b as u32);
