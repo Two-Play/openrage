@@ -41,3 +41,28 @@ lto = "thin"
 # Crypto and inflate are hot loops; keep them fast even in debug builds.
 [profile.dev.package."*"]
 opt-level = 3
+
+# The plugin runtime (wasmtime and its Cranelift compiler) is large; compiled
+# for size it costs far less download, and plugins are small and run rarely.
+[profile.release.package.cranelift-codegen]
+opt-level = "s"
+[profile.release.package.cranelift-assembler-x64]
+opt-level = "s"
+[profile.release.package.regalloc2]
+opt-level = "s"
+[profile.release.package.wasmtime]
+opt-level = "s"
+[profile.release.package.wasmtime-environ]
+opt-level = "s"
+[profile.release.package.wasmtime-internal-cranelift]
+opt-level = "s"
+[profile.release.package.wasmparser]
+opt-level = "s"
+[profile.release.package.pulley-interpreter]
+opt-level = "s"
+[profile.release.package.wasmtime-wasi]
+opt-level = "s"
+[profile.release.package.wit-parser]
+opt-level = "s"
+[profile.release.package.wit-component]
+opt-level = "s"

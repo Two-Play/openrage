@@ -87,7 +87,8 @@ Typing `?query` into the address bar searches as well; Back returns to the resul
 
 - the theme (light, dark or system) and the accent colour (a preset or any colour of your own);
 - the games: *Switch game…*, *Add or change a game…* and whether to ask at start;
-- whether the history opens in its own window and whether the mods overlay is shown.
+- whether the history opens in its own window and whether the mods overlay is shown;
+- the [plugins](#plugins): which are on, their permissions, the plugin folder.
 
 The sun/moon button in the toolbar switches the theme quickly.
 
@@ -98,9 +99,17 @@ in a sandbox: a plugin sees only the files you open with it and, if you allow it
 change anything, open other files or go online.
 
 - **Install:** put a plugin's folder into your plugin folder: `~/.config/openrage/plugins` (Linux),
-  `%APPDATA%\openrage\plugins` (Windows) or `plugins` next to the program.
-- **Enable:** new plugins are off. Enabling one shows the permissions it asks for.
-- **Use:** for now from the [command line](@/cli.md#plugins); the explorer follows.
+  `%APPDATA%\openrage\plugins` (Windows) or `plugins` next to the program. **Settings → Plugins → Open plugin folder**
+  opens it; **Reload plugins** picks up new ones. The download comes with the example plugin *Strings*.
+- **Enable:** **Settings → Plugins** lists each plugin with what it does, its licence and the permissions it asks
+  for. New plugins are off; turning one on grants what it asks for. A new version that asks for more is off again
+  until you confirm. Plugins that cannot be loaded are listed with the reason.
+- **File list:** plugins name the file types they add and give them an icon.
+- **Preview:** files OpenRAGE has no viewer for are shown by a plugin (text, tree, table or picture). The info panel
+  names the plugin and shows its messages and errors. A plugin for every type (like *Strings*) only gets binary files.
+- **Context menu:** plugin entries such as **Export strings…**. One result is saved with a save dialog, several into
+  a folder you pick.
+- **Command line:** everything also works with [`openrage plugin`](@/cli.md#plugins).
 
 Want to write one? See [Writing plugins](@/plugins.md).
 

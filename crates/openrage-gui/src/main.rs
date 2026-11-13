@@ -9,6 +9,7 @@ mod browser;
 mod editor;
 mod gpu;
 mod history;
+mod plugins;
 mod preview;
 mod scene;
 mod viewer;
@@ -109,6 +110,7 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> R {
 fn main() -> anyhow::Result<()> {
     let ui = AppWindow::new()?;
     let cfg = Config::load();
+    plugins::reload(&cfg);
     let keys = load_keys().unwrap_or(None);
     // Several games set up and none chosen as default: ask (after the window is up).
     let known = installed_games(&cfg);
@@ -241,7 +243,8 @@ fn debug_snapshot(ui: &AppWindow) {
             ui.set_game_chooser_visible(false);
             ui.invoke_game_chosen(i.parse().unwrap_or(0), false);
         }
-        if std::env::var("OPENRAGE_SETTINGS").is_ok() {
+        if let Ok(page) = std::env::var("OPENRAGE_SETTINGS") {
+            ui.set_settings_scroll_end(page == "plugins");
             ui.invoke_open_settings();
         }
         // `OPENRAGE_ABOUT=<tab>` opens the About dialog on that tab (0–2).
@@ -767,6 +770,44 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_row_action(move |i, action| with_ui(&w, |ui| row_action(ui, i as usize, &action)));
     let w = ui.as_weak();
     ui.on_game_chosen(move |i, remember| with_ui(&w, |ui| open_game(ui, i as usize, remember)));
+    refresh_plugin_rows(ui);
+    let w = ui.as_weak();
+    ui.on_plugin_toggled(move |id, on| {
+        with_ui(&w, |ui| {
+            let result = with_app(|a| plugins::set_enabled(&mut a.cfg, &id, on));
+            if let Err(e) = result {
+                ui.set_status(format!("Cannot change plugin {id}: {e:#}").into());
+            }
+            after_plugins_change(ui);
+        });
+    });
+    let w = ui.as_weak();
+    ui.on_reload_plugins(move || {
+        with_ui(&w, |ui| {
+            with_app(|a| plugins::reload(&a.cfg));
+            after_plugins_change(ui);
+            ui.set_status("Plugins reloaded".into());
+        });
+    });
+    let w = ui.as_weak();
+    ui.on_open_plugin_folder(move || {
+        with_ui(&w, |ui| {
+            let Some(dir) = plugins::user_folder() else { return };
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                return ui.set_status(format!("Cannot create {}: {e}", dir.display()).into());
+            }
+            let opened = if cfg!(target_os = "windows") {
+                std::process::Command::new("explorer").arg(&dir).spawn()
+            } else if cfg!(target_os = "macos") {
+                std::process::Command::new("open").arg(&dir).spawn()
+            } else {
+                std::process::Command::new("xdg-open").arg(&dir).spawn()
+            };
+            if let Err(e) = opened {
+                ui.set_status(format!("Cannot open {}: {e}", dir.display()).into());
+            }
+        });
+    });
     let w = ui.as_weak();
     ui.on_ask_game_changed(move |ask| {
         with_ui(&w, |ui| {
@@ -967,6 +1008,17 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
     if ui.get_file_selected() != row as i32 {
         select_row(ui, row);
     }
+    if let Some(index) = action.strip_prefix("plugin:").and_then(|i| i.parse::<usize>().ok()) {
+        let vpath = with_app(|a| {
+            let listing = a.listing.as_ref()?;
+            let item = &listing.items[*a.visible.get(row)?];
+            Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+        });
+        if let Some(vpath) = vpath {
+            run_plugin_action(ui, index, vpath);
+        }
+        return;
+    }
     match action {
         "open" => ui.invoke_file_open(row as i32),
         "view" => open_viewer(ui),
@@ -1137,6 +1189,7 @@ fn with_ui(w: &Weak<AppWindow>, f: impl FnOnce(&AppWindow)) {
 // Browsing
 
 fn start_browsing(ui: &AppWindow) {
+    plugins::set_game(with_app(|a| a.game_dir.clone()).as_deref());
     let label = with_app(|a| a.game_dir.as_deref().and_then(detect::game_name)).unwrap_or("Game");
     GAME_LABEL.with(|l| *l.borrow_mut() = label.to_owned());
     ui.set_settings_game(label.into());
@@ -1394,6 +1447,17 @@ fn is_openable(item: &Item) -> bool {
         || (item.kind == ItemKind::File && browser::is_audio(&item.name))
 }
 
+/// Context-menu entries plugins add for a file.
+fn plugin_actions(item: &Item) -> ModelRc<SharedString> {
+    let file =
+        matches!(item.kind, ItemKind::File | ItemKind::Resource | ItemKind::Ped) && item.mark != Some(Mark::Removed);
+    let titles = if file { plugins::action_titles(&item.name) } else { Vec::new() };
+    if titles.is_empty() {
+        return ModelRc::default();
+    }
+    ModelRc::new(VecModel::from(titles.into_iter().map(SharedString::from).collect::<Vec<_>>()))
+}
+
 fn file_row(item: &Item) -> FileRow {
     let (icon, tint) = badges::icon(&item.name, item.kind);
     let info = match (item.mark, item.info.is_empty()) {
@@ -1414,6 +1478,7 @@ fn file_row(item: &Item) -> FileRow {
         is_meta: is_meta_file(item),
         is_gfx: item.name.to_ascii_lowercase().ends_with(".gfx"),
         is_table: is_text_file(item) && openrage_app::texttable::is_text_table(&item.name),
+        plugin_actions: plugin_actions(item),
         kind: match &item.vpath {
             Some(_) if item.detail.is_some() => item.detail.clone().unwrap_or_default().into(),
             Some(vpath) => browser::short_location(&browser::parent(vpath).unwrap_or_default(), 40).into(),
@@ -1768,8 +1833,17 @@ fn select_row(ui: &AppWindow, row: usize) {
 
     let counter = with_app(|a| Arc::clone(&a.preview_generation));
     let weak = ui.as_weak();
+    // Files the explorer has no viewer for may have one from a plugin.
+    let plugin = (matches!(item.kind, ItemKind::File | ItemKind::Resource) && !badges::is_known(&item.name))
+        .then(|| plugins::previews(&item.name))
+        .flatten();
+    let game = plugins::GameContext { dir: with_app(|a| a.game_dir.clone()), keys: keys.clone() };
     std::thread::spawn(move || {
-        let (extra, body, image) = load_preview(source, keys);
+        let from_plugin = plugin.and_then(|(id, specific)| plugin_preview(&id, specific, &game, &vpath));
+        let (extra, body, image) = match from_plugin {
+            Some(p) => (p.info, p.text, p.image),
+            None => load_preview(source, keys),
+        };
         if counter.load(Ordering::SeqCst) != generation {
             return; // a newer selection superseded this one
         }
@@ -1796,6 +1870,122 @@ fn select_row(ui: &AppWindow, row: usize) {
             ui.set_preview_loading(false);
         });
     });
+}
+
+/// Shows the installed plugins on the settings page.
+fn refresh_plugin_rows(ui: &AppWindow) {
+    let rows: Vec<PluginRow> = plugins::rows()
+        .into_iter()
+        .map(|r| PluginRow {
+            id: r.id.into(),
+            title: r.title.into(),
+            description: r.description.into(),
+            status: r.status.into(),
+            permissions: r.permissions.into(),
+            enabled: r.enabled,
+            broken: r.broken,
+        })
+        .collect();
+    ui.set_plugins(ModelRc::new(VecModel::from(rows)));
+    let folder = plugins::user_folder().map(|d| format!("Plugin folder: {}", d.display())).unwrap_or_default();
+    ui.set_plugin_folder(folder.into());
+}
+
+/// Plugins were turned on or off or reloaded: their type names, menu entries
+/// and previews change.
+fn after_plugins_change(ui: &AppWindow) {
+    refresh_plugin_rows(ui);
+    if with_app(|a| a.listing.is_some()) {
+        refresh_files(ui, None);
+    }
+}
+
+/// A plugin's preview of a file, if it has one. A fallback plugin (`*`) is
+/// only asked about binary files: text is shown as text.
+fn plugin_preview(
+    id: &str,
+    specific: bool,
+    game: &plugins::GameContext,
+    vpath: &str,
+) -> Option<plugins::PreviewResult> {
+    /// Larger files are not handed to plugins for a preview.
+    const MAX: u64 = 256 << 20;
+    let dir = game.dir.as_deref()?;
+    let node = rage_mods::resolve(dir, vpath, game.keys.clone()).ok()?.0;
+    let data = match node {
+        Node::PlainFile(p) if std::fs::metadata(&p).ok()?.len() <= MAX => std::fs::read(p).ok()?,
+        Node::ArchiveFile(rpf, id) if rpf.entry(id).size() <= MAX => rpf.read(id).ok()?,
+        Node::Rpf8File(rpf, i) => {
+            let entry = rpf.entries()?.get(i)?;
+            if entry.size() > MAX {
+                return None;
+            }
+            rpf.read(entry).ok()?
+        }
+        Node::Gta4File(a, id) if a.entry(id).size() <= MAX => a.read(id).ok()?,
+        _ => return None,
+    };
+    if !specific && rage_core::text::decode_text(&data, 4096).is_some() {
+        return None;
+    }
+    Some(plugins::preview(id, game, vpath, &data))
+}
+
+/// Runs a plugin's action on a file and saves what it produces: one file
+/// where the user picks, several into a folder the user picks.
+fn run_plugin_action(ui: &AppWindow, index: usize, vpath: String) {
+    let game = plugins::GameContext { dir: with_app(|a| a.game_dir.clone()), keys: with_app(|a| a.keys.clone()) };
+    ui.set_status(format!("Running plugin on {vpath}…").into());
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let status = match plugins::run_action(index, &game, &vpath) {
+            Err(e) => e,
+            Ok(result) => save_plugin_outputs(result),
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(status.into()));
+    });
+}
+
+fn save_plugin_outputs(result: plugins::ActionResult) -> String {
+    let plugin = &result.plugin;
+    let outputs = match result.outputs {
+        Ok(o) => o,
+        Err(e) => {
+            let last = result.log.last().map(|l| format!(" ({})", l.message)).unwrap_or_default();
+            return format!("{plugin}: {e}{last}");
+        }
+    };
+    let write = |dir: &Path, o: &openrage_plugins::OutputFile| -> anyhow::Result<PathBuf> {
+        // The host has checked that the names stay inside the folder.
+        let rel = vfs::safe_relative_path(&o.name).ok_or_else(|| anyhow::anyhow!("bad file name {}", o.name))?;
+        let path = dir.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &o.data)?;
+        Ok(path)
+    };
+    match outputs.as_slice() {
+        [] => format!("{plugin}: {} produced no files", result.title),
+        [one] => {
+            let name = one.name.rsplit('/').next().unwrap_or(&one.name);
+            let Some(path) = rfd::FileDialog::new().set_title(&result.title).set_file_name(name).save_file() else {
+                return String::new();
+            };
+            match std::fs::write(&path, &one.data) {
+                Ok(()) => format!("Saved {}", path.display()),
+                Err(e) => format!("Saving failed: {e}"),
+            }
+        }
+        many => {
+            let title = format!("{}: choose a folder for {} files", result.title, many.len());
+            let Some(dir) = rfd::FileDialog::new().set_title(title).pick_folder() else { return String::new() };
+            match many.iter().map(|o| write(&dir, o)).collect::<anyhow::Result<Vec<_>>>() {
+                Ok(paths) => format!("Saved {} files in {}", paths.len(), dir.display()),
+                Err(e) => format!("Saving failed: {e:#}"),
+            }
+        }
+    }
 }
 
 /// Decoded RGBA image: (width, height, pixels).

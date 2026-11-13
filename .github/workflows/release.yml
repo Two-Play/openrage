@@ -51,6 +51,15 @@ jobs:
           key: release
       - name: Build
         run: cargo build --release --locked -p openrage-cli -p openrage-gui
+      # The example plugin ships in `plugins/` next to the programs (off until
+      # the user enables it). The same .wasm works on every system.
+      - name: Build the example plugin
+        shell: bash
+        run: |
+          cargo build --release --locked --manifest-path plugins/Cargo.toml --target wasm32-wasip2 -p strings
+          mkdir -p shipped-plugins/strings
+          cp plugins/examples/strings/plugin.toml plugins/target/wasm32-wasip2/release/strings.wasm shipped-plugins/strings/
+          cp plugins/LICENSE-MIT plugins/LICENSE-APACHE shipped-plugins/strings/
       - name: Package
         shell: bash
         run: |
@@ -59,6 +68,7 @@ jobs:
           mkdir -p "$dir" out
           cp README.md LICENSE NOTICE.md THIRD_PARTY_LICENSES.md "$dir/"
           cp crates/rage-tfit2/LICENSE "$dir/LICENSE-AGPL-3.0"
+          cp -r shipped-plugins "$dir/plugins"
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp target/release/openrage.exe target/release/openrage-gui.exe "$dir/"
             7z a -tzip "out/$dir.zip" "$dir" > /dev/null
@@ -74,6 +84,7 @@ jobs:
           app=OpenRAGE.AppDir
           mkdir -p "$app/usr/bin" "$app/usr/share/applications" "$app/usr/share/icons/hicolor/256x256/apps" "$app/usr/share/doc/openrage"
           cp target/release/openrage target/release/openrage-gui "$app/usr/bin/"
+          cp -r shipped-plugins "$app/usr/bin/plugins"
           cp packaging/AppRun "$app/AppRun"
           chmod +x "$app/AppRun"
           cp packaging/openrage.desktop "$app/openrage.desktop"
