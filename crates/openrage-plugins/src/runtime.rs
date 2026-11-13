@@ -21,7 +21,10 @@ mod bindings {
 
 use bindings::openrage::plugin::{host as wit_host, types as wit};
 
-pub use wit::{DirEntry, Game, Image as ImageView, Info, Input, Level, OutputFile, Preview, Table, TreeNode, View};
+pub use wit::{
+    DirEntry, Game, Image as ImageView, Info, Input, Level, Material, Mesh, Model, OutputFile, Preview, Table,
+    TreeNode, View,
+};
 
 /// How much a single call may use.
 #[derive(Debug, Clone, Copy)]
@@ -48,6 +51,14 @@ pub trait GameFiles: Send + Sync {
     fn read(&self, vpath: &str) -> Result<Vec<u8>>;
     /// Lists a folder ("" for the game folder).
     fn list(&self, vpath: &str) -> Result<Vec<DirEntry>>;
+    /// A model as the explorer shows it (see `load-model`).
+    fn model(&self, vpath: &str) -> Result<Model> {
+        bail!("{vpath}: models cannot be read here")
+    }
+    /// A texture of a texture dictionary or a model (see `load-texture`).
+    fn texture(&self, vpath: &str, name: &str) -> Result<ImageView> {
+        bail!("{vpath}: textures of {name} cannot be read here")
+    }
 }
 
 /// No game open: plugins can only see the files they are handed.
@@ -159,7 +170,8 @@ impl Host {
         vpath: &str,
         data: &[u8],
     ) -> Outcome<Preview> {
-        self.call(plugin, component, files, false, |p, store| {
+        let handed = vec![vpath.replace('\\', "/")];
+        self.call(plugin, component, files, false, handed, |p, store| {
             let preview = p.call_preview(store, vpath, data)?.map_err(|e| anyhow!("{e}"))?;
             check_preview(&preview)?;
             Ok(preview)
@@ -183,7 +195,8 @@ impl Host {
             };
         }
         let may_write = plugin.manifest.action(action).is_some_and(|a| a.kind == ActionKind::Modify);
-        self.call(plugin, component, files, may_write, |p, store| {
+        let handed = inputs.iter().filter(|i| !i.picked).map(|i| i.vpath.replace('\\', "/")).collect();
+        self.call(plugin, component, files, may_write, handed, |p, store| {
             let outputs = p.call_run_action(store, action, inputs)?.map_err(|e| anyhow!("{e}"))?;
             check_outputs(&outputs)?;
             Ok(outputs)
@@ -196,6 +209,7 @@ impl Host {
         component: &Component,
         files: Arc<dyn GameFiles>,
         may_write: bool,
+        handed: Vec<String>,
         f: impl FnOnce(&bindings::Plugin, &mut Store<Ctx>) -> Result<T>,
     ) -> Outcome<T> {
         let stdout = MemoryOutputPipe::new(OUTPUT_CAPACITY);
@@ -215,6 +229,7 @@ impl Host {
             files,
             permissions: plugin.granted.clone(),
             may_write,
+            handed,
             writes: Vec::new(),
             written: 0,
             log: Vec::new(),
@@ -297,7 +312,44 @@ fn check_preview(p: &Preview) -> Result<()> {
                 bail!("the plugin returned a table with rows of the wrong length");
             }
         }
+        Some(View::Model(model)) => check_model(model)?,
         Some(View::Text(_)) | None => {}
+    }
+    Ok(())
+}
+
+/// Most vertices a plugin's model may have.
+const MAX_VERTICES: usize = 20_000_000;
+
+/// Rejects models the viewer could not show safely.
+fn check_model(model: &Model) -> Result<()> {
+    let mut vertices = 0usize;
+    for (i, m) in model.meshes.iter().enumerate() {
+        let n = m.positions.len() / 3;
+        vertices += n;
+        let bad = m.positions.len() % 3 != 0
+            || (!m.normals.is_empty() && m.normals.len() != n * 3)
+            || (!m.uvs.is_empty() && m.uvs.len() != n * 2)
+            || m.indices.len() % 3 != 0
+            || m.indices.iter().any(|&k| k as usize >= n)
+            || m.material as usize >= model.materials.len();
+        if bad {
+            bail!("the plugin returned a model whose mesh {i} does not fit together");
+        }
+    }
+    if vertices > MAX_VERTICES {
+        bail!("the plugin returned a model with more than {MAX_VERTICES} vertices");
+    }
+    for m in &model.materials {
+        if let Some(img) = &m.image
+            && (img.width == 0
+                || img.height == 0
+                || img.width > 16384
+                || img.height > 16384
+                || img.rgba.len() as u64 != u64::from(img.width) * u64::from(img.height) * 4)
+        {
+            bail!("the plugin returned a texture whose size does not match its pixels");
+        }
     }
     Ok(())
 }
@@ -325,12 +377,24 @@ struct Ctx {
     log: Vec<LogLine>,
     /// The call is a `modify` action: `write-mod-file` works.
     may_write: bool,
+    /// The game files the user handed to this call: readable without
+    /// `read-game`.
+    handed: Vec<String>,
     writes: Vec<ModWrite>,
     /// Bytes in `writes`, against [`MAX_WRITES`].
     written: usize,
 }
 
 impl Ctx {
+    /// A path the plugin may read: one it was handed, or any with `read-game`.
+    fn readable(&self, vpath: &str) -> Result<String, String> {
+        let vpath = checked_vpath(vpath)?;
+        if !self.handed.iter().any(|h| h.eq_ignore_ascii_case(&vpath)) {
+            self.require(Permission::ReadGame)?;
+        }
+        Ok(vpath)
+    }
+
     fn require(&self, p: Permission) -> Result<(), String> {
         if self.permissions.contains(&p) {
             Ok(())
@@ -359,9 +423,18 @@ impl wit_host::Host for Ctx {
     }
 
     fn read_file(&mut self, vpath: String) -> Result<Vec<u8>, String> {
-        self.require(Permission::ReadGame)?;
-        let vpath = checked_vpath(&vpath)?;
+        let vpath = self.readable(&vpath)?;
         self.files.read(&vpath).map_err(|e| format!("{e:#}"))
+    }
+
+    fn load_model(&mut self, vpath: String) -> Result<Model, String> {
+        let vpath = self.readable(&vpath)?;
+        self.files.model(&vpath).map_err(|e| format!("{e:#}"))
+    }
+
+    fn load_texture(&mut self, vpath: String, name: String) -> Result<ImageView, String> {
+        let vpath = self.readable(&vpath)?;
+        self.files.texture(&vpath, &name).map_err(|e| format!("{e:#}"))
     }
 
     fn list_dir(&mut self, vpath: String) -> Result<Vec<DirEntry>, String> {

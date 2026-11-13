@@ -164,6 +164,8 @@ pub struct PreviewResult {
     pub info: Vec<(String, String)>,
     pub text: String,
     pub image: Option<(u32, u32, Vec<u8>)>,
+    /// A 3D model, for the model view.
+    pub model: Option<openrage_app::models::LoadedModel>,
 }
 
 /// Runs a plugin's preview (call it from a worker thread).
@@ -175,19 +177,26 @@ pub fn preview(id: &str, game: &GameContext, vpath: &str, data: &[u8]) -> Previe
             Ok(p) => {
                 info.extend(p.info.into_iter().map(|i| (i.key, i.value)));
                 info.extend(log_lines(&outcome.log));
+                let mut model = None;
                 let (text, image) = match p.view {
                     None => (String::new(), None),
                     Some(View::Text(t)) => (t, None),
                     Some(View::Tree(nodes)) => (tree_text(&nodes), None),
                     Some(View::Table(t)) => (table_text(&t.columns, &t.rows), None),
                     Some(View::Image(img)) => (String::new(), Some((img.width, img.height, img.rgba))),
+                    Some(View::Model(m)) => {
+                        let name = vpath.rsplit('/').next().unwrap_or(vpath);
+                        let stem = name.split('.').next().unwrap_or(name);
+                        model = Some(openrage_app::plugins::from_plugin_model(&m, stem));
+                        (String::new(), None)
+                    }
                 };
-                Ok(PreviewResult { info, text, image })
+                Ok(PreviewResult { info, text, image, model })
             }
             Err(e) => {
                 info.push(("Plugin error".to_owned(), format!("{e:#}")));
                 info.extend(log_lines(&outcome.log));
-                Ok(PreviewResult { info, text: String::new(), image: None })
+                Ok(PreviewResult { info, text: String::new(), image: None, model: None })
             }
         }
     });
@@ -195,6 +204,7 @@ pub fn preview(id: &str, game: &GameContext, vpath: &str, data: &[u8]) -> Previe
         info: vec![("Plugin error".to_owned(), e)],
         text: String::new(),
         image: None,
+        model: None,
     })
 }
 

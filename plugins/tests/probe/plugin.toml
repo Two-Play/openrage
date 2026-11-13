@@ -2,13 +2,13 @@
 id = "probe"
 name = "Probe"
 version = "0.1.0"
-api = "0.2"
+api = "0.3"
 license = "MIT OR Apache-2.0"
 wasm = "probe.wasm"
 permissions = ["read-game", "write-mods"]
 
 [[preview]]
-extensions = ["tree", "table", "image", "badimage", "probe"]
+extensions = ["tree", "table", "image", "badimage", "badmodel", "probe"]
 
 [[actions]]
 id = "run"

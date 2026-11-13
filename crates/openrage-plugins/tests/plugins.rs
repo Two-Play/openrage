@@ -31,15 +31,20 @@ fn plugin_dir() -> &'static Path {
                 "probe",
                 "-p",
                 "gxt2-patch",
+                "-p",
+                "obj-tools",
             ])
             .status()
             .expect("running cargo for the plugins");
         assert!(status.success(), "building the plugins failed (is the wasm32-wasip2 target installed?)");
         let out = std::env::temp_dir().join(format!("openrage-plugin-tests-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
-        for (id, folder) in
-            [("strings", "examples/strings"), ("probe", "tests/probe"), ("gxt2_patch", "examples/gxt2-patch")]
-        {
+        for (id, folder) in [
+            ("strings", "examples/strings"),
+            ("probe", "tests/probe"),
+            ("gxt2_patch", "examples/gxt2-patch"),
+            ("obj_tools", "examples/obj-tools"),
+        ] {
             let dir = out.join(id);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::copy(root.join(folder).join("plugin.toml"), dir.join("plugin.toml")).unwrap();
@@ -79,6 +84,25 @@ impl GameFiles for FakeGame {
             "" => Ok(vec![DirEntry { name: "a.rpf".into(), is_dir: true, size: 0 }]),
             _ => bail!("{vpath} not found"),
         }
+    }
+    fn model(&self, vpath: &str) -> Result<openrage_plugins::Model> {
+        let mesh = || openrage_plugins::Mesh {
+            part: String::new(),
+            positions: vec![0.0; 9],
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            indices: vec![0, 1, 2],
+            material: 0,
+        };
+        let material = openrage_plugins::Material {
+            name: "m".into(),
+            texture: String::new(),
+            color: (1.0, 1.0, 1.0, 1.0),
+            image: None,
+        };
+        // The handed file has one mesh, every other model two.
+        let meshes = if vpath.ends_with("model.ydr") { vec![mesh()] } else { vec![mesh(), mesh()] };
+        Ok(openrage_plugins::Model { meshes, materials: vec![material] })
     }
 }
 
@@ -275,4 +299,44 @@ fn gxt2_patch_applies_an_oxt_file() {
     assert_eq!(&out[..8], b"2TXG\x03\x00\x00\x00");
     let text = String::from_utf8_lossy(out);
     assert!(text.contains("Ten\0Zwanzig\0New\0"), "{text:?}");
+}
+
+#[test]
+fn models_follow_the_handed_file_rule() {
+    let host = host();
+    let reg = registry(&[("probe", &[Permission::ReadGame, Permission::WriteMods])]);
+    let mut probe = reg.get("probe").unwrap().clone();
+    let game: Arc<dyn GameFiles> = Arc::new(FakeGame);
+    assert_eq!(
+        run(&host, &probe, game.clone(), "model.ydr", "x.rpf/other.ydr").unwrap()[0].1,
+        "own: 1 meshes, other: 2 meshes"
+    );
+    // Without read-game: the handed model still works, others do not.
+    probe.granted.clear();
+    assert_eq!(run(&host, &probe, game.clone(), "model.ydr", "").unwrap()[0].1, "own: 1 meshes");
+    let e = run(&host, &probe, game, "model.ydr", "x.rpf/other.ydr").unwrap_err();
+    assert!(format!("{e:#}").contains("permission read-game"), "{e:#}");
+}
+
+#[test]
+fn plugin_models_are_checked_and_shown() {
+    let host = host();
+    let reg = registry(&[("probe", &[Permission::ReadGame, Permission::WriteMods]), ("obj-tools", &[])]);
+    let probe = reg.get("probe").unwrap();
+    let component = host.compile(probe).unwrap();
+    let bad = host.preview(probe, &component, Arc::new(NoGame), "a.badmodel", b"").value;
+    assert!(format!("{:#}", bad.unwrap_err()).contains("does not fit together"));
+
+    let obj = reg.preview_for("dir/house.OBJ", None).unwrap();
+    assert_eq!(obj.manifest.id, "obj-tools");
+    let component = host.compile(obj).unwrap();
+    let text = b"v 0 0 0\nv 1 0 0\nv 1 1 0\nusemtl wall\nf 1 2 3\n";
+    let preview = host.preview(obj, &component, Arc::new(NoGame), "dir/house.obj", text).value.unwrap();
+    match preview.view {
+        Some(View::Model(m)) => {
+            assert_eq!(m.meshes.len(), 1);
+            assert_eq!(m.materials[0].name, "wall");
+        }
+        other => panic!("expected a model, got {other:?}"),
+    }
 }

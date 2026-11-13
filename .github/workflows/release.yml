@@ -56,8 +56,8 @@ jobs:
       - name: Build the example plugins
         shell: bash
         run: |
-          cargo build --release --locked --manifest-path plugins/Cargo.toml --target wasm32-wasip2 -p strings -p gxt2-patch
-          for p in strings:strings gxt2-patch:gxt2_patch; do
+          cargo build --release --locked --manifest-path plugins/Cargo.toml --target wasm32-wasip2 -p strings -p gxt2-patch -p obj-tools
+          for p in strings:strings gxt2-patch:gxt2_patch obj-tools:obj_tools; do
             dir="${p%%:*}" wasm="${p##*:}"
             mkdir -p "shipped-plugins/$dir"
             cp "plugins/examples/$dir/plugin.toml" "plugins/target/wasm32-wasip2/release/$wasm.wasm" "shipped-plugins/$dir/"

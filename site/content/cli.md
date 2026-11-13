@@ -120,6 +120,8 @@ openrage plugin disable strings
 openrage plugin preview x64a.rpf/data/x.dat    # show a file the way a plugin previews it
 openrage plugin preview --file x.bin --plugin strings
 openrage plugin preview --file x.xyz --png x.png   # save an image preview
+openrage plugin preview --file car.obj --glb car.glb   # save a 3D model preview as glTF
+openrage plugin run obj-tools export x64e.rpf/levels/gta5/vehicles.rpf/adder.yft --out adder/
 openrage plugin run strings export x64a.rpf/data/x.dat --out exported/
 openrage plugin run strings export x64a.rpf/data --out exported/   # batch actions also take folders and archives
 openrage plugin run gxt2-patch apply update/update.rpf/x64/data/lang/american_rel.rpf/global.gxt2 --pick patch.oxt

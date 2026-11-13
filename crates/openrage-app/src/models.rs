@@ -91,6 +91,35 @@ pub struct MaterialLook {
 pub const PLAIN: [f32; 4] = [0.72, 0.72, 0.74, 1.0];
 
 impl LoadedModel {
+    /// A model put together from drawables (e.g. by a plugin), each shown
+    /// once in place.
+    pub fn from_drawables(drawables: Vec<(String, Drawable)>) -> Self {
+        let parts = drawables
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| Part {
+                name: name.clone(),
+                group: String::new(),
+                drawable: i,
+                transform: math::IDENTITY,
+                visible: true,
+                bone: None,
+            })
+            .collect();
+        let mut model = LoadedModel {
+            drawables,
+            parts,
+            external: Vec::new(),
+            materials: Vec::new(),
+            shader_material: Vec::new(),
+            skeleton: None,
+            expressions: Vec::new(),
+            ped: None,
+        };
+        model.collect_materials();
+        model
+    }
+
     /// Finds a texture by name: embedded in the drawable first, then next to the model.
     pub fn texture<'a>(&'a self, drawable: &'a Drawable, name: &str) -> Option<&'a Texture> {
         let find = |d: &'a TextureDictionary| d.textures.iter().find(|t| t.name.eq_ignore_ascii_case(name));

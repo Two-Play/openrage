@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 /// The plugin API version this OpenRAGE implements (`api` in plugin.toml).
 /// Before 1.0 every minor version may break plugins, so it must match exactly.
-pub const API_VERSION: &str = "0.2";
+pub const API_VERSION: &str = "0.3";
 
 /// The manifest's file name in a plugin folder.
 pub const FILE_NAME: &str = "plugin.toml";
@@ -295,7 +295,7 @@ mod tests {
         id = "demo"
         name = "Demo"
         version = "1.0.0"
-        api = "0.2"
+        api = "0.3"
     "#;
 
     #[test]
@@ -305,7 +305,7 @@ mod tests {
             id = "obj-tools"
             name = "OBJ tools"
             version = "0.2.0"
-            api = "0.2"
+            api = "0.3"
             license = "MIT"
             games = ["gta5", "rdr2"]
             permissions = ["read-game"]
@@ -338,19 +338,19 @@ mod tests {
     fn rejects_bad_manifests() {
         let bad = [
             ("id = \"demo\"", "id = \"Demo\""),
-            ("api = \"0.2\"", "api = \"9.0\""),
+            ("api = \"0.3\"", "api = \"9.0\""),
             ("version = \"1.0.0\"", "version = \"1.0.0\"\nwasm = \"../x.wasm\""),
             ("version = \"1.0.0\"", "version = \"1.0.0\"\npermissions = [\"network\"]"),
             ("version = \"1.0.0\"", "version = \"1.0.0\"\nunknown = 1"),
-            ("api = \"0.2\"", "api = \"0.2\"\n[[preview]]\nextensions = [\".ydr\"]"),
-            ("api = \"0.2\"", "api = \"0.2\"\n[[file-types]]\nextensions = [\"*\"]\nname = \"x\""),
+            ("api = \"0.3\"", "api = \"0.3\"\n[[preview]]\nextensions = [\".ydr\"]"),
+            ("api = \"0.3\"", "api = \"0.3\"\n[[file-types]]\nextensions = [\"*\"]\nname = \"x\""),
             (
-                "api = \"0.2\"",
-                "api = \"0.2\"\n[[actions]]\nid = \"a\"\ntitle = \"A\"\nkind = \"modify\"\nextensions = [\"x\"]",
+                "api = \"0.3\"",
+                "api = \"0.3\"\n[[actions]]\nid = \"a\"\ntitle = \"A\"\nkind = \"modify\"\nextensions = [\"x\"]",
             ),
             (
-                "api = \"0.2\"",
-                "api = \"0.2\"\n[[actions]]\nid = \"a\"\ntitle = \"A\"\nextensions = [\"x\"]\npick = [\"*\"]",
+                "api = \"0.3\"",
+                "api = \"0.3\"\n[[actions]]\nid = \"a\"\ntitle = \"A\"\nextensions = [\"x\"]\npick = [\"*\"]",
             ),
         ];
         for (from, to) in bad {

@@ -2,7 +2,7 @@
 id = "gxt2-patch"
 name = "Text patch"
 version = "0.1.0"
-api = "0.2"
+api = "0.3"
 description = "Applies an OpenIV text file (.oxt) to a GTA V text table (.gxt2): its lines replace or add entries, everything else stays."
 authors = ["OpenRAGE contributors"]
 license = "MIT OR Apache-2.0"

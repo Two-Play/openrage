@@ -8,10 +8,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use openrage_plugins::{
-    Action, Component, DirEntry, GameFiles, GameId, Host, Input, LogLine, ModWrite, OutputFile, Permission, Plugin,
-    Registry,
+    Action, Component, DirEntry, GameFiles, GameId, Host, ImageView, Input, LogLine, Material, Mesh, ModWrite, Model,
+    OutputFile, Permission, Plugin, Registry,
 };
 use rage_crypto::GtaVKeys;
+use rage_formats::drawable::{self, Drawable};
+use rage_formats::math;
+use rage_formats::texture::Texture;
+use rage_formats::ytd::TextureDictionary;
 use rage_rpf::vfs::Node;
 
 use crate::config::Config;
@@ -60,11 +64,43 @@ pub struct GameDir {
     dir: PathBuf,
     game: GameId,
     keys: Option<Arc<GtaVKeys>>,
+    /// The model read last, for its textures (`load-texture` after `load-model`).
+    last_model: std::sync::Mutex<Option<(String, Arc<crate::models::LoadedModel>)>>,
 }
 
 impl GameDir {
     pub fn new(dir: &Path, keys: Option<Arc<GtaVKeys>>) -> Self {
-        Self { dir: dir.to_path_buf(), game: game_id(dir), keys }
+        Self { dir: dir.to_path_buf(), game: game_id(dir), keys, last_model: std::sync::Mutex::new(None) }
+    }
+
+    fn loaded_model(&self, vpath: &str) -> Result<Arc<crate::models::LoadedModel>> {
+        if let Ok(last) = self.last_model.lock()
+            && let Some((path, model)) = last.as_ref()
+            && path.eq_ignore_ascii_case(vpath)
+        {
+            return Ok(Arc::clone(model));
+        }
+        if !crate::models::is_model(vpath) || is_collision_or_path(vpath) {
+            bail!("{vpath} is not a model (.ydr, .yft, .ydd, .wdr, .wdd, .wft)");
+        }
+        let model = Arc::new(crate::models::load(&self.dir, self.keys.clone(), vpath)?);
+        if let Ok(mut last) = self.last_model.lock() {
+            *last = Some((vpath.to_owned(), Arc::clone(&model)));
+        }
+        Ok(model)
+    }
+
+    /// A texture dictionary of any game.
+    fn dictionary(&self, vpath: &str) -> Result<TextureDictionary> {
+        Ok(match self.resolve(vpath)? {
+            Node::ArchiveFile(rpf, id) => rage_formats::ytd::parse(&rpf.read_resource(id)?)?,
+            Node::Rpf8File(rpf, i) => {
+                let entry = rpf.entries().and_then(|e| e.get(i)).context("archive table not readable")?;
+                rage_formats::ytd::parse_rdr2(&rpf.read_resource(entry)?)?
+            }
+            Node::Gta4File(a, id) => rage_formats::ytd::parse_gta4(&a.read_resource(id)?)?,
+            _ => bail!("{vpath} is not a texture dictionary inside an archive"),
+        })
     }
 
     fn resolve(&self, vpath: &str) -> Result<Node> {
@@ -75,6 +111,24 @@ impl GameDir {
 impl GameFiles for GameDir {
     fn game(&self) -> Option<GameId> {
         Some(self.game)
+    }
+
+    fn model(&self, vpath: &str) -> Result<Model> {
+        Ok(to_plugin_model(&*self.loaded_model(vpath)?))
+    }
+
+    fn texture(&self, vpath: &str, name: &str) -> Result<ImageView> {
+        let lower = vpath.to_ascii_lowercase();
+        let texture = if lower.ends_with(".ytd") || lower.ends_with(".wtd") {
+            let dict = self.dictionary(vpath)?;
+            dict.textures.into_iter().find(|t| t.name.eq_ignore_ascii_case(name))
+        } else {
+            let model = self.loaded_model(vpath)?;
+            model.drawables.iter().find_map(|(_, d)| model.texture(d, name)).cloned()
+        };
+        let t = texture.with_context(|| format!("{vpath} has no texture {name:?}"))?;
+        let rgba = t.to_rgba().with_context(|| format!("texture {name:?}: format {:?} cannot be decoded", t.format))?;
+        Ok(ImageView { width: t.width, height: t.height, rgba })
     }
 
     fn read(&self, vpath: &str) -> Result<Vec<u8>> {
@@ -152,6 +206,166 @@ impl GameFiles for GameDir {
         out.sort_by_key(|e| (!e.is_dir, e.name.to_ascii_lowercase()));
         Ok(out)
     }
+}
+
+/// Collision and path files count as models in the explorer, but plugins
+/// get only real models.
+fn is_collision_or_path(vpath: &str) -> bool {
+    let lower = vpath.to_ascii_lowercase();
+    lower.ends_with(".ybn")
+        || lower.ends_with(".wbn")
+        || lower.ends_with(".wbd")
+        || lower.ends_with(".ypt")
+        || rage_formats::paths::is_path_file(&lower)
+}
+
+/// Neutral grey for materials without a colour of their own.
+const GREY: (f32, f32, f32, f32) = (0.7, 0.7, 0.7, 1.0);
+
+/// A model as plugins see it: the parts shown by default, placed in model
+/// space, one material per shader kind.
+pub fn to_plugin_model(model: &crate::models::LoadedModel) -> Model {
+    let mut materials: Vec<(u32, Material)> = Vec::new();
+    let mut meshes = Vec::new();
+    let visible = model.default_visibility();
+    // Child drawables of fragments (wheels, doors) have no shaders of their
+    // own: they use the main drawable's, as the renderer does.
+    let main_shaders = model.drawables.first().map(|(_, d)| d.shaders.as_slice()).unwrap_or_default();
+    for (part, d) in model.shown(&visible) {
+        let shaders = if d.shaders.is_empty() { main_shaders } else { d.shaders.as_slice() };
+        for m in &d.meshes {
+            let Some(shader) = shaders.get(m.shader as usize) else { continue };
+            let texture = shader.base_texture().unwrap_or_default().to_owned();
+            // Same shader kind and texture: one material.
+            let key = shader.name_hash ^ rage_core::hash::joaat(&texture);
+            let material = match materials.iter().position(|(k, _)| *k == key) {
+                Some(i) => i,
+                None => {
+                    let kind = rage_formats::shaders::name(shader.name_hash)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("shader_{:08x}", shader.name_hash));
+                    let name = if texture.is_empty() { kind } else { format!("{kind}_{texture}") };
+                    let color =
+                        rage_formats::shaders::color(shader.name_hash).map_or(GREY, |c| (c[0], c[1], c[2], c[3]));
+                    materials.push((key, Material { name, texture, color, image: None }));
+                    materials.len() - 1
+                }
+            };
+            let flat =
+                |v: &[[f32; 3]], f: &dyn Fn([f32; 3]) -> [f32; 3]| v.iter().flat_map(|p| f(*p)).collect::<Vec<_>>();
+            meshes.push(Mesh {
+                part: part.name.clone(),
+                positions: flat(&m.positions, &|p| math::transform_point(&part.transform, p)),
+                normals: flat(&m.normals, &|n| math::transform_dir(&part.transform, n)),
+                uvs: m.uvs.iter().flatten().copied().collect(),
+                indices: m.indices.clone(),
+                material: material as u32,
+            });
+        }
+    }
+    Model { meshes, materials: materials.into_iter().map(|(_, m)| m).collect() }
+}
+
+/// A plugin's model for the 3D view: one drawable per part, one shader per
+/// material, the materials' pixels as embedded textures.
+pub fn from_plugin_model(model: &Model, name: &str) -> crate::models::LoadedModel {
+    let mut textures = Vec::new();
+    let shaders: Vec<drawable::Shader> = model
+        .materials
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            // Plugin materials get hashes of their own, so they never take a game shader's colour.
+            let name_hash = rage_core::hash::joaat(&format!("plugin:{i}:{}", m.name));
+            let (r, g, b, a) = m.color;
+            rage_formats::shaders::register(name_hash, m.name.clone(), [r, g, b, a]);
+            let mut texture_names = Vec::new();
+            let mut samplers = Vec::new();
+            if let Some(img) = &m.image {
+                let tex = if m.texture.is_empty() { format!("{}_texture", m.name) } else { m.texture.clone() };
+                textures.push(Texture {
+                    name: tex.clone(),
+                    width: img.width,
+                    height: img.height,
+                    depth: 1,
+                    levels: 1,
+                    format: rage_formats::texture::Format::R8G8B8A8_UNORM,
+                    dimension: rage_formats::texture::Dimension::Texture2D,
+                    usage: 0,
+                    data: img.rgba.clone(),
+                });
+                texture_names.push(tex.clone());
+                samplers.push((drawable::param::DIFFUSE_TEX, tex));
+            }
+            drawable::Shader { name_hash, textures: texture_names, samplers }
+        })
+        .collect();
+    let dictionary = (!textures.is_empty()).then(|| TextureDictionary {
+        textures,
+        errors: Vec::new(),
+        layout: rage_formats::ytd::Layout::Enhanced,
+        version: 0,
+        root: Vec::new(),
+        stored: Vec::new(),
+    });
+    // One drawable per part, in the order the parts first appear, each with
+    // the shaders of the materials it uses.
+    let mut parts: Vec<(String, Vec<drawable::Mesh>, Vec<u32>)> = Vec::new();
+    for m in &model.meshes {
+        let chunk = |v: &[f32]| v.as_chunks::<3>().0.to_vec();
+        let mesh = drawable::Mesh {
+            positions: chunk(&m.positions),
+            normals: chunk(&m.normals),
+            uvs: m.uvs.as_chunks::<2>().0.to_vec(),
+            indices: m.indices.clone(),
+            ..Default::default()
+        };
+        let part = if m.part.is_empty() { name.to_owned() } else { m.part.clone() };
+        let at = match parts.iter().position(|(n, _, _)| *n == part) {
+            Some(i) => i,
+            None => {
+                parts.push((part, Vec::new(), Vec::new()));
+                parts.len() - 1
+            }
+        };
+        let (_, list, used) = &mut parts[at];
+        let local = match used.iter().position(|&u| u == m.material) {
+            Some(i) => i,
+            None => {
+                used.push(m.material);
+                used.len() - 1
+            }
+        };
+        list.push(drawable::Mesh { shader: local as u16, ..mesh });
+    }
+    let drawables = parts
+        .into_iter()
+        .map(|(part, meshes, used)| {
+            let shaders: Vec<drawable::Shader> = used.iter().map(|&u| shaders[u as usize].clone()).collect();
+            let mut min = [f32::MAX; 3];
+            let mut max = [f32::MIN; 3];
+            for p in meshes.iter().flat_map(|m| &m.positions) {
+                for k in 0..3 {
+                    min[k] = min[k].min(p[k]);
+                    max[k] = max[k].max(p[k]);
+                }
+            }
+            if min[0] > max[0] {
+                (min, max) = ([0.0; 3], [0.0; 3]);
+            }
+            let d = Drawable {
+                name: part.clone(),
+                meshes,
+                shaders,
+                textures: dictionary.clone(),
+                bounds_min: min,
+                bounds_max: max,
+                skeleton: None,
+            };
+            (part, d)
+        })
+        .collect();
+    crate::models::LoadedModel::from_drawables(drawables)
 }
 
 /// A file the user chose from disk for an action that asks for files (`pick`).
@@ -432,6 +646,49 @@ mod tests {
         assert_eq!(game.read("test.rpf/data/a.txt").unwrap(), b"original");
         assert!(!tmp.join("mods/common/x.meta").exists());
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn converts_models_both_ways() {
+        let tri = |shader: u16| drawable::Mesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 3],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            indices: vec![0, 1, 2],
+            shader,
+            ..Default::default()
+        };
+        let shader = |t: &str| drawable::Shader {
+            name_hash: rage_core::hash::joaat("default"),
+            textures: vec![t.to_owned()],
+            samplers: vec![(drawable::param::DIFFUSE_SAMPLER, t.to_owned())],
+        };
+        let body = Drawable {
+            name: "body".into(),
+            meshes: vec![tri(0), tri(1)],
+            shaders: vec![shader("paint"), shader("glass")],
+            textures: None,
+            bounds_min: [0.0; 3],
+            bounds_max: [1.0; 3],
+            skeleton: None,
+        };
+        // A wheel without shaders of its own uses the body's.
+        let wheel = Drawable { name: "wheel".into(), meshes: vec![tri(1)], shaders: Vec::new(), ..body.clone() };
+        let loaded = crate::models::LoadedModel::from_drawables(vec![("body".into(), body), ("wheel".into(), wheel)]);
+        let model = to_plugin_model(&loaded);
+        assert_eq!(model.meshes.len(), 3);
+        assert_eq!(model.materials.len(), 2);
+        assert_eq!(model.materials[1].texture, "glass");
+        assert_eq!(model.meshes[2].part, "wheel");
+        assert_eq!(model.meshes[2].material, 1);
+
+        let back = from_plugin_model(&model, "x");
+        assert_eq!(back.drawables.len(), 2);
+        let (_, wheel) = &back.drawables[1];
+        // The wheel only carries the one material it uses.
+        assert_eq!(wheel.shaders.len(), 1);
+        assert_eq!(wheel.meshes[0].shader, 0);
+        assert_eq!(wheel.meshes[0].positions[1], [1.0, 0.0, 0.0]);
     }
 
     #[test]
