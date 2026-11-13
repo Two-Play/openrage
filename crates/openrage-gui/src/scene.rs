@@ -45,6 +45,8 @@ struct State {
     show_surroundings: bool,
     /// The surroundings are still loading.
     surroundings_pending: bool,
+    /// Per surroundings model: shown (the object list of a map scene).
+    object_shown: Vec<bool>,
     /// The cutscene's lights, ready for the renderer; `show_lights` switches them.
     lights: Vec<crate::gpu::SceneLight>,
     show_lights: bool,
@@ -279,6 +281,7 @@ fn start(
         surroundings: Vec::new(),
         show_surroundings: true,
         surroundings_pending: true,
+        object_shown: Vec::new(),
         lights: scene_lights(&cut.lights),
         show_lights: !cut.lights.is_empty(),
         timer: slint::Timer::default(),
@@ -501,7 +504,10 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         })
         .collect();
     if st.show_surroundings {
-        for (preview, look, placements) in &st.surroundings {
+        for (k, (preview, look, placements)) in st.surroundings.iter().enumerate() {
+            if !st.object_shown.get(k).copied().unwrap_or(true) {
+                continue;
+            }
             for t in placements {
                 items.push(crate::gpu::SceneItem { preview, look, model: *t, skin: None });
             }
@@ -520,7 +526,7 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         None => {
             // No GPU: the software renderer, at a smaller size to stay responsive.
             let (sw, sh) = ((width / 2).max(64) as usize, (height / 2).max(64) as usize);
-            let soft: Vec<render::SceneItem> = st
+            let mut soft: Vec<render::SceneItem> = st
                 .actors
                 .iter()
                 .zip(&poses)
@@ -532,6 +538,23 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
                     skin: skin.as_deref(),
                 })
                 .collect();
+            // A map scene is all surroundings.
+            if st.actors.is_empty() && st.show_surroundings {
+                for (k, (preview, look, placements)) in st.surroundings.iter().enumerate() {
+                    if !st.object_shown.get(k).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    for t in placements {
+                        soft.push(render::SceneItem {
+                            model: &preview.loaded,
+                            look,
+                            materials: &preview.materials,
+                            transform: *t,
+                            skin: None,
+                        });
+                    }
+                }
+            }
             let rgba = render::render_scene(&soft, &camera, sw, sh);
             let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, sw as u32, sh as u32);
             win.set_frame(slint::Image::from_rgba8_premultiplied(buffer));
@@ -539,6 +562,184 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
     }
     win.set_time(st.time);
     win.set_time_text(format!("{:.1} / {:.1} s", st.time, st.duration).into());
+}
+
+/// Opens a map file (`.ymap`) as a scene: every object it places, with its
+/// model and textures, an object list and glTF export.
+pub fn open_map(ui: &AppWindow, vpath: String) {
+    let Ok(win) = SceneWindow::new() else { return };
+    win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(&win);
+    let name = vpath.rsplit('/').next().unwrap_or(&vpath).to_owned();
+    win.set_heading(name.clone().into());
+    win.set_path(vpath.clone().into());
+    win.set_timeline(false);
+    win.set_status("Reading the map …".into());
+    let state: Shared = Rc::new(RefCell::new(None));
+    wire(&win, &state);
+    wire_map(&win, &state, ui.as_weak(), name);
+    win.window().on_close_requested(|| {
+        forget_closed();
+        slint::CloseRequestResponse::HideWindow
+    });
+    let _ = win.show();
+    let id = NEXT_ID.with(|n| {
+        n.set(n.get() + 1);
+        n.get()
+    });
+    OPEN.with(|o| o.borrow_mut().push((id, win.clone_strong(), Rc::clone(&state))));
+    let Some((game_dir, keys)) = crate::with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone()))) else { return };
+    let progress = watch_progress(&win);
+    let weak = win.as_weak();
+    std::thread::spawn(move || {
+        progress.set("Reading the world (once, a few seconds) …", 0, 0);
+        let result = (|| -> anyhow::Result<MapLoaded> {
+            let world = openrage_app::world::load(&game_dir, keys.clone())?;
+            let files = openrage_app::world::files(&game_dir)?;
+            progress.set("Loading the map's models", 0, 0);
+            let scene = openrage_app::world::load_map(&world, &files, &game_dir, keys, &vpath, &|done, total| {
+                progress.step(done, total)
+            })?;
+            let models = scene
+                .models
+                .into_iter()
+                .map(|(name, loaded, transforms)| {
+                    let materials = render::Materials::new(&loaded);
+                    let look = std::sync::RwLock::new(loaded.default_look());
+                    (ModelPreview { loaded, look, materials, name }, transforms)
+                })
+                .collect();
+            Ok(MapLoaded { models, objects: scene.objects, missing: scene.missing.iter().map(|(_, n)| n).sum() })
+        })();
+        progress.set("", 0, 0);
+        let _ = weak.upgrade_in_event_loop(move |win| {
+            let Some(state) = OPEN.with(|o| o.borrow().iter().find(|(i, ..)| *i == id).map(|(_, _, s)| Rc::clone(s)))
+            else {
+                return;
+            };
+            win.set_loading(false);
+            match result {
+                Ok(loaded) => start_map(&win, &state, loaded),
+                Err(e) => win.set_status(format!("Cannot show the map: {e:#}").into()),
+            }
+        });
+    });
+}
+
+/// A map file's models with their placements, loaded in the background.
+struct MapLoaded {
+    models: Vec<(ModelPreview, Vec<Mat4>)>,
+    objects: usize,
+    /// Objects whose model was not found.
+    missing: usize,
+}
+
+fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
+    let mut surroundings: Vec<(Arc<ModelPreview>, Look, Vec<Mat4>)> = scene
+        .models
+        .into_iter()
+        .map(|(p, transforms)| {
+            let mut look = p.loaded.default_look();
+            // Decals need blending the scene does not do (see load_surroundings).
+            for (slot, l) in p.loaded.materials.iter().zip(look.materials.iter_mut()) {
+                if rage_formats::shaders::name(slot.name_hash).is_some_and(|n| n.contains("decal")) {
+                    l.visible = false;
+                }
+            }
+            (Arc::new(p), look, transforms)
+        })
+        .collect();
+    surroundings.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+    let items: Vec<(&openrage_app::models::LoadedModel, &Look, &[Mat4])> =
+        surroundings.iter().map(|(p, l, t)| (&p.loaded, l, t.as_slice())).collect();
+    let bounds = openrage_app::world::scene_bounds(&items).unwrap_or(([-1.0; 3], [1.0; 3]));
+    let rows: Vec<crate::PartRow> = surroundings
+        .iter()
+        .map(|(p, _, t)| crate::PartRow { name: p.name.clone().into(), visible: true, level: 0, count: t.len() as i32 })
+        .collect();
+    win.set_objects(slint::ModelRc::new(slint::VecModel::from(rows)));
+    win.set_can_export(!surroundings.is_empty());
+    let (lo, hi) = bounds;
+    let mut status = format!(
+        "{} objects · {} models · {:.0} × {:.0} m",
+        scene.objects,
+        surroundings.len(),
+        hi[0] - lo[0],
+        hi[1] - lo[1]
+    );
+    if scene.missing > 0 {
+        status.push_str(&format!(" · {} without a model", scene.missing));
+    }
+    status.push_str(" · drag to turn, scroll to zoom");
+    win.set_status(status.into());
+    let object_shown = vec![true; surroundings.len()];
+    *state.borrow_mut() = Some(State {
+        dict: Arc::new(ClipDictionary::default()),
+        actors: Vec::new(),
+        camera_clip: None,
+        duration: 0.0,
+        time: 0.0,
+        playing: false,
+        last: Instant::now(),
+        cut_camera: false,
+        view: View::default(),
+        bounds,
+        surroundings,
+        show_surroundings: true,
+        surroundings_pending: false,
+        object_shown,
+        lights: Vec::new(),
+        show_lights: false,
+        timer: slint::Timer::default(),
+    });
+    render_frame(win, state);
+}
+
+/// The object list and the export of a map scene.
+fn wire_map(win: &SceneWindow, state: &Shared, main: slint::Weak<AppWindow>, name: String) {
+    let set_shown = |s: &Shared, w: &slint::Weak<SceneWindow>, which: Option<usize>, on: bool| {
+        let Some(win) = w.upgrade() else { return };
+        if let Some(st) = s.borrow_mut().as_mut() {
+            for (k, v) in st.object_shown.iter_mut().enumerate() {
+                if which.is_none_or(|i| i == k) {
+                    *v = on;
+                }
+            }
+            let rows: Vec<crate::PartRow> = st
+                .surroundings
+                .iter()
+                .zip(&st.object_shown)
+                .map(|((p, _, t), v)| crate::PartRow {
+                    name: p.name.clone().into(),
+                    visible: *v,
+                    level: 0,
+                    count: t.len() as i32,
+                })
+                .collect();
+            crate::viewer::update_model(win.get_objects(), rows, |m| win.set_objects(m));
+        }
+        render_frame(&win, s);
+    };
+    let (w, s) = (win.as_weak(), Rc::clone(state));
+    win.on_object_toggled(move |i, on| set_shown(&s, &w, usize::try_from(i).ok(), on));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
+    win.on_all_objects(move |on| set_shown(&s, &w, None, on));
+    let s = Rc::clone(state);
+    win.on_export_gltf(move || {
+        let st = s.borrow();
+        let Some(st) = st.as_ref() else { return };
+        // The shown objects, as they are (the export runs in the background).
+        let shown: Vec<(Arc<ModelPreview>, Look, Vec<Mat4>)> = st
+            .surroundings
+            .iter()
+            .zip(&st.object_shown)
+            .filter(|(_, v)| **v)
+            .map(|((p, l, t), _)| (Arc::clone(p), l.clone(), t.clone()))
+            .collect();
+        let (lo, hi) = st.bounds;
+        let center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, lo[2]];
+        crate::save_scene_glb(name.clone(), shown, center, main.clone());
+    });
 }
 
 fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {

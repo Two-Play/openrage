@@ -351,6 +351,30 @@ fn debug_snapshot_rest(ui: &AppWindow, path: String) {
     // `OPENRAGE_SCENE=<cut>` (+ `OPENRAGE_SCENE_TIME`, `OPENRAGE_FREE`): the whole cutscene.
     // `OPENRAGE_SCENE_SNAP_AT=<ms>` takes the picture that soon (while loading);
     // `OPENRAGE_SCENE_PLAY=<s>` plays that long and quits without a picture.
+    // `OPENRAGE_MAP=<ymap>`: the map file's 3D scene, once its models have loaded.
+    if let Ok(map) = std::env::var("OPENRAGE_MAP") {
+        open_xml_view(ui, map);
+        if let Some(x) = xmlview::newest() {
+            x.invoke_show_map();
+        }
+        let waiting = std::rc::Rc::new(slint::Timer::default());
+        let (started, timer) = (Instant::now(), std::rc::Rc::clone(&waiting));
+        waiting.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
+            if !scene::ready() && started.elapsed() < Duration::from_secs(180) {
+                return;
+            }
+            timer.stop();
+            let path = path.clone();
+            slint::Timer::single_shot(Duration::from_millis(800), move || {
+                if let Some(Ok(img)) = scene::newest().map(|w| w.window().take_snapshot()) {
+                    let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
+                        .map(|png| std::fs::write(&path, png));
+                }
+                let _ = slint::quit_event_loop();
+            });
+        });
+        return;
+    }
     if let Ok(cut) = std::env::var("OPENRAGE_SCENE") {
         open_xml_view(ui, cut);
         if let Some(x) = xmlview::newest() {
@@ -3073,6 +3097,37 @@ fn export_gltf(ui: &AppWindow) {
     if let Some(model) = with_app(|a| a.model.clone()) {
         save_glb(model, ui.as_weak());
     }
+}
+
+/// Asks for a file name and writes a scene's shown objects as one `.glb`
+/// (centred on `center`); reports in the main window.
+fn save_scene_glb(
+    name: String,
+    items: Vec<(Arc<ModelPreview>, openrage_app::models::Look, Vec<rage_formats::math::Mat4>)>,
+    center: [f32; 3],
+    main: Weak<AppWindow>,
+) {
+    std::thread::spawn(move || {
+        let stem = name.split('.').next().unwrap_or(&name).to_owned();
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Export glTF")
+            .set_file_name(format!("{stem}.glb"))
+            .add_filter("glTF binary", &["glb"])
+            .save_file()
+        else {
+            return;
+        };
+        let refs: Vec<(&openrage_app::models::LoadedModel, &openrage_app::models::Look, &[rage_formats::math::Mat4])> =
+            items.iter().map(|(p, l, t)| (&p.loaded, l, t.as_slice())).collect();
+        let result = openrage_app::models::scene_to_glb(&stem, &refs, center)
+            .ok_or_else(|| "nothing visible to export".to_owned())
+            .and_then(|glb| std::fs::write(&path, glb).map_err(|e| e.to_string()));
+        let message = match result {
+            Ok(()) => format!("Exported {}", path.display()),
+            Err(e) => format!("Cannot export {stem}: {e}"),
+        };
+        let _ = main.upgrade_in_event_loop(move |ui| ui.set_status(message.into()));
+    });
 }
 
 /// Asks for a file name and writes the model as `.glb`; reports in the main window.
