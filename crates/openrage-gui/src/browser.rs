@@ -116,7 +116,7 @@ pub fn is_audio(name: &str) -> bool {
 /// Whether a file name is a texture dictionary that can be opened like a folder.
 pub fn is_texture_dict(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".ytd") || lower.ends_with(".ypt")
+    lower.ends_with(".ytd") || lower.ends_with(".ypt") || lower.ends_with(".wtd")
 }
 
 /// Particle dictionaries open like texture dictionaries, read-only.
@@ -261,6 +261,11 @@ pub fn list(
             Ok((audio_listing(vpath, awc, origin), None))
         }
         Node::Gta4Dir(a, dir) => Ok((list_gta4(vpath, a, dir, origin), None)),
+        Node::Gta4File(a, i) if is_texture_dict(&a.entry(i).name) && a.entry(i).resource_type().is_some() => {
+            let dict = rage_formats::ytd::parse_gta4(&a.read_resource(i)?)
+                .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
+            Ok((texture_listing(vpath, dict, origin), None))
+        }
         Node::ArchiveFile(..) | Node::PlainFile(_) | Node::Rpf8File(..) | Node::Gta4File(..) => {
             let name = last_segment(&vpath);
             let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys, overlay)?;
@@ -334,12 +339,8 @@ fn list_textures(vpath: String, rpf: Arc<Rpf7>, id: EntryId, origin: Origin) -> 
     Ok(Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict), read_only }, items })
 }
 
-/// The textures of a Red Dead Redemption 2 texture dictionary (read-only).
-fn list_rpf8_textures(vpath: String, rpf: Arc<rage_rpf::Rpf8>, i: usize, origin: Origin) -> Result<Listing, RpfError> {
-    let entry = rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| RpfError::NotFound(vpath.clone()))?;
-    let res = rpf.read_resource(entry)?;
-    let dict = rage_formats::ytd::parse_rdr2(&res)
-        .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
+/// The textures of a dictionary that cannot be changed (GTA IV, RDR2).
+fn texture_listing(vpath: String, dict: rage_formats::ytd::TextureDictionary, origin: Origin) -> Listing {
     let items = dict
         .textures
         .iter()
@@ -354,7 +355,16 @@ fn list_rpf8_textures(vpath: String, rpf: Arc<rage_rpf::Rpf8>, i: usize, origin:
             detail: None,
         })
         .collect();
-    Ok(Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict), read_only: true }, items })
+    Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict), read_only: true }, items }
+}
+
+/// The textures of a Red Dead Redemption 2 texture dictionary (read-only).
+fn list_rpf8_textures(vpath: String, rpf: Arc<rage_rpf::Rpf8>, i: usize, origin: Origin) -> Result<Listing, RpfError> {
+    let entry = rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| RpfError::NotFound(vpath.clone()))?;
+    let res = rpf.read_resource(entry)?;
+    let dict = rage_formats::ytd::parse_rdr2(&res)
+        .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
+    Ok(texture_listing(vpath, dict, origin))
 }
 
 fn list_audio(

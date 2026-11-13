@@ -1277,10 +1277,17 @@ fn refresh_files(ui: &AppWindow, select: Option<&str>) {
     ui.set_textures_locked(with_app(|a| {
         matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { read_only: true, .. }))
     }));
-    ui.set_textures_rdr2(with_app(|a| {
-        matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { .. }))
-            && a.game_dir.as_deref().is_some_and(is_rdr2_dir)
-    }));
+    ui.set_textures_game(
+        with_app(|a| {
+            let textures = matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Textures { .. }));
+            match a.game_dir.as_deref() {
+                Some(d) if textures && is_rdr2_dir(d) => "Red Dead Redemption 2",
+                Some(d) if textures && is_gta4_dir(d) => "GTA IV",
+                _ => "",
+            }
+        })
+        .into(),
+    );
     ui.set_texture_selected(texture_mode && selected_row.is_some());
     let history_mode = with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::History)));
     ui.set_history_mode(history_mode);
@@ -1827,6 +1834,19 @@ fn texture_sheet(textures: &[rage_formats::texture::Texture]) -> Option<Rgba> {
     Some((w as u32, h as u32, out))
 }
 
+/// Summary and texture sheet of a texture dictionary for the preview.
+fn texture_dict_preview(dict: &rage_formats::ytd::TextureDictionary) -> (Meta, String, Option<Rgba>) {
+    let names: Vec<&str> = dict.textures.iter().take(8).map(|t| t.name.as_str()).collect();
+    let more = if dict.textures.len() > 8 { ", …" } else { "" };
+    let shown = dict.textures.len().min(SHEET_CELLS);
+    let meta = vec![
+        kv("Textures", dict.textures.len()),
+        kv("Contains", format!("{}{more}", names.join(", "))),
+        note(format!("The preview shows {shown} of them. Double-click to open the dictionary.")),
+    ];
+    (meta, String::new(), texture_sheet(&dict.textures))
+}
+
 fn texture_image(t: &rage_formats::texture::Texture) -> Option<Rgba> {
     t.to_rgba().map(|rgba| (t.width, t.height, rgba))
 }
@@ -1845,23 +1865,23 @@ fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, St
             }
             None => (Meta::new(), String::new(), None),
         },
+        PreviewSource::Gta4(a, id) if browser::is_texture_dict(&a.entry(id).name) => {
+            match a
+                .read_resource(id)
+                .map_err(|e| e.to_string())
+                .and_then(|r| rage_formats::ytd::parse_gta4(&r).map_err(|e| e.to_string()))
+            {
+                Ok(dict) => texture_dict_preview(&dict),
+                Err(e) => (vec![kv("Error", e)], String::new(), None),
+            }
+        }
         PreviewSource::Entry(rpf, id) if browser::is_texture_dict(&rpf.entry(id).name) => {
             match rpf
                 .read_resource(id)
                 .map_err(|e| e.to_string())
                 .and_then(|r| rage_formats::ytd::parse(&r).map_err(|e| e.to_string()))
             {
-                Ok(dict) => {
-                    let names: Vec<&str> = dict.textures.iter().take(8).map(|t| t.name.as_str()).collect();
-                    let more = if dict.textures.len() > 8 { ", …" } else { "" };
-                    let shown = dict.textures.len().min(SHEET_CELLS);
-                    let meta = vec![
-                        kv("Textures", dict.textures.len()),
-                        kv("Contains", format!("{}{more}", names.join(", "))),
-                        note(format!("The preview shows {shown} of them. Double-click to open the dictionary.")),
-                    ];
-                    (meta, String::new(), texture_sheet(&dict.textures))
-                }
+                Ok(dict) => texture_dict_preview(&dict),
                 Err(e) => (vec![kv("Error", e)], String::new(), None),
             }
         }

@@ -146,8 +146,13 @@ Archives then open like folders, read-only: file details, a text preview for pla
 sizes for resources, and *Extract…* for files, folders and whole archives. Files are saved as stored, like OpenIV does:
 resources (`.wtd`, `.wdr`, `.wdd`, `.wft`, `.wbd`, `.wbn`, `.wad`, …) as RSC5 files with their header. RPF3 archives keep
 only a hash of each name, so their entries show as hexadecimal numbers. `openrage verify` reads all 303 archives of the
-game (46,889 resources inflated, no errors). Textures, models, text and maps come in the next steps; the search index is
-GTA V only for now.
+game (46,889 resources inflated, no errors).
+
+**Textures** (`.wtd`) open like GTA V's texture dictionaries, read-only: preview, viewer and export as DDS or PNG
+(`openrage textures <path> --export <dir> [--png]`). GTA IV stores DXT1/3/5 and uncompressed 32-bit textures; names
+drop the `pack:/` prefix and `.dds` suffix the game keeps. `openrage verify --textures` reads every dictionary of the game
+(6,400 dictionaries, 70,845 textures, all decoded). Textures embedded in models come with the models; models, text and
+maps follow in the next steps. The search index is GTA V only for now.
 
 ## Red Dead Redemption 2
 
