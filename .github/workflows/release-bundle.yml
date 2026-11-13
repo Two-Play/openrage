@@ -1,0 +1,90 @@
+name: Release bundle
+
+# One download with both the Linux and the Windows version, for mod sites
+# that host a single file per release (GTA5-Mods, Nexus Mods, …).
+#
+# It runs after the Release workflow has published a tag's release: it takes
+# that release's Linux .tar.gz and Windows .zip, unpacks them into `linux/`
+# and `windows/` next to a short README and the license files, and attaches
+# `openrage-<tag>-linux-windows.zip` to the same release (its checksum is
+# added to SHA256SUMS.txt). Nothing is built again.
+#
+# "Run workflow" (manual) makes the bundle for an existing release tag; with
+# "upload" off it is only kept as a workflow artifact, to check it first.
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.2.0
+        required: true
+      upload:
+        description: Attach the bundle to the release
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    # After Release: only for successful tag pushes (manual Release runs publish nothing).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+      UPLOAD: ${{ github.event_name == 'workflow_run' || inputs.upload }}
+    steps:
+      # The default branch: it has the bundle README also for older tags.
+      - uses: actions/checkout@v5
+      - name: Download the Linux and Windows archives of the release
+        run: |
+          gh release view "$TAG" > /dev/null
+          mkdir -p dl
+          gh release download "$TAG" --dir dl \
+            --pattern "openrage-${TAG}-linux-x86_64.tar.gz" \
+            --pattern "openrage-${TAG}-windows-x86_64.zip" \
+            --pattern SHA256SUMS.txt
+          (cd dl && sha256sum --check --ignore-missing SHA256SUMS.txt)
+      - name: Put both into one archive
+        run: |
+          bundle="openrage-${TAG}-linux-windows"
+          mkdir -p "$bundle" unpacked out
+          tar xzf "dl/openrage-${TAG}-linux-x86_64.tar.gz" -C unpacked
+          unzip -q "dl/openrage-${TAG}-windows-x86_64.zip" -d unpacked
+          mv "unpacked/openrage-${TAG}-linux-x86_64" "$bundle/linux"
+          mv "unpacked/openrage-${TAG}-windows-x86_64" "$bundle/windows"
+          # The license files and README once, at the top.
+          for f in LICENSE LICENSE-AGPL-3.0 NOTICE.md README.md; do
+            mv "$bundle/linux/$f" "$bundle/$f"
+            rm -f "$bundle/windows/$f"
+          done
+          # Every file the archives held, and nothing else, ends up in the bundle.
+          for f in "$bundle"/linux/* "$bundle"/windows/*; do test -s "$f"; done
+          test -x "$bundle/linux/openrage-gui" && test -f "$bundle/windows/openrage-gui.exe"
+          sed "s/{VERSION}/${TAG}/" packaging/BUNDLE-README.txt > "$bundle/README.txt"
+          # Windows users open README.txt in Notepad: CRLF line ends.
+          sed -i 's/$/\r/' "$bundle/README.txt"
+          # -X: no Unix owner fields; Unix permissions stay, so the Linux files remain executable.
+          zip -q -r -X -9 "out/${bundle}.zip" "$bundle"
+          (cd out && sha256sum "${bundle}.zip" | tee "${bundle}.zip.sha256")
+          unzip -l "out/${bundle}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle
+          path: out/*.zip
+          if-no-files-found: error
+      - name: Attach the bundle to the release
+        if: env.UPLOAD == 'true'
+        run: |
+          bundle="openrage-${TAG}-linux-windows.zip"
+          grep -v " ${bundle}\$" dl/SHA256SUMS.txt > SHA256SUMS.txt || true
+          cat "out/${bundle}.sha256" >> SHA256SUMS.txt
+          gh release upload "$TAG" "out/${bundle}" SHA256SUMS.txt --clobber
