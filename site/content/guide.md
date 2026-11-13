@@ -55,6 +55,13 @@ matches OpenIV's.
 Every action is in the menu bar (File, Edit, View, Go, Help) with its shortcut. Right-click a file for the actions that
 apply to it: open, view, extract, export, replace, rename, delete, copy name or path.
 
+The other windows have right-click menus too:
+
+- **XML window:** on a tree entry, expand or collapse, copy its name, its values or its XML, or *Show in XML* (jumps to
+  its line); on a value, copy the value or the name; on an XML line, copy the line or the whole XML.
+- **Viewer:** reset the view, look from the front, side or above, switch to the fly camera, export glTF (models) or
+  save PNG (textures), show or hide the details, copy the path, close.
+
 | Keys | Action |
 |---|---|
 | Arrow keys, Page Up/Down, Home/End | Move in the list |

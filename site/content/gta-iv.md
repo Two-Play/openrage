@@ -25,7 +25,7 @@ openrage ls pc/models/cdimages
 
 | What | Files | Status |
 |---|---|---|
-| Archives | `.img` (IMG3), `.rpf` (RPF2, RPF3) | browse and extract; change `.img` archives |
+| Archives | `.img` (IMG3), `.rpf` (RPF2, RPF3) | browse, extract and change |
 | Textures | `.wtd`, inside `.wdr` | view, export DDS/PNG; replace, add and remove |
 | Models | `.wdr`, `.wdd`, `.wft` | view, export glTF |
 | Texts | `.gxt` | view and edit |
@@ -35,7 +35,7 @@ openrage ls pc/models/cdimages
 | Scripts | `.sco` | read the disassembly |
 | Search | everything above, `.ide`, `.dat`, `.gxt` | names, hashes and full text |
 
-Changes go into the `update` folder; see [Editing](#editing). Changing `.rpf` archives is not available yet.
+Changes go into the `update` folder; see [Editing](#editing).
 
 ## Search
 
@@ -177,20 +177,25 @@ loads files from the `update` folder next to `GTAIV.exe` in place of the origina
 there, as it uses the `mods` folder for GTA V; the game folder itself stays untouched. Without FusionFix the game
 ignores the `update` folder, and OpenRAGE says so when you make a change.
 
-- **Archives (`.img`):** the first change copies the whole archive into the `update` folder; that copy is edited from
-  then on. Import, replace, rename and remove entries as in GTA V. Resources (`.wtd`, `.wdr`, `.wft`, …) keep their
-  type and flags from their header.
+- **Archives (`.img`, `.rpf`):** the first change copies the whole archive into the `update` folder; that copy is
+  edited from then on. Import, replace, rename and remove entries as in GTA V; `.rpf` archives also have folders.
+  Resources (`.wtd`, `.wdr`, `.wft`, …) keep their type and flags from their header. The table of an `.rpf` is written
+  the way the game's own are (same order, encrypted again with the key from your `GTAIV.exe`); `openrage verify
+  --rebuild` checks this against every `.rpf` of the game without writing anything.
+- **Audio (`.rpf`, RPF3):** these archives store only a hash of each name, shown as eight hex digits. Replace an entry
+  by importing a file under the same hex name; new entries need a hex name too.
 - **Loose files** (`.dat`, `.ide`, `.gxt`, …) are written to the `update` folder under the same path.
 - **Texts:** `.gxt` files open in the text editor and save into the `update` folder.
 - **Changes and history:** **Changes** lists every file and archive entry that differs from the game, **History**
   every change OpenRAGE made; all of them can be undone. The browser hides the `update` folder and shows its files in
   place of the originals.
-- `.rpf` archives (the episodes' and some audio) cannot be changed yet.
 
 ```
 openrage put admiral.wtd pc/models/cdimages/vehicles.img/       # import into a copy of the archive in update/
 openrage mv pc/models/cdimages/vehicles.img/a.wft pc/models/cdimages/vehicles.img/b.wft
 openrage rm pc/models/cdimages/vehicles.img/biff.wft
+openrage put niko_feet.wdr pc/models/cdimages/playerped.rpf/feet_000_u.wdr   # .rpf archives work the same way
+openrage put 061b65da pc/audio/sfx/general.rpf/6b34fe60/                     # audio: entries named by hash
 openrage put handling.dat common/data/                          # a loose file, written to update/common/data/
 openrage mods --changes                                         # everything that differs from the game
 openrage history

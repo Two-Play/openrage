@@ -39,6 +39,7 @@ openrage index && openrage search admiral       # search index: names, hashes, .
 openrage verify                                # read every entry of every .img and .rpf
 openrage textures pc/models/cdimages/vehicles.img/admiral.wtd --export out/ --png
 openrage verify --textures                     # parse every .wtd and decode every texture
+openrage verify --rebuild                      # rebuild every .rpf table in memory, compare with the stored one
 openrage textures pc/models/cdimages/vehicles.img/admiral.wtd --set name=new.dds [--remove name]   # change textures
 openrage textures pc/anim/cutsprops.img/csak47.wdr [--set name=new.dds]   # textures inside a model (.wdr)
 openrage model pc/models/cdimages/vehicles.img/admiral.wft --export admiral.glb --render admiral.png

@@ -17,6 +17,8 @@ struct Entry {
     depth: usize,
     fields: Vec<(String, String)>,
     children: Vec<usize>,
+    /// Where the element is in the XML text (bytes).
+    range: std::ops::Range<usize>,
     /// Lowercased label and fields, for the filter.
     haystack: String,
 }
@@ -38,7 +40,14 @@ fn flatten(node: &Node, depth: usize, out: &mut Vec<Entry>) -> usize {
         haystack.push('\t');
         haystack.push_str(&v.to_lowercase());
     }
-    out.push(Entry { label: node.label.clone(), depth, fields: node.fields.clone(), children: Vec::new(), haystack });
+    out.push(Entry {
+        label: node.label.clone(),
+        depth,
+        fields: node.fields.clone(),
+        children: Vec::new(),
+        range: node.range.clone(),
+        haystack,
+    });
     let children: Vec<usize> = node.children.iter().map(|c| flatten(c, depth + 1, out)).collect();
     out[id].children = children;
     id
@@ -119,6 +128,14 @@ impl Model for Lines {
 
     fn model_tracker(&self) -> &dyn ModelTracker {
         &()
+    }
+}
+
+/// Copies text to the clipboard and says what happened, for the status line.
+fn copy(text: &str) -> String {
+    match crate::copy_to_clipboard(text) {
+        Ok(()) => format!("Copied {} characters", text.chars().count()),
+        Err(e) => format!("Cannot copy to the clipboard: {e}"),
     }
 }
 
@@ -259,14 +276,54 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
     // XML stored as text is edited as the file itself; converted XML is read-only.
     let plain = xml.encoding == openrage_app::metadata::Encoding::Text;
     win.set_plain_text(plain);
-    let (main, text) = (ui.as_weak(), xml.text.clone());
+    let text = Rc::new(xml.text.clone());
+    let w = win.as_weak();
+    win.on_copy_text(move |t: SharedString| {
+        let msg = copy(t.as_str());
+        if let Some(win) = w.upgrade() {
+            win.set_status(msg.into());
+        }
+    });
+    let (w, st, t) = (win.as_weak(), Rc::clone(&state), Rc::clone(&text));
+    win.on_node_action(move |row, action: SharedString| {
+        let Some(win) = w.upgrade() else { return };
+        let s = st.borrow();
+        let Some(e) = usize::try_from(row).ok().and_then(|r| s.shown.get(r)).map(|&id| &s.entries[id]) else {
+            return;
+        };
+        match action.as_str() {
+            "copy-values" => {
+                let values: Vec<String> = e.fields.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+                win.set_status(copy(&values.join("\n")).into());
+            }
+            "copy-xml" => {
+                // From the start of the element's line, so the indentation stays even.
+                let start = t[..e.range.start].rfind('\n').map_or(0, |i| i + 1);
+                let snippet = if t[start..e.range.start].trim().is_empty() { start } else { e.range.start };
+                win.set_status(copy(&t[snippet..e.range.end]).into());
+            }
+            "show-xml" => win.invoke_show_line(t[..e.range.start].matches('\n').count() as i32),
+            _ => {}
+        }
+    });
+    let (w, t) = (win.as_weak(), Rc::clone(&text));
+    win.on_line_action(move |row, action: SharedString| {
+        let Some(win) = w.upgrade() else { return };
+        let msg = match action.as_str() {
+            "copy" => copy(t.lines().nth(row as usize).unwrap_or_default()),
+            "copy-all" => copy(&t),
+            _ => return,
+        };
+        win.set_status(msg.into());
+    });
+    let main = ui.as_weak();
     let format = xml.encoding.name();
     win.on_open_text(move || {
         if let Some(ui) = main.upgrade() {
             if plain {
                 crate::open_editor(&ui, vpath.clone());
             } else {
-                crate::editor::open(&ui, crate::editor::Document::converted(vpath.clone(), text.clone(), format));
+                crate::editor::open(&ui, crate::editor::Document::converted(vpath.clone(), text.to_string(), format));
             }
         }
     });
