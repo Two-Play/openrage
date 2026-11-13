@@ -579,8 +579,10 @@ fn wire_callbacks(ui: &AppWindow) {
             let script = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
-                (item.kind == ItemKind::Resource && item.name.to_ascii_lowercase().ends_with(".ysc"))
-                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+                let name = item.name.to_ascii_lowercase();
+                ((item.kind == ItemKind::Resource && name.ends_with(".ysc"))
+                    || (item.kind == ItemKind::File && name.ends_with(".sco")))
+                .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = script {
                 open_script_view(ui, vpath);
@@ -2275,14 +2277,29 @@ fn gta4_preview(a: &rage_rpf::Gta4Archive, i: rage_rpf::Gta4EntryId) -> (Meta, S
             (meta, text)
         }
         rage_rpf::Gta4EntryKind::File { .. } if e.name.to_ascii_lowercase().ends_with(".sco") => {
-            match a.read(i).ok().and_then(|d| openrage_app::gta4::sco_rows(&d)) {
+            let data = a.read(i).ok();
+            match data.as_deref().and_then(openrage_app::gta4::sco_rows) {
                 Some(rows) => {
                     meta.extend(rows.into_iter().map(|(k, v)| kv(&k, v)));
-                    meta.push(note("GTA IV scripts cannot be disassembled yet."));
+                    meta.push(note("Double-click to read the disassembly."));
                 }
                 None => meta.push(kv("Error", "not a GTA IV script")),
             }
-            (meta, String::new())
+            // The strings the script uses, like for GTA V scripts.
+            let strings =
+                data.and_then(|d| openrage_app::gta4::read_sco(&d).ok()).map(|s| s.strings()).unwrap_or_default();
+            let mut text = String::new();
+            if !strings.is_empty() {
+                text.push_str("Strings used by the script:\n\n");
+                for st in strings.iter().take(400) {
+                    text.push_str(st);
+                    text.push('\n');
+                }
+                if strings.len() > 400 {
+                    text.push_str(&format!("… ({} in all)\n", strings.len()));
+                }
+            }
+            (meta, text)
         }
         rage_rpf::Gta4EntryKind::File { stored, compressed, .. } => {
             if compressed {
@@ -3523,6 +3540,7 @@ fn read_file(ui: &AppWindow, vpath: &str) -> anyhow::Result<Vec<u8>> {
                 rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| anyhow::anyhow!("archive table not readable"))?;
             Ok(rpf.read(entry)?)
         }
+        Node::Gta4File(a, id) => Ok(a.read(id)?),
         _ => anyhow::bail!("{vpath} is not a file"),
     }
 }
@@ -3568,6 +3586,10 @@ fn open_editor(ui: &AppWindow, vpath: String) {
 /// Disassembles a script (`.ysc`).
 fn read_script_listing(ui: &AppWindow, vpath: &str) -> anyhow::Result<String> {
     let data = read_file(ui, vpath)?;
+    if vpath.to_ascii_lowercase().ends_with(".sco") {
+        let name = vpath.rsplit('/').next().unwrap_or(vpath);
+        return openrage_app::gta4::sco_listing(name, &data);
+    }
     let res = rage_resource_from(&data)?;
     let s = rage_formats::ysc::parse(&res)?;
     let header = script_header(&s);

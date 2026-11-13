@@ -543,6 +543,7 @@ fn run() -> Result<()> {
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
         Command::Verify { path, media: true, .. } => cmd_verify_media(&game_dir, &path, keys),
+        Command::Verify { path, scripts: true, .. } if gta4 => cmd_verify_gta4_scripts(&game_dir, &path),
         Command::Verify { path, scripts: true, .. } => cmd_verify_scripts(&game_dir, &path, keys),
         Command::Verify { path, paths: true, .. } => cmd_verify_paths(&game_dir, &path, keys),
         Command::Verify { path, collisions: true, .. } if gta4 => cmd_verify_gta4_collisions(&game_dir, &path),
@@ -2221,11 +2222,19 @@ fn cmd_script(
 ) -> Result<()> {
     let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
     if let Node::Gta4File(a, id) = &node {
-        let rows = openrage_app::gta4::sco_rows(&a.read(*id)?).context("not a GTA IV script (.sco)")?;
-        for (k, v) in rows {
-            outln!("{k:<17} {v}");
+        let data = a.read(*id)?;
+        let text = if strings {
+            openrage_app::gta4::read_sco(&data)?.strings().join("\n") + "\n"
+        } else {
+            openrage_app::gta4::sco_listing(&a.entry(*id).name, &data)?
+        };
+        match out {
+            Some(file) => {
+                fs::write(file, &text)?;
+                outln!("Wrote {}", file.display());
+            }
+            None => outln!("{}", text.trim_end()),
         }
-        outln!("(GTA IV scripts cannot be disassembled yet.)");
         return Ok(());
     }
     let Node::ArchiveFile(rpf, id) = node else { bail!("{path} is not a file inside an archive") };
@@ -3266,6 +3275,52 @@ fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
     );
     if !total.errors.is_empty() {
         bail!("verification found {} errors", total.errors.len());
+    }
+    Ok(())
+}
+
+/// Disassembles every GTA IV script (`.sco`) and checks every jump, call and switch case.
+fn cmd_verify_gta4_scripts(game_dir: &Path, within: &str) -> Result<()> {
+    let (starts, open_errors) = gta4_starts(game_dir, within)?;
+    let started = Instant::now();
+    let all: Vec<(usize, usize, Vec<String>)> = starts
+        .par_iter()
+        .map(|(prefix, a, dir)| {
+            let (mut files, mut instructions, mut errors) = (0, 0, Vec::new());
+            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
+                if !a.entry(id).name.to_ascii_lowercase().ends_with(".sco") {
+                    return;
+                }
+                files += 1;
+                let checked = a
+                    .read(id)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|d| openrage_app::gta4::read_sco(&d))
+                    .and_then(|s| s.check().map_err(|e| anyhow::anyhow!(e)));
+                match checked {
+                    Ok(n) => instructions += n,
+                    Err(e) => errors.push(format!("{p}: {e:#}")),
+                }
+            });
+            (files, instructions, errors)
+        })
+        .collect();
+    let (mut files, mut instructions, mut errors) = (0, 0, open_errors);
+    for (f, i, e) in all {
+        files += f;
+        instructions += i;
+        errors.extend(e);
+    }
+    for e in errors.iter().take(50) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{files} scripts, {instructions} instructions, {} errors ({:.1}s)",
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() {
+        bail!("{} errors", errors.len());
     }
     Ok(())
 }
