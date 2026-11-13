@@ -124,6 +124,20 @@ pub fn is_particles(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".ypt")
 }
 
+/// Last segment of `<model>.wdr/textures`: the textures inside a GTA IV model.
+pub const MODEL_TEXTURES: &str = "textures";
+
+/// The model whose own textures `vpath` lists (`…/x.wdr/textures` → `…/x.wdr`).
+pub fn model_of_textures(vpath: &str) -> Option<&str> {
+    let model = vpath.strip_suffix(MODEL_TEXTURES)?.strip_suffix('/')?;
+    openrage_app::textures::is_gta4_model(model).then_some(model)
+}
+
+/// The file texture edits go to: the model for its textures, else the dictionary itself.
+pub fn texture_owner(vpath: &str) -> &str {
+    model_of_textures(vpath).unwrap_or(vpath)
+}
+
 /// The virtual path of the mod change list.
 pub const CHANGES_PATH: &str = "!mods";
 /// The virtual path of the change journal.
@@ -229,6 +243,16 @@ pub fn list(
             let dict_path = parent(&vpath).unwrap_or_default();
             let (listing, _) = list(game_dir, &dict_path, keys, overlay)?;
             return Ok((listing, Some(last_segment(&vpath))));
+        }
+        // `…/x.wdr/textures`: the textures inside a GTA IV model.
+        Err(RpfError::NotFound(_)) if model_of_textures(&vpath).is_some() => {
+            let model = model_of_textures(&vpath).unwrap_or_default();
+            let (Node::Gta4File(a, i), origin) = resolve(model)? else {
+                return Err(RpfError::NotFound(vpath.clone()));
+            };
+            let dict = openrage_app::textures::gta4_model_textures(&a.read_resource(i)?)
+                .ok_or_else(|| RpfError::NotFound(format!("{model} has no textures of its own")))?;
+            return Ok((texture_listing(vpath, dict, origin, false), None));
         }
         Err(e) => return Err(e),
     };

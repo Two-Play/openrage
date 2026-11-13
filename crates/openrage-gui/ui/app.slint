@@ -1055,6 +1055,9 @@ export component AppWindow inherits Window {
     callback audio-skip(float);
     callback audio-save-wav();
     callback open-viewer();
+    /// GTA IV: textures inside the selected model (.wdr); 0 hides the button.
+    in property <int> model-textures;
+    callback open-model-textures();
     callback archive-import();
     callback archive-replace();
     callback archive-rename();
@@ -2110,6 +2113,12 @@ export component AppWindow inherits Window {
                         icon: @image-url("icons/expand.svg");
                         colorize-icon: true;
                         clicked => { root.open-viewer(); }
+                    }
+                    if root.model-mode && root.model-textures > 0: Button {
+                        text: @tr("Textures ({})", root.model-textures);
+                        icon: @image-url("icons/image.svg");
+                        colorize-icon: true;
+                        clicked => { root.open-model-textures(); }
                     }
                     if root.model-mode: Button {
                         text: @tr("Export glTF…");

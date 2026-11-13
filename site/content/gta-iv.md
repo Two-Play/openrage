@@ -26,7 +26,7 @@ openrage ls pc/models/cdimages
 | What | Files | Status |
 |---|---|---|
 | Archives | `.img` (IMG3), `.rpf` (RPF2, RPF3) | browse and extract; change `.img` archives |
-| Textures | `.wtd` | view, export DDS/PNG; replace, add and remove |
+| Textures | `.wtd`, inside `.wdr` | view, export DDS/PNG; replace, add and remove |
 | Models | `.wdr`, `.wdd`, `.wft` | view, export glTF |
 | Texts | `.gxt` | view and edit |
 | Placement files and maps | `.wpl`, map archives | view as text and in 3D, export glTF |
@@ -70,16 +70,24 @@ In edit mode, textures can be replaced from a DDS file, added and removed, as in
 into the `update` folder (or the game files, see [Editing](#editing)) and can be undone. A replacement with the same
 format, size and mip count only swaps the pixel data. Anything else rebuilds the dictionary: its other data stays as
 it was, so fields OpenRAGE does not interpret are kept. Use DXT1, DXT3, DXT5 or 32-bit BGRA DDS files; textures that
-only exist in newer formats (BC7 and others) cannot go into GTA IV. Textures inside models (`.wdr`, `.wft`) cannot be
-changed yet.
+only exist in newer formats (BC7 and others) cannot go into GTA IV.
+
+**Textures inside models:** many props and cutscene objects (`.wdr`) carry their own textures; vehicles and peds
+(`.wft`, `.wdd`) never do, theirs are in `.wtd` files. Selecting such a model shows a **Textures (N)** button that opens
+them as a list, edited like a dictionary. The model's other data stays untouched: a replacement with a new size or
+format adds its pixel data at the end, and every texture keeps its place, because the model's shaders point at it. A
+texture a shader uses cannot be removed (replace it instead); added textures are only used once a shader refers to
+them.
 
 ```
 openrage textures pc/models/cdimages/vehicles.img/admiral.wtd --set admiral_badges=badges.dds   # replace
 openrage textures pc/models/cdimages/vehicles.img/admiral.wtd --set my_decal=decal.dds --remove admiral_sign
+openrage textures pc/anim/cutsprops.img/csak47.wdr --set cj_ak1=wood.dds        # a model's own textures
 openrage verify --textures --rebuild           # rebuild every dictionary in memory and compare (writes nothing)
 ```
 
-**Checked:** 6,400 dictionaries, 70,845 textures, all decoded; every dictionary rebuilt and read back identically.
+**Checked:** 6,400 dictionaries and 9,820 models with their own textures (136,125 textures), all decoded; every
+dictionary rebuilt and read back identically, every model rebuilt byte for byte.
 
 ## Models
 

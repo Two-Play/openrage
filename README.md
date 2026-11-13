@@ -61,7 +61,7 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 | **GTA V** (Legacy & Enhanced) | ✅ read and edit (mods folder, with undo) | ✅ textures · models · audio · animations · metadata · text · collisions · paths · cutscenes · scripts |
 | **Red Dead Redemption 2** | ✅ read, with keys from your own game | ◐ textures · models · texts · metadata · audio · animations · ped outfits (read-only) |
 | **GTA VI** | 🔜 next: as fast as possible once it comes to PC | – |
-| **GTA IV** (Complete Edition) | ✅ read (IMG3, RPF2, RPF3), key from your own `GTAIV.exe` | ◐ textures · models · collisions · animations · text · scripts · maps in 3D · editing `.img`, loose files and `.wtd` textures (update folder, or the game files with originals kept) |
+| **GTA IV** (Complete Edition) | ✅ read (IMG3, RPF2, RPF3), key from your own `GTAIV.exe` | ◐ textures · models · collisions · animations · text · scripts · maps in 3D · editing `.img`, loose files and textures (`.wtd`, inside `.wdr`) (update folder, or the game files with originals kept) |
 
 **Plugins** (API 0.3, preview): sandboxed WebAssembly plugins add file types, previews (text, tree, table, image, 3D model), export and batch actions with access to the game's models and textures, and changes to game files through the `mods` folder (with undo), for every game. ✅ explorer (file list, preview, context menu, Settings → Plugins) and command line (`openrage plugin`), three example plugins included (OBJ export among them) · 🔜 openFormats, importers into game formats, plugin packages. [Writing plugins](https://two-play.github.io/openrage/plugins/)
 
