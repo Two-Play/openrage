@@ -262,6 +262,16 @@ pub fn open(ui: &AppWindow, doc: Document) {
             ui.set_edit_mode(on);
         }
     });
+    let w = win.as_weak();
+    win.on_copy_path(move || {
+        let Some(win) = w.upgrade() else { return };
+        let path = win.get_path();
+        let msg = match crate::copy_to_clipboard(&path) {
+            Ok(()) => format!("Copied {path}"),
+            Err(e) => format!("Cannot copy to the clipboard: {e}"),
+        };
+        win.set_status(msg.into());
+    });
     let (w, d) = (win.as_weak(), Rc::clone(&doc));
     win.on_toggle_tabs(move || {
         let Some(win) = w.upgrade() else { return };

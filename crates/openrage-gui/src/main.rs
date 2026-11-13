@@ -483,7 +483,10 @@ fn debug_snapshot_rest(ui: &AppWindow, path: String) {
                 debug_click(v.window(), "OPENRAGE_WINDOW_CLICK");
                 v.window().take_snapshot()
             }
-            (None, Some(e), _) => e.window().take_snapshot(),
+            (None, Some(e), _) => {
+                debug_click(e.window(), "OPENRAGE_WINDOW_CLICK");
+                e.window().take_snapshot()
+            }
             (None, None, Some(h)) => h.window().take_snapshot(),
             (None, None, None) => ui.window().take_snapshot(),
         };
