@@ -40,6 +40,23 @@ pub fn page_size_from_flags(flags: u32) -> usize {
 
 pub mod builder;
 
+/// Type and flags of an RSC5 (GTA IV) resource header, if `file` starts with one.
+pub fn rsc5_header(file: &[u8]) -> Option<(u32, u32)> {
+    if file.len() < 12 || &file[0..4] != b"RSC\x05" {
+        return None;
+    }
+    let word = |i: usize| u32::from_le_bytes(file[i..i + 4].try_into().unwrap());
+    Some((word(4), word(8)))
+}
+
+/// System and graphics memory sizes described by RSC5 flags: each is an
+/// 11-bit page count shifted by a 4-bit exponent (base page 256 bytes).
+pub fn rsc5_sizes(flags: u32) -> (usize, usize) {
+    let sys = ((flags & 0x7FF) as usize) << (((flags >> 11) & 0xF) + 8);
+    let gfx = (((flags >> 15) & 0x7FF) as usize) << (((flags >> 26) & 0xF) + 8);
+    (sys, gfx)
+}
+
 /// An inflated resource, split into its memory segments.
 #[derive(Clone)]
 pub struct Resource {
@@ -77,6 +94,25 @@ impl Resource {
             .read_to_end(&mut pages)
             .map_err(|e| ResourceError::Format(format!("cannot inflate resource: {e}")))?;
         Self::from_pages(word(4), word(8), word(12), pages)
+    }
+
+    /// Parses a GTA IV RSC5 resource: a 12-byte header (`RSC\x05`, type,
+    /// flags) followed by a zlib stream of system then graphics memory.
+    /// Bytes after the end of the stream (archive padding) are ignored.
+    pub fn from_rsc5(file: &[u8]) -> Result<Self, ResourceError> {
+        use std::io::Read;
+        let (version, flags) = rsc5_header(file).ok_or_else(|| ResourceError::Format("not an RSC5 resource".into()))?;
+        let (sys, gfx) = rsc5_sizes(flags);
+        let mut pages = Vec::with_capacity(sys + gfx);
+        flate2::read::ZlibDecoder::new(&file[12..])
+            .take((sys + gfx) as u64)
+            .read_to_end(&mut pages)
+            .map_err(|e| ResourceError::Format(format!("cannot inflate resource: {e}")))?;
+        if pages.len() < sys {
+            return Err(ResourceError::SizeMismatch { actual: pages.len(), expected: sys + gfx });
+        }
+        let graphics = pages.split_off(sys);
+        Ok(Self { version, system: pages, graphics })
     }
 
     /// Segment and offset of a virtual address. Graphics memory can exceed

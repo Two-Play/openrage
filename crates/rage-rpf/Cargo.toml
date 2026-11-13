@@ -1,6 +1,6 @@
 [package]
 name = "rage-rpf"
-description = "Reader for RAGE RPF archives (RPF7 / GTA V)"
+description = "Reader for RAGE archives (RPF7 GTA V, RPF8 RDR2, IMG3/RPF2/RPF3 GTA IV)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

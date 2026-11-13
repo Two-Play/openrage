@@ -82,6 +82,8 @@ pub enum Location {
     Archive(Arc<Rpf7>, EntryId),
     /// A folder inside a Red Dead Redemption 2 archive (read-only).
     Rpf8(Arc<rage_rpf::Rpf8>, String),
+    /// A folder inside a GTA IV archive (`.img`, RPF2/RPF3; read-only).
+    Gta4(Arc<rage_rpf::Gta4Archive>, rage_rpf::Gta4EntryId),
     /// Results of a search; `summary` describes hash lookups etc.
     Search {
         query: String,
@@ -258,7 +260,8 @@ pub fn list(
                 .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
             Ok((audio_listing(vpath, awc, origin), None))
         }
-        Node::ArchiveFile(..) | Node::PlainFile(_) | Node::Rpf8File(..) => {
+        Node::Gta4Dir(a, dir) => Ok((list_gta4(vpath, a, dir, origin), None)),
+        Node::ArchiveFile(..) | Node::PlainFile(_) | Node::Rpf8File(..) | Node::Gta4File(..) => {
             let name = last_segment(&vpath);
             let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys, overlay)?;
             Ok((listing, Some(name)))
@@ -417,9 +420,12 @@ fn list_disk(vpath: String, dir: PathBuf, origin: Origin) -> Result<Listing, Rpf
     for entry in fs::read_dir(&dir)?.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
         let kind = if meta.is_dir() {
             ItemKind::Dir
-        } else if name.to_ascii_lowercase().ends_with(".rpf") {
+        } else if lower.ends_with(".rpf")
+            || (lower.ends_with(".img") && rage_rpf::Gta4Archive::file_is_gta4(&entry.path()))
+        {
             ItemKind::Archive
         } else {
             ItemKind::File
@@ -481,6 +487,37 @@ fn list_rpf8(vpath: String, rpf: Arc<rage_rpf::Rpf8>, dir: String, origin: Origi
         items.push(Item { name, kind, size: e.size(), info, entry: None, vpath: None, mark: None, detail: None });
     }
     Listing { vpath, origin, location: Location::Rpf8(rpf, dir), items }
+}
+
+/// A folder of a GTA IV archive: its folders, files and resources.
+fn list_gta4(vpath: String, a: Arc<rage_rpf::Gta4Archive>, dir: rage_rpf::Gta4EntryId, origin: Origin) -> Listing {
+    let items = a
+        .children(dir)
+        .map(|id| {
+            let e = a.entry(id);
+            let (kind, info) = if e.is_dir() {
+                (ItemKind::Dir, String::new())
+            } else if let Some(t) = e.resource_type() {
+                (ItemKind::Resource, openrage_app::gta4::resource_type_name(t).to_owned())
+            } else {
+                match e.kind {
+                    rage_rpf::Gta4EntryKind::File { compressed: true, .. } => (ItemKind::File, "zlib".to_owned()),
+                    _ => (ItemKind::File, String::new()),
+                }
+            };
+            Item {
+                name: e.name.clone(),
+                kind,
+                size: e.size(),
+                info,
+                entry: None,
+                vpath: None,
+                mark: None,
+                detail: None,
+            }
+        })
+        .collect();
+    Listing { vpath, origin, location: Location::Gta4(a, dir), items }
 }
 
 fn list_archive(vpath: String, rpf: Arc<Rpf7>, dir: EntryId, origin: Origin) -> Listing {

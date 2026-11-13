@@ -119,7 +119,9 @@ fn main() -> anyhow::Result<()> {
     } else {
         default.or_else(|| cfg.game_dir.clone().filter(|d| known.contains(d))).or_else(|| known.first().cloned())
     };
-    let rdr2_ready = game_dir.as_deref().is_some_and(|d| is_rdr2_dir(d) && register_rdr2(d));
+    let rdr2_ready = game_dir.as_deref().is_some_and(|d| {
+        (is_rdr2_dir(d) && register_rdr2(d)) || (is_gta4_dir(d) && openrage_app::gta4::register(d).is_ok())
+    });
 
     APP.with(|a| {
         *a.borrow_mut() = Some(App {
@@ -1557,6 +1559,12 @@ fn show_folder_info(ui: &AppWindow) {
                     note("Read-only. Names come from `openrage rdr2-names`; unnamed files are under hash/."),
                 ]
             }
+            Location::Gta4(a, _) => {
+                let mut meta = vec![kv("Type", "Inside a GTA IV archive")];
+                meta.extend(gta4_archive_info(a));
+                meta.push(note("Read-only. Extract… saves files as stored (resources as RSC5 files, like OpenIV)."));
+                meta
+            }
             Location::Archive(rpf, _) => vec![
                 kv("Type", "Inside an archive"),
                 kv("Archive", rpf.name()),
@@ -1592,6 +1600,8 @@ enum PreviewSource {
     Entry(Arc<Rpf7>, EntryId),
     /// A file in a Red Dead Redemption 2 archive (index into its entries).
     Rpf8(Arc<rage_rpf::Rpf8>, usize),
+    /// A file in a GTA IV archive.
+    Gta4(Arc<rage_rpf::Gta4Archive>, rage_rpf::Gta4EntryId),
     /// A texture of an opened texture dictionary (index into its textures).
     Texture(Arc<rage_formats::ytd::TextureDictionary>, usize),
     /// A search hit; resolved in the worker. `query` is set for text hits to show the matching line.
@@ -1651,6 +1661,9 @@ fn select_row(ui: &AppWindow, row: usize) {
             }
             (Location::Rpf8(rpf, dir), _) if item.kind != ItemKind::Dir => {
                 rpf.find(&browser::join(dir, &item.name)).map(|i| PreviewSource::Rpf8(Arc::clone(rpf), i))
+            }
+            (Location::Gta4(a, dir), _) if item.kind != ItemKind::Dir => {
+                a.find_child(*dir, &item.name).map(|i| PreviewSource::Gta4(Arc::clone(a), i))
             }
             _ => None,
         };
@@ -1920,9 +1933,13 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
             Ok(Node::PlainFile(p)) => load_preview_text(PreviewSource::DiskFile(p), keys),
             Ok(Node::Rpf8File(rpf, i)) => rpf8_preview(&rpf, i),
             Ok(Node::Rpf8Dir(..)) => (Meta::new(), String::new()),
+            Ok(Node::Gta4File(a, i)) => gta4_preview(&a, i),
+            Ok(Node::Gta4Dir(a, i)) if i == rage_rpf::Gta4Archive::ROOT => (gta4_archive_info(&a), String::new()),
+            Ok(Node::Gta4Dir(..)) => (Meta::new(), String::new()),
             Err(e) => (vec![kv("Error", e)], String::new()),
         },
         PreviewSource::Rpf8(rpf, i) => rpf8_preview(&rpf, i),
+        PreviewSource::Gta4(a, i) => gta4_preview(&a, i),
         PreviewSource::Texture(..) => (Meta::new(), String::new()),
         PreviewSource::DiskFile(path)
             if openrage_app::metadata::is_metadata(&path.file_name().unwrap_or_default().to_string_lossy()) =>
@@ -1937,6 +1954,12 @@ fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Met
             let mut data = Vec::new();
             match File::open(&path).and_then(|f| f.take(1 << 20).read_to_end(&mut data)) {
                 Ok(_) => (Meta::new(), preview::render(&data)),
+                Err(e) => (vec![kv("Error", e)], String::new()),
+            }
+        }
+        PreviewSource::DiskArchive(path) if rage_rpf::Gta4Archive::file_is_gta4(&path) => {
+            match rage_rpf::Gta4Archive::open_default(&path) {
+                Ok(a) => (gta4_archive_info(&a), String::new()),
                 Err(e) => (vec![kv("Error", e)], String::new()),
             }
         }
@@ -2132,6 +2155,65 @@ fn rpf8_preview(rpf: &rage_rpf::Rpf8, i: usize) -> (Meta, String) {
     }
 }
 
+/// Format, encryption and counts of a GTA IV archive.
+fn gta4_archive_info(a: &rage_rpf::Gta4Archive) -> Meta {
+    let ids = 1..a.len();
+    let dirs = ids.clone().filter(|&i| a.entry(i).is_dir()).count();
+    let resources = ids.clone().filter(|&i| a.entry(i).resource_type().is_some()).count();
+    let mut meta = vec![
+        kv("Archive", a.display_name()),
+        kv("Format", format!("{} (GTA IV)", a.format().name())),
+        kv("Encryption", if a.is_encrypted() { "AES" } else { "none" }),
+    ];
+    if dirs > 0 {
+        meta.push(kv("Folders", dirs));
+    }
+    meta.push(kv("Files", a.len() - 1 - dirs - resources));
+    meta.push(kv("Resources", resources));
+    meta
+}
+
+/// Details of a file in a GTA IV archive; plain text files are shown as text.
+fn gta4_preview(a: &rage_rpf::Gta4Archive, i: rage_rpf::Gta4EntryId) -> (Meta, String) {
+    let e = a.entry(i);
+    let mut meta = Meta::new();
+    match e.kind {
+        rage_rpf::Gta4EntryKind::Resource { resource_type, .. } => {
+            let (sys, gfx) = e.resource_sizes().unwrap_or_default();
+            meta.push(kv(
+                "Resource",
+                format!("RSC5 type {resource_type} ({})", openrage_app::gta4::resource_type_name(resource_type)),
+            ));
+            meta.push(kv("System memory", human_size(sys as u64)));
+            meta.push(kv("Graphics memory", human_size(gfx as u64)));
+            match a.read_resource(i) {
+                Ok(res) => {
+                    let mut pages = res.system;
+                    pages.truncate(64 * 1024);
+                    (meta, preview::hex_dump(&pages))
+                }
+                Err(err) => {
+                    meta.push(kv("Error", err));
+                    (meta, String::new())
+                }
+            }
+        }
+        rage_rpf::Gta4EntryKind::File { stored, compressed, .. } => {
+            if compressed {
+                meta.push(kv("Compressed", format!("{} → {}", human_size(stored), human_size(e.size()))));
+            }
+            if e.size() > 4 << 20 {
+                return (meta, String::new());
+            }
+            match a.read(i) {
+                Ok(data) => (meta, preview::render(&data)),
+                Err(err) => (vec![kv("Error", err)], String::new()),
+            }
+        }
+        rage_rpf::Gta4EntryKind::Dir { .. } => (meta, String::new()),
+    }
+}
+
 fn archive_info(rpf: &Rpf7) -> Meta {
     let (mut dirs, mut files, mut resources, mut archives) = (0, 0, 0, 0);
     for e in rpf.entries() {
@@ -2158,7 +2240,7 @@ fn archive_info(rpf: &Rpf7) -> Meta {
 fn start_index_update(ui: &AppWindow) {
     let Some((game_dir, keys)) = with_app(|a| {
         // The search index covers GTA V's archives; RDR2 is browsed without it for now.
-        if a.index_running || a.game_dir.as_deref().is_some_and(is_rdr2_dir) {
+        if a.index_running || a.game_dir.as_deref().is_some_and(|d| is_rdr2_dir(d) || is_gta4_dir(d)) {
             return None;
         }
         a.index_running = true;
@@ -4182,6 +4264,39 @@ fn start_extract(ui: &AppWindow) {
         export_sounds(ui);
         return;
     }
+    // GTA IV: the selected entry, or the whole folder (or an archive on disk).
+    let gta4 = with_app(|a| {
+        let listing = a.listing.as_ref()?;
+        let item = a.selected.map(|s| &listing.items[s]);
+        match (&listing.location, item) {
+            (Location::Gta4(arc, dir), Some(item)) => {
+                arc.find_child(*dir, &item.name).map(|i| Ok((Arc::clone(arc), i)))
+            }
+            (Location::Gta4(arc, dir), None) => Some(Ok((Arc::clone(arc), *dir))),
+            (Location::Disk(dir), Some(item))
+                if item.kind == ItemKind::Archive && rage_rpf::Gta4Archive::file_is_gta4(&dir.join(&item.name)) =>
+            {
+                Some(
+                    rage_rpf::Gta4Archive::open_default(&dir.join(&item.name))
+                        .map(|arc| (Arc::new(arc), rage_rpf::Gta4Archive::ROOT)),
+                )
+            }
+            _ => None,
+        }
+    });
+    match gta4 {
+        Some(Ok((arc, id))) => {
+            spawn_extract(ui, move |out, cancel, progress| {
+                openrage_app::gta4::extract(&arc, id, out, cancel, progress)
+            });
+            return;
+        }
+        Some(Err(e)) => {
+            ui.set_status(e.to_string().into());
+            return;
+        }
+        None => {}
+    }
     // Red Dead Redemption 2: the selected file or folder, or the whole folder.
     let rdr2 = with_app(|a| {
         let listing = a.listing.as_ref()?;
@@ -4194,34 +4309,8 @@ fn start_extract(ui: &AppWindow) {
         })
     });
     if let Some((rpf, dir, file)) = rdr2 {
-        let cancel = with_app(|a| {
-            a.cancel.store(false, Ordering::Relaxed);
-            Arc::clone(&a.cancel)
-        });
-        let weak = ui.as_weak();
-        std::thread::spawn(move || {
-            let Some(out) = rfd::FileDialog::new().set_title("Extract to folder").pick_folder() else { return };
-            let _ = weak.upgrade_in_event_loop(|ui| set_busy(&ui, true, "Extracting…".into()));
-            let mut last = Instant::now();
-            let result = openrage_app::extract::extract_rpf8(&rpf, &dir, file, &out, &cancel, &mut |s, path| {
-                if last.elapsed() > Duration::from_millis(100) {
-                    last = Instant::now();
-                    let msg = format!("Extracting… {} files, {} — {path}", s.files, human_size(s.bytes));
-                    let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
-                }
-            });
-            let msg = match result {
-                Ok(s) if s.cancelled => format!("Cancelled after {} files.", s.files),
-                Ok(s) => {
-                    let mut m = format!("Extracted {} files ({}) to {}", s.files, human_size(s.bytes), out.display());
-                    if !s.failures.is_empty() {
-                        m.push_str(&format!(" — {} could not be read", s.failures.len()));
-                    }
-                    m
-                }
-                Err(e) => format!("Extraction failed: {e:#}"),
-            };
-            let _ = weak.upgrade_in_event_loop(move |ui| set_busy(&ui, false, msg));
+        spawn_extract(ui, move |out, cancel, progress| {
+            openrage_app::extract::extract_rpf8(&rpf, &dir, file, out, cancel, progress)
         });
         return;
     }
@@ -4284,6 +4373,47 @@ fn start_extract(ui: &AppWindow) {
     });
 }
 
+type ExtractProgress<'a> = &'a mut dyn FnMut(&openrage_app::extract::ExtractSummary, &str);
+
+/// Asks for a target folder, then runs `job` in the background with progress
+/// in the status bar; the cancel button stops it.
+fn spawn_extract(
+    ui: &AppWindow,
+    job: impl FnOnce(&Path, &AtomicBool, ExtractProgress) -> anyhow::Result<openrage_app::extract::ExtractSummary>
+    + Send
+    + 'static,
+) {
+    let cancel = with_app(|a| {
+        a.cancel.store(false, Ordering::Relaxed);
+        Arc::clone(&a.cancel)
+    });
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let Some(out) = rfd::FileDialog::new().set_title("Extract to folder").pick_folder() else { return };
+        let _ = weak.upgrade_in_event_loop(|ui| set_busy(&ui, true, "Extracting…".into()));
+        let mut last = Instant::now();
+        let result = job(&out, &cancel, &mut |s, path| {
+            if last.elapsed() > Duration::from_millis(100) {
+                last = Instant::now();
+                let msg = format!("Extracting… {} files, {} — {path}", s.files, human_size(s.bytes));
+                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+            }
+        });
+        let msg = match result {
+            Ok(s) if s.cancelled => format!("Cancelled after {} files.", s.files),
+            Ok(s) => {
+                let mut m = format!("Extracted {} files ({}) to {}", s.files, human_size(s.bytes), out.display());
+                if !s.failures.is_empty() {
+                    m.push_str(&format!(" — {} could not be read", s.failures.len()));
+                }
+                m
+            }
+            Err(e) => format!("Extraction failed: {e:#}"),
+        };
+        let _ = weak.upgrade_in_event_loop(move |ui| set_busy(&ui, false, msg));
+    });
+}
+
 fn set_busy(ui: &AppWindow, busy: bool, status: String) {
     with_app(|a| a.busy = busy);
     ui.set_busy(busy);
@@ -4295,7 +4425,7 @@ fn set_busy(ui: &AppWindow, busy: bool, status: String) {
 
 /// The games set up so far that are still installed.
 fn installed_games(cfg: &Config) -> Vec<PathBuf> {
-    cfg.known_games().into_iter().filter(|d| detect::is_gta5_dir(d) || is_rdr2_dir(d)).collect()
+    cfg.known_games().into_iter().filter(|d| detect::is_gta5_dir(d) || is_rdr2_dir(d) || is_gta4_dir(d)).collect()
 }
 
 /// Fills the game switcher (File → Switch game…, settings).
@@ -4319,7 +4449,13 @@ fn refresh_games(ui: &AppWindow) {
 /// Opens a game that was set up before (from the chooser); `remember` makes it the default.
 fn open_game(ui: &AppWindow, index: usize, remember: bool) {
     let Some(dir) = with_app(|a| installed_games(&a.cfg).get(index).cloned()) else { return };
-    let ready = if is_rdr2_dir(&dir) { register_rdr2(&dir) } else { with_app(|a| a.keys.is_some()) };
+    let ready = if is_rdr2_dir(&dir) {
+        register_rdr2(&dir)
+    } else if is_gta4_dir(&dir) {
+        openrage_app::gta4::register(&dir).is_ok()
+    } else {
+        with_app(|a| a.keys.is_some())
+    };
     let saved = with_app(|a| {
         a.game_dir = Some(dir.clone());
         a.cfg.game_dir = Some(dir.clone());
@@ -4337,6 +4473,11 @@ fn open_game(ui: &AppWindow, index: usize, remember: bool) {
     if let Err(e) = saved {
         ui.set_status(format!("Could not save the settings: {e}").into());
     }
+}
+
+/// Whether a folder is a GTA IV installation (the folder holding `GTAIV.exe`).
+fn is_gta4_dir(dir: &Path) -> bool {
+    openrage_app::gta4::is_gta4_dir(dir)
 }
 
 /// Whether a folder is a Red Dead Redemption 2 installation.
@@ -4363,14 +4504,16 @@ fn register_rdr2(game_dir: &Path) -> bool {
 }
 
 fn show_setup(ui: &AppWindow, can_cancel: bool) {
-    let detected: Vec<String> = detect::find_gta5_installs().iter().map(|p| p.display().to_string()).collect();
+    let detected: Vec<String> = detect::find_installs().iter().map(|p| p.display().to_string()).collect();
     with_app(|a| {
         let game = a.game_dir.clone().or_else(|| a.cfg.game_dir.clone()).map(|p| p.display().to_string());
         let game = game.or_else(|| detected.first().cloned()).unwrap_or_default();
         ui.set_setup_game_dir(game.into());
         ui.set_setup_magic_path(a.cfg.magic_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default().into());
         ui.set_setup_can_cancel(
-            can_cancel && (a.keys.is_some() || rage_rpf::rpf8::has_default_keys()) && a.game_dir.is_some(),
+            can_cancel
+                && (a.keys.is_some() || rage_rpf::rpf8::has_default_keys() || rage_rpf::gta4::default_key().is_some())
+                && a.game_dir.is_some(),
         );
     });
     let model: Vec<SharedString> = detected.into_iter().map(Into::into).collect();
@@ -4390,7 +4533,36 @@ fn pick_path(w: Weak<AppWindow>, file: bool, title: &'static str, apply: fn(&App
 }
 
 fn run_setup(ui: &AppWindow) {
-    let game_dir = PathBuf::from(ui.get_setup_game_dir().trim());
+    let game_dir = openrage_app::gta4::normalize_dir(&PathBuf::from(ui.get_setup_game_dir().trim()));
+    if is_gta4_dir(&game_dir) {
+        ui.set_setup_running(true);
+        ui.set_setup_log("Looking for the archive key in GTAIV.exe…".into());
+        let weak = ui.as_weak();
+        std::thread::spawn(move || {
+            let result = openrage_app::gta4::register(&game_dir);
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                ui.set_setup_running(false);
+                match result {
+                    Ok(_) => {
+                        let saved = with_app(|a| {
+                            a.cfg.remember_game(&game_dir);
+                            a.game_dir = Some(game_dir.clone());
+                            a.cfg.game_dir = Some(game_dir);
+                            a.cfg.save()
+                        });
+                        ui.set_setup_visible(false);
+                        refresh_games(&ui);
+                        start_browsing(&ui);
+                        if let Err(e) = saved {
+                            ui.set_status(format!("Could not save the settings: {e}").into());
+                        }
+                    }
+                    Err(e) => ui.set_setup_log(format!("Error: {e:#}").into()),
+                }
+            });
+        });
+        return;
+    }
     let magic = Some(ui.get_setup_magic_path().trim().to_owned()).filter(|s| !s.is_empty()).map(PathBuf::from);
     if is_rdr2_dir(&game_dir) {
         if !register_rdr2(&game_dir) {
@@ -4416,7 +4588,8 @@ fn run_setup(ui: &AppWindow) {
     }
     if !detect::is_gta5_dir(&game_dir) {
         ui.set_setup_log(
-            format!("{} does not contain GTA5_Enhanced.exe, GTA5.exe or RDR2.exe.", game_dir.display()).into(),
+            format!("{} does not contain GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe or RDR2.exe.", game_dir.display())
+                .into(),
         );
         return;
     }

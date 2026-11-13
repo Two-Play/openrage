@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use rage_crypto::GtaVKeys;
 
-use crate::{EntryId, Rpf7, Rpf8, RpfError};
+use crate::{EntryId, Gta4Archive, Gta4EntryId, Rpf7, Rpf8, RpfError};
 
 /// What a virtual path points to.
 pub enum Node {
@@ -26,6 +26,11 @@ pub enum Node {
     Rpf8Dir(Arc<Rpf8>, String),
     /// A file inside an RDR2 archive (index into its entries).
     Rpf8File(Arc<Rpf8>, usize),
+    /// A folder inside a GTA IV archive (`.img`, RPF2/RPF3); the archive root
+    /// is [`Gta4Archive::ROOT`].
+    Gta4Dir(Arc<Gta4Archive>, Gta4EntryId),
+    /// A file inside a GTA IV archive.
+    Gta4File(Arc<Gta4Archive>, Gta4EntryId),
 }
 
 fn is_rpf(name: &str) -> bool {
@@ -47,6 +52,10 @@ pub fn resolve(root: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
         if next.is_dir() {
             phys = next;
             continue;
+        }
+        if crate::gta4::is_archive_name(&comp) && Gta4Archive::file_is_gta4(&next) {
+            let rest: Vec<String> = components.collect();
+            return resolve_gta4(Arc::new(Gta4Archive::open_default(&next)?), &rest, vpath);
         }
         if is_rpf(&comp) {
             if Rpf8::file_is_rpf8(&next) {
@@ -110,6 +119,35 @@ fn resolve_rpf8(mut archive: Arc<Rpf8>, rest: &[String], vpath: &str) -> Result<
         }
     }
     Ok(Node::Rpf8Dir(archive, dir))
+}
+
+/// Walks the rest of a path inside a GTA IV archive.
+fn resolve_gta4(archive: Arc<Gta4Archive>, rest: &[String], vpath: &str) -> Result<Node, RpfError> {
+    let mut cur = Gta4Archive::ROOT;
+    for (i, comp) in rest.iter().enumerate() {
+        let child = archive.find_child(cur, comp).ok_or_else(|| RpfError::NotFound(vpath.to_owned()))?;
+        if archive.entry(child).is_dir() {
+            cur = child;
+        } else if i + 1 == rest.len() {
+            return Ok(Node::Gta4File(archive, child));
+        } else {
+            return Err(RpfError::NotFound(vpath.to_owned()));
+        }
+    }
+    Ok(Node::Gta4Dir(archive, cur))
+}
+
+/// Depth-first walk over a folder inside a GTA IV archive; `visit` receives
+/// each entry and its path relative to the walk start.
+pub fn walk_gta4(archive: &Gta4Archive, dir: Gta4EntryId, prefix: &str, visit: &mut dyn FnMut(Gta4EntryId, &str)) {
+    for child in archive.children(dir) {
+        let entry = archive.entry(child);
+        let path = if prefix.is_empty() { entry.name.clone() } else { format!("{prefix}/{}", entry.name) };
+        visit(child, &path);
+        if entry.is_dir() {
+            walk_gta4(archive, child, &path, visit);
+        }
+    }
 }
 
 /// Finds `name` inside `dir`, ignoring ASCII case (game files keep Windows

@@ -133,6 +133,22 @@ OpenRAGE understands the `mods` folder used by OpenIV.asi, where a file at `mods
 - Inside a modded archive every folder is compared with the original: entries are marked *added* (green), *changed* (orange) or *removed* (red, shown greyed out with a preview of the original).
 - **Changes** lists every difference of all mods at once, across nested archives — including complete copies of game archives that contain no change at all and can simply be deleted.
 
+## GTA IV
+
+GTA IV (the Complete Edition on Steam, with *The Lost and Damned* and *The Ballad of Gay Tony* in `TLAD` and `TBoGT`) keeps
+most of its files in `.img` archives (IMG3) and a few in `.rpf` archives (RPF2; the audio archives are RPF3). Their tables —
+and, in some RPF2 archives, the files — are encrypted with one AES key, which OpenRAGE finds in your own `GTAIV.exe` by its
+SHA-1 fingerprint (a checksum only) and keeps in `gta4.keys` in your config folder. Choosing the game folder in the setup
+(or `openrage --game <folder> keys`) does that in under a second; the Steam folder `Grand Theft Auto IV` and the `GTAIV`
+folder inside it both work.
+
+Archives then open like folders, read-only: file details, a text preview for plain files, the resource type and memory
+sizes for resources, and *Extract…* for files, folders and whole archives. Files are saved as stored, like OpenIV does:
+resources (`.wtd`, `.wdr`, `.wdd`, `.wft`, `.wbd`, `.wbn`, `.wad`, …) as RSC5 files with their header. RPF3 archives keep
+only a hash of each name, so their entries show as hexadecimal numbers. `openrage verify` reads all 303 archives of the
+game (46,889 resources inflated, no errors). Textures, models, text and maps come in the next steps; the search index is
+GTA V only for now.
+
 ## Red Dead Redemption 2
 
 Setting up the keys is described in [Getting started](@/getting-started.md#set-up-red-dead-redemption-2). In both cases the cipher tables and the IV come from your `RDR2.exe`: OpenRAGE finds their 565 pieces by SHA-256 fingerprints (checksums only). All archive keys start with the same 32 bytes; every place in the dump or key file that starts that way is tried on your archives, and the keys that open them are kept. Only the Steam version of 2 April 2024 is known so far; other versions report which pieces are missing.

@@ -135,6 +135,19 @@ openrage textures <path to .ytd> --export out/ --png
 Only the Steam version of 2 April 2024 is known so far; other versions report which pieces are missing.
 The search index and the other format viewers (models, …) are GTA V only for now.
 
+## Set up GTA IV
+
+Choose the GTA IV folder in the setup (or under **File → Switch game… → Add a game…**). The Steam folder
+`Grand Theft Auto IV` and the `GTAIV` folder inside it both work. OpenRAGE takes the archive key from your own `GTAIV.exe`
+in under a second; nothing else is needed. On the command line:
+
+```
+openrage --game "/path/to/Grand Theft Auto IV" keys
+openrage ls pc/models/cdimages
+```
+
+GTA IV is read-only for now: browse, preview and extract. Its formats (textures, models, …) follow.
+
 ## Using the GUI
 
 - Archives, even nested ones, open like folders. Double-click a model, texture or sound to open its viewer.
