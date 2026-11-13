@@ -56,6 +56,8 @@ openrage model pc/models/cdimages/componentpeds.img/m_y_gmaf_hi_01.wdd --anim "p
 openrage verify --animations                   # every .wad, every frame of every bone track
 openrage put admiral.wtd pc/models/cdimages/vehicles.img/   # edit: GTA IV uses the update folder (needs FusionFix)
 openrage put handling.dat common/data/          # loose files go to update/<same path>
+openrage write-target game                     # GTA IV: write into the game files instead (originals kept)
+openrage originals [--restore PATH | --restore-all]   # GTA IV: kept originals, put them back
 ```
 
 ## Formats: textures, models, audio, animations, metadata, text

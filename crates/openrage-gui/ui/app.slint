@@ -748,6 +748,11 @@ component Dialog inherits Rectangle {
 component UnlockDialog {
     /// The folder changes go to: `mods`, or `update` for GTA IV.
     in property <string> folder: "mods";
+    /// GTA IV: whether changes may go into the game's own files instead.
+    in property <bool> can-choose;
+    /// Changes go into the game's own files (originals kept).
+    in property <bool> in-game;
+    callback choose(bool);
     callback confirm();
     callback cancel();
     Dialog {
@@ -755,7 +760,7 @@ component UnlockDialog {
         height: root.height;
         title: @tr("Unlock editing?");
         panel-width: 540px;
-        panel-height: 360px;
+        panel-height: root.can-choose ? 395px : 360px;
         close => { root.cancel(); }
         Text {
             wrap: word-wrap;
@@ -798,12 +803,19 @@ component UnlockDialog {
             Text {
                 wrap: word-wrap;
                 color: Theme.text-muted;
-                text: @tr("• Game files are never changed: an archive is copied to the {} folder before its first change.", root.folder);
+                text: root.in-game
+                    ? @tr("• Changes go into the game's own files. The original of each file is kept first and can be put back from History.")
+                    : @tr("• Game files are never changed: an archive is copied to the {} folder before its first change.", root.folder);
             }
             Text {
                 wrap: word-wrap;
                 color: Theme.text-muted;
                 text: @tr("• Every change is recorded in History and can be undone.");
+            }
+            if root.can-choose: CheckBox {
+                text: @tr("Write directly into the game files (instead of the {} folder)", root.folder);
+                checked: root.in-game;
+                toggled => { root.choose(self.checked); }
             }
         }
         Rectangle {
@@ -830,6 +842,7 @@ component UnlockDialog {
 // Shown while edit mode is on, with a way to lock again.
 component EditModeStrip inherits Rectangle {
     in property <string> folder: "mods";
+    in property <bool> in-game;
     callback lock();
     background: Theme.warning.with-alpha(0.16);
     HorizontalLayout {
@@ -850,7 +863,9 @@ component EditModeStrip inherits Rectangle {
             vertical-alignment: center;
             overflow: elide;
             color: Theme.text;
-            text: @tr("Edit mode is on — changes are written to the {} folder. Lock it when you are done.", root.folder);
+            text: root.in-game
+                ? @tr("Edit mode is on — changes are written into the game files (originals kept). Lock it when you are done.")
+                : @tr("Edit mode is on — changes are written to the {} folder. Lock it when you are done.", root.folder);
         }
         Button {
             text: @tr("Lock editing");
@@ -947,6 +962,11 @@ export component AppWindow inherits Window {
     in-out property <bool> edit-mode;
     /// The folder changes go to: `mods`, or `update` for GTA IV.
     in property <string> overlay-folder: "mods";
+    /// Changes go into the game's own files (GTA IV, when chosen).
+    in property <bool> write-in-game;
+    /// GTA IV: the unlock dialog offers writing into the game's own files.
+    in property <bool> can-write-in-game;
+    callback write-target-changed(bool);
     in-out property <bool> unlock-visible;
     // The current archive or folder comes from the mods folder.
     in property <bool> in-mods;
@@ -1612,7 +1632,8 @@ export component AppWindow inherits Window {
         }
 
         if root.edit-mode: EditModeStrip {
-        folder: root.overlay-folder;
+            folder: root.overlay-folder;
+            in-game: root.write-in-game;
             lock => { root.edit-mode = false; }
         }
 
@@ -1707,6 +1728,7 @@ export component AppWindow inherits Window {
                     title: root.in-mods ? @tr("Archive in the {} folder", root.overlay-folder) : @tr("Original game archive");
                     description: !root.edit-mode ? @tr("Read-only. Unlock editing to change it.")
                         : root.in-mods ? @tr("Changes apply to this copy and can be undone.")
+                        : root.write-in-game ? @tr("Changes go into this game file; its original is kept and can be restored in History.")
                         : @tr("Changes are copied to the {} folder; the game file stays untouched.", root.overlay-folder);
                     background: root.edit-mode && !root.in-mods ? Theme.warning.with-alpha(0.14) : Theme.accent-subtle;
                     if !root.edit-mode: Button {
@@ -1769,6 +1791,7 @@ export component AppWindow inherits Window {
                     title: @tr("Texture dictionary");
                     description: !root.edit-mode ? @tr("Read-only. Unlock editing to change textures.")
                         : root.in-mods ? @tr("Changes apply to the copy in the {} folder.", root.overlay-folder)
+                        : root.write-in-game ? @tr("Changes go into this game file; its original is kept and can be restored in History.")
                         : @tr("Changes are copied to the {} folder; the game file stays untouched.", root.overlay-folder);
                     background: root.edit-mode && !root.in-mods ? Theme.warning.with-alpha(0.14) : Theme.accent-subtle;
                     Button {
@@ -2767,6 +2790,9 @@ export component AppWindow inherits Window {
     // Edit mode warning
     if root.unlock-visible: UnlockDialog {
         folder: root.overlay-folder;
+        can-choose: root.can-write-in-game;
+        in-game: root.write-in-game;
+        choose(on) => { root.write-target-changed(on); }
         width: root.width;
         height: root.height;
         confirm => {
@@ -3840,6 +3866,8 @@ export component ViewerWindow inherits Window {
 export component EditorWindow inherits Window {
     /// The folder changes go to: `mods`, or `update` for GTA IV.
     in property <string> overlay-folder: "mods";
+    /// Changes go into the game's own files (GTA IV, when chosen).
+    in property <bool> write-in-game;
     title: (root.modified ? "• " : "") + root.heading + " — OpenRAGE";
     icon: @image-url("logo.svg");
     preferred-width: 980px;
@@ -3948,7 +3976,8 @@ export component EditorWindow inherits Window {
                 }
             }
             if root.editable && root.locked-reason == "": EditModeStrip {
-        folder: root.overlay-folder;
+                folder: root.overlay-folder;
+                in-game: root.write-in-game;
                 lock => { root.set-edit-mode(false); }
             }
             // Protection banner
@@ -4017,6 +4046,7 @@ export component EditorWindow inherits Window {
 
     if root.unlock-visible: UnlockDialog {
         folder: root.overlay-folder;
+        in-game: root.write-in-game;
         width: root.width;
         height: root.height;
         confirm => {
@@ -4734,6 +4764,8 @@ export component SceneWindow inherits Window {
 export component HistoryWindow inherits Window {
     /// The folder changes go to: `mods`, or `update` for GTA IV.
     in property <string> overlay-folder: "mods";
+    /// Changes go into the game's own files (GTA IV, when chosen).
+    in property <bool> write-in-game;
     title: @tr("History — OpenRAGE");
     icon: @image-url("logo.svg");
     preferred-width: 820px;
@@ -4755,6 +4787,10 @@ export component HistoryWindow inherits Window {
     callback show-in-main();
     callback set-edit-mode(bool);
     in-out property <bool> unlock-visible;
+    /// Game files changed in place whose originals are kept (GTA IV).
+    in property <int> originals;
+    callback restore-originals();
+    property <bool> confirm-restore;
 
     changed theme-mode => { root.apply-theme(); }
     init => { root.apply-theme(); }
@@ -4782,7 +4818,9 @@ export component HistoryWindow inherits Window {
                         color: Theme.text;
                     }
                     Text {
-                        text: @tr("Every change OpenRAGE made to the {} folder, newest first. Everything can be undone.", root.overlay-folder);
+                        text: root.write-in-game || root.originals > 0
+                            ? @tr("Every change OpenRAGE made to the {} folder and the game files, newest first. Everything can be undone.", root.overlay-folder)
+                            : @tr("Every change OpenRAGE made to the {} folder, newest first. Everything can be undone.", root.overlay-folder);
                         font-size: Theme.font-small;
                         overflow: elide;
                         color: Theme.text-muted;
@@ -4896,6 +4934,13 @@ export component HistoryWindow inherits Window {
                     overflow: elide;
                     color: Theme.text-muted;
                 }
+                if root.originals > 0: Button {
+                    text: @tr("Restore game files ({})", root.originals);
+                    icon: @image-url("icons/undo.svg");
+                    colorize-icon: true;
+                    enabled: root.edit-mode && !root.busy;
+                    clicked => { root.confirm-restore = true; }
+                }
                 Button {
                     text: root.group == "" ? @tr("Uninstall package") : @tr("Uninstall “{}”", root.group);
                     icon: @image-url("icons/remove.svg");
@@ -4915,8 +4960,42 @@ export component HistoryWindow inherits Window {
         }
     }
 
+    if root.confirm-restore: Dialog {
+        width: root.width;
+        height: root.height;
+        title: @tr("Restore the original game files?");
+        panel-width: 480px;
+        panel-height: 210px;
+        close => { root.confirm-restore = false; }
+        Text {
+            text: @tr("{} game files changed in place get their original content back. Their changes leave the history and cannot be redone.", root.originals);
+            wrap: word-wrap;
+            color: Theme.text;
+        }
+        Rectangle {
+            vertical-stretch: 1;
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: Theme.space-s;
+            Button {
+                text: @tr("Cancel");
+                clicked => { root.confirm-restore = false; }
+            }
+            Button {
+                text: @tr("Restore");
+                primary: true;
+                clicked => {
+                    root.confirm-restore = false;
+                    root.restore-originals();
+                }
+            }
+        }
+    }
+
     if root.unlock-visible: UnlockDialog {
         folder: root.overlay-folder;
+        in-game: root.write-in-game;
         width: root.width;
         height: root.height;
         confirm => {

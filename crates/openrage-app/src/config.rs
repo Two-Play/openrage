@@ -25,6 +25,9 @@ pub struct Config {
     /// Enabled plugins with the permissions the user granted them:
     /// `(id, "perm+perm")` (see `crate::plugins`).
     pub plugins: Vec<(String, String)>,
+    /// Games whose changes are written into the game folder itself instead of
+    /// the overlay folder (GTA IV only; see `crate::install::WriteTarget`).
+    pub write_in_game: Vec<PathBuf>,
 }
 
 fn dir() -> Option<PathBuf> {
@@ -50,6 +53,7 @@ impl Config {
                 "theme" => cfg.theme = Some(v.to_owned()),
                 "accent" => cfg.accent = Some(v.to_owned()),
                 "history_window" => cfg.history_window = Some(v == "true"),
+                "write_in_game" => cfg.write_in_game.push(PathBuf::from(v)),
                 "plugin" => {
                     let (id, grants) = v.split_once(':').unwrap_or((v, ""));
                     cfg.plugins.push((id.trim().to_owned(), grants.trim().to_owned()));
@@ -84,6 +88,9 @@ impl Config {
         }
         if let Some(h) = self.history_window {
             text.push_str(&format!("history_window={h}\n"));
+        }
+        for g in &self.write_in_game {
+            text.push_str(&format!("write_in_game={}\n", g.display()));
         }
         for (id, grants) in &self.plugins {
             text.push_str(&format!("plugin={id}:{grants}\n"));

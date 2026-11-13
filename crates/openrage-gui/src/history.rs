@@ -45,6 +45,12 @@ pub fn open(ui: &AppWindow) {
                     ui.set_edit_mode(on);
                 }
             });
+            let main = ui.as_weak();
+            win.on_restore_originals(move || {
+                if let Some(ui) = main.upgrade() {
+                    crate::restore_originals(&ui);
+                }
+            });
             WINDOW.with(|w| *w.borrow_mut() = Some(win.clone_strong()));
             win
         }
@@ -61,14 +67,19 @@ pub fn refresh(ui: &AppWindow) {
     win.set_edit_mode(ui.get_edit_mode());
     win.set_busy(ui.get_busy());
     win.set_status(ui.get_status());
+    win.set_overlay_folder(crate::overlay_name().into());
+    win.set_write_in_game(crate::writes_in_game());
+    win.set_originals(crate::kept_originals().len() as i32);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let rows: Vec<HistoryRow> = crate::journal_entries()
         .into_iter()
         .map(|e| {
             use openrage_app::journal::Kind;
             let place = match e.kind {
-                Kind::FileWritten { in_game: true, .. } => format!("game folder: {}", e.archive),
-                _ => format!("mods/{}", e.archive),
+                Kind::FileWritten { in_game: true, .. } | Kind::Edited { in_game: true, .. } => {
+                    format!("game folder: {}", e.archive)
+                }
+                _ => format!("{}/{}", crate::overlay_name(), e.archive),
             };
             HistoryRow {
                 when: ago(now.saturating_sub(e.time)).into(),

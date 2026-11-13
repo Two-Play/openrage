@@ -17,8 +17,10 @@ pub enum Kind {
     /// A file was created in the mods folder (copy of a game archive, or a new
     /// archive); undo deletes it.
     Created,
-    /// An archive in the mods folder was edited in place (undo: restore the backup).
-    Edited { old_len: u64, new_len: u64 },
+    /// An archive was edited in place (undo: restore the backup): its copy in
+    /// the mods folder, or the game's own file if `in_game` (GTA IV, written
+    /// into the game on request).
+    Edited { old_len: u64, new_len: u64, in_game: bool },
     /// A loose file was written (in the game folder if `in_game`, else in mods);
     /// undo restores the previous content or deletes the file if it did not exist.
     FileWritten { in_game: bool, existed: bool },
@@ -72,9 +74,10 @@ impl Journal {
         }
         match kind {
             Kind::Created => text.push_str("kind=created\n"),
-            Kind::Edited { old_len, new_len } => {
-                text.push_str(&format!("kind=edited\nold_len={old_len}\nnew_len={new_len}\n"))
-            }
+            Kind::Edited { old_len, new_len, in_game } => text.push_str(&format!(
+                "kind=edited\nold_len={old_len}\nnew_len={new_len}{}\n",
+                if *in_game { "\nin_game=true" } else { "" }
+            )),
             Kind::FileWritten { in_game, existed } => {
                 text.push_str(&format!("kind=file\nin_game={in_game}\nexisted={existed}\n"))
             }
@@ -94,8 +97,30 @@ impl Journal {
     }
 
     pub fn record_edit(&self, archive: &str, description: &str, backup: &Backup) -> Result<u64> {
-        let kind = Kind::Edited { old_len: backup.old_len, new_len: backup.new_len };
+        let kind = Kind::Edited { old_len: backup.old_len, new_len: backup.new_len, in_game: false };
         self.write(&kind, archive, description, Some(&backup.region))
+    }
+
+    /// Like [`Self::record_edit`] for an archive in the game folder itself.
+    pub fn record_game_edit(&self, archive: &str, description: &str, backup: &Backup) -> Result<u64> {
+        let kind = Kind::Edited { old_len: backup.old_len, new_len: backup.new_len, in_game: true };
+        self.write(&kind, archive, description, Some(&backup.region))
+    }
+
+    /// Drops every entry that changed `path` in the game folder (after the
+    /// original file was put back, they cannot be undone any more).
+    pub fn forget_game_file(&self, path: &str) -> Result<usize> {
+        let mut n = 0;
+        for e in self.entries()? {
+            let in_game =
+                matches!(e.kind, Kind::Edited { in_game: true, .. } | Kind::FileWritten { in_game: true, .. });
+            if in_game && e.archive.eq_ignore_ascii_case(path) {
+                let _ = fs::remove_file(self.dir.join(format!("{:06}.bin", e.id)));
+                fs::remove_file(self.dir.join(format!("{:06}.txt", e.id)))?;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// Writes a loose file (relative to the game folder if `in_game`, else to
@@ -137,6 +162,7 @@ impl Journal {
                 "edited" => Kind::Edited {
                     old_len: get("old_len").parse().unwrap_or(0),
                     new_len: get("new_len").parse().unwrap_or(0),
+                    in_game: get("in_game") == "true",
                 },
                 "file" => Kind::FileWritten { in_game: get("in_game") == "true", existed: get("existed") == "true" },
                 _ => continue,
@@ -164,9 +190,10 @@ impl Journal {
                     .with_context(|| format!("{} no longer exists in the mods folder", entry.archive))?;
                 fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
             }
-            Kind::Edited { old_len, new_len } => {
-                let path = vfs::find_case_insensitive(&self.mods, &entry.archive)
-                    .with_context(|| format!("{} no longer exists in the mods folder", entry.archive))?;
+            Kind::Edited { old_len, new_len, in_game } => {
+                let root = if in_game { self.game_dir() } else { self.mods.clone() };
+                let path = vfs::find_case_insensitive(&root, &entry.archive)
+                    .with_context(|| format!("{} no longer exists", entry.archive))?;
                 let region = fs::read(&bin).with_context(|| format!("reading {}", bin.display()))?;
                 let backup = Backup { old_len, new_len, region };
                 if let Err(e) = backup.restore(&path) {

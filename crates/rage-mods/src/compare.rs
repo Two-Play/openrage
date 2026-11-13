@@ -330,6 +330,69 @@ fn files_identical(a: &Path, b: &Path) -> bool {
 /// Every change of every file in the mods folder, relative to the game.
 ///
 /// `progress` is called before each mod file with (index, total, path).
+/// Entry changes between two GTA IV image archives (`None` if one cannot be opened).
+fn gta4_archive_changes(changed: &Path, original: &Path, rel: &str) -> Option<Vec<Change>> {
+    let m = rage_rpf::Gta4Archive::open_default(changed).ok()?;
+    let b = rage_rpf::Gta4Archive::open_default(original).ok()?;
+    let d = compare_gta4_folders(&m, rage_rpf::Gta4Archive::ROOT, &b, rage_rpf::Gta4Archive::ROOT);
+    let mut out = Vec::new();
+    let mut names: Vec<(&String, &Mark)> = d.marks.iter().filter(|(_, k)| **k != Mark::Unchanged).collect();
+    names.sort_by(|a, b| a.0.cmp(b.0));
+    for (key, mark) in names {
+        let id = m.find_child(rage_rpf::Gta4Archive::ROOT, key);
+        let (name, size) = id.map_or((key.clone(), 0), |i| (m.entry(i).name.clone(), m.entry(i).size()));
+        let kind = if *mark == Mark::Added { ChangeKind::Added } else { ChangeKind::Modified };
+        out.push(Change { vpath: format!("{rel}/{name}"), kind, is_dir: false, size });
+    }
+    for r in &d.removed {
+        out.push(Change { vpath: format!("{rel}/{}", r.name), kind: ChangeKind::Removed, is_dir: false, size: r.size });
+    }
+    Some(out)
+}
+
+/// Where OpenRAGE keeps the originals of game files it changed in place
+/// (GTA IV, when writing into the game folder is chosen).
+pub fn originals_dir(game_dir: &Path) -> Option<std::path::PathBuf> {
+    Some(mods_dir(game_dir)?.join(crate::overlay::OPENRAGE_FOLDER).join(crate::overlay::ORIGINALS_FOLDER))
+}
+
+/// Changes made to the game's own files (compared with the kept originals):
+/// entries of changed image archives, or the whole file for anything else.
+pub fn list_game_changes(game_dir: &Path) -> Vec<Change> {
+    let Some(root) = originals_dir(game_dir) else { return Vec::new() };
+    let mut files = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_none_or(|x| x != "openrage-tmp") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    let mut out = Vec::new();
+    for original in files {
+        let rel = original.strip_prefix(&root).unwrap_or(&original).to_string_lossy().replace('\\', "/");
+        let Some(current) = vfs::find_case_insensitive(game_dir, &rel).filter(|p| p.is_file()) else { continue };
+        if files_identical(&current, &original) {
+            continue;
+        }
+        let size = std::fs::metadata(&current).map_or(0, |m| m.len());
+        if rel.to_ascii_lowercase().ends_with(".img")
+            && let Some(found) = gta4_archive_changes(&current, &original, &rel)
+        {
+            out.extend(found);
+            continue;
+        }
+        out.push(Change { vpath: rel, kind: ChangeKind::ReplacedFile, is_dir: false, size });
+    }
+    out
+}
+
 pub fn list_changes(
     game_dir: &Path,
     keys: Option<Arc<GtaVKeys>>,
@@ -355,39 +418,16 @@ pub fn list_changes(
             continue;
         }
         // GTA IV archives: one level of entries, compared by name.
-        if f.is_archive && rage_rpf::Gta4Archive::file_is_gta4(&base_path) {
-            let pair = rage_rpf::Gta4Archive::open_default(&mod_path)
-                .ok()
-                .zip(rage_rpf::Gta4Archive::open_default(&base_path).ok());
-            if let Some((m, b)) = pair {
-                let d = compare_gta4_folders(&m, rage_rpf::Gta4Archive::ROOT, &b, rage_rpf::Gta4Archive::ROOT);
-                let before = out.len();
-                let mut names: Vec<(&String, &Mark)> = d.marks.iter().filter(|(_, k)| **k != Mark::Unchanged).collect();
-                names.sort_by(|a, b| a.0.cmp(b.0));
-                for (key, mark) in names {
-                    let id = m.find_child(rage_rpf::Gta4Archive::ROOT, key);
-                    let (name, size) = id.map_or((key.clone(), 0), |i| (m.entry(i).name.clone(), m.entry(i).size()));
-                    let kind = if *mark == Mark::Added { ChangeKind::Added } else { ChangeKind::Modified };
-                    out.push(Change { vpath: format!("{}/{name}", f.rel), kind, is_dir: false, size });
-                }
-                for r in &d.removed {
-                    out.push(Change {
-                        vpath: format!("{}/{}", f.rel, r.name),
-                        kind: ChangeKind::Removed,
-                        is_dir: false,
-                        size: r.size,
-                    });
-                }
-                if out.len() == before {
-                    out.push(Change {
-                        vpath: f.rel.clone(),
-                        kind: ChangeKind::IdenticalCopy,
-                        is_dir: false,
-                        size: f.size,
-                    });
-                }
-                continue;
+        if f.is_archive
+            && rage_rpf::Gta4Archive::file_is_gta4(&base_path)
+            && let Some(found) = gta4_archive_changes(&mod_path, &base_path, &f.rel)
+        {
+            let empty = found.is_empty();
+            out.extend(found);
+            if empty {
+                out.push(Change { vpath: f.rel.clone(), kind: ChangeKind::IdenticalCopy, is_dir: false, size: f.size });
             }
+            continue;
         }
         let archives = if f.is_archive {
             Rpf7::open(&mod_path, keys.clone()).ok().zip(Rpf7::open(&base_path, keys.clone()).ok())
