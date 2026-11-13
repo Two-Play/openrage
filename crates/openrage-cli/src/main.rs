@@ -626,7 +626,7 @@ fn run() -> Result<()> {
             cmd_verify_gta4_tables(&game_dir, &path)
         }
         Command::Verify { textures: false, rebuild: true, .. } => {
-            bail!("--rebuild needs --textures (or a GTA IV game)")
+            bail!("--rebuild needs --textures or --models (or a GTA IV game)")
         }
         Command::Verify { path, textures: false, .. } if gta4 => cmd_verify_gta4(&game_dir, &path),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
