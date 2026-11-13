@@ -10,6 +10,7 @@
 //!
 //! The index is updated incrementally: only top-level archives whose size or
 //! modification time changed are re-read.
+#![forbid(unsafe_code)]
 
 mod content;
 mod schema;

@@ -49,7 +49,7 @@ pub fn disable(cfg: &mut Config, id: &str) -> bool {
 
 /// The game a folder holds.
 pub fn game_id(dir: &Path) -> GameId {
-    if dir.join("RDR2.exe").is_file() {
+    if crate::detect::is_rdr2_dir(dir) {
         GameId::Rdr2
     } else if crate::gta4::is_gta4_dir(dir) {
         GameId::Gta4

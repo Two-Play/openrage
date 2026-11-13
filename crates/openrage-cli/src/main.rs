@@ -1,4 +1,5 @@
 //! `openrage` — command-line access to RAGE game archives.
+#![forbid(unsafe_code)]
 
 /// `println!` that exits quietly when stdout is closed (e.g. piped into `head`).
 macro_rules! outln {
@@ -19,6 +20,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use openrage_app::config::Config;
+use openrage_app::detect::{collect_archives, collect_rpfs};
 use openrage_app::extract::{extract_entry, human_size as human};
 use openrage_app::install::{self, Op};
 use openrage_app::setup::{self, KeySource};
@@ -589,14 +591,8 @@ fn run() -> Result<()> {
     if gta4 && let Err(e) = openrage_app::gta4::register(&game_dir) {
         eprintln!("warning: GTA IV archive key: {e:#}");
     }
-    if game_dir.join("RDR2.exe").is_file() {
-        let names = rage_rpf::rpf8_names::NameIndex::default_path(&game_dir)
-            .and_then(|p| rage_rpf::rpf8_names::NameIndex::load(&p).ok().flatten())
-            .map(Arc::new);
-        if let Some(n) = &names {
-            openrage_app::rdr2::register_names(n);
-        }
-        rage_rpf::rpf8::set_defaults(rdr2_keys()?, names);
+    if openrage_app::detect::is_rdr2_dir(&game_dir) {
+        openrage_app::rdr2::register(&game_dir)?;
     }
     let keys = openrage_app::load_keys().unwrap_or_else(|e| {
         eprintln!("warning: {e}");
@@ -4544,27 +4540,6 @@ fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: bool) -> Res
     Ok(())
 }
 
-fn collect_archives(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
-    let Ok(rd) = fs::read_dir(dir) else { return };
-    let mut items: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-    items.sort();
-    for p in items {
-        // OpenRAGE's own data (journal, kept originals) is not part of the game.
-        if p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(rage_mods::overlay::OPENRAGE_FOLDER)) {
-            continue;
-        }
-        if p.is_dir() {
-            collect_archives(&p, extensions, out);
-        } else if p.extension().is_some_and(|e| extensions.iter().any(|x| e.eq_ignore_ascii_case(x))) {
-            out.push(p);
-        }
-    }
-}
-
-fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
-    collect_archives(dir, &["rpf"], out);
-}
-
 /// Which files `openrage rpf8` parses instead of only reading them.
 #[derive(Clone, Copy)]
 struct Checks {
@@ -4579,11 +4554,9 @@ struct Checks {
 fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
     let Checks { textures, models, texts: text, meta, audio, anims } = checks;
     use rage_rpf::rpf8::{Compression, Rpf8};
-    let keys = rdr2_keys()?;
-    let names = rdr2_game_folder(path)
-        .and_then(|g| rage_rpf::rpf8_names::NameIndex::default_path(&g))
-        .and_then(|p| rage_rpf::rpf8_names::NameIndex::load(&p).ok().flatten())
-        .map(std::sync::Arc::new);
+    let keys = openrage_app::rdr2::load_keys()?;
+    let start = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+    let names = openrage_app::rdr2::game_folder(start).and_then(|g| openrage_app::rdr2::load_names(&g));
     fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         for e in std::fs::read_dir(dir)? {
             let p = e?.path();
@@ -4920,15 +4893,6 @@ fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
 }
 
 /// The stored RDR2 keys, if `openrage rdr2-keys` was run.
-fn rdr2_keys() -> Result<Option<std::sync::Arc<rage_rpf::rpf8::Rdr2Keys>>> {
-    use rage_rpf::rpf8_keys::KeyStore;
-    let Some(path) = KeyStore::default_path() else { return Ok(None) };
-    let Some(store) = KeyStore::load(&path)? else { return Ok(None) };
-    let keys =
-        store.to_keys().with_context(|| format!("{} is damaged; run `openrage rdr2-keys` again", path.display()))?;
-    Ok(Some(std::sync::Arc::new(keys)))
-}
-
 fn cmd_rdr2_keys(game: &Path, dump: Option<&Path>, file: Option<&Path>) -> Result<()> {
     use rage_rpf::rpf8_exe::{keys_in_dump, tables_from_exe};
     use rage_rpf::rpf8_keys::{Candidates, KeyStore, archives_under, identify, parse_secrets};
@@ -4936,7 +4900,7 @@ fn cmd_rdr2_keys(game: &Path, dump: Option<&Path>, file: Option<&Path>) -> Resul
     if dump.is_none() && file.is_none() {
         bail!("pass --dump <memory dump of the running game> or --file <key file>");
     }
-    let exe_path = game.join("RDR2.exe");
+    let exe_path = game.join(openrage_app::detect::RDR2_EXE);
     let exe = std::fs::read(&exe_path).with_context(|| format!("cannot read {}", exe_path.display()))?;
     let tables = tables_from_exe(&exe)?;
     drop(exe);
@@ -4980,15 +4944,9 @@ fn cmd_rdr2_keys(game: &Path, dump: Option<&Path>, file: Option<&Path>) -> Resul
     Ok(())
 }
 
-/// The RDR2 game folder a path lies in (the folder with RDR2.exe).
-fn rdr2_game_folder(path: &Path) -> Option<PathBuf> {
-    let start = if path.is_dir() { path } else { path.parent()? };
-    start.ancestors().find(|d| d.join("RDR2.exe").is_file()).map(Path::to_path_buf)
-}
-
 fn cmd_rdr2_ped(game: &Path, name: Option<&str>, outfit: Option<usize>, check: bool, load: bool) -> Result<()> {
     use openrage_app::metaped;
-    if !game.join("RDR2.exe").is_file() {
+    if !openrage_app::detect::is_rdr2_dir(game) {
         bail!("{} is not a Red Dead Redemption 2 folder", game.display());
     }
     let started = Instant::now();
@@ -5208,7 +5166,7 @@ fn cmd_rdr2_names(game: &Path, import: Option<&Path>) -> Result<()> {
     use rage_rpf::rpf8_keys::archives_under;
     use rage_rpf::rpf8_names::{NameIndex, build, entry_hashes};
     let started = Instant::now();
-    let keys = rdr2_keys()?.context("no RDR2 keys yet: run `openrage rdr2-keys` first")?;
+    let keys = openrage_app::rdr2::load_keys()?.context("no RDR2 keys yet: run `openrage rdr2-keys` first")?;
     let files = archives_under(game);
     if files.is_empty() {
         bail!("no .rpf archives under {}", game.display());

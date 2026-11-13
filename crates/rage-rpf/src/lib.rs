@@ -2,6 +2,7 @@
 //!
 //! Supports RPF7 (GTA V Legacy and Enhanced, including nested archives),
 //! RPF8 (RDR2) and the GTA IV archives (IMG3, RPF2, RPF3).
+#![forbid(unsafe_code)]
 
 pub mod editor;
 mod error;

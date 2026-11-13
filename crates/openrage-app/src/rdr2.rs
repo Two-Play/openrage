@@ -233,9 +233,47 @@ pub fn register_names(index: &rage_rpf::rpf8_names::NameIndex) {
     rage_formats::names::register(names);
 }
 
-/// The RDR2 game folder an archive belongs to.
-pub fn game_folder(archive: &Path) -> Option<PathBuf> {
-    archive.ancestors().find(|d| d.join("RDR2.exe").is_file()).map(Path::to_path_buf)
+/// The RDR2 game folder a file or folder lies in.
+pub fn game_folder(path: &Path) -> Option<PathBuf> {
+    path.ancestors().find(|d| crate::detect::is_rdr2_dir(d)).map(Path::to_path_buf)
+}
+
+/// The archive keys saved by `openrage rdr2-keys`; `None` before that.
+pub fn load_keys() -> anyhow::Result<Option<Arc<Rdr2Keys>>> {
+    use anyhow::Context;
+    use rage_rpf::rpf8_keys::KeyStore;
+    let Some(path) = KeyStore::default_path() else { return Ok(None) };
+    let Some(store) = KeyStore::load(&path)? else { return Ok(None) };
+    let keys =
+        store.to_keys().with_context(|| format!("{} is damaged; run `openrage rdr2-keys` again", path.display()))?;
+    Ok(Some(Arc::new(keys)))
+}
+
+/// The cached file names of the game's archives, if they were collected.
+pub fn load_names(game_dir: &Path) -> Option<Arc<rage_rpf::rpf8_names::NameIndex>> {
+    use rage_rpf::rpf8_names::NameIndex;
+    NameIndex::default_path(game_dir).and_then(|p| NameIndex::load(&p).ok().flatten()).map(Arc::new)
+}
+
+/// Prepares archives of a game folder to be opened through the virtual file
+/// system: the keys and the file names. `Ok(true)` when the keys are there;
+/// an error when the key file is damaged (the names are registered anyway).
+pub fn register(game_dir: &Path) -> anyhow::Result<bool> {
+    let names = load_names(game_dir);
+    if let Some(n) = &names {
+        register_names(n);
+    }
+    match load_keys() {
+        Ok(keys) => {
+            let ready = keys.is_some();
+            rage_rpf::rpf8::set_defaults(keys, names);
+            Ok(ready)
+        }
+        Err(e) => {
+            rage_rpf::rpf8::set_defaults(None, names);
+            Err(e)
+        }
+    }
 }
 
 #[cfg(test)]

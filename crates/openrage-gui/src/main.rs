@@ -1,6 +1,8 @@
 //! OpenRAGE graphical explorer.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
+// Slint's generated code allows `unsafe` for itself; our own code may not use it.
+#![deny(unsafe_code)]
 
 mod accent;
 mod audio;
@@ -24,10 +26,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use openrage_app::config::Config;
+use openrage_app::detect::{self, is_rdr2_dir};
 use openrage_app::extract::{extract_entry, human_size};
+use openrage_app::gta4::is_gta4_dir;
 use openrage_app::install::{self, Op};
 use openrage_app::setup::{self, KeyBlobRequired, KeySource};
-use openrage_app::{detect, game_language_from_locale, index_path, load_keys, suggest};
+use openrage_app::{game_language_from_locale, index_path, load_keys, suggest};
 use rage_crypto::GtaVKeys;
 use rage_index::{EntryTag, HitReason, Index, LANGUAGES};
 use rage_rpf::vfs::{self, Node};
@@ -5371,32 +5375,15 @@ fn open_game(ui: &AppWindow, index: usize, remember: bool) {
     }
 }
 
-/// Whether a folder is a GTA IV installation (the folder holding `GTAIV.exe`).
-fn is_gta4_dir(dir: &Path) -> bool {
-    openrage_app::gta4::is_gta4_dir(dir)
-}
-
-/// Whether a folder is a Red Dead Redemption 2 installation.
-fn is_rdr2_dir(dir: &Path) -> bool {
-    dir.join("RDR2.exe").is_file()
-}
-
 /// Loads the RDR2 archive keys (from `openrage rdr2-keys`) and the cached file
-/// names for archives opened through the virtual file system; false without keys.
+/// names for archives opened through the virtual file system; false without
+/// keys. A damaged key file is reported on stderr and counts as no keys (the
+/// setup then asks for them again).
 fn register_rdr2(game_dir: &Path) -> bool {
-    use rage_rpf::rpf8_keys::KeyStore;
-    use rage_rpf::rpf8_names::NameIndex;
-    let keys = KeyStore::default_path()
-        .and_then(|p| KeyStore::load(&p).ok().flatten())
-        .and_then(|s| s.to_keys())
-        .map(Arc::new);
-    let names = NameIndex::default_path(game_dir).and_then(|p| NameIndex::load(&p).ok().flatten()).map(Arc::new);
-    let ok = keys.is_some();
-    if let Some(n) = &names {
-        openrage_app::rdr2::register_names(n);
-    }
-    rage_rpf::rpf8::set_defaults(keys, names);
-    ok
+    openrage_app::rdr2::register(game_dir).unwrap_or_else(|e| {
+        eprintln!("RDR2 keys: {e:#}");
+        false
+    })
 }
 
 fn show_setup(ui: &AppWindow, can_cancel: bool) {

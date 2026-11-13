@@ -11,6 +11,7 @@
 //!   original, per folder (for browsing) or as a complete change list?
 //!
 //! Everything here is read-only; the `mods` folder format is not changed.
+#![forbid(unsafe_code)]
 
 pub mod compare;
 pub mod overlay;

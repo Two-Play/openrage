@@ -7,6 +7,7 @@
 //! Pointers inside the resource address these segments virtually:
 //! `0x5xxxxxxx` is an offset into system memory, `0x6xxxxxxx` into graphics
 //! memory, and `0` means null.
+#![forbid(unsafe_code)]
 
 const SYSTEM_BASE: u64 = 0x5000_0000;
 const GRAPHICS_BASE: u64 = 0x6000_0000;

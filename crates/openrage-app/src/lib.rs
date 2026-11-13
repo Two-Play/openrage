@@ -1,5 +1,6 @@
 //! Application logic shared by the OpenRAGE CLI and GUI:
 //! settings, key setup and game detection.
+#![forbid(unsafe_code)]
 
 pub mod anim;
 pub mod audio;

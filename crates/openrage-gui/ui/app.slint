@@ -4353,7 +4353,7 @@ export component XmlWindow inherits Window {
     public function show-line(line: int) {
         root.tab = 1;
         root.marked-line = line;
-        xml-list.viewport-y = -max(0px, (line - 3) * 18px);
+        xml-list.content-y = -max(0px, (line - 3) * 18px);
     }
 
     changed theme-mode => { root.apply-theme(); }

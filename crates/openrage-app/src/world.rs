@@ -19,6 +19,8 @@ use rayon::prelude::*;
 
 use rage_formats::math::{self, Mat4};
 
+use crate::detect::collect_rpfs;
+
 const CACHE_VERSION: &str = "openrage-world 3";
 
 /// An object inside an interior, relative to the interior.
@@ -56,19 +58,6 @@ fn cache_path(game_dir: &Path) -> Option<PathBuf> {
     let index = crate::index_path(game_dir)?;
     let name = index.file_name()?.to_string_lossy().replace("index-", "world-").replace(".sqlite", ".tsv");
     Some(index.with_file_name(name))
-}
-
-fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    let mut items: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-    items.sort();
-    for p in items {
-        if p.is_dir() {
-            collect_rpfs(&p, out);
-        } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rpf")) {
-            out.push(p);
-        }
-    }
 }
 
 fn vec3(n: roxmltree::Node) -> Option<[f32; 3]> {
