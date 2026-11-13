@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 
 /// Where the imported list lives.
 pub fn path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("openrage").join("natives.json"))
+    Some(crate::paths::config_dir()?.join("natives.json"))
 }
 
 fn table() -> &'static RwLock<Option<HashMap<u64, String>>> {

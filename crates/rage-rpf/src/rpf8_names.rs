@@ -36,13 +36,6 @@ pub struct NameIndex {
 }
 
 impl NameIndex {
-    /// Where the names for a game folder are cached.
-    pub fn default_path(game: &Path) -> Option<PathBuf> {
-        let canonical = game.canonicalize().unwrap_or_else(|_| game.to_path_buf());
-        let id = rage_core::hash::jenkins_bytes(canonical.to_string_lossy().as_bytes());
-        Some(dirs::cache_dir()?.join("openrage").join(format!("rdr2-names-{id:08x}.tsv")))
-    }
-
     pub fn to_text(&self) -> String {
         let mut lines: Vec<String> = self
             .names

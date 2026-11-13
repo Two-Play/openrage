@@ -31,7 +31,7 @@ pub struct Config {
 }
 
 fn dir() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("openrage"))
+    crate::paths::config_dir()
 }
 
 impl Config {

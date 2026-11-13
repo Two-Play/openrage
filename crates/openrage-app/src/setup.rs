@@ -95,7 +95,7 @@ pub fn derive_keys(
         None
     };
 
-    let cache_path = GtaVKeys::default_cache_path()?;
+    let cache_path = crate::paths::gtav_keys().context("no per-user config directory available")?;
     keys.save(&cache_path)?;
     let report = SetupReport {
         exe,

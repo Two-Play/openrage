@@ -13,13 +13,12 @@ use crate::{aes_ecb, scan::ExeScan};
 const CACHE_MAGIC: &[u8; 8] = b"ORKEYS01";
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum KeyCacheError {
     #[error("I/O error on key cache {path}: {source}")]
     Io { path: PathBuf, source: std::io::Error },
     #[error("key cache {0} is corrupt or from an incompatible OpenRAGE version")]
     Corrupt(PathBuf),
-    #[error("no per-user config directory available on this system")]
-    NoConfigDir,
 }
 
 /// Everything needed to read GTA V PC archives.
@@ -102,11 +101,6 @@ impl GtaVKeys {
 
     pub fn decrypt_aes(&self, data: &mut [u8]) {
         aes_ecb::decrypt_aes(data, &self.aes_key);
-    }
-
-    /// Default cache location: `<config dir>/openrage/gtav.keys`.
-    pub fn default_cache_path() -> Result<PathBuf, KeyCacheError> {
-        Ok(dirs::config_dir().ok_or(KeyCacheError::NoConfigDir)?.join("openrage").join("gtav.keys"))
     }
 
     pub fn save(&self, path: &Path) -> Result<(), KeyCacheError> {

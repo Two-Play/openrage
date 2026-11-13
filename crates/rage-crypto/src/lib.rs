@@ -1,8 +1,9 @@
 //! RAGE archive cryptography (GTA V, GTA IV).
 //!
-//! OpenRAGE never ships Rockstar key material. All keys are derived at runtime
+//! This crate ships no Rockstar key material. All keys are derived at runtime
 //! from files the user already owns (the game executable, or a key blob the
-//! user points us to) and cached locally in the user's config directory.
+//! user points to). Key caches are written to and read from a path the caller
+//! chooses ([`GtaVKeys::save`], [`Gta4Key::load`], …).
 #![forbid(unsafe_code)]
 
 mod aes_ecb;

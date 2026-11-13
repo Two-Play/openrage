@@ -30,11 +30,6 @@ pub struct KeyStore {
 }
 
 impl KeyStore {
-    /// Where OpenRAGE keeps the keys (`<config dir>/openrage/rdr2.keys`).
-    pub fn default_path() -> Option<PathBuf> {
-        Some(dirs::config_dir()?.join("openrage").join("rdr2.keys"))
-    }
-
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + CONTEXT_LEN + IV_LEN + 4 + self.keys.len() * (1 + KEY_LEN));
         out.extend(STORE_MAGIC);
