@@ -24,4 +24,7 @@ pub enum RpfError {
     NotFound(String),
     #[error("not a file or directory: {0}")]
     BadPath(PathBuf),
+    /// An edit that cannot be made (with the reason).
+    #[error("{0}")]
+    Edit(String),
 }

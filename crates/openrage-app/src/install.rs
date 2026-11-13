@@ -227,7 +227,7 @@ pub fn apply_grouped(
     if let Some(p) = vfs::find_case_insensitive(game_dir, archive)
         && rage_rpf::Gta4Archive::file_is_gta4(&p)
     {
-        bail!("{archive}: changing GTA IV .rpf archives is not supported yet (only .img)");
+        return apply_gta4_rpf(game_dir, &mods, archive, ops, description, &journal);
     }
     let (path, rel, created) = ensure_in_mods(game_dir, &mods, archive, &journal)?;
     let mut editor = ArchiveEditor::open(&path, keys.clone())?;
@@ -274,23 +274,66 @@ fn apply_img(
         })
         .collect::<Result<_>>()?;
     let key = rage_rpf::gta4::default_key();
+    commit_gta4(game_dir, mods, archive, description, journal, &mut |path, before| {
+        commit_img_with(path, key.as_deref(), &edits, before)
+    })
+}
+
+/// Applies `ops` to a GTA IV package (`.rpf`, RPF2 or RPF3), like [`apply_img`].
+fn apply_gta4_rpf(
+    game_dir: &Path,
+    mods: &Path,
+    archive: &str,
+    ops: &[(String, Op)],
+    description: &str,
+    journal: &Journal,
+) -> Result<Applied> {
+    use rage_rpf::gta4_rpf_editor::{RpfEdit, commit_rpf_with};
+    let clean = |p: &str| p.trim_matches('/').to_owned();
+    let edits: Vec<RpfEdit> = ops
+        .iter()
+        .map(|(path, op)| {
+            Ok(match op {
+                Op::Set(data) => RpfEdit::Set { path: clean(path), data: data.clone() },
+                Op::Remove => RpfEdit::Remove { path: clean(path) },
+                Op::Rename(to) => RpfEdit::Rename { from: clean(path), to: clean(to) },
+                Op::CreateDir => RpfEdit::CreateDir { path: clean(path) },
+                Op::SetRaw(_) => bail!("{path}: stored GTA V entries cannot go into a GTA IV archive"),
+            })
+        })
+        .collect::<Result<_>>()?;
+    let key = rage_rpf::gta4::default_key();
+    commit_gta4(game_dir, mods, archive, description, journal, &mut |path, before| {
+        commit_rpf_with(path, key.as_deref(), &edits, before)
+    })
+}
+
+type Commit<'a> = dyn FnMut(
+        &Path,
+        &mut dyn FnMut(&rage_rpf::Backup) -> Result<(), rage_rpf::RpfError>,
+    ) -> Result<CommitStats, rage_rpf::RpfError>
+    + 'a;
+
+/// Runs a GTA IV archive commit on the chosen target: the archive's copy in
+/// the overlay folder (made on the first change), or the game's own file
+/// (original kept). Every commit is recorded for undo.
+fn commit_gta4(
+    game_dir: &Path,
+    mods: &Path,
+    archive: &str,
+    description: &str,
+    journal: &Journal,
+    commit: &mut Commit,
+) -> Result<Applied> {
+    let io = |e: anyhow::Error| rage_rpf::RpfError::Io(std::io::Error::other(e.to_string()));
     if write_target(game_dir) == WriteTarget::Game {
         let (path, rel) = prepare_game_file(game_dir, mods, archive)?;
-        let stats = commit_img_with(&path, key.as_deref(), &edits, &mut |backup| {
-            journal
-                .record_game_edit(&rel, description, backup)
-                .map(|_| ())
-                .map_err(|e| rage_rpf::RpfError::Io(std::io::Error::other(e.to_string())))
-        })?;
+        let stats =
+            commit(&path, &mut |backup| journal.record_game_edit(&rel, description, backup).map(|_| ()).map_err(io))?;
         return Ok(Applied { path, created: false, stats });
     }
     let (path, rel, created) = ensure_in_mods(game_dir, mods, archive, journal)?;
-    let stats = commit_img_with(&path, key.as_deref(), &edits, &mut |backup| {
-        journal
-            .record_edit(&rel, description, backup)
-            .map(|_| ())
-            .map_err(|e| rage_rpf::RpfError::Io(std::io::Error::other(e.to_string())))
-    })?;
+    let stats = commit(&path, &mut |backup| journal.record_edit(&rel, description, backup).map(|_| ()).map_err(io))?;
     Ok(Applied { path, created, stats })
 }
 

@@ -111,7 +111,9 @@ enum Command {
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths", "scripts"])]
         media: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
-        #[arg(long, requires = "textures")]
+        /// GTA IV without --textures: rebuild the table of every .rpf package in memory and
+        /// check that it matches the stored one byte for byte (nothing is written).
+        #[arg(long)]
         rebuild: bool,
     },
     /// Convert a metadata file (.ymap, .ytyp, .ymt, .ymf, .cut, .pso) to XML.
@@ -600,6 +602,12 @@ fn run() -> Result<()> {
         Command::Rdr2Ped { name, outfit, check, load } => cmd_rdr2_ped(&game_dir, name.as_deref(), outfit, check, load),
         Command::Verify { path, animations: true, .. } if gta4 => cmd_verify_gta4_animations(&game_dir, &path),
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
+        Command::Verify { path, textures: false, rebuild: true, .. } if gta4 => {
+            cmd_verify_gta4_tables(&game_dir, &path)
+        }
+        Command::Verify { textures: false, rebuild: true, .. } => {
+            bail!("--rebuild needs --textures (or a GTA IV game)")
+        }
         Command::Verify { path, textures: false, .. } if gta4 => cmd_verify_gta4(&game_dir, &path),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
         Command::Verify { path, textures: true, rebuild, .. } if gta4 => {
@@ -3968,6 +3976,55 @@ fn cmd_verify_gta4_text(game_dir: &Path, within: &str) -> Result<()> {
     );
     if !errors.is_empty() {
         bail!("{} errors", errors.len());
+    }
+    Ok(())
+}
+
+/// Rebuilds the table of every GTA IV package (`.rpf`) in memory and compares
+/// it with the stored one: the editor writes tables exactly like the game's.
+fn cmd_verify_gta4_tables(game_dir: &Path, within: &str) -> Result<()> {
+    let root = game_dir.join(within.trim_start_matches('/'));
+    let mut found = Vec::new();
+    if root.is_file() {
+        found.push(root);
+    } else {
+        collect_archives(&root, &["rpf"], &mut found);
+    }
+    let key = rage_rpf::gta4::default_key();
+    let started = Instant::now();
+    let results: Vec<(String, Result<bool, String>)> = found
+        .par_iter()
+        .filter(|p| rage_rpf::Gta4Archive::file_is_gta4(p))
+        .map(|p| {
+            let rel = p.strip_prefix(game_dir).unwrap_or(p).to_string_lossy().replace('\\', "/");
+            let r = rage_rpf::gta4_rpf_editor::rebuild_toc(p, key.as_deref())
+                .map(|(stored, rebuilt)| stored == rebuilt)
+                .map_err(|e| e.to_string());
+            (rel, r)
+        })
+        .collect();
+    let mut failed = 0;
+    for (rel, r) in &results {
+        match r {
+            Ok(true) => {}
+            Ok(false) => {
+                failed += 1;
+                outln!("FAIL {rel}: rebuilt table differs");
+            }
+            Err(e) => {
+                failed += 1;
+                outln!("FAIL {rel}: {e}");
+            }
+        }
+    }
+    outln!(
+        "{} packages, {} tables rebuilt byte for byte, {failed} errors ({:.1}s)",
+        results.len(),
+        results.len() - failed,
+        started.elapsed().as_secs_f32()
+    );
+    if failed > 0 {
+        bail!("{failed} errors");
     }
     Ok(())
 }
