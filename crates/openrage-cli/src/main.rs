@@ -579,7 +579,9 @@ fn run() -> Result<()> {
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
         Command::Verify { path, textures: false, .. } if gta4 => cmd_verify_gta4(&game_dir, &path),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
-        Command::Verify { path, textures: true, .. } if gta4 => cmd_verify_gta4_textures(&game_dir, &path),
+        Command::Verify { path, textures: true, rebuild, .. } if gta4 => {
+            cmd_verify_gta4_textures(&game_dir, &path, rebuild)
+        }
         Command::Verify { path, textures: true, rebuild, .. } => cmd_verify_textures(&game_dir, &path, rebuild, keys),
         Command::Textures { path, sets, removes, .. } if !sets.is_empty() || !removes.is_empty() => {
             cmd_edit_textures(&game_dir, &path, &sets, &removes, keys)
@@ -3861,12 +3863,13 @@ fn cmd_verify_gta4_text(game_dir: &Path, within: &str) -> Result<()> {
 }
 
 /// Parses every GTA IV texture dictionary (`.wtd`) and decodes every texture.
-fn cmd_verify_gta4_textures(game_dir: &Path, within: &str) -> Result<()> {
+fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: bool) -> Result<()> {
     #[derive(Default)]
     struct Stats {
         dicts: usize,
         textures: usize,
         decoded: usize,
+        rebuilt: usize,
         formats: std::collections::BTreeMap<String, usize>,
         errors: Vec<String>,
     }
@@ -3882,15 +3885,37 @@ fn cmd_verify_gta4_textures(game_dir: &Path, within: &str) -> Result<()> {
                     return;
                 }
                 s.dicts += 1;
-                let dict = match a
-                    .read_resource(id)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|r| Ok(rage_formats::ytd::parse_gta4(&r)?))
-                {
+                let read = a.read(id).map_err(anyhow::Error::from).and_then(|raw| {
+                    let header = rage_resource::rsc5_header(&raw).context("no RSC5 header")?;
+                    let res = rage_resource::Resource::from_rsc5(&raw)?;
+                    let dict = rage_formats::ytd::parse_gta4(&res)?;
+                    Ok((header, res, dict))
+                });
+                let ((kind, flags), res, dict) = match read {
                     Ok(d) => d,
                     Err(err) => return s.errors.push(format!("{p}: {err:#}")),
                 };
                 s.errors.extend(dict.errors.iter().map(|err| format!("{p}: {err}")));
+                if rebuild && dict.errors.is_empty() {
+                    // The writer's rebuild must read back to the same textures.
+                    let check = rage_formats::wtd_write::rebuild(&res, kind, flags, &dict)
+                        .and_then(|file| rage_resource::Resource::from_rsc5(&file))
+                        .and_then(|r| rage_formats::ytd::parse_gta4(&r));
+                    let key = |d: &rage_formats::ytd::TextureDictionary| {
+                        let mut v: Vec<_> = d
+                            .textures
+                            .iter()
+                            .map(|t| (t.name.clone(), t.width, t.height, t.levels, t.format, t.data.clone()))
+                            .collect();
+                        v.sort_by(|x, y| x.0.cmp(&y.0));
+                        v
+                    };
+                    match check {
+                        Ok(back) if back.errors.is_empty() && key(&back) == key(&dict) => s.rebuilt += 1,
+                        Ok(_) => s.errors.push(format!("{p}: rebuilt dictionary differs")),
+                        Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
+                    }
+                }
                 for t in &dict.textures {
                     s.textures += 1;
                     *s.formats.entry(t.format.name()).or_default() += 1;
@@ -3908,6 +3933,7 @@ fn cmd_verify_gta4_textures(game_dir: &Path, within: &str) -> Result<()> {
         total.dicts += s.dicts;
         total.textures += s.textures;
         total.decoded += s.decoded;
+        total.rebuilt += s.rebuilt;
         total.errors.extend(s.errors);
         for (k, v) in s.formats {
             *total.formats.entry(k).or_default() += v;
@@ -3918,6 +3944,9 @@ fn cmd_verify_gta4_textures(game_dir: &Path, within: &str) -> Result<()> {
     }
     let formats: Vec<String> = total.formats.iter().map(|(f, n)| format!("{f} {n}")).collect();
     outln!("formats: {}", formats.join(", "));
+    if rebuild {
+        outln!("{} dictionaries rebuilt and read back identically", total.rebuilt);
+    }
     outln!(
         "{} texture dictionaries, {} textures, {} decoded, {} errors ({:.1}s)",
         total.dicts,
