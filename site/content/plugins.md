@@ -137,7 +137,7 @@ could not be read, with the reason.
 id = "strings"                 # unique: lowercase letters, digits and '-'
 name = "Strings"
 version = "0.1.0"
-api = "0.2"                    # the plugin API it was built for
+api = "0.3"                    # the plugin API it was built for
 description = "Shows the readable text in files."
 authors = ["You"]
 license = "MIT OR Apache-2.0"  # SPDX expression of your plugin
