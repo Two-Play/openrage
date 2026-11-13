@@ -17,6 +17,7 @@ use std::path::Path;
 use rage_core::io::read_exact_at;
 use rage_crypto::Gta4Key;
 
+use crate::word;
 use crate::{Backup, CommitStats, RpfError};
 
 const MAGIC: u32 = 0xA94E_2A52;
@@ -52,10 +53,6 @@ struct Item {
     blocks: u16,
     pad: u16,
     data: Option<Vec<u8>>,
-}
-
-fn word(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes(b[o..o + 4].try_into().expect("4 bytes"))
 }
 
 fn corrupt(path: &Path, reason: impl Into<String>) -> RpfError {

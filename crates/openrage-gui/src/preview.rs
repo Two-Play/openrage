@@ -423,6 +423,7 @@ pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys
             Ok(Node::Gta4File(a, i)) => gta4_preview(&a, i),
             Ok(Node::Gta4Dir(a, i)) if i == rage_rpf::Gta4Archive::ROOT => (gta4_archive_info(&a), String::new()),
             Ok(Node::Gta4Dir(..)) => (Meta::new(), String::new()),
+            Ok(_) => (Meta::new(), String::new()),
             Err(e) => (vec![kv("Error", e)], String::new()),
         },
         PreviewSource::Rpf8(rpf, i) => rpf8_preview(&rpf, i),

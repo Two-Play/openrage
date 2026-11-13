@@ -298,7 +298,8 @@ pub fn list(
             // GTA IV dictionaries can be changed (RDR2's not yet).
             Ok((texture_listing(vpath, dict, origin, false), None))
         }
-        Node::ArchiveFile(..) | Node::PlainFile(_) | Node::Rpf8File(..) | Node::Gta4File(..) => {
+        // Files (and node kinds added later) list their folder, with the file selected.
+        _ => {
             let name = last_segment(&vpath);
             let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys, overlay)?;
             Ok((listing, Some(name)))

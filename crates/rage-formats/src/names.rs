@@ -38,6 +38,10 @@ fn extra() -> &'static RwLock<HashMap<u32, String>> {
 
 /// Makes more names known (hashed with the usual lowercase joaat), e.g. the
 /// model and texture names found in the game's archives.
+///
+/// The registry is process-wide and only grows: every later lookup in the
+/// process (XML export of metadata, model names, …) sees these names.
+/// Registering is optional; without it, unknown hashes print as hex.
 pub fn register<I, S>(names: I)
 where
     I: IntoIterator<Item = S>,

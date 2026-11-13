@@ -164,6 +164,7 @@ impl GameFiles for GameDir {
             Node::Dir(_) | Node::ArchiveDir(..) | Node::Rpf8Dir(..) | Node::Gta4Dir(..) => {
                 bail!("{vpath} is a folder")
             }
+            _ => bail!("{vpath}: not supported"),
         })
     }
 
@@ -223,6 +224,7 @@ impl GameFiles for GameDir {
             Node::PlainFile(_) | Node::ArchiveFile(..) | Node::Rpf8File(..) | Node::Gta4File(..) => {
                 bail!("{vpath} is a file")
             }
+            _ => bail!("{vpath}: not supported"),
         }
         out.sort_by_key(|e| (!e.is_dir, e.name.to_ascii_lowercase()));
         Ok(out)

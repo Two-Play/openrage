@@ -23,6 +23,7 @@ use std::path::Path;
 use rage_core::io::read_exact_at;
 use rage_crypto::Gta4Key;
 
+use crate::word;
 use crate::{Backup, CommitStats, RpfError};
 
 const TOC_OFFSET: u64 = 0x800;
@@ -86,10 +87,6 @@ struct Package {
     root: Node,
     data_key: Option<Gta4Key>,
     toc_key: Option<Gta4Key>,
-}
-
-fn word(b: &[u8], i: usize) -> u32 {
-    u32::from_le_bytes(b[i..i + 4].try_into().expect("4 bytes"))
 }
 
 fn corrupt(path: &Path, reason: impl Into<String>) -> RpfError {

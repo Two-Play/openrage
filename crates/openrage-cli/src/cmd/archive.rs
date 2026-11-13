@@ -172,6 +172,7 @@ pub(crate) fn cmd_ls(game_dir: &Path, path: &str, recursive: bool, keys: Option<
                 }
             }
         }
+        _ => bail!("{path}: not supported"),
     }
     Ok(())
 }
@@ -277,6 +278,7 @@ pub(crate) fn cmd_info(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>)
             }
         }
         Node::Dir(p) | Node::PlainFile(p) => outln!("{} is not inside an archive", p.display()),
+        _ => outln!("{path}: not supported"),
     }
     Ok(())
 }
@@ -337,7 +339,7 @@ pub(crate) fn cmd_extract(
             );
             return extraction_result(s.failures.len());
         }
-        Node::Dir(_) | Node::PlainFile(_) => bail!("{path} is not inside an archive"),
+        _ => bail!("{path} is not inside an archive"),
     };
     let summary = extract_entry(&rpf, id, out, expand, &AtomicBool::new(false), &mut |_, _| {})?;
     for failure in &summary.failures {

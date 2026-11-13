@@ -24,6 +24,7 @@ use rage_core::io::read_exact_at;
 use rage_crypto::Gta4Key;
 
 use crate::RpfError;
+use crate::word;
 
 const IMG3_MAGIC: u32 = 0xA94E_2A52;
 const IMG_BLOCK: u64 = 2048;
@@ -136,7 +137,7 @@ fn audio_names_slot() -> &'static std::sync::RwLock<Option<Arc<AudioNames>>> {
 
 /// Registers names for audio packages (from the game's audio configuration;
 /// set at start-up, before packages are opened). Entries without a known name
-/// keep their hash as eight hex digits.
+/// keep their hash as eight hex digits. Process-wide, like [`set_default_key`].
 pub fn set_audio_names(names: Option<Arc<AudioNames>>) {
     if let Ok(mut n) = audio_names_slot().write() {
         *n = names;
@@ -170,7 +171,9 @@ fn default_key_slot() -> &'static std::sync::RwLock<Option<Arc<Gta4Key>>> {
     KEY.get_or_init(Default::default)
 }
 
-/// Registers the key [`Gta4Archive::open_default`] uses (set once at start-up).
+/// Registers the key [`Gta4Archive::open_default`] (and so [`crate::vfs::resolve`])
+/// uses. This is process-wide state, meant to be set once at start-up; code
+/// that knows its key should call [`Gta4Archive::open`] instead.
 pub fn set_default_key(key: Option<Arc<Gta4Key>>) {
     if let Ok(mut k) = default_key_slot().write() {
         *k = key;
@@ -180,10 +183,6 @@ pub fn set_default_key(key: Option<Arc<Gta4Key>>) {
 /// The key registered with [`set_default_key`].
 pub fn default_key() -> Option<Arc<Gta4Key>> {
     default_key_slot().read().ok()?.clone()
-}
-
-fn word(b: &[u8], i: usize) -> u32 {
-    u32::from_le_bytes(b[i..i + 4].try_into().expect("4 bytes"))
 }
 
 /// Whether a file name is a GTA IV archive candidate.
