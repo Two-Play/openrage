@@ -195,8 +195,18 @@ models they belong to) — open in the preview and the viewer like GTA V's `.ybn
 from GTA IV's own `common/data/materials/materials.dat`, and export as glTF. They are the 32-bit ancestors of GTA V's
 bounds: spheres, capsules, boxes, geometry with and without a BVH, and composites of these; polygons are quads or
 triangles of quantised vertices, each with its material. `openrage verify --collisions` reads every collision file of
-the game (1,079 files, 9,102 bounds, 26 million triangles, no errors). The collisions inside fragments (`.wft`) and
-animations follow; the search index is GTA V only for now.
+the game (1,079 files, 9,102 bounds, 26 million triangles, no errors). The collisions inside fragments (`.wft`) are
+not read yet.
+
+**Animations** (`.wad`, in `pc/anim/anim.img`, the cutscenes' in `cuts.img`) open like GTA V's clip dictionaries: one
+clip per animation, with the ped models (`componentpeds.img`) to play it on — every GTA IV ped shares one skeleton —
+and the viewer plays it (`openrage clips <path>`, `openrage model <ped> --anim <wad>:<clip>[@seconds] --render …`).
+GTA IV stores every bone track as separate channels: raw floats, constants, quantised floats (bit-packed, scale and
+offset) and constant quaternions or vectors; translations, rotations and the mover are read, other tracks (facial and
+custom values) are skipped. The game turns its twist and roll helper bones (`Char_L_ForeTwist`, `L_ArmRoll`, …) itself;
+OpenRAGE lets each follow the animated bone it rests on, so forearms and upper arms stay in one piece.
+`openrage verify --animations` reads every animation of the game (1,772 dictionaries, 22,866 animations, 13.9 million
+frames, 925,224 bone tracks, every frame evaluated, no errors). The search index is GTA V only for now.
 
 ## Red Dead Redemption 2
 

@@ -612,7 +612,7 @@ fn wire_callbacks(ui: &AppWindow) {
             }
             let is_ycd = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                Some(listing.items[*a.visible.get(i as usize)?].name.to_ascii_lowercase().ends_with(".ycd"))
+                Some(is_clip_dictionary(&listing.items[*a.visible.get(i as usize)?]))
             });
             if is_ycd == Some(true) {
                 if ui.get_file_selected() != i {
@@ -1735,7 +1735,7 @@ fn select_row(ui: &AppWindow, row: usize) {
         a.suggest_awc.clear();
         a.suggest_pending = false;
     });
-    if item.name.to_ascii_lowercase().ends_with(".ycd") && item.mark != Some(Mark::Removed) {
+    if is_clip_dictionary(&item) && item.mark != Some(Mark::Removed) {
         show_clip_dictionary(ui, vpath.clone(), info);
         return;
     }
@@ -3083,6 +3083,11 @@ fn open_model_with_animation(ui: &AppWindow, model: String, ycd: String) {
 /// animations without a named vehicle; they are ranked by how many of the
 /// animated bones their skeletons have.
 fn suggest_models(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, profile: &suggest::Profile) -> Vec<String> {
+    if is_gta4_dir(game_dir) {
+        let tags: std::collections::HashSet<u16> =
+            profile.animations.iter().flat_map(|(t, _)| t.iter().copied()).collect();
+        return openrage_app::gta4::animation_models(game_dir, &tags);
+    }
     let Some(index) = index_path(game_dir).filter(|p| p.exists()).and_then(|p| Index::open(&p).ok()) else {
         return Vec::new();
     };
@@ -3406,14 +3411,22 @@ fn show_audio_container(ui: &AppWindow, vpath: String, mut info: Meta) {
     }
 }
 
-/// Selecting a `.ycd`: its clips and (found in the background) the models it fits.
+/// Whether an item is a clip dictionary (`.ycd`; GTA IV `.wad`).
+fn is_clip_dictionary(item: &Item) -> bool {
+    let n = item.name.to_ascii_lowercase();
+    n.ends_with(".ycd") || (n.ends_with(".wad") && item.kind == ItemKind::Resource)
+}
+
+/// Selecting a `.ycd` (or `.wad`): its clips and (found in the background) the models it fits.
 fn show_clip_dictionary(ui: &AppWindow, vpath: String, mut info: Meta) {
     match load_clip_dictionary(&vpath) {
         Ok(dict) => {
             let profile = suggest::Profile::new(&vpath, &dict);
             info.push(kv("Clips", dict.clips.len()));
             info.push(kv("Animations", dict.animations.len()));
-            info.push(kv("Kind", profile.describe()));
+            // The kinds are told apart by GTA V's bone tags.
+            let gta4 = with_app(|a| a.game_dir.as_deref().is_some_and(is_gta4_dir));
+            info.push(kv("Kind", if gta4 { "GTA IV animation".to_owned() } else { profile.describe() }));
             let names: Vec<&str> = dict.clips.iter().take(12).map(|c| c.name.as_str()).collect();
             let more = if dict.clips.len() > 12 { ", …" } else { "" };
             info.push(kv("Clips", format!("{}{more}", names.join(", "))));
