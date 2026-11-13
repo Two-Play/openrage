@@ -28,12 +28,30 @@
 //!   count, `0x0C` index size, `0x18` data, `0x30` buffer object;
 //! * declaration: 52 offsets (u32), 52 bytes (the stride), 52 DXGI formats;
 //!   slots 0 position, 4 normal, 8 tangent, 16/20 blend weights/indices,
-//!   24/25 colours, 28–35 texture coordinates.
+//!   24/25 colours, 28–35 texture coordinates;
+//! * shader group: `0x08` embedded texture dictionary, `0x10` shader
+//!   pointers, `0x18` count and capacity (u16);
+//! * shader (0x40): `0x08` constant buffers, `0x10` texture references (one
+//!   pointer per texture slot), `0x20` parameter info: number of textures
+//!   at 1, of parameters at 4, then (name hash, slot) pairs from 8 (slot kind
+//!   in the low two bits, 0 = texture; the rest is the texture index);
+//! * texture reference (0x50): a texture without data, `0x28` its name; the
+//!   game finds it by name, first in the embedded dictionary;
+//! * embedded dictionary: like a `.ytd`'s root (0x40): `0x20` name hashes
+//!   (sorted), `0x30` texture pointers, counts at `0x28`/`0x2A`/`0x38`/`0x3A`.
+//!
+//! With [`NewMaterial`]s, every material gets its own copy of a template
+//! shader (so several materials can use the same kind of shader), and
+//! materials with a texture get it embedded and bound to the copy's colour
+//! slot.
 
 use rage_resource::builder::{BlockId, Builder, Segment};
 use rage_resource::{Resource, ResourceError};
 
-use crate::drawable::{Gen, VERSION_YDR_ENHANCED};
+use crate::drawable::{Gen, VERSION_YDR_ENHANCED, param};
+use crate::texture::{Dimension, Format, Texture};
+use crate::ytd::Layout as DictLayout;
+use crate::ytd_write::{guess_usage, name_hash, write_fields};
 
 const SYS: u64 = 0x5000_0000;
 const GFX: u64 = 0x6000_0000;
@@ -42,9 +60,67 @@ const MODEL_SIZE: usize = 0x30;
 const GEOMETRY_SIZE: usize = 0xA0;
 const BUFFER_SIZE: usize = 0x40;
 const BUFFER_OBJECT_SIZE: usize = 0x20;
+const SHADER_SIZE: usize = 0x40;
+const TEXTURE_REF_SIZE: usize = 0x50;
+const DICTIONARY_ROOT_SIZE: usize = 0x40;
 
 /// Most vertices of one geometry (16-bit indices).
 pub const MAX_VERTICES: usize = 0xFFFF;
+
+/// A material of the new model: drawn with a copy of one of the template's
+/// shaders, optionally with a colour texture of its own.
+#[derive(Debug, Clone)]
+pub struct NewMaterial {
+    /// The template shader to copy.
+    pub shader: u16,
+    /// Embedded and bound to the copy's colour slot ([`texture_from_rgba`]).
+    pub texture: Option<Texture>,
+}
+
+/// A colour texture from 8-bit RGBA pixels: BGRA with all mip levels (each
+/// half the size, box filtered).
+pub fn texture_from_rgba(name: &str, width: u32, height: u32, rgba: &[u8]) -> Result<Texture, ResourceError> {
+    if width == 0 || height == 0 || width > 8192 || height > 8192 || rgba.len() != (width * height * 4) as usize {
+        return Err(bad(format!("texture {name}: {width}×{height} with {} bytes of pixels", rgba.len())));
+    }
+    let levels = 32 - width.min(height).leading_zeros();
+    let mut data = Vec::new();
+    let (mut w, mut h) = (width as usize, height as usize);
+    let mut level: Vec<u8> = rgba.to_vec();
+    for l in 0..levels {
+        if l > 0 {
+            let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+            let mut next = vec![0u8; nw * nh * 4];
+            for y in 0..nh {
+                for x in 0..nw {
+                    for c in 0..4 {
+                        let mut sum = 0u32;
+                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                            let (sx, sy) = ((x * 2 + dx).min(w - 1), (y * 2 + dy).min(h - 1));
+                            sum += u32::from(level[(sy * w + sx) * 4 + c]);
+                        }
+                        next[(y * nw + x) * 4 + c] = ((sum + 2) / 4) as u8;
+                    }
+                }
+            }
+            level = next;
+            (w, h) = (nw, nh);
+        }
+        // RGBA → BGRA
+        data.extend(level.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0], p[3]]));
+    }
+    Ok(Texture {
+        name: name.to_owned(),
+        width,
+        height,
+        depth: 1,
+        levels,
+        format: Format::B8G8R8A8_UNORM,
+        dimension: Dimension::Texture2D,
+        usage: guess_usage(name),
+        data,
+    })
+}
 
 /// A mesh to write: triangles of one shader of the template.
 #[derive(Debug, Clone, Default)]
@@ -367,34 +443,117 @@ fn put_box(d: &mut [u8], at: usize, (min, max): ([f32; 3], [f32; 3])) {
 /// `.ydr`, read with [`Resource`]). Every mesh uses one of the template's
 /// shaders ([`usable_shaders`]); the result has one detail level.
 pub fn replace_meshes(template: &Resource, meshes: &[NewMesh]) -> Result<Vec<u8>, ResourceError> {
+    build(template, &[meshes], None, None)
+}
+
+/// Like [`replace_meshes`], but every mesh's `shader` is an index into
+/// `materials`: each material gets its own copy of a template shader, with
+/// its texture embedded. Textures need a texture structure to copy: from the
+/// template's embedded dictionary, else from `donor` (an Enhanced drawable
+/// with one, or an Enhanced `.ydr`/`.ytd` resource).
+pub fn replace_with_materials(
+    template: &Resource,
+    meshes: &[NewMesh],
+    materials: &[NewMaterial],
+    donor: Option<&Resource>,
+) -> Result<Vec<u8>, ResourceError> {
+    build(template, &[meshes], Some(materials), donor)
+}
+
+/// Like [`replace_with_materials`] (or [`replace_meshes`] without
+/// `materials`), with one to four detail levels: `lods[0]` is shown close
+/// up, each further one from further away. Distances come from the
+/// template's levels where it has them (else 50 m, doubling per level); the
+/// last level is seen as far as the template's furthest.
+pub fn replace_lods(
+    template: &Resource,
+    lods: &[&[NewMesh]],
+    materials: Option<&[NewMaterial]>,
+    donor: Option<&Resource>,
+) -> Result<Vec<u8>, ResourceError> {
+    build(template, lods, materials, donor)
+}
+
+/// Whether `res` (an Enhanced drawable or texture dictionary) has a texture
+/// structure that [`replace_with_materials`] can copy (as the `donor`).
+pub fn can_donate_textures(res: &Resource) -> bool {
+    texture_templates(res).is_some()
+}
+
+/// The first texture structure and dictionary root of an Enhanced resource:
+/// its embedded dictionary (drawable) or its root (texture dictionary).
+fn texture_templates(res: &Resource) -> Option<(Vec<u8>, Vec<u8>)> {
+    let root = if res.version == VERSION_YDR_ENHANCED {
+        let group = res.u64(SYS + 0x10).ok().filter(|&g| g != 0)?;
+        res.u64(group + 0x08).ok().filter(|&t| t != 0)?
+    } else {
+        SYS
+    };
+    let count = res.u16(root + 0x38).ok()?;
+    if count == 0 {
+        return None;
+    }
+    let first = res.u64(res.u64(root + 0x30).ok()?).ok()?;
+    let texture = res.bytes(first, DictLayout::Enhanced.texture_size()).ok()?.to_vec();
+    let root = res.bytes(root, DICTIONARY_ROOT_SIZE).ok()?.to_vec();
+    Some((root, texture))
+}
+
+fn build(
+    template: &Resource,
+    lods: &[&[NewMesh]],
+    materials: Option<&[NewMaterial]>,
+    donor: Option<&Resource>,
+) -> Result<Vec<u8>, ResourceError> {
     check_template(template)?;
-    if meshes.is_empty() {
-        return Err(bad("no meshes to write"));
+    if lods.is_empty() || lods.len() > 4 || lods.iter().any(|l| l.is_empty()) {
+        return Err(bad("give one to four detail levels, each with meshes"));
     }
     let geometries = template_geometries(template)?;
     let usable: Vec<u16> = geometries.iter().map(|(s, _)| *s).collect();
-    for (i, m) in meshes.iter().enumerate() {
-        let n = m.positions.len();
-        if !usable.contains(&m.shader) {
-            return Err(bad(format!("mesh {i} uses shader {}, the template only has {usable:?}", m.shader)));
+    if let Some(mats) = materials {
+        for (k, mat) in mats.iter().enumerate() {
+            if !usable.contains(&mat.shader) {
+                return Err(bad(format!("material {k} uses shader {}, the template only has {usable:?}", mat.shader)));
+            }
         }
-        if n == 0 || m.indices.is_empty() || m.indices.len() % 3 != 0 {
-            return Err(bad(format!("mesh {i} has no triangles")));
+    }
+    // The template shader each mesh is drawn with (its vertex layout).
+    let source = |m: &NewMesh| -> Option<u16> {
+        match materials {
+            Some(mats) => mats.get(m.shader as usize).map(|mat| mat.shader),
+            None => Some(m.shader),
         }
-        if n > MAX_VERTICES {
-            return Err(bad(format!("mesh {i} has {n} vertices; split it (at most {MAX_VERTICES} per mesh)")));
-        }
-        if m.indices.iter().any(|&k| k as usize >= n) {
-            return Err(bad(format!("mesh {i} has triangles pointing at missing vertices")));
-        }
-        if (!m.normals.is_empty() && m.normals.len() != n)
-            || (!m.uvs.is_empty() && m.uvs.len() != n)
-            || (!m.colors.is_empty() && m.colors.len() != n)
-        {
-            return Err(bad(format!("mesh {i} has per-vertex data of the wrong length")));
-        }
-        if m.positions.iter().flatten().any(|v| !v.is_finite()) {
-            return Err(bad(format!("mesh {i} has positions that are not numbers")));
+    };
+    for (level, meshes) in lods.iter().enumerate() {
+        for (i, m) in meshes.iter().enumerate() {
+            let what = format!("level {level}, mesh {i}");
+            let n = m.positions.len();
+            match source(m) {
+                Some(s) if usable.contains(&s) => {}
+                _ if materials.is_some() => {
+                    return Err(bad(format!("{what} uses material {}, which does not exist", m.shader)));
+                }
+                _ => return Err(bad(format!("{what} uses shader {}, the template only has {usable:?}", m.shader))),
+            }
+            if n == 0 || m.indices.is_empty() || m.indices.len() % 3 != 0 {
+                return Err(bad(format!("{what} has no triangles")));
+            }
+            if n > MAX_VERTICES {
+                return Err(bad(format!("{what} has {n} vertices; split it (at most {MAX_VERTICES} per mesh)")));
+            }
+            if m.indices.iter().any(|&k| k as usize >= n) {
+                return Err(bad(format!("{what} has triangles pointing at missing vertices")));
+            }
+            if (!m.normals.is_empty() && m.normals.len() != n)
+                || (!m.uvs.is_empty() && m.uvs.len() != n)
+                || (!m.colors.is_empty() && m.colors.len() != n)
+            {
+                return Err(bad(format!("{what} has per-vertex data of the wrong length")));
+            }
+            if m.positions.iter().flatten().any(|v| !v.is_finite()) {
+                return Err(bad(format!("{what} has positions that are not numbers")));
+            }
         }
     }
     let template_of = |shader: u16| &geometries.iter().find(|(s, _)| *s == shader).expect("checked").1;
@@ -405,7 +564,6 @@ pub fn replace_meshes(template: &Resource, meshes: &[NewMesh]) -> Result<Vec<u8>
     if !template.graphics.is_empty() {
         b.add(Segment::Graphics, template.graphics.clone());
     }
-    let old = |addr: u64| -> usize { (addr - SYS) as usize };
     let copy = |addr: u64, len: usize| -> Result<Vec<u8>, ResourceError> {
         if !(SYS..GFX).contains(&addr) {
             return Err(bad("template structure outside system memory"));
@@ -414,94 +572,140 @@ pub fn replace_meshes(template: &Resource, meshes: &[NewMesh]) -> Result<Vec<u8>
     };
     b.add_pages_info(sys, 0x08);
 
-    let mut geometry_blocks: Vec<BlockId> = Vec::new();
-    let mut boxes = Vec::new();
-    for m in meshes {
-        let t = template_of(m.shader);
-        let data = vertex_data(m, &t.layout, t.stride)?;
-        let vdata = b.add(Segment::System, data);
-        let mut idx = Vec::with_capacity(m.indices.len() * 2);
-        for &k in &m.indices {
-            idx.extend_from_slice(&(k as u16).to_le_bytes());
+    // Materials: one shader copy each (indices after the template's shaders).
+    let group = template.u64(SYS + 0x10)?;
+    let first_new = if group != 0 { template.u16(group + 0x18)? } else { 0 };
+    if let Some(mats) = materials {
+        if group == 0 {
+            return Err(bad("the template has no shader group"));
         }
-        let idata = b.add(Segment::System, idx);
-
-        let mut vb = copy(t.vertex_buffer, BUFFER_SIZE)?;
-        put_u32(&mut vb, 0x08, m.positions.len() as u32);
-        put_u32(&mut vb, 0x0C, t.stride as u32);
-        let vb_obj = b.add(Segment::System, copy(template.u64(t.vertex_buffer + 0x30)?, BUFFER_OBJECT_SIZE)?);
-        let vb = b.add(Segment::System, vb);
-        b.pointer(vb, 0x18, vdata, 0);
-        b.pointer(vb, 0x30, vb_obj, 0);
-
-        let mut ib = copy(t.index_buffer, BUFFER_SIZE)?;
-        put_u32(&mut ib, 0x08, m.indices.len() as u32);
-        put_u32(&mut ib, 0x0C, 2);
-        let ib_obj = b.add(Segment::System, copy(template.u64(t.index_buffer + 0x30)?, BUFFER_OBJECT_SIZE)?);
-        let ib = b.add(Segment::System, ib);
-        b.pointer(ib, 0x18, idata, 0);
-        b.pointer(ib, 0x30, ib_obj, 0);
-
-        let mut g = copy(t.geometry, GEOMETRY_SIZE)?;
-        put_u32(&mut g, 0x58, m.indices.len() as u32);
-        put_u32(&mut g, 0x5C, (m.indices.len() / 3) as u32);
-        put_u16(&mut g, 0x60, m.positions.len() as u16);
-        put_u16(&mut g, 0x70, t.stride as u16);
-        let g = b.add(Segment::System, g);
-        b.pointer(g, 0x18, vb, 0);
-        b.pointer(g, 0x38, ib, 0);
-        b.pointer(g, 0x78, vdata, 0);
-        geometry_blocks.push(g);
-        boxes.push(bounds(m.positions.iter()));
+        add_materials(&mut b, sys, template, group, mats, donor)?;
     }
-    let n = meshes.len();
-    let all = bounds(meshes.iter().flat_map(|m| &m.positions));
+    let output_shader = |m: &NewMesh| if materials.is_some() { first_new + m.shader } else { m.shader };
 
-    // The model: a copy of the one the first template geometry belongs to.
-    let mut model = copy(template_of(meshes[0].shader).model, MODEL_SIZE)?;
-    put_u16(&mut model, 0x10, n as u16);
-    put_u16(&mut model, 0x12, n as u16);
-    let pointers = b.add(Segment::System, vec![0u8; 8 * n]);
-    for (i, g) in geometry_blocks.iter().enumerate() {
-        b.pointer(pointers, i * 8, *g, 0);
+    // The template's detail levels: model list, distance, render mask.
+    let mut levels = Vec::new();
+    for k in 0..4u64 {
+        let list = template.u64(SYS + 0x50 + k * 8)?;
+        let model = if list != 0 && template.u16(list + 8)? > 0 { template.u64(template.u64(list)?)? } else { 0 };
+        let distance = f32::from_le_bytes(template.bytes(SYS + 0x70 + k * 4, 4)?.try_into().unwrap());
+        levels.push((model, distance, template.u32(SYS + 0x80 + k * 4)?));
     }
-    let box_count = if n > 1 { n + 1 } else { 1 };
-    let mut aabbs = vec![0u8; 32 * box_count];
-    if n > 1 {
-        put_box(&mut aabbs, 0, all);
-    }
-    for (i, bx) in boxes.iter().enumerate() {
-        put_box(&mut aabbs, 32 * (i + usize::from(n > 1)), *bx);
-    }
-    let aabbs = b.add(Segment::System, aabbs);
-    let mut shader_indices = vec![0u8; (2 * n).div_ceil(16) * 16];
-    for (i, m) in meshes.iter().enumerate() {
-        put_u16(&mut shader_indices, i * 2, m.shader);
-    }
-    let shader_indices = b.add(Segment::System, shader_indices);
-    let model = b.add(Segment::System, model);
-    b.pointer(model, 0x08, pointers, 0);
-    b.pointer(model, 0x18, aabbs, 0);
-    b.pointer(model, 0x20, shader_indices, 0);
+    let template_levels = levels.iter().take_while(|l| l.0 != 0).count();
+    let far = levels.iter().map(|l| l.1).fold(0.0f32, f32::max);
+    let far = if far > 0.0 { far } else { 9998.0 };
 
-    let models = b.add(Segment::System, vec![0u8; 16]);
-    b.pointer(models, 0, model, 0);
-    let mut list = vec![0u8; 16];
-    put_u16(&mut list, 8, 1);
-    put_u16(&mut list, 10, 1);
-    let list = b.add(Segment::System, list);
-    b.pointer(list, 0, models, 0);
+    let mut lists = Vec::new();
+    for (level, meshes) in lods.iter().enumerate() {
+        let mut geometry_blocks: Vec<BlockId> = Vec::new();
+        let mut boxes = Vec::new();
+        for m in meshes.iter() {
+            let t = template_of(source(m).expect("checked"));
+            let data = vertex_data(m, &t.layout, t.stride)?;
+            let vdata = b.add(Segment::System, data);
+            let mut idx = Vec::with_capacity(m.indices.len() * 2);
+            for &k in &m.indices {
+                idx.extend_from_slice(&(k as u16).to_le_bytes());
+            }
+            let idata = b.add(Segment::System, idx);
 
-    // The drawable: one detail level, seen as far as the template's furthest.
-    let root = old(SYS);
-    let far = (0..4).map(|k| template.bytes(SYS + 0x70 + k * 4, 4).map(|d| f32::from_le_bytes(d.try_into().unwrap())));
-    let far = far.collect::<Result<Vec<f32>, _>>()?.into_iter().fold(0.0f32, f32::max);
+            let mut vb = copy(t.vertex_buffer, BUFFER_SIZE)?;
+            put_u32(&mut vb, 0x08, m.positions.len() as u32);
+            put_u32(&mut vb, 0x0C, t.stride as u32);
+            let vb_obj = b.add(Segment::System, copy(template.u64(t.vertex_buffer + 0x30)?, BUFFER_OBJECT_SIZE)?);
+            let vb = b.add(Segment::System, vb);
+            b.pointer(vb, 0x18, vdata, 0);
+            b.pointer(vb, 0x30, vb_obj, 0);
+
+            let mut ib = copy(t.index_buffer, BUFFER_SIZE)?;
+            put_u32(&mut ib, 0x08, m.indices.len() as u32);
+            put_u32(&mut ib, 0x0C, 2);
+            let ib_obj = b.add(Segment::System, copy(template.u64(t.index_buffer + 0x30)?, BUFFER_OBJECT_SIZE)?);
+            let ib = b.add(Segment::System, ib);
+            b.pointer(ib, 0x18, idata, 0);
+            b.pointer(ib, 0x30, ib_obj, 0);
+
+            let mut g = copy(t.geometry, GEOMETRY_SIZE)?;
+            put_u32(&mut g, 0x58, m.indices.len() as u32);
+            put_u32(&mut g, 0x5C, (m.indices.len() / 3) as u32);
+            put_u16(&mut g, 0x60, m.positions.len() as u16);
+            put_u16(&mut g, 0x70, t.stride as u16);
+            let g = b.add(Segment::System, g);
+            b.pointer(g, 0x18, vb, 0);
+            b.pointer(g, 0x38, ib, 0);
+            b.pointer(g, 0x78, vdata, 0);
+            geometry_blocks.push(g);
+            boxes.push(bounds(m.positions.iter()));
+        }
+        let n = meshes.len();
+        let all = bounds(meshes.iter().flat_map(|m| &m.positions));
+
+        // The model: the template's at this level (its flags), else the one
+        // the first mesh's template geometry belongs to.
+        let source_model = match levels.get(level) {
+            Some(&(model, _, _)) if model != 0 => model,
+            _ => template_of(source(&meshes[0]).expect("checked")).model,
+        };
+        let mut model = copy(source_model, MODEL_SIZE)?;
+        if template.u32(source_model + 0x28)? >> 8 & 0xFF != 0 {
+            model = copy(template_of(source(&meshes[0]).expect("checked")).model, MODEL_SIZE)?;
+        }
+        put_u16(&mut model, 0x10, n as u16);
+        put_u16(&mut model, 0x12, n as u16);
+        let pointers = b.add(Segment::System, vec![0u8; 8 * n]);
+        for (i, g) in geometry_blocks.iter().enumerate() {
+            b.pointer(pointers, i * 8, *g, 0);
+        }
+        let box_count = if n > 1 { n + 1 } else { 1 };
+        let mut aabbs = vec![0u8; 32 * box_count];
+        if n > 1 {
+            put_box(&mut aabbs, 0, all);
+        }
+        for (i, bx) in boxes.iter().enumerate() {
+            put_box(&mut aabbs, 32 * (i + usize::from(n > 1)), *bx);
+        }
+        let aabbs = b.add(Segment::System, aabbs);
+        let mut shader_indices = vec![0u8; (2 * n).div_ceil(16) * 16];
+        for (i, m) in meshes.iter().enumerate() {
+            put_u16(&mut shader_indices, i * 2, output_shader(m));
+        }
+        let shader_indices = b.add(Segment::System, shader_indices);
+        let model = b.add(Segment::System, model);
+        b.pointer(model, 0x08, pointers, 0);
+        b.pointer(model, 0x18, aabbs, 0);
+        b.pointer(model, 0x20, shader_indices, 0);
+
+        let models = b.add(Segment::System, vec![0u8; 16]);
+        b.pointer(models, 0, model, 0);
+        let mut list = vec![0u8; 16];
+        put_u16(&mut list, 8, 1);
+        put_u16(&mut list, 10, 1);
+        let list = b.add(Segment::System, list);
+        b.pointer(list, 0, models, 0);
+        lists.push(list);
+    }
+
+    // Distances: the template's where it has a level that is not its last;
+    // 50 m doubling per level otherwise; the last level as far as the
+    // template's furthest.
+    let mut distances = [far; 4];
+    for (level, d) in distances.iter_mut().enumerate().take(lods.len() - 1) {
+        let fallback = 50.0 * (1 << level) as f32;
+        *d = if level + 1 < template_levels && levels[level].1 > 0.0 { levels[level].1 } else { fallback.min(far) };
+    }
+    let mask_of = |level: usize| match levels.get(level) {
+        Some(&(model, _, mask)) if model != 0 => mask,
+        _ => levels[0].2,
+    };
+
+    let all = bounds(lods[0].iter().flat_map(|m| &m.positions));
     let centre = [(all.0[0] + all.1[0]) / 2.0, (all.0[1] + all.1[1]) / 2.0, (all.0[2] + all.1[2]) / 2.0];
-    let radius = meshes
+    let radius = lods[0]
         .iter()
         .flat_map(|m| &m.positions)
         .map(|p| dot(sub(*p, centre), sub(*p, centre)).sqrt())
         .fold(0.0f32, f32::max);
+    let root = 0usize;
     {
         let d = b.data_mut(sys);
         for (k, c) in centre.iter().enumerate() {
@@ -510,11 +714,165 @@ pub fn replace_meshes(template: &Resource, meshes: &[NewMesh]) -> Result<Vec<u8>
             put_f32(d, root + 0x40 + k * 4, all.1[k]);
         }
         put_f32(d, root + 0x2C, radius);
-        d[root + 0x58..root + 0x70].fill(0);
-        put_f32(d, root + 0x70, if far > 0.0 { far } else { 9998.0 });
+        d[root + 0x50..root + 0x70].fill(0);
+        for (k, distance) in distances.iter().enumerate() {
+            put_f32(d, root + 0x70 + k * 4, *distance);
+            put_u32(d, root + 0x80 + k * 4, if k < lods.len() { mask_of(k) } else { 0 });
+        }
     }
-    b.pointer(sys, root + 0x50, list, 0);
+    for (k, list) in lists.into_iter().enumerate() {
+        b.pointer(sys, root + 0x50 + k * 8, list, 0);
+    }
     b.build(VERSION_YDR_ENHANCED)
+}
+
+/// The colour texture slot of a template shader: its index into the texture
+/// references.
+fn colour_slot(res: &Resource, shader: u64) -> Result<usize, ResourceError> {
+    let infos = res.u64(shader + 0x20)?;
+    if infos == 0 {
+        return Err(bad("the shader has no parameter information"));
+    }
+    let total = res.u8(infos + 4)? as u64;
+    for k in 0..total {
+        let (hash, slot) = (res.u32(infos + 8 + k * 8)?, res.u32(infos + 12 + k * 8)?);
+        if slot & 3 == 0 && (hash == param::DIFFUSE_TEX || hash == param::DIFFUSE_SAMPLER) {
+            return Ok((slot >> 2) as usize);
+        }
+    }
+    Err(bad("the shader has no colour texture slot"))
+}
+
+/// Adds one copy of a template shader per material, the materials'
+/// textures to the embedded dictionary and binds them to the copies.
+fn add_materials(
+    b: &mut Builder,
+    sys: BlockId,
+    template: &Resource,
+    group: u64,
+    materials: &[NewMaterial],
+    donor: Option<&Resource>,
+) -> Result<(), ResourceError> {
+    let old_list = template.u64(group + 0x10)?;
+    let old_count = template.u16(group + 0x18)? as usize;
+    let list = b.add(Segment::System, vec![0u8; 8 * (old_count + materials.len())]);
+    for i in 0..old_count {
+        let p = template.u64(old_list + i as u64 * 8)?;
+        b.data_mut(list)[i * 8..i * 8 + 8].copy_from_slice(&p.to_le_bytes());
+    }
+    // Materials sharing a texture (same name) share its one embedded copy.
+    let mut new_textures: Vec<(Texture, BlockId)> = Vec::new();
+    for (k, mat) in materials.iter().enumerate() {
+        let src = template.u64(old_list + u64::from(mat.shader) * 8)?;
+        let shader = b.add(Segment::System, template.bytes(src, SHADER_SIZE)?.to_vec());
+        let infos = template.u64(src + 0x20)?;
+        let slots = if infos != 0 { template.u8(infos + 1)? as usize } else { 0 };
+        let refs_at = template.u64(src + 0x10)?;
+        if slots > 0 && refs_at != 0 {
+            let refs = b.add(Segment::System, template.bytes(refs_at, slots * 8)?.to_vec());
+            b.pointer(shader, 0x10, refs, 0);
+            if let Some(tex) = &mat.texture {
+                let slot = colour_slot(template, src).map_err(|e| bad(format!("material {k}: {e}")))?;
+                let old_ref = template.u64(refs_at + slot as u64 * 8)?;
+                if old_ref == 0 {
+                    return Err(bad(format!("material {k}: the shader's colour slot is empty")));
+                }
+                let reference = b.add(Segment::System, template.bytes(old_ref, TEXTURE_REF_SIZE)?.to_vec());
+                let mut name = tex.name.clone().into_bytes();
+                name.push(0);
+                let name = b.add(Segment::System, name);
+                b.pointer(reference, 0x28, name, 0);
+                b.pointer(refs, slot * 8, reference, 0);
+                if !new_textures.iter().any(|(t, _)| t.name.eq_ignore_ascii_case(&tex.name)) {
+                    new_textures.push((tex.clone(), name));
+                }
+            }
+        } else if mat.texture.is_some() {
+            return Err(bad(format!("material {k}: the shader takes no textures")));
+        }
+        b.pointer(list, (old_count + k) * 8, shader, 0);
+    }
+    let group_at = (group - SYS) as usize;
+    let count = (old_count + materials.len()) as u16;
+    put_u16(b.data_mut(sys), group_at + 0x18, count);
+    put_u16(b.data_mut(sys), group_at + 0x1A, count);
+    b.pointer(sys, group_at + 0x10, list, 0);
+    if !new_textures.is_empty() {
+        add_textures(b, sys, template, group, new_textures, donor)?;
+    }
+    Ok(())
+}
+
+/// A new embedded dictionary: the template's textures (kept where they are)
+/// and the new ones, sorted by name hash as the game expects.
+fn add_textures(
+    b: &mut Builder,
+    sys: BlockId,
+    template: &Resource,
+    group: u64,
+    textures: Vec<(Texture, BlockId)>,
+    donor: Option<&Resource>,
+) -> Result<(), ResourceError> {
+    let (root_template, texture_template) =
+        texture_templates(template)
+            .or_else(|| donor.and_then(texture_templates))
+            .ok_or_else(|| bad("no texture structure to copy: the model has no embedded textures (give a donor)"))?;
+    // (hash, existing pointer or new block)
+    enum Entry {
+        Old(u64),
+        New(BlockId),
+    }
+    let mut entries: Vec<(u32, Entry)> = Vec::new();
+    let old = template.u64(group + 0x08)?;
+    let new_hashes: Vec<u32> = textures.iter().map(|(t, _)| name_hash(&t.name)).collect();
+    if old != 0 {
+        let list = template.u64(old + 0x30)?;
+        let hashes = template.u64(old + 0x20)?;
+        for i in 0..template.u16(old + 0x38)? as u64 {
+            let hash = template.u32(hashes + i * 4)?;
+            // A new texture of the same name replaces the old one.
+            if !new_hashes.contains(&hash) {
+                entries.push((hash, Entry::Old(template.u64(list + i * 8)?)));
+            }
+        }
+    }
+    for ((tex, name), hash) in textures.into_iter().zip(new_hashes) {
+        let size = tex.expected_size().ok_or_else(|| bad(format!("{}: unsupported format", tex.name)))?;
+        let mut t = texture_template.clone();
+        write_fields(DictLayout::Enhanced, &mut t, &tex, true)?;
+        let block = b.add(Segment::System, t);
+        let data = b.add(Segment::Graphics, tex.data[..size].to_vec());
+        b.pointer(block, 0x28, name, 0);
+        b.pointer(block, 0x30, block, 0x58);
+        b.pointer(block, 0x38, data, 0);
+        entries.push((hash, Entry::New(block)));
+    }
+    entries.sort_by_key(|(h, _)| *h);
+    let mut root = if old != 0 { template.bytes(old, DICTIONARY_ROOT_SIZE)?.to_vec() } else { root_template };
+    root[0x08..0x10].fill(0); // no pages info inside a drawable
+    let count = entries.len() as u16;
+    for at in [0x28, 0x2A, 0x38, 0x3A] {
+        put_u16(&mut root, at, count);
+    }
+    let hashes: Vec<u8> = entries.iter().flat_map(|(h, _)| h.to_le_bytes()).collect();
+    let mut pointers = vec![0u8; 8 * entries.len()];
+    for (i, (_, e)) in entries.iter().enumerate() {
+        if let Entry::Old(p) = e {
+            pointers[i * 8..i * 8 + 8].copy_from_slice(&p.to_le_bytes());
+        }
+    }
+    let hashes = b.add(Segment::System, hashes);
+    let pointers = b.add(Segment::System, pointers);
+    for (i, (_, e)) in entries.iter().enumerate() {
+        if let Entry::New(block) = e {
+            b.pointer(pointers, i * 8, *block, 0);
+        }
+    }
+    let root = b.add(Segment::System, root);
+    b.pointer(root, 0x20, hashes, 0);
+    b.pointer(root, 0x30, pointers, 0);
+    b.pointer(sys, (group - SYS) as usize + 0x08, root, 0);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -526,16 +884,36 @@ pub(crate) mod tests {
     /// position, normal, tangent, colour and uv, shader group with `shaders`
     /// shaders (no parameters). Enough for the writer and the reader.
     pub(crate) fn template(shaders: u16) -> Resource {
+        template_with(shaders, false)
+    }
+
+    /// With `embedded`, the shader group has an embedded dictionary with one
+    /// 2×2 texture (`old_tex`).
+    pub(crate) fn template_with(shaders: u16, embedded: bool) -> Resource {
         let mut b = Builder::new();
         let root = b.add(Segment::System, vec![0u8; 0xC0]);
         b.add_pages_info(root, 0x08);
-        // Shader group: pointer list of empty shaders (name hash only).
+        // Shader group: shaders with one texture slot (colour) referencing `orig_tex`.
         let mut list = Vec::new();
         let mut shader_blocks = Vec::new();
+        let orig_name = b.add(Segment::System, b"orig_tex\0".to_vec());
         for s in 0..shaders {
-            let mut sh = vec![0u8; 0x40];
+            let mut sh = vec![0u8; SHADER_SIZE];
             put_u32(&mut sh, 0, 0x1000 + u32::from(s));
-            shader_blocks.push(b.add(Segment::System, sh));
+            let sh = b.add(Segment::System, sh);
+            let mut infos = vec![0u8; 16];
+            infos[1] = 1;
+            infos[4] = 1;
+            put_u32(&mut infos, 8, param::DIFFUSE_TEX);
+            put_u32(&mut infos, 12, 0);
+            let infos = b.add(Segment::System, infos);
+            let reference = b.add(Segment::System, vec![0u8; TEXTURE_REF_SIZE]);
+            b.pointer(reference, 0x28, orig_name, 0);
+            let refs = b.add(Segment::System, vec![0u8; 8]);
+            b.pointer(refs, 0, reference, 0);
+            b.pointer(sh, 0x10, refs, 0);
+            b.pointer(sh, 0x20, infos, 0);
+            shader_blocks.push(sh);
             list.extend_from_slice(&[0u8; 8]);
         }
         let list = b.add(Segment::System, list);
@@ -548,6 +926,28 @@ pub(crate) mod tests {
         let group = b.add(Segment::System, group);
         b.pointer(group, 0x10, list, 0);
         b.pointer(root, 0x10, group, 0);
+        if embedded {
+            let old = texture_from_rgba("old_tex", 2, 2, &[9u8; 16]).unwrap();
+            let mut t = vec![0u8; DictLayout::Enhanced.texture_size()];
+            write_fields(DictLayout::Enhanced, &mut t, &old, true).unwrap();
+            let t = b.add(Segment::System, t);
+            let name = b.add(Segment::System, b"old_tex\0".to_vec());
+            let data = b.add(Segment::Graphics, old.data.clone());
+            b.pointer(t, 0x28, name, 0);
+            b.pointer(t, 0x30, t, 0x58);
+            b.pointer(t, 0x38, data, 0);
+            let mut dict = vec![0u8; DICTIONARY_ROOT_SIZE];
+            for at in [0x28, 0x2A, 0x38, 0x3A] {
+                put_u16(&mut dict, at, 1);
+            }
+            let hashes = b.add(Segment::System, name_hash("old_tex").to_le_bytes().to_vec());
+            let ptrs = b.add(Segment::System, vec![0u8; 8]);
+            b.pointer(ptrs, 0, t, 0);
+            let dict = b.add(Segment::System, dict);
+            b.pointer(dict, 0x20, hashes, 0);
+            b.pointer(dict, 0x30, ptrs, 0);
+            b.pointer(group, 0x08, dict, 0);
+        }
         // Declaration: position (0), normal (4), tangent (8), colour (24), uv (28).
         let stride = 12 + 12 + 16 + 4 + 8;
         let mut decl = vec![0u8; 52 * 4 + 52 + 52 + 12];
@@ -665,6 +1065,65 @@ pub(crate) mod tests {
         let d2 = drawable::parse_ydr(&Resource::from_rsc7(&again).unwrap()).unwrap();
         assert_eq!(d2.meshes.len(), 1);
         assert_eq!(d2.meshes[0].positions[1], [2.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn materials_get_their_own_shaders_and_textures() {
+        let t = template_with(2, true);
+        let rgba: Vec<u8> = (0..4 * 4 * 4).map(|i| i as u8).collect();
+        let brick = texture_from_rgba("brick", 4, 4, &rgba).unwrap();
+        assert_eq!(brick.levels, 3);
+        assert_eq!(brick.data.len(), (16 + 4 + 1) * 4);
+        let materials = [NewMaterial { shader: 1, texture: Some(brick) }, NewMaterial { shader: 1, texture: None }];
+        let meshes = [quad(0, 0.0), quad(1, 1.0)];
+        let file = replace_with_materials(&t, &meshes, &materials, None).unwrap();
+        let d = drawable::parse_ydr(&Resource::from_rsc7(&file).unwrap()).unwrap();
+        assert_eq!(d.shaders.len(), 4, "two template shaders, two copies");
+        assert_eq!(d.shaders[2].textures, ["brick"]);
+        assert_eq!(d.shaders[3].textures, ["orig_tex"], "no texture: the copy keeps the template's");
+        assert_eq!(d.shaders[0].textures, ["orig_tex"], "the template's shaders stay");
+        assert_eq!(d.meshes.iter().map(|m| m.shader).collect::<Vec<_>>(), [2, 3]);
+        let dict = d.textures.expect("embedded dictionary");
+        let names: Vec<&str> = dict.textures.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"old_tex") && names.contains(&"brick"));
+        let got = dict.textures.iter().find(|t| t.name == "brick").unwrap();
+        assert_eq!((got.width, got.height, got.levels), (4, 4, 3));
+        assert_eq!(got.to_rgba().unwrap(), rgba, "pixels come back as given");
+
+        // No embedded dictionary in the template: needs a donor.
+        let plain = template_with(1, false);
+        let tex = || Some(texture_from_rgba("x", 2, 2, &[1u8; 16]).unwrap());
+        let mats = [NewMaterial { shader: 0, texture: tex() }];
+        assert!(replace_with_materials(&plain, &[quad(0, 0.0)], &mats, None).is_err());
+        let file = replace_with_materials(&plain, &[quad(0, 0.0)], &mats, Some(&t)).unwrap();
+        let d = drawable::parse_ydr(&Resource::from_rsc7(&file).unwrap()).unwrap();
+        assert_eq!(d.textures.unwrap().textures[0].name, "x");
+        // Materials must name existing shaders, meshes existing materials.
+        assert!(
+            replace_with_materials(&t, &[quad(0, 0.0)], &[NewMaterial { shader: 7, texture: None }], None).is_err()
+        );
+        assert!(replace_with_materials(&t, &[quad(3, 0.0)], &materials, None).is_err());
+    }
+
+    #[test]
+    fn writes_detail_levels() {
+        // The template has two levels: 50 m and 300 m.
+        let t = template(1);
+        let (hi, med, low) = (vec![quad(0, 0.0), quad(0, 1.0)], vec![quad(0, 0.0)], vec![quad(0, 2.0)]);
+        let file = replace_lods(&t, &[&hi, &med, &low], None, None).unwrap();
+        let res = Resource::from_rsc7(&file).unwrap();
+        let geometries = |level: u64| {
+            let list = res.u64(SYS + 0x50 + level * 8).unwrap();
+            (list != 0).then(|| res.u16(res.u64(res.u64(list).unwrap()).unwrap() + 0x10).unwrap())
+        };
+        assert_eq!([0, 1, 2, 3].map(geometries), [Some(2), Some(1), Some(1), None]);
+        let distance = |k: u64| f32::from_le_bytes(res.bytes(SYS + 0x70 + k * 4, 4).unwrap().try_into().unwrap());
+        assert_eq!([0, 1, 2].map(distance), [50.0, 100.0, 300.0]);
+        // The reader shows the closest level.
+        assert_eq!(drawable::parse_ydr(&res).unwrap().meshes.len(), 2);
+        assert!(replace_lods(&t, &[&hi, &med, &low, &low, &low], None, None).is_err());
+        assert!(replace_lods(&t, &[&hi, &[]], None, None).is_err());
     }
 
     #[test]

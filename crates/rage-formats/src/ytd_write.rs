@@ -49,7 +49,7 @@ pub(crate) fn name_hash(name: &str) -> u32 {
 }
 
 /// Usage class guessed from common GTA naming conventions (for added textures).
-fn guess_usage(name: &str) -> u8 {
+pub(crate) fn guess_usage(name: &str) -> u8 {
     let n = name.to_ascii_lowercase();
     if n.ends_with("_n") || n.contains("_normal") {
         22

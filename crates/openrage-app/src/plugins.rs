@@ -126,8 +126,12 @@ impl GameFiles for GameDir {
             bail!("{template}: only drawables (.ydr) can be built so far");
         }
         let res = rpf.read_resource(id)?;
-        let meshes = plugin_meshes(model, &ydr_write::usable_shaders(&res)?)?;
-        let file = ydr_write::replace_meshes(&res, &meshes)?;
+        let (levels, materials) = plugin_meshes(model, &ydr_write::usable_shaders(&res)?)?;
+        let donor = (materials.iter().any(|m| m.texture.is_some()) && !ydr_write::can_donate_textures(&res))
+            .then(|| crate::obj::find_texture_donor(&self.dir, template, self.keys.clone()))
+            .flatten();
+        let refs: Vec<&[ydr_write::NewMesh]> = levels.iter().map(Vec::as_slice).collect();
+        let file = ydr_write::replace_lods(&res, &refs, Some(&materials), donor.as_ref())?;
         // What the game gets must read back.
         drawable::parse_ydr(&rage_resource::Resource::from_rsc7(&file)?)
             .context("the built model does not read back")?;
@@ -225,26 +229,46 @@ impl GameFiles for GameDir {
     }
 }
 
-/// Meshes for the model writer from a plugin's model: material `i` goes to
-/// the template's `i`-th usable shader (the last one takes the rest), a
-/// material named `#n` to shader `n`. Meshes too large for one geometry are
+/// A plugin's model for the model writer: one [`NewMaterial`] per material
+/// (material `i` on the template's `i`-th usable shader, the last one taking
+/// the rest, or on shader `n` for a material named `#n`; its pixels, if any,
+/// as its texture, named after `texture` or the material) and the meshes per
+/// detail level: meshes whose part ends in `_lod1`, `_lod2` or `_lod3` (or is
+/// `lod1` …) go to the further levels. Meshes too large for one geometry are
 /// split.
-pub fn plugin_meshes(model: &Model, shaders: &[u16]) -> Result<Vec<rage_formats::ydr_write::NewMesh>> {
+pub fn plugin_meshes(
+    model: &Model,
+    shaders: &[u16],
+) -> Result<(Vec<Vec<rage_formats::ydr_write::NewMesh>>, Vec<rage_formats::ydr_write::NewMaterial>)> {
+    use rage_formats::ydr_write::{NewMaterial, NewMesh, texture_from_rgba};
     let Some(&last) = shaders.last() else { bail!("the template has no shader meshes can use") };
-    let mut shader_of = Vec::new();
+    let mut materials = Vec::new();
     for (i, m) in model.materials.iter().enumerate() {
-        let s = match m.name.strip_prefix('#').map(str::parse::<u16>) {
+        let shader = match m.name.strip_prefix('#').map(str::parse::<u16>) {
             Some(Ok(n)) if shaders.contains(&n) => n,
             Some(_) => bail!("material {:?}: the template has the shaders {shaders:?}", m.name),
             None => shaders.get(i).copied().unwrap_or(last),
         };
-        shader_of.push(s);
+        let texture = match &m.image {
+            Some(img) => {
+                let name = crate::obj::texture_name(if m.texture.is_empty() { &m.name } else { &m.texture });
+                Some(texture_from_rgba(&name, img.width, img.height, &img.rgba)?)
+            }
+            None => None,
+        };
+        materials.push(NewMaterial { shader, texture });
     }
-    let mut out = Vec::new();
+    let level_of = |part: &str| -> usize {
+        let p = part.to_ascii_lowercase();
+        (1..=3).rev().find(|k| p == format!("lod{k}") || p.ends_with(&format!("_lod{k}"))).unwrap_or(0)
+    };
+    let mut levels: Vec<Vec<NewMesh>> = vec![Vec::new(); 4];
     for m in &model.meshes {
-        let shader = *shader_of.get(m.material as usize).context("mesh with an unknown material")?;
-        out.extend(crate::obj::split(rage_formats::ydr_write::NewMesh {
-            shader,
+        if m.material as usize >= materials.len() {
+            bail!("mesh with an unknown material");
+        }
+        levels[level_of(&m.part)].extend(crate::obj::split(NewMesh {
+            shader: m.material as u16,
             positions: m.positions.as_chunks::<3>().0.to_vec(),
             normals: m.normals.as_chunks::<3>().0.to_vec(),
             uvs: m.uvs.as_chunks::<2>().0.to_vec(),
@@ -252,7 +276,12 @@ pub fn plugin_meshes(model: &Model, shaders: &[u16]) -> Result<Vec<rage_formats:
             indices: m.indices.clone(),
         }));
     }
-    Ok(out)
+    if levels[0].is_empty() {
+        bail!("the model has no meshes for the closest detail level (only _lod parts)");
+    }
+    // Levels in order, without gaps.
+    let levels: Vec<Vec<NewMesh>> = levels.into_iter().take_while(|l| !l.is_empty()).collect();
+    Ok((levels, materials))
 }
 
 /// Collision and path files count as models in the explorer, but plugins
@@ -741,24 +770,29 @@ mod tests {
     #[test]
     fn maps_plugin_materials_to_shaders() {
         let material = |name: &str| Material { name: name.into(), texture: String::new(), color: GREY, image: None };
-        let mesh = |material: u32| Mesh {
-            part: String::new(),
+        let mesh = |material: u32, part: &str| Mesh {
+            part: part.into(),
             positions: vec![0.0; 9],
             normals: Vec::new(),
             uvs: Vec::new(),
             indices: vec![0, 1, 2],
             material,
         };
+        let mut textured = material("c");
+        textured.image = Some(ImageView { width: 2, height: 2, rgba: vec![1; 16] });
         let model = Model {
-            meshes: vec![mesh(0), mesh(1), mesh(2), mesh(3)],
-            materials: vec![material("a"), material("#0"), material("b"), material("c")],
+            meshes: vec![mesh(0, "body"), mesh(1, ""), mesh(2, "body_LOD1"), mesh(3, "lod2")],
+            materials: vec![material("a"), material("#0"), textured, material("d")],
         };
-        let meshes = plugin_meshes(&model, &[0, 3]).unwrap();
-        let shaders: Vec<u16> = meshes.iter().map(|m| m.shader).collect();
-        assert_eq!(shaders, [0, 0, 3, 3]);
-        assert_eq!(meshes[0].positions.len(), 3);
-        let pinned = Model { meshes: vec![mesh(0)], materials: vec![material("#7")] };
+        let (levels, materials) = plugin_meshes(&model, &[0, 3]).unwrap();
+        assert_eq!(materials.iter().map(|m| m.shader).collect::<Vec<_>>(), [0, 0, 3, 3]);
+        assert_eq!(materials[2].texture.as_ref().unwrap().name, "c");
+        assert_eq!(levels.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1, 1]);
+        assert_eq!(levels[1][0].shader, 2, "meshes keep their material index");
+        let pinned = Model { meshes: vec![mesh(0, "")], materials: vec![material("#7")] };
         assert!(plugin_meshes(&pinned, &[0, 3]).is_err());
+        let only_lod = Model { meshes: vec![mesh(0, "x_lod1")], materials: vec![material("a")] };
+        assert!(plugin_meshes(&only_lod, &[0]).is_err());
     }
 
     #[test]

@@ -32,5 +32,6 @@ id = "replace"
 title = "Replace with OBJ…"
 kind = "modify"
 extensions = ["ydr"]
-pick = ["obj"]
-pick-title = "Choose the OBJ model"
+# The OBJ, and optionally its .mtl and the PNG textures it names.
+pick = ["obj", "mtl", "png"]
+pick-title = "Choose the OBJ model (and its .mtl and PNG textures)"

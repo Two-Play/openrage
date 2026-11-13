@@ -5,9 +5,14 @@
 //! Z-up with DirectX coordinates, so `(x, y, z) → (x, −z, y)` and `v → 1 − v`.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::{Result, bail};
-use rage_formats::ydr_write::{MAX_VERTICES, NewMesh};
+use anyhow::{Context, Result, bail};
+use rage_crypto::GtaVKeys;
+use rage_formats::texture::Texture;
+use rage_formats::ydr_write::{MAX_VERTICES, NewMaterial, NewMesh};
+use rage_rpf::vfs::Node;
 
 /// Triangles of one material.
 #[derive(Debug, Clone, Default)]
@@ -140,6 +145,170 @@ pub fn read(text: &str) -> Result<Vec<ObjMesh>> {
     Ok(meshes)
 }
 
+/// What a `.mtl` says about a material: its colour texture (`map_Kd`) and
+/// colour (`Kd`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MtlMaterial {
+    pub texture: Option<PathBuf>,
+    pub colour: Option<[f32; 3]>,
+}
+
+/// The materials of the `.mtl` files an OBJ names (`mtllib`), by name;
+/// texture paths relative to the `.mtl` files.
+pub fn materials(obj_text: &str, obj_dir: &Path) -> HashMap<String, MtlMaterial> {
+    let mut out: HashMap<String, MtlMaterial> = HashMap::new();
+    for line in obj_text.lines() {
+        let Some(lib) = line.trim().strip_prefix("mtllib ") else { continue };
+        let mtl = obj_dir.join(lib.trim());
+        let Ok(text) = std::fs::read_to_string(&mtl) else { continue };
+        let dir = mtl.parent().unwrap_or(obj_dir).to_path_buf();
+        let mut current = String::new();
+        for l in text.lines() {
+            let l = l.trim();
+            if let Some(name) = l.strip_prefix("newmtl ") {
+                current = name.trim().to_owned();
+                out.entry(current.clone()).or_default();
+            } else if let Some(rest) = l.strip_prefix("map_Kd ") {
+                // Options (`-s 1 1 1 …`) come first; the file name is last.
+                if let Some(file) = rest.split_whitespace().last() {
+                    out.entry(current.clone()).or_default().texture = Some(dir.join(file.replace('\\', "/")));
+                }
+            } else if let Some(rest) = l.strip_prefix("Kd ") {
+                let v: Vec<f32> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                if v.len() >= 3 {
+                    out.entry(current.clone()).or_default().colour = Some([v[0], v[1], v[2]]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A texture name from a material or file name: lowercase letters, digits
+/// and `_`.
+pub fn texture_name(name: &str) -> String {
+    let n: String =
+        name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).take(60).collect();
+    if n.is_empty() { "texture".to_owned() } else { n }
+}
+
+/// Reads a PNG as 8-bit RGBA: (width, height, pixels).
+pub fn read_png(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().with_context(|| format!("{} is not a PNG", path.display()))?;
+    let mut buf = vec![0u8; reader.output_buffer_size().context("PNG too large")?];
+    let info = reader.next_frame(&mut buf)?;
+    let pixels = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => pixels.to_vec(),
+        png::ColorType::Rgb => pixels.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => {
+            pixels.as_chunks::<2>().0.iter().flat_map(|p| [p[0], p[0], p[0], p[1]]).collect()
+        }
+        png::ColorType::Grayscale => pixels.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::Indexed => bail!("{}: indexed PNG could not be expanded", path.display()),
+    };
+    Ok((info.width, info.height, rgba))
+}
+
+/// Puts OBJ meshes of one or more detail levels on materials: every OBJ
+/// material (by name, across levels) becomes one [`NewMaterial`] on a
+/// template shader (in order, the last taking the rest, or all on `shader`)
+/// with its texture, if `textures` has one.
+pub struct Fitter<'a> {
+    shaders: &'a [u16],
+    shader: Option<u16>,
+    textures: &'a HashMap<String, Texture>,
+    /// (OBJ material name, material)
+    pub materials: Vec<(String, NewMaterial)>,
+}
+
+impl<'a> Fitter<'a> {
+    pub fn new(shaders: &'a [u16], shader: Option<u16>, textures: &'a HashMap<String, Texture>) -> Result<Self> {
+        if shaders.is_empty() {
+            bail!("the template has no shader meshes can use");
+        }
+        if let Some(s) = shader
+            && !shaders.contains(&s)
+        {
+            bail!("shader {s} cannot be used; the template has {shaders:?}");
+        }
+        Ok(Self { shaders, shader, textures, materials: Vec::new() })
+    }
+
+    /// The meshes of one level, their `shader` the index of their material.
+    pub fn level(&mut self, meshes: Vec<ObjMesh>) -> Vec<NewMesh> {
+        let mut out = Vec::new();
+        for m in meshes {
+            let k = match self.materials.iter().position(|(name, _)| *name == m.material) {
+                Some(k) => k,
+                None => {
+                    let i = self.materials.len();
+                    let shader = self
+                        .shader
+                        .unwrap_or_else(|| *self.shaders.get(i).unwrap_or(self.shaders.last().expect("checked")));
+                    let texture = self.textures.get(&m.material).cloned();
+                    self.materials.push((m.material.clone(), NewMaterial { shader, texture }));
+                    i
+                }
+            };
+            out.extend(split(NewMesh {
+                shader: k as u16,
+                positions: m.positions,
+                normals: m.normals,
+                uvs: m.uvs,
+                colors: Vec::new(),
+                indices: m.indices,
+            }));
+        }
+        out
+    }
+}
+
+/// An Enhanced drawable with embedded textures, to lend its texture
+/// structure to a model that has none: one next to `vpath` in its archive,
+/// else any in that archive.
+pub fn find_texture_donor(
+    game_dir: &Path,
+    vpath: &str,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Option<rage_resource::Resource> {
+    let parent = vpath.rsplit_once('/').map_or("", |(p, _)| p);
+    let Ok((Node::ArchiveDir(rpf, dir), _)) = rage_mods::resolve(game_dir, parent, keys) else { return None };
+    let donates = |r: &rage_resource::Resource| rage_formats::ydr_write::can_donate_textures(r);
+    for c in rpf.children(dir) {
+        if rpf.entry(c).name.to_ascii_lowercase().ends_with(".ydr")
+            && let Ok(r) = rpf.read_resource(c)
+            && donates(&r)
+        {
+            return Some(r);
+        }
+    }
+    let mut found = None;
+    let mut seen = 0;
+    rage_rpf::vfs::walk(
+        &rpf,
+        rage_rpf::Rpf7::ROOT,
+        "",
+        true,
+        &mut |a, id, p| {
+            if found.is_some() || seen > 5000 || !p.to_ascii_lowercase().ends_with(".ydr") {
+                return;
+            }
+            seen += 1;
+            if let Ok(r) = a.read_resource(id)
+                && donates(&r)
+            {
+                found = Some(r);
+            }
+        },
+        &mut |_| {},
+    );
+    found
+}
+
 /// Splits a mesh into pieces of at most [`MAX_VERTICES`] vertices.
 pub fn split(m: NewMesh) -> Vec<NewMesh> {
     if m.positions.len() <= MAX_VERTICES {
@@ -178,37 +347,6 @@ pub fn split(m: NewMesh) -> Vec<NewMesh> {
     out
 }
 
-/// Meshes for the writer, and per OBJ material the shader it went to.
-pub type Fitted = (Vec<NewMesh>, Vec<(String, u16)>);
-
-/// Meshes for the model writer: the OBJ materials in order go to the
-/// template's shaders in order (`shader` puts everything on one); the last
-/// shader takes the materials left over. Returns the meshes and, per OBJ
-/// material, the shader it went to.
-pub fn fit(meshes: Vec<ObjMesh>, shaders: &[u16], shader: Option<u16>) -> Result<Fitted> {
-    let Some(&last) = shaders.last() else { bail!("the template has no shader meshes can use") };
-    if let Some(s) = shader
-        && !shaders.contains(&s)
-    {
-        bail!("shader {s} cannot be used; the template has {shaders:?}");
-    }
-    let mut out = Vec::new();
-    let mut mapping = Vec::new();
-    for (i, m) in meshes.into_iter().enumerate() {
-        let s = shader.unwrap_or_else(|| shaders.get(i).copied().unwrap_or(last));
-        mapping.push((m.material.clone(), s));
-        out.extend(split(NewMesh {
-            shader: s,
-            positions: m.positions,
-            normals: m.normals,
-            uvs: m.uvs,
-            colors: Vec::new(),
-            indices: m.indices,
-        }));
-    }
-    Ok((out, mapping))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +365,22 @@ mod tests {
     }
 
     #[test]
+    fn reads_mtl_files() {
+        let dir = std::env::temp_dir().join(format!("openrage-mtl-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("tex")).unwrap();
+        std::fs::write(
+            dir.join("m.mtl"),
+            "newmtl Paint\nKd 1 0.5 0\n\nnewmtl Glass\nKd 0.2 0.2 0.2\nmap_Kd -s 1 1 1 tex\\glass.png\n",
+        )
+        .unwrap();
+        let m = materials("mtllib m.mtl\nv 0 0 0\n", &dir);
+        assert_eq!(m["Paint"], MtlMaterial { texture: None, colour: Some([1.0, 0.5, 0.0]) });
+        assert_eq!(m["Glass"].texture.as_deref(), Some(dir.join("tex/glass.png").as_path()));
+        assert_eq!(texture_name("Vehicle Paint #1"), "vehicle_paint__1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fits_materials_to_shaders_and_splits_big_meshes() {
         let mesh = |name: &str| ObjMesh {
             material: name.into(),
@@ -235,10 +389,15 @@ mod tests {
             uvs: Vec::new(),
             indices: vec![0, 1, 2],
         };
-        let (meshes, mapping) = fit(vec![mesh("a"), mesh("b"), mesh("c")], &[0, 2], None).unwrap();
-        assert_eq!(mapping, [("a".to_owned(), 0), ("b".to_owned(), 2), ("c".to_owned(), 2)]);
-        assert_eq!(meshes.len(), 3);
-        assert!(fit(vec![mesh("a")], &[0], Some(5)).is_err());
+        let textures = HashMap::new();
+        let mut fit = Fitter::new(&[0, 2], None, &textures).unwrap();
+        let hi = fit.level(vec![mesh("a"), mesh("b"), mesh("c")]);
+        let lod = fit.level(vec![mesh("c"), mesh("d")]);
+        let shaders: Vec<u16> = fit.materials.iter().map(|(_, m)| m.shader).collect();
+        assert_eq!(shaders, [0, 2, 2, 2], "in order, the last taking the rest");
+        assert_eq!(hi.iter().map(|m| m.shader).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(lod.iter().map(|m| m.shader).collect::<Vec<_>>(), [2, 3], "materials shared across levels by name");
+        assert!(Fitter::new(&[0], Some(5), &textures).is_err());
 
         // 30,000 separate triangles (90,000 vertices): two pieces.
         let n = 30_000 * 3;

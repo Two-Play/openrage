@@ -279,6 +279,12 @@ enum Command {
         /// Put every OBJ material on this shader of the drawable.
         #[arg(long)]
         shader: Option<u16>,
+        /// Further detail levels, from closest to furthest (up to three OBJ files).
+        #[arg(long, num_args = 1)]
+        lod: Vec<PathBuf>,
+        /// Keep the drawable's textures instead of embedding the ones the OBJ's materials name.
+        #[arg(long)]
+        no_textures: bool,
     },
     /// Show a model (.ydr, .yft, .ydd; GTA IV .wdr, .wft, .wdd) and optionally export it as glTF (.glb).
     Model {
@@ -644,8 +650,9 @@ fn run() -> Result<()> {
             cmd_model(&game_dir, &path, outfit, view, keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
-        Command::ReplaceModel { path, obj, out, mods, shader } => {
-            cmd_replace_model(&game_dir, &path, &obj, out.as_deref(), mods, shader, keys)
+        Command::ReplaceModel { path, obj, out, mods, shader, lod, no_textures } => {
+            let options = ReplaceOptions { out: out.as_deref(), mods, shader, lods: &lod, textures: !no_textures };
+            cmd_replace_model(&game_dir, &path, &obj, options, keys)
         }
         Command::World { x, y, z, radius } => {
             let started = Instant::now();
@@ -1438,15 +1445,22 @@ fn cmd_edit(game_dir: &Path, path: &str, op: Op, description: &str, keys: Option
     Ok(())
 }
 
+struct ReplaceOptions<'a> {
+    out: Option<&'a Path>,
+    mods: bool,
+    shader: Option<u16>,
+    lods: &'a [PathBuf],
+    textures: bool,
+}
+
 fn cmd_replace_model(
     game_dir: &Path,
     vpath: &str,
     obj: &Path,
-    out: Option<&Path>,
-    mods: bool,
-    shader: Option<u16>,
+    o: ReplaceOptions,
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
+    use openrage_app::obj;
     use rage_formats::{drawable, ydr_write};
     let Node::ArchiveFile(rpf, id) = rage_mods::resolve(game_dir, vpath, keys.clone())?.0 else {
         bail!("{vpath} is not a file inside an archive")
@@ -1454,24 +1468,75 @@ fn cmd_replace_model(
     if !vpath.to_ascii_lowercase().ends_with(".ydr") {
         bail!("{vpath} is not a drawable (.ydr)");
     }
+    if o.lods.len() > 3 {
+        bail!("at most three further detail levels (--lod)");
+    }
     let template = rpf.read_resource(id)?;
     let shaders = ydr_write::usable_shaders(&template)?;
-    let text = fs::read_to_string(obj).with_context(|| format!("reading {}", obj.display()))?;
-    let (meshes, mapping) = openrage_app::obj::fit(openrage_app::obj::read(&text)?, &shaders, shader)?;
-    for (material, s) in &mapping {
-        outln!("material {material:<24} → shader {s}");
+    // Every level's OBJ, and the textures their materials name.
+    let mut files = vec![obj.to_path_buf()];
+    files.extend(o.lods.iter().cloned());
+    let mut levels_text = Vec::new();
+    let mut textures = std::collections::HashMap::new();
+    for f in &files {
+        let text = fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
+        if o.textures {
+            let dir = f.parent().unwrap_or(Path::new("."));
+            for (material, mtl) in obj::materials(&text, dir) {
+                if textures.contains_key(&material) {
+                    continue;
+                }
+                let texture = match (mtl.texture, mtl.colour) {
+                    (Some(png), _) => {
+                        let name = obj::texture_name(&png.file_stem().unwrap_or_default().to_string_lossy());
+                        let (w, h, rgba) =
+                            obj::read_png(&png).with_context(|| format!("texture of material {material}"))?;
+                        ydr_write::texture_from_rgba(&name, w, h, &rgba)?
+                    }
+                    // Only a colour: a small texture of that colour.
+                    (None, Some(c)) => {
+                        let px = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                        let rgba: Vec<u8> = (0..16).flat_map(|_| [px[0], px[1], px[2], 255]).collect();
+                        ydr_write::texture_from_rgba(&format!("{}_colour", obj::texture_name(&material)), 4, 4, &rgba)?
+                    }
+                    (None, None) => continue,
+                };
+                textures.insert(material, texture);
+            }
+        }
+        levels_text.push(text);
     }
-    let file = ydr_write::replace_meshes(&template, &meshes)?;
+    let mut fitter = obj::Fitter::new(&shaders, o.shader, &textures)?;
+    let mut levels = Vec::new();
+    for text in &levels_text {
+        levels.push(fitter.level(obj::read(text)?));
+    }
+    for (material, m) in &fitter.materials {
+        let texture =
+            m.texture.as_ref().map(|t| format!(", texture {} ({}×{})", t.name, t.width, t.height)).unwrap_or_default();
+        outln!("material {material:<24} → shader {}{texture}", m.shader);
+    }
+    let materials: Vec<ydr_write::NewMaterial> = fitter.materials.into_iter().map(|(_, m)| m).collect();
+    let donor = (materials.iter().any(|m| m.texture.is_some()) && !ydr_write::can_donate_textures(&template))
+        .then(|| obj::find_texture_donor(game_dir, vpath, keys.clone()))
+        .flatten();
+    let level_refs: Vec<&[ydr_write::NewMesh]> = levels.iter().map(Vec::as_slice).collect();
+    let file = ydr_write::replace_lods(&template, &level_refs, Some(&materials), donor.as_ref())?;
     // What the game will read: check it reads back.
     let check = drawable::parse_ydr(&rage_resource::Resource::from_rsc7(&file)?)?;
     let vertices: usize = check.meshes.iter().map(|m| m.positions.len()).sum();
     let triangles: usize = check.meshes.iter().map(|m| m.indices.len() / 3).sum();
-    outln!("{} meshes, {vertices} vertices, {triangles} triangles ({})", check.meshes.len(), human(file.len() as u64));
-    if let Some(out) = out {
+    outln!(
+        "{} detail level(s); closest: {} meshes, {vertices} vertices, {triangles} triangles ({})",
+        levels.len(),
+        check.meshes.len(),
+        human(file.len() as u64)
+    );
+    if let Some(out) = o.out {
         fs::write(out, &file).with_context(|| format!("writing {}", out.display()))?;
         outln!("Saved {}", out.display());
     }
-    if mods {
+    if o.mods {
         let name = obj.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         cmd_edit(game_dir, vpath, Op::Set(file), &format!("Replaced the meshes of {vpath} with {name}"), keys)?;
     }
@@ -3157,6 +3222,63 @@ fn cmd_verify_model_writer(game_dir: &Path, within: &str, keys: Option<Arc<GtaVK
             if !m.colors.is_empty() && a.colors.first() != m.colors.first() {
                 bail!("mesh {i}: colours differ after writing");
             }
+        }
+        // Materials: a shader copy per mesh shader, with a texture where the
+        // model has an embedded dictionary to put it in.
+        // (A model with an empty embedded dictionary borrows the structure from another one when
+        // importing; here only models with embedded textures get one.)
+        let embedded = ydr_write::can_donate_textures(res);
+        let mut materials: Vec<ydr_write::NewMaterial> = Vec::new();
+        let mut with_materials = meshes.clone();
+        for m in &mut with_materials {
+            let k = match materials.iter().position(|mat| mat.shader == m.shader) {
+                Some(k) => k,
+                None => {
+                    let texture = embedded
+                        .then(|| {
+                            ydr_write::texture_from_rgba(
+                                &format!("openrage_check_{}", materials.len()),
+                                2,
+                                2,
+                                &[200; 16],
+                            )
+                        })
+                        .transpose()?;
+                    materials.push(ydr_write::NewMaterial { shader: m.shader, texture });
+                    materials.len() - 1
+                }
+            };
+            m.shader = k as u16;
+        }
+        let shaders_before = before.shaders.len();
+        let file = match ydr_write::replace_with_materials(res, &with_materials, &materials, None) {
+            Ok(f) => f,
+            // Shaders without a colour slot cannot take a texture: fine, skip that part.
+            Err(e) if e.to_string().contains("colour") => return Ok(true),
+            Err(e) => return Err(e.into()),
+        };
+        let after = drawable::parse_ydr(&rage_resource::Resource::from_rsc7(&file)?)?;
+        if after.shaders.len() != shaders_before + materials.len() {
+            bail!("materials: {} shaders, expected {}", after.shaders.len(), shaders_before + materials.len());
+        }
+        for (k, mat) in materials.iter().enumerate() {
+            if let Some(t) = &mat.texture {
+                if !after.shaders[shaders_before + k].textures.contains(&t.name) {
+                    bail!("material {k}: its shader does not use {}", t.name);
+                }
+                let found = after.textures.as_ref().and_then(|d| d.textures.iter().find(|x| x.name == t.name));
+                if found.and_then(|x| x.to_rgba()).as_deref() != Some(&[200u8; 16][..]) {
+                    bail!("material {k}: texture {} not embedded intact", t.name);
+                }
+            }
+        }
+        if after
+            .meshes
+            .iter()
+            .map(|m| m.shader as usize)
+            .ne((0..with_materials.len()).map(|i| shaders_before + with_materials[i].shader as usize))
+        {
+            bail!("materials: meshes do not use their shader copies");
         }
         Ok(true)
     };
