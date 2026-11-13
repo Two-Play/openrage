@@ -120,8 +120,49 @@ pub struct Gta4Archive {
     toc_encrypted: bool,
     data_encrypted: bool,
     entries: Vec<Gta4Entry>,
+    /// RPF3: the name hash of every entry (names are known only for some).
+    hashes: Vec<u32>,
     key: Option<Arc<Gta4Key>>,
     file: File,
+}
+
+/// Names for the hashes RPF3 (audio) packages store instead of names.
+pub type AudioNames = std::collections::HashMap<u32, String>;
+
+fn audio_names_slot() -> &'static std::sync::RwLock<Option<Arc<AudioNames>>> {
+    static NAMES: std::sync::OnceLock<std::sync::RwLock<Option<Arc<AudioNames>>>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(Default::default)
+}
+
+/// Registers names for audio packages (from the game's audio configuration;
+/// set at start-up, before packages are opened). Entries without a known name
+/// keep their hash as eight hex digits.
+pub fn set_audio_names(names: Option<Arc<AudioNames>>) {
+    if let Ok(mut n) = audio_names_slot().write() {
+        *n = names;
+    }
+}
+
+/// Adds names to the registered ones (e.g. of entries the user created).
+pub fn add_audio_names(more: &[String]) {
+    if let Ok(mut slot) = audio_names_slot().write() {
+        let mut names = slot.as_deref().cloned().unwrap_or_default();
+        for n in more {
+            names.entry(audio_hash(n)).or_insert_with(|| n.to_ascii_lowercase());
+        }
+        *slot = Some(Arc::new(names));
+    }
+}
+
+/// The hash an RPF3 entry name stands for: eight hex digits are the hash
+/// itself, anything else is hashed (joaat of the lower-case name).
+pub fn audio_hash(name: &str) -> u32 {
+    if name.len() == 8
+        && let Ok(h) = u32::from_str_radix(name, 16)
+    {
+        return h;
+    }
+    rage_core::hash::joaat(name)
 }
 
 fn default_key_slot() -> &'static std::sync::RwLock<Option<Arc<Gta4Key>>> {
@@ -187,6 +228,7 @@ impl Gta4Archive {
             toc_encrypted: false,
             data_encrypted: false,
             entries: Vec::new(),
+            hashes: Vec::new(),
             key,
             file,
         };
@@ -280,6 +322,8 @@ impl Gta4Archive {
             String::from_utf8_lossy(&rest[..end]).into_owned()
         };
         let file_len = self.file.metadata()?.len();
+        let audio_names =
+            if format == Gta4Format::Rpf3 { audio_names_slot().read().ok().and_then(|n| n.clone()) } else { None };
         let mut entries = Vec::with_capacity(count);
         for i in 0..count {
             let e = &toc[i * 16..i * 16 + 16];
@@ -287,7 +331,9 @@ impl Gta4Archive {
             let name = if i == 0 {
                 String::new()
             } else if format == Gta4Format::Rpf3 {
-                format!("{w0:08x}")
+                self.hashes.resize(i, 0);
+                self.hashes.push(w0);
+                audio_names.as_ref().and_then(|n| n.get(&w0)).cloned().unwrap_or_else(|| format!("{w0:08x}"))
             } else {
                 name_at(w0)
             };
@@ -364,7 +410,17 @@ impl Gta4Archive {
 
     /// Finds `name` in a folder, ignoring ASCII case.
     pub fn find_child(&self, dir: Gta4EntryId, name: &str) -> Option<Gta4EntryId> {
+        if self.format == Gta4Format::Rpf3 {
+            // By name or by hash (`061b65da`), whichever the caller has.
+            let hash = audio_hash(name);
+            return self.children(dir).find(|&i| self.hashes.get(i) == Some(&hash));
+        }
         self.children(dir).find(|&i| self.entries[i].name.eq_ignore_ascii_case(name))
+    }
+
+    /// The name hash of an RPF3 (audio) entry.
+    pub fn audio_hash_of(&self, id: Gta4EntryId) -> Option<u32> {
+        (self.format == Gta4Format::Rpf3).then(|| self.hashes.get(id).copied()).flatten()
     }
 
     /// The path of an entry inside the archive.

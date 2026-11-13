@@ -72,7 +72,87 @@ pub fn register(game_dir: &Path) -> Result<Arc<Gta4Key>> {
         None => derive_key(game_dir)?.0,
     };
     rage_rpf::gta4::set_default_key(Some(key.clone()));
+    rage_rpf::gta4::set_audio_names(Some(Arc::new(audio_names(game_dir))));
     Ok(key)
+}
+
+/// Folders with the audio configuration (main game and episodes; the
+/// `update` folder's copies as well).
+const AUDIO_CONFIG: [&str; 3] = ["pc/audio/config", "TLAD/pc/audio/config", "TBoGT/pc/audio/config"];
+
+/// Names for the hashes of the audio packages (RPF3), taken from the game's
+/// own audio configuration: its banks are named there as `FOLDER\BANK`.
+/// Names are lower case; hashes are joaat of the name.
+pub fn audio_names(game_dir: &Path) -> rage_rpf::gta4::AudioNames {
+    let mut names = rage_rpf::gta4::AudioNames::new();
+    // Names of entries created with OpenRAGE.
+    if let Some(file) = own_audio_names_file(game_dir)
+        && let Ok(text) = fs::read_to_string(file)
+    {
+        for n in text.lines().map(str::trim).filter(|n| !n.is_empty()) {
+            names.entry(rage_core::hash::joaat(n)).or_insert_with(|| n.to_ascii_lowercase());
+        }
+    }
+    let roots = [game_dir.to_owned(), game_dir.join(rage_mods::overlay::UPDATE_FOLDER)];
+    for root in &roots {
+        for dir in AUDIO_CONFIG {
+            let Some(dir) = rage_rpf::vfs::find_case_insensitive(root, dir) else { continue };
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for file in rd.flatten() {
+                let Ok(data) = fs::read(file.path()) else { continue };
+                add_audio_names(&data, &mut names);
+            }
+        }
+    }
+    names
+}
+
+/// Where names of audio entries created with OpenRAGE are kept:
+/// `<update>/.openrage/audio-names.txt`, one per line.
+fn own_audio_names_file(game_dir: &Path) -> Option<PathBuf> {
+    let overlay = rage_mods::mods_dir(game_dir)?;
+    Some(overlay.join(rage_mods::overlay::OPENRAGE_FOLDER).join("audio-names.txt"))
+}
+
+/// Remembers the names of audio entries the user created (names that are
+/// not just a hash), so they show by name from now on.
+pub fn remember_audio_names(game_dir: &Path, names: &[String]) -> Result<()> {
+    let names: Vec<String> = names
+        .iter()
+        .filter(|n| !(n.len() == 8 && u32::from_str_radix(n, 16).is_ok()))
+        .map(|n| n.to_ascii_lowercase())
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    rage_rpf::gta4::add_audio_names(&names);
+    let Some(file) = own_audio_names_file(game_dir) else { return Ok(()) };
+    let known = fs::read_to_string(&file).unwrap_or_default();
+    let new: Vec<&String> = names.iter().filter(|n| !known.lines().any(|k| k.trim() == n.as_str())).collect();
+    if new.is_empty() {
+        return Ok(());
+    }
+    if let Some(dir) = file.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut text = known;
+    for n in new {
+        text.push_str(n);
+        text.push('\n');
+    }
+    fs::write(&file, text).with_context(|| format!("writing {}", file.display()))
+}
+
+/// Adds every word of `data` (letters, digits, `_`, `-`, `.`; split at `\`
+/// and `/`) as a name.
+fn add_audio_names(data: &[u8], names: &mut rage_rpf::gta4::AudioNames) {
+    let word = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.');
+    for run in data.split(|b| !word(b)) {
+        if run.len() >= 2 && run.len() <= 64 {
+            let name = String::from_utf8_lossy(run).to_ascii_lowercase();
+            names.entry(rage_core::hash::joaat(&name)).or_insert(name);
+        }
+    }
 }
 
 /// Extracts an entry of a GTA IV archive (a file, a folder or the whole

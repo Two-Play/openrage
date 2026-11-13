@@ -3924,12 +3924,22 @@ fn gta4_starts(game_dir: &Path, within: &str) -> Result<(Vec<Gta4Start>, Vec<Str
 fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
     let (starts, open_errors) = gta4_starts(game_dir, within)?;
     let started = Instant::now();
+    // Audio entries (RPF3) with a name instead of only a hash.
+    let audio = std::sync::atomic::AtomicUsize::new(0);
+    let audio_named = std::sync::atomic::AtomicUsize::new(0);
     let stats: Vec<VerifyStats> = starts
         .par_iter()
         .map(|(prefix, a, dir)| {
             let mut s = VerifyStats { archives: 1, ..Default::default() };
             vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
                 let e = a.entry(id);
+                if let Some(hash) = a.audio_hash_of(id) {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    audio.fetch_add(1, Relaxed);
+                    if e.name != format!("{hash:08x}") {
+                        audio_named.fetch_add(1, Relaxed);
+                    }
+                }
                 let result = if e.is_dir() {
                     return;
                 } else if e.resource_type().is_some() {
@@ -3958,6 +3968,13 @@ fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
     }
     for e in &total.errors {
         outln!("FAIL {e}");
+    }
+    let audio = audio.into_inner();
+    if audio > 0 {
+        outln!(
+            "{} of {audio} audio entries named (from the game's audio configuration); the others show their hash",
+            audio_named.into_inner()
+        );
     }
     outln!(
         "{} archives, {} files, {} resources, {} decoded, {} errors ({:.1}s)",
