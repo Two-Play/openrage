@@ -39,25 +39,34 @@ In a texture dictionary, **Replace…**, **Add…** and **Remove** change textur
 
 ## Models (preview)
 
-A drawable of GTA V Enhanced (`.ydr`) can get new geometry from a Wavefront OBJ file:
+A drawable of GTA V Enhanced (`.ydr`) can get new geometry and textures from a Wavefront OBJ file:
 
 - **In the explorer:** turn on the *OBJ tools* plugin (it comes with OpenRAGE, **Settings → Plugins**), unlock
-  editing, right-click the `.ydr` → **Replace with OBJ…** and choose the OBJ. The change goes into the `mods` folder
-  and is one entry in **History**. *OBJ tools* also exports models as OBJ, so you can export, edit (e.g. in Blender)
-  and bring them back.
-- **From the command line:** `openrage replace-model x64i.rpf/levels/gta5/props/…/prop_x.ydr model.obj --mods`, or
-  `openrage plugin run obj-tools replace <path>.ydr --pick model.obj`.
+  editing, right-click the `.ydr` → **Replace with OBJ…** and choose the OBJ together with its `.mtl` and PNG
+  textures. The change goes into the `mods` folder and is one entry in **History**. *OBJ tools* also exports models as
+  OBJ with their textures, so you can export, edit (e.g. in Blender) and bring them back.
+- **From the command line:** `openrage replace-model x64i.rpf/levels/gta5/props/…/prop_x.ydr model.obj --mods`
+  (it finds the `.mtl` and textures next to the OBJ), or `openrage plugin run obj-tools replace <path>.ydr --pick
+  model.obj --pick model.mtl --pick texture.png …`.
 
-- The drawable keeps its shaders and textures: OpenRAGE copies them, with the vertex layout each shader expects,
-  from the original file and writes only the new geometry. The OBJ materials go to the drawable's shaders in order
-  (`--shader N` puts everything on one); the output lists which went where.
-- The model gets one detail level, visible as far as the original's furthest. Meshes over 65,535 vertices are split.
-- OBJ is converted from Y-up to the game's Z-up; missing normals are computed, tangents always.
-- `--mods` puts it into the `mods` folder in place of the original (undo with **Undo** / `openrage undo`), `--out`
-  writes the file elsewhere.
-- Not yet: GTA V Legacy, `.yft`/`.ydd`, skinned models, new textures and collisions (the original collision stays).
-  The written drawables read back identically in OpenRAGE (`openrage verify --models --rebuild` writes every drawable
-  of the game anew and compares); please report how they behave in the game.
+How it works:
+
+- **Shaders:** every OBJ material gets its own copy of one of the drawable's shaders (in order; `--shader N` uses
+  shader N for all). The copies keep the original shader's settings and the vertex layout it expects.
+- **Textures:** a material's `map_Kd` (PNG) is embedded in the drawable and bound to its copy's colour slot, with all
+  mip levels; a material with only a colour (`Kd`) gets a small texture of that colour; without either it keeps the
+  original texture. Models without embedded textures borrow the texture structure of another model of the game.
+  `--no-textures` keeps the original textures.
+- **Detail levels:** `--lod near.obj --lod far.obj` (up to three) add further levels; plugins mark them with parts
+  named `…_lod1`, `…_lod2`, `…_lod3`. Distances come from the original's levels where it has them, otherwise 50 m
+  doubling per level; the last level is seen as far as the original's furthest.
+- OBJ is converted from Y-up to the game's Z-up; missing normals are computed, tangents always. Meshes over 65,535
+  vertices are split. `--mods` puts the result into the `mods` folder in place of the original (undo with **Undo** /
+  `openrage undo`), `--out` writes the file elsewhere.
+- Not yet: GTA V Legacy, `.yft`/`.ydd`, skinned models and collisions (the original collision stays). Textures are
+  embedded uncompressed. The written drawables read back identically in OpenRAGE (`openrage verify --models
+  --rebuild` rewrites every drawable of the game, also with shader copies and embedded textures); please report how
+  they behave in the game.
 
 ## Text files and game text
 

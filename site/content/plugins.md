@@ -206,10 +206,12 @@ OpenRAGE offers:
 - `load-texture(vpath, name)`: a texture as RGBA pixels: from a texture dictionary (`.ytd`, `.wtd`), or a texture of a
   model (embedded, or in the dictionaries next to it that the explorer uses, such as `vehshare.ytd`).
 - `build-model(template, model)`: a game model file built from `model` on top of the model at `template` (so far a
-  GTA V Enhanced `.ydr`): the template keeps its shaders, textures and settings, OpenRAGE writes the meshes (normals
-  if missing, tangents, bounds). Materials go to the template's shaders in order; a material named `#n` goes to
-  shader `n`. Returns the file's bytes; pass them to `write-mod-file` in a `modify` action. Same permission rule as
-  `read-file`. Added to API 0.3 after its first release: OpenRAGE versions without it refuse plugins that use it.
+  GTA V Enhanced `.ydr`): the template keeps its settings, OpenRAGE writes the meshes (normals if missing, tangents,
+  bounds). Every material gets its own copy of a template shader: in order, or shader `n` for a material named `#n`.
+  A material with `image` gets it embedded as its colour texture (named after `texture`, else the material). Meshes
+  whose part ends in `_lod1`, `_lod2` or `_lod3` form further detail levels. Returns the file's bytes; pass them to
+  `write-mod-file` in a `modify` action. Same permission rule as `read-file`. Added to API 0.3 after its first
+  release: OpenRAGE versions without it refuse plugins that use it.
 - `log(level, message)`: shown by `openrage plugin`, and in the explorer's info panel next to a preview (the last
   lines) or in the status bar when an action fails. Whatever the plugin prints to stdout
   or stderr ends up there too, panics included.

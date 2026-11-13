@@ -49,7 +49,7 @@ pub(crate) fn name_hash(name: &str) -> u32 {
 }
 
 /// Usage class guessed from common GTA naming conventions (for added textures).
-fn guess_usage(name: &str) -> u8 {
+pub(crate) fn guess_usage(name: &str) -> u8 {
     let n = name.to_ascii_lowercase();
     if n.ends_with("_n") || n.contains("_normal") {
         22
@@ -196,16 +196,7 @@ fn apply_inner(
             }
             Layout::Rdr2 => return Err(bad("Red Dead Redemption 2 texture dictionaries cannot be written yet")),
             Layout::Gta4 => return Err(bad("GTA IV texture dictionaries cannot be written yet")),
-            Layout::Enhanced => {
-                let blocks = gen9_block_count(tex);
-                t[0x08..0x0C].copy_from_slice(&blocks.to_le_bytes());
-                t[0x0C..0x10].copy_from_slice(&tex.format.block_or_pixel_bytes().to_le_bytes());
-                t[0x18..0x1A].copy_from_slice(&(tex.width as u16).to_le_bytes());
-                t[0x1A..0x1C].copy_from_slice(&(tex.height as u16).to_le_bytes());
-                t[0x1C..0x1E].copy_from_slice(&(tex.depth as u16).to_le_bytes());
-                t[0x1F] = tex.format.0 as u8;
-                t[0x22] = tex.levels as u8;
-            }
+            Layout::Enhanced => patch_enhanced_texture(&mut t, tex),
         }
         if *is_new || tex.usage != 0 {
             let usage_at = 0x40;
@@ -231,6 +222,19 @@ fn apply_inner(
     }
     let file = b.build(dict.version)?;
     Ok(EditResult { file, in_place: false, replaced, added, removed })
+}
+
+/// Writes size, format and mip count of `tex` into an Enhanced texture
+/// structure (a copy of one from the game); pointers are the caller's.
+pub(crate) fn patch_enhanced_texture(t: &mut [u8], tex: &Texture) {
+    let blocks = gen9_block_count(tex);
+    t[0x08..0x0C].copy_from_slice(&blocks.to_le_bytes());
+    t[0x0C..0x10].copy_from_slice(&tex.format.block_or_pixel_bytes().to_le_bytes());
+    t[0x18..0x1A].copy_from_slice(&(tex.width as u16).to_le_bytes());
+    t[0x1A..0x1C].copy_from_slice(&(tex.height as u16).to_le_bytes());
+    t[0x1C..0x1E].copy_from_slice(&(tex.depth as u16).to_le_bytes());
+    t[0x1F] = tex.format.0 as u8;
+    t[0x22] = tex.levels as u8;
 }
 
 /// Number of format blocks (or pixels) over all mips, as GTA V Enhanced stores it.

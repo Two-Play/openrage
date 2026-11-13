@@ -110,6 +110,7 @@ openrage rm x64e.rpf/levels/gta5/paths.rpf       # remove a file or folder
 openrage mkdir x64e.rpf/my_folder
 openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --mods   # new geometry for an Enhanced .ydr (preview)
 openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --out new.ydr --shader 0
+openrage replace-model x64i.rpf/…/prop_x.ydr hi.obj --lod med.obj --lod low.obj --mods   # with detail levels
 openrage oiv info mod.oiv                      # what a package would change
 openrage oiv install mod.oiv                   # install into the mods folder
 openrage oiv list / oiv uninstall "Name 1.0"   # installed packages, uninstall

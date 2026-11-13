@@ -43,8 +43,15 @@ impl Plugin for ObjTools {
                 Ok(out)
             }
             "replace" => {
-                let obj = inputs.iter().find(|i| i.picked).ok_or("choose an OBJ file")?;
-                let model = parse_obj(&String::from_utf8_lossy(&obj.data))?;
+                let picked = |ext: &'static str| {
+                    inputs.iter().filter(move |i| i.picked && i.vpath.to_ascii_lowercase().ends_with(ext))
+                };
+                let obj = picked(".obj").next().ok_or("choose an OBJ file")?;
+                let mut model = parse_obj(&String::from_utf8_lossy(&obj.data))?;
+                let pngs: Vec<&Input> = picked(".png").collect();
+                for mtl in picked(".mtl") {
+                    apply_mtl(&mut model, &String::from_utf8_lossy(&mtl.data), &pngs);
+                }
                 for target in inputs.iter().filter(|i| !i.picked) {
                     // The drawable keeps its shaders and textures; OpenRAGE writes the meshes.
                     let file = build_model(&target.vpath, &model)?;
@@ -149,6 +156,66 @@ fn export(vpath: &str) -> Result<Vec<OutputFile>, String> {
     files.push(OutputFile::new(format!("{stem}.obj"), obj));
     files.push(OutputFile::new(format!("{stem}.mtl"), mtl));
     Ok(files)
+}
+
+/// Colours and textures from a `.mtl`: a material's `map_Kd` becomes its
+/// pixels when that PNG was picked too; a material with only `Kd` gets a
+/// small texture of that colour.
+fn apply_mtl(model: &mut Model, mtl: &str, pngs: &[&Input]) {
+    let mut current: Option<usize> = None;
+    for line in mtl.lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix("newmtl ") {
+            current = model.materials.iter().position(|m| m.name == name.trim());
+        } else if let (Some(k), Some(rest)) = (current, line.strip_prefix("Kd ")) {
+            let v: Vec<f32> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            if v.len() >= 3 {
+                let m = &mut model.materials[k];
+                m.color = (v[0], v[1], v[2], 1.0);
+                if m.image.is_none() {
+                    let px = [v[0], v[1], v[2]].map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+                    m.image = Some(Image {
+                        width: 4,
+                        height: 4,
+                        rgba: (0..16).flat_map(|_| [px[0], px[1], px[2], 255]).collect(),
+                    });
+                    m.texture = format!("{}_colour", m.name);
+                }
+            }
+        } else if let (Some(k), Some(rest)) = (current, line.strip_prefix("map_Kd ")) {
+            let Some(file) = rest.split_whitespace().last() else { continue };
+            let base = file.rsplit(['/', '\\']).next().unwrap_or(file);
+            match pngs.iter().find(|p| file_name(&p.vpath).eq_ignore_ascii_case(base)).map(|p| decode_png(&p.data)) {
+                Some(Ok(img)) => {
+                    let m = &mut model.materials[k];
+                    m.texture = base.rsplit_once('.').map_or(base, |(s, _)| s).to_owned();
+                    m.image = Some(img);
+                }
+                Some(Err(e)) => log(Level::Warn, format!("{base}: {e}")),
+                None => log(
+                    Level::Warn,
+                    format!("{base} was not picked; material {} keeps the model's texture", model.materials[k].name),
+                ),
+            }
+        }
+    }
+}
+
+fn decode_png(data: &[u8]) -> Result<Image, String> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+    let mut buf = vec![0u8; reader.output_buffer_size().ok_or("PNG too large")?];
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+    let px = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => px.to_vec(),
+        png::ColorType::Rgb => px.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => px.as_chunks::<2>().0.iter().flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+        png::ColorType::Grayscale => px.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::Indexed => return Err("indexed PNG".into()),
+    };
+    Ok(Image { width: info.width, height: info.height, rgba })
 }
 
 fn encode_png(img: &Image) -> Result<Vec<u8>, String> {
