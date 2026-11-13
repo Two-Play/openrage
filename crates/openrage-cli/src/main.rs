@@ -154,6 +154,15 @@ enum Command {
     },
     /// Import native names for script disassembly from a NativeDB-style natives.json.
     Natives { file: PathBuf },
+    /// Show OpenRAGE's licence, its credits and the licences of all third-party crates it contains.
+    Licenses {
+        /// Show the full licence text of this crate (or of `openrage` for the GPL, `notice` for NOTICE.md).
+        #[arg(long, value_name = "CRATE")]
+        text: Option<String>,
+        /// Print every licence text (as in THIRD_PARTY_LICENSES.md).
+        #[arg(long, conflicts_with = "text")]
+        all: bool,
+    },
     /// Set up the Red Dead Redemption 2 archive keys from your own game and store them locally.
     ///
     /// The cipher tables come from RDR2.exe; the keys from a memory dump of your running
@@ -425,6 +434,9 @@ fn run() -> Result<()> {
             Checks { textures: *textures, models: *models, texts: *text, meta: *meta, audio: *audio, anims: *anims },
         );
     }
+    if let Command::Licenses { text, all } = &cli.command {
+        return cmd_licenses(text.as_deref(), *all);
+    }
     if let Command::Rdr2Names { game, import } = &cli.command {
         return cmd_rdr2_names(game, import.as_deref());
     }
@@ -453,7 +465,11 @@ fn run() -> Result<()> {
     });
 
     match cli.command {
-        Command::Keys { .. } | Command::Rpf8 { .. } | Command::Rdr2Keys { .. } | Command::Rdr2Names { .. } => {
+        Command::Keys { .. }
+        | Command::Rpf8 { .. }
+        | Command::Rdr2Keys { .. }
+        | Command::Rdr2Names { .. }
+        | Command::Licenses { .. } => {
             unreachable!()
         }
         Command::Ls { path, recursive } => cmd_ls(&game_dir, &path, recursive, keys),
@@ -557,6 +573,76 @@ fn print_gta4_entry(archive: &rage_rpf::Gta4Archive, id: rage_rpf::Gta4EntryId, 
     let ty = e.resource_type().map(|t| format!("t{t}")).unwrap_or_default();
     let slash = if e.is_dir() { "/" } else { "" };
     outln!("{kind:<8} {:>8} {ty:>4}  {path}{slash}", human(e.size()));
+}
+
+fn cmd_licenses(text: Option<&str>, all: bool) -> Result<()> {
+    use openrage_app::licenses;
+    match text {
+        Some(name) if name.eq_ignore_ascii_case("openrage") => outln!("{}", licenses::gpl_text()),
+        Some(name) if name.eq_ignore_ascii_case("notice") => outln!("{}", licenses::notice()),
+        Some(name) => {
+            let found: Vec<_> = licenses::dependencies().iter().filter(|d| d.name.eq_ignore_ascii_case(name)).collect();
+            if found.is_empty() {
+                bail!("no crate named {name}; `openrage licenses` lists them");
+            }
+            for d in found {
+                outln!(
+                    "{} {} — {}
+",
+                    d.name,
+                    d.version,
+                    d.license
+                );
+                outln!(
+                    "{}
+",
+                    licenses::dependency_text(d)
+                );
+            }
+        }
+        None if all => {
+            for d in licenses::dependencies() {
+                outln!(
+                    "==== {} {} — {}
+",
+                    d.name,
+                    d.version,
+                    d.license
+                );
+                outln!(
+                    "{}
+",
+                    licenses::dependency_text(d)
+                );
+            }
+        }
+        None => {
+            outln!("OpenRAGE {} — {} ({})", licenses::VERSION, licenses::LICENSE, licenses::REPOSITORY);
+            outln!(
+                "{}
+",
+                licenses::NOTICE_SHORT
+            );
+            outln!("Credits (NOTICE.md):");
+            for c in licenses::credits() {
+                outln!("  {}", c.title);
+            }
+            let deps = licenses::dependencies();
+            outln!(
+                "
+{} third-party crates:",
+                deps.len()
+            );
+            for d in deps {
+                outln!("  {:<36} {:<12} {}", d.name, d.version, d.license);
+            }
+            outln!(
+                "
+Full texts: `openrage licenses --text <crate>` (`openrage` for the GPL, `notice` for NOTICE.md) or `--all`."
+            );
+        }
+    }
+    Ok(())
 }
 
 fn cmd_keys(game_dir: &Path, exe: Option<&Path>, magic: Option<&Path>) -> Result<()> {

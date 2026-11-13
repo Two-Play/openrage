@@ -11,6 +11,7 @@ pub mod extract;
 pub mod gta4;
 pub mod install;
 pub mod journal;
+pub mod licenses;
 pub mod media;
 pub mod metadata;
 pub mod metaped;

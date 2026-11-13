@@ -66,6 +66,11 @@ jobs:
             mv "$bundle/linux/$f" "$bundle/$f"
             rm -f "$bundle/windows/$f"
           done
+          # Releases before 0.3 have no THIRD_PARTY_LICENSES.md.
+          if [ -f "$bundle/linux/THIRD_PARTY_LICENSES.md" ]; then
+            mv "$bundle/linux/THIRD_PARTY_LICENSES.md" "$bundle/THIRD_PARTY_LICENSES.md"
+            rm -f "$bundle/windows/THIRD_PARTY_LICENSES.md"
+          fi
           # Every file the archives held, and nothing else, ends up in the bundle.
           for f in "$bundle"/linux/* "$bundle"/windows/*; do test -s "$f"; done
           test -x "$bundle/linux/openrage-gui" && test -f "$bundle/windows/openrage-gui.exe"

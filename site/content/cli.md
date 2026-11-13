@@ -99,6 +99,14 @@ openrage mods                                  # files in the OpenIV mods folder
 openrage mods --changes [--deep]               # every added/removed/modified entry
 ```
 
+## About and licenses
+
+```
+openrage licenses                              # OpenRAGE's license, credits and all third-party crates
+openrage licenses --text slint                 # full license text of one crate (`openrage`: the GPL, `notice`: NOTICE.md)
+openrage licenses --all                        # every license text
+```
+
 ## Verifying against the whole game
 
 ```
