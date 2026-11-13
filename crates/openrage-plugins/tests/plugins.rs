@@ -20,13 +20,26 @@ fn plugin_dir() -> &'static Path {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let status = Command::new(cargo)
             .current_dir(&root)
-            .args(["build", "--release", "--target", "wasm32-wasip2", "-p", "strings", "-p", "probe"])
+            .args([
+                "build",
+                "--release",
+                "--target",
+                "wasm32-wasip2",
+                "-p",
+                "strings",
+                "-p",
+                "probe",
+                "-p",
+                "gxt2-patch",
+            ])
             .status()
             .expect("running cargo for the plugins");
         assert!(status.success(), "building the plugins failed (is the wasm32-wasip2 target installed?)");
         let out = std::env::temp_dir().join(format!("openrage-plugin-tests-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
-        for (id, folder) in [("strings", "examples/strings"), ("probe", "tests/probe")] {
+        for (id, folder) in
+            [("strings", "examples/strings"), ("probe", "tests/probe"), ("gxt2_patch", "examples/gxt2-patch")]
+        {
             let dir = out.join(id);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::copy(root.join(folder).join("plugin.toml"), dir.join("plugin.toml")).unwrap();
@@ -77,7 +90,7 @@ fn run(
     arg: &str,
 ) -> Result<Vec<(String, String)>> {
     let component = host.compile(plugin).unwrap();
-    let input = Input { vpath: format!("some/dir/{probe}"), data: arg.as_bytes().to_vec() };
+    let input = Input { vpath: format!("some/dir/{probe}"), data: arg.as_bytes().to_vec(), picked: false };
     let outcome = host.run_action(plugin, &component, files, "run", &[input]);
     outcome
         .value
@@ -99,7 +112,7 @@ fn strings_previews_and_exports() {
 
     let (plugin, action) = reg.actions_for("a.ydr", None)[0];
     assert_eq!(action.id, "export");
-    let inputs = [Input { vpath: "x64.rpf/a.ydr".into(), data }];
+    let inputs = [Input { vpath: "x64.rpf/a.ydr".into(), data, picked: false }];
     let out = host.run_action(plugin, &component, Arc::new(NoGame), "export", &inputs).value.unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].name, "a.ydr.strings.txt");
@@ -117,7 +130,7 @@ fn disabled_plugins_are_not_offered() {
 
 #[test]
 fn views_and_logs() {
-    let reg = registry(&[("probe", &[Permission::ReadGame])]);
+    let reg = registry(&[("probe", &[Permission::ReadGame, Permission::WriteMods])]);
     let plugin = reg.get("probe").unwrap();
     let host = host();
     let component = host.compile(plugin).unwrap();
@@ -138,7 +151,7 @@ fn views_and_logs() {
 #[test]
 fn reading_the_game_needs_the_permission() {
     let host = host();
-    let with = registry(&[("probe", &[Permission::ReadGame])]);
+    let with = registry(&[("probe", &[Permission::ReadGame, Permission::WriteMods])]);
     let probe = with.get("probe").unwrap();
     let game: Arc<dyn GameFiles> = Arc::new(FakeGame);
     assert_eq!(run(&host, probe, game.clone(), "read", "a.rpf/x.txt").unwrap()[0].1, "from the game");
@@ -161,7 +174,7 @@ fn reading_the_game_needs_the_permission() {
 
 #[test]
 fn the_sandbox_holds() {
-    let reg = registry(&[("probe", &[Permission::ReadGame])]);
+    let reg = registry(&[("probe", &[Permission::ReadGame, Permission::WriteMods])]);
     let probe = reg.get("probe").unwrap();
     let host = host();
     let game: Arc<dyn GameFiles> = Arc::new(FakeGame);
@@ -179,4 +192,87 @@ fn the_sandbox_holds() {
     assert!(run(&host, probe, game.clone(), "alloc", "").is_err());
     // And the host still works afterwards.
     assert_eq!(run(&host, probe, game, "game", "").unwrap()[0].1, "Game::Rdr2");
+}
+
+/// Output names (or the error), and the staged writes as (path, text).
+type ModifyResult = (Result<Vec<(String, String)>>, Vec<(String, String)>);
+
+/// Runs the probe's `modify` action and returns its staged writes.
+fn modify(host: &Host, plugin: &Plugin, probe: &str, arg: &str) -> ModifyResult {
+    let component = host.compile(plugin).unwrap();
+    let input = Input { vpath: probe.into(), data: arg.as_bytes().to_vec(), picked: false };
+    let outcome = host.run_action(plugin, &component, Arc::new(FakeGame), "modify", &[input]);
+    let writes = outcome.writes.into_iter().map(|w| (w.vpath, String::from_utf8_lossy(&w.data).into_owned())).collect();
+    (outcome.value.map(|o| o.into_iter().map(|f| (f.name, String::new())).collect()), writes)
+}
+
+#[test]
+fn writes_are_staged_and_checked() {
+    let host = host();
+    let reg = registry(&[("probe", &[Permission::ReadGame, Permission::WriteMods])]);
+    let probe = reg.get("probe").unwrap();
+    // Staged, last content wins.
+    let (value, writes) = modify(&host, probe, "write", "second");
+    value.unwrap();
+    assert_eq!(writes, [("a.rpf/x.txt".to_owned(), "second".to_owned())]);
+    // Paths must stay in the game; a failed action changes nothing.
+    let (value, writes) = modify(&host, probe, "write-escape", "");
+    assert!(format!("{:#}", value.unwrap_err()).contains("not a path inside the game folder"));
+    assert!(writes.is_empty());
+    let (value, writes) = modify(&host, probe, "write-then-fail", "");
+    assert!(value.is_err());
+    assert!(writes.is_empty());
+    // Only modify actions may write.
+    let e = run(&host, probe, Arc::new(FakeGame), "write", "x").unwrap_err();
+    assert!(format!("{e:#}").contains("only be changed in actions of kind"), "{e:#}");
+
+    // Without the permission (forced, as a caller bug would): refused.
+    let mut forced = probe.clone();
+    forced.granted = vec![Permission::ReadGame];
+    let (value, writes) = modify(&host, &forced, "write", "x");
+    assert!(format!("{:#}", value.unwrap_err()).contains("permission write-mods"));
+    assert!(writes.is_empty());
+}
+
+#[test]
+fn gxt2_patch_applies_an_oxt_file() {
+    let host = host();
+    let reg = registry(&[("gxt2-patch", &[Permission::WriteMods])]);
+    let plugin = reg.get("gxt2-patch").unwrap();
+    assert!(plugin.enabled());
+    let component = host.compile(plugin).unwrap();
+    // A table with two entries: 0x10 "Ten" and 0x20 "Twenty".
+    let mut table = b"2TXG".to_vec();
+    table.extend(2u32.to_le_bytes());
+    let start = 8 + 16 + 8u32;
+    for (hash, offset) in [(0x10u32, start), (0x20, start + 4)] {
+        table.extend(hash.to_le_bytes());
+        table.extend(offset.to_le_bytes());
+    }
+    table.extend(b"2TXG");
+    table.extend((start + 11).to_le_bytes());
+    table.extend(b"Ten\0Twenty\0");
+    let inputs = [
+        Input {
+            vpath: "update/update.rpf/x64/data/lang/american_rel.rpf/global.gxt2".into(),
+            data: table,
+            picked: false,
+        },
+        Input {
+            vpath: "patch.oxt".into(),
+            data: b"Version 2 30\n{\n\t0x00000020 = Zwanzig\n\t0x00000030 = New\n}\n".to_vec(),
+            picked: true,
+        },
+    ];
+    let outcome = host.run_action(plugin, &component, Arc::new(FakeGame), "apply", &inputs);
+    assert!(outcome.value.unwrap().is_empty());
+    assert_eq!(
+        outcome.log[0].message,
+        "update/update.rpf/x64/data/lang/american_rel.rpf/global.gxt2: 1 changed, 1 added"
+    );
+    assert_eq!(outcome.writes.len(), 1);
+    let out = &outcome.writes[0].data;
+    assert_eq!(&out[..8], b"2TXG\x03\x00\x00\x00");
+    let text = String::from_utf8_lossy(out);
+    assert!(text.contains("Ten\0Zwanzig\0New\0"), "{text:?}");
 }

@@ -1,0 +1,22 @@
+# OpenRAGE example plugin: changes game files through the mods folder.
+id = "gxt2-patch"
+name = "Text patch"
+version = "0.1.0"
+api = "0.2"
+description = "Applies an OpenIV text file (.oxt) to a GTA V text table (.gxt2): its lines replace or add entries, everything else stays."
+authors = ["OpenRAGE contributors"]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/Two-Play/openrage"
+wasm = "gxt2_patch.wasm"
+games = ["gta5"]
+# The patched table goes into the mods folder; History can undo it.
+permissions = ["write-mods"]
+
+[[actions]]
+id = "apply"
+title = "Apply text patch…"
+kind = "modify"
+extensions = ["gxt2"]
+# Asks for the patch file.
+pick = ["oxt", "txt"]
+pick-title = "Choose a text patch (.oxt)"

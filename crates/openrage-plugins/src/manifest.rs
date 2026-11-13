@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 /// The plugin API version this OpenRAGE implements (`api` in plugin.toml).
 /// Before 1.0 every minor version may break plugins, so it must match exactly.
-pub const API_VERSION: &str = "0.1";
+pub const API_VERSION: &str = "0.2";
 
 /// The manifest's file name in a plugin folder.
 pub const FILE_NAME: &str = "plugin.toml";
@@ -79,14 +79,17 @@ impl GameId {
 pub enum Permission {
     /// Read any file of the game (`read-file`, `list-dir`).
     ReadGame,
+    /// Change files of the game through the `mods` folder (`write-mod-file`).
+    WriteMods,
 }
 
 impl Permission {
-    pub const ALL: [Permission; 1] = [Permission::ReadGame];
+    pub const ALL: [Permission; 2] = [Permission::ReadGame, Permission::WriteMods];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Permission::ReadGame => "read-game",
+            Permission::WriteMods => "write-mods",
         }
     }
 
@@ -98,6 +101,9 @@ impl Permission {
     pub fn description(self) -> &'static str {
         match self {
             Permission::ReadGame => "read every file of the game, not only the ones you open with it",
+            Permission::WriteMods => {
+                "change game files: its changes go into the mods folder and can be undone in History"
+            }
         }
     }
 }
@@ -147,6 +153,17 @@ pub struct Action {
     pub kind: ActionKind,
     /// The files it applies to; `*` for every file.
     pub extensions: Vec<String>,
+    /// Also offered on folders and archives: runs once for every matching
+    /// file inside (with progress, cancellable).
+    #[serde(default)]
+    pub batch: bool,
+    /// Asks the user for files from disk (these extensions) and hands them
+    /// to the action too, e.g. a patch to apply.
+    #[serde(default)]
+    pub pick: Vec<String>,
+    /// Title of the file dialog for `pick`.
+    #[serde(default)]
+    pub pick_title: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -157,6 +174,9 @@ pub enum ActionKind {
     Export,
     /// Anything else that produces files (reports, lists, …).
     Tool,
+    /// Changes game files through the `mods` folder (`write-mod-file`);
+    /// needs the `write-mods` permission.
+    Modify,
 }
 
 impl Manifest {
@@ -202,6 +222,12 @@ impl Manifest {
                 bail!("action id {:?} is used twice", a.id);
             }
             check_extensions(&a.extensions, true)?;
+            if !a.pick.is_empty() {
+                check_extensions(&a.pick, false)?;
+            }
+            if a.kind == ActionKind::Modify && !self.permissions.contains(&Permission::WriteMods) {
+                bail!("action {:?} is of kind modify, which needs the write-mods permission", a.id);
+            }
         }
         Ok(())
     }
@@ -269,7 +295,7 @@ mod tests {
         id = "demo"
         name = "Demo"
         version = "1.0.0"
-        api = "0.1"
+        api = "0.2"
     "#;
 
     #[test]
@@ -279,7 +305,7 @@ mod tests {
             id = "obj-tools"
             name = "OBJ tools"
             version = "0.2.0"
-            api = "0.1"
+            api = "0.2"
             license = "MIT"
             games = ["gta5", "rdr2"]
             permissions = ["read-game"]
@@ -312,12 +338,20 @@ mod tests {
     fn rejects_bad_manifests() {
         let bad = [
             ("id = \"demo\"", "id = \"Demo\""),
-            ("api = \"0.1\"", "api = \"9.0\""),
+            ("api = \"0.2\"", "api = \"9.0\""),
             ("version = \"1.0.0\"", "version = \"1.0.0\"\nwasm = \"../x.wasm\""),
             ("version = \"1.0.0\"", "version = \"1.0.0\"\npermissions = [\"network\"]"),
             ("version = \"1.0.0\"", "version = \"1.0.0\"\nunknown = 1"),
-            ("api = \"0.1\"", "api = \"0.1\"\n[[preview]]\nextensions = [\".ydr\"]"),
-            ("api = \"0.1\"", "api = \"0.1\"\n[[file-types]]\nextensions = [\"*\"]\nname = \"x\""),
+            ("api = \"0.2\"", "api = \"0.2\"\n[[preview]]\nextensions = [\".ydr\"]"),
+            ("api = \"0.2\"", "api = \"0.2\"\n[[file-types]]\nextensions = [\"*\"]\nname = \"x\""),
+            (
+                "api = \"0.2\"",
+                "api = \"0.2\"\n[[actions]]\nid = \"a\"\ntitle = \"A\"\nkind = \"modify\"\nextensions = [\"x\"]",
+            ),
+            (
+                "api = \"0.2\"",
+                "api = \"0.2\"\n[[actions]]\nid = \"a\"\ntitle = \"A\"\nextensions = [\"x\"]\npick = [\"*\"]",
+            ),
         ];
         for (from, to) in bad {
             let text = MINIMAL.replace(from, to);

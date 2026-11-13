@@ -14,19 +14,22 @@ grants that (read-only). It has no access to other files, the network or the env
 memory and a time limit. The same `.wasm` runs on Linux and Windows.
 
 > [!NOTE]
-> The plugin API is at version **0.1** and may still change: plugins name the version they were built for and
-> OpenRAGE only loads plugins for its own version. Plugins work in the explorer (file list, preview pane, context
-> menu, **Settings → Plugins**) and from the [command line](@/cli.md#plugins). Next: writing into the `mods` folder,
-> batch tools, 3D models, importers and installable plugin packages.
+> The plugin API is at version **0.2** and may still change: plugins name the version they were built for and
+> OpenRAGE only loads plugins for its own version (0.1 plugins need `api = "0.2"` and a rebuild with the new SDK).
+> Plugins work in the explorer (file list, preview pane, context menu, **Settings → Plugins**) and from the
+> [command line](@/cli.md#plugins). Next: 3D models, importers and installable plugin packages.
 
 ## What plugins can do
 
-| | API 0.1 |
+| | API 0.2 |
 |---|---|
 | **Preview** files of the types they register: text, a tree, a table or an image | ✅ |
 | **Actions** on the files the user picks (export, convert, reports), producing files the user saves | ✅ |
+| **Batch** actions on whole folders and archives, with progress and cancel | ✅ (`batch = true`) |
+| **Ask for files** from disk for an action, e.g. a patch to apply | ✅ (`pick`) |
 | **Read** any file of the game (archives included, with the changes in `mods/`) | ✅ with the `read-game` permission |
-| Write into the `mods` folder, batch tools over folders, 3D previews, imports | planned |
+| **Change** game files: into the `mods` folder, as one step the user can undo | ✅ with `write-mods`, in `modify` actions |
+| 3D previews, importers (e.g. openFormats) | planned |
 
 ## Quick start (Rust)
 
@@ -105,7 +108,7 @@ could not be read, with the reason.
 id = "strings"                 # unique: lowercase letters, digits and '-'
 name = "Strings"
 version = "0.1.0"
-api = "0.1"                    # the plugin API it was built for
+api = "0.2"                    # the plugin API it was built for
 description = "Shows the readable text in files."
 authors = ["You"]
 license = "MIT OR Apache-2.0"  # SPDX expression of your plugin
@@ -128,8 +131,11 @@ extensions = ["xyz"]
 [[actions]]
 id = "export"                  # passed to run-action
 title = "Export strings…"
-kind = "export"                # export or tool
+kind = "export"                # export, tool or modify (changes game files)
 extensions = ["*"]
+batch = true                   # also on folders and archives: once per matching file inside
+pick = ["oxt", "txt"]          # ask the user for files from disk (handed over with picked = true)
+pick-title = "Choose a patch"  # title of that file dialog
 ```
 
 Unknown keys, permissions or categories are errors, so typos show up in `openrage plugin list` right away.
@@ -140,6 +146,7 @@ Unknown keys, permissions or categories are errors, so typos show up in `openrag
 |---|---|
 | *(none)* | looking at the files the user picks for a preview or an action |
 | `read-game` | `read-file` and `list-dir` on every file of the game |
+| `write-mods` | `write-mod-file` in actions of kind `modify`: changes go into the `mods` folder |
 
 The user grants the permissions when enabling a plugin. If a new version asks for more, it stays off until the user
 enables it again (`needs approval` in `openrage plugin list`).
@@ -155,7 +162,8 @@ A plugin exports:
   parents first, each with the index of its parent), `table` (columns and rows) or `image` (8-bit RGBA, rows from the
   top).
 - `run-action(action, inputs) -> result<list<output-file>, string>`: each input has its `vpath` (its path in the game,
-  or its file name for files from disk) and its data. Output names may contain `/` for sub-folders but never `..`.
+  or its file name for files from disk), its data and `picked` (true for files the user chose because of `pick`).
+  Output names may contain `/` for sub-folders but never `..`.
 
 OpenRAGE offers:
 
@@ -165,6 +173,12 @@ OpenRAGE offers:
 - `log(level, message)`: shown by `openrage plugin`, and in the explorer's info panel next to a preview (the last
   lines) or in the status bar when an action fails. Whatever the plugin prints to stdout
   or stderr ends up there too, panics included.
+- `write-mod-file(vpath, data)`: changes a game file, e.g. `update/update.rpf/x64/data/lang/american_rel.rpf/global.gxt2`.
+  Only in `modify` actions and with `write-mods`. The changes are collected and applied when the action has
+  succeeded (a failing action changes nothing): files in archives through OpenRAGE's archive editor (the archive is
+  copied into `mods` first), loose files into `mods/`. The game's own files are never touched. Everything one run
+  changed is one entry in History and can be undone at once. Loose files that could run code (`.asi`, `.dll`, `.exe`,
+  scripts) are refused, and one run may change at most 1 GB.
 
 Each call starts a fresh instance: plugins keep no state between calls. Limits per call: 1 GiB of memory and 60
 seconds. A plugin that crashes, loops or runs out of memory ends that call with an error; OpenRAGE goes on.
@@ -191,8 +205,39 @@ Never put Rockstar's files or keys into a plugin. Read what you need from the us
 - **Previews** (`[[preview]]`) are used for files OpenRAGE has no viewer for. A plugin naming the extension wins over
   one registered for `*`; `*` plugins are only asked about binary files. Files larger than 256 MB are not handed to
   plugins for a preview. Trees and tables are shown as indented text and aligned columns for now.
-- **Actions** (`[[actions]]`) appear in the context menu of matching files. One output file is saved with a save
-  dialog, several into a folder the user picks.
+- **Actions** (`[[actions]]`) appear in the context menu of matching files; `batch` actions also on folders and
+  archives, where they run once per matching file inside (progress in the status bar, **Cancel** stops and keeps
+  nothing). One output file is saved with a save dialog, several into a folder the user picks; batch outputs keep
+  the folder structure. `pick` actions first ask for the files.
+- **Modify** actions only run while editing is unlocked (the **Read-only** button), like every change in OpenRAGE.
+
+## Example: changing game files
+
+[`plugins/examples/gxt2-patch`](https://github.com/Two-Play/openrage/tree/main/plugins/examples/gxt2-patch) applies an
+OpenIV text file (`.oxt`, lines like `LABEL = text`) to a GTA V text table: right-click a `.gxt2`, **Apply text
+patch…**, choose the `.oxt`. Its lines replace or add entries; the patched table goes into the `mods` folder. The
+important parts:
+
+```toml
+permissions = ["write-mods"]
+
+[[actions]]
+id = "apply"
+title = "Apply text patch…"
+kind = "modify"
+extensions = ["gxt2"]
+pick = ["oxt", "txt"]
+```
+
+```rust
+let patch = inputs.iter().filter(|i| i.picked);      // the .oxt the user chose
+for table in inputs.iter().filter(|i| !i.picked) {   // the .gxt2 right-clicked
+    // … merge …
+    write_mod_file(&table.vpath, &patched)?;
+}
+```
+
+From the command line: `openrage plugin run gxt2-patch apply <path>.gxt2 --pick patch.oxt`.
 
 ## Tips
 

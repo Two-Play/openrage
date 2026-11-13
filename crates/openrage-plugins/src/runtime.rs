@@ -9,7 +9,7 @@ use wasmtime::{Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use crate::manifest::{self, GameId, Permission};
+use crate::manifest::{self, ActionKind, GameId, Permission};
 use crate::registry::Plugin;
 
 mod bindings {
@@ -65,6 +65,16 @@ impl GameFiles for NoGame {
     }
 }
 
+/// The name of a log level, for people (`info`, `warning`, …).
+pub fn level_name(level: Level) -> &'static str {
+    match level {
+        Level::Debug => "debug",
+        Level::Info => "info",
+        Level::Warn => "warning",
+        Level::Error => "error",
+    }
+}
+
 /// A line a plugin logged (or printed to stdout/stderr).
 #[derive(Debug, Clone)]
 pub struct LogLine {
@@ -77,6 +87,17 @@ pub struct LogLine {
 pub struct Outcome<T> {
     pub value: Result<T>,
     pub log: Vec<LogLine>,
+    /// Changes to game files the plugin asked for (only from successful
+    /// `modify` actions; empty otherwise). Applying them is up to the caller.
+    pub writes: Vec<ModWrite>,
+}
+
+/// A change to a game file a plugin asked for (`write-mod-file`).
+#[derive(Debug, Clone)]
+pub struct ModWrite {
+    /// Checked to be relative and free of `..`, with `/` separators.
+    pub vpath: String,
+    pub data: Vec<u8>,
 }
 
 /// Compiles and runs plugins.
@@ -93,6 +114,8 @@ const OUTPUT_CAPACITY: usize = 64 * 1024;
 /// Most log lines kept per call, and their length.
 const MAX_LOG_LINES: usize = 1000;
 const MAX_LOG_LINE: usize = 4096;
+/// Most bytes one call may ask to write into the mods folder.
+const MAX_WRITES: usize = 1 << 30;
 
 impl Host {
     pub fn new(limits: Limits) -> Result<Self> {
@@ -136,7 +159,7 @@ impl Host {
         vpath: &str,
         data: &[u8],
     ) -> Outcome<Preview> {
-        self.call(plugin, component, files, |p, store| {
+        self.call(plugin, component, files, false, |p, store| {
             let preview = p.call_preview(store, vpath, data)?.map_err(|e| anyhow!("{e}"))?;
             check_preview(&preview)?;
             Ok(preview)
@@ -153,9 +176,14 @@ impl Host {
         inputs: &[Input],
     ) -> Outcome<Vec<OutputFile>> {
         if plugin.manifest.action(action).is_none() {
-            return Outcome { value: Err(anyhow!("{} has no action {action:?}", plugin.manifest.id)), log: Vec::new() };
+            return Outcome {
+                value: Err(anyhow!("{} has no action {action:?}", plugin.manifest.id)),
+                log: Vec::new(),
+                writes: Vec::new(),
+            };
         }
-        self.call(plugin, component, files, |p, store| {
+        let may_write = plugin.manifest.action(action).is_some_and(|a| a.kind == ActionKind::Modify);
+        self.call(plugin, component, files, may_write, |p, store| {
             let outputs = p.call_run_action(store, action, inputs)?.map_err(|e| anyhow!("{e}"))?;
             check_outputs(&outputs)?;
             Ok(outputs)
@@ -167,6 +195,7 @@ impl Host {
         plugin: &Plugin,
         component: &Component,
         files: Arc<dyn GameFiles>,
+        may_write: bool,
         f: impl FnOnce(&bindings::Plugin, &mut Store<Ctx>) -> Result<T>,
     ) -> Outcome<T> {
         let stdout = MemoryOutputPipe::new(OUTPUT_CAPACITY);
@@ -185,6 +214,9 @@ impl Host {
             limits: StoreLimitsBuilder::new().memory_size(self.limits.memory).instances(16).tables(64).build(),
             files,
             permissions: plugin.granted.clone(),
+            may_write,
+            writes: Vec::new(),
+            written: 0,
             log: Vec::new(),
         };
         let mut store = Store::new(&self.engine, ctx);
@@ -206,7 +238,12 @@ impl Host {
                 push_log(&mut log, level, line);
             }
         }
-        Outcome { value, log }
+        // Changes count only when the action succeeded.
+        let writes = match value {
+            Ok(_) => std::mem::take(&mut store.data_mut().writes),
+            Err(_) => Vec::new(),
+        };
+        Outcome { value, log, writes }
     }
 }
 
@@ -286,6 +323,11 @@ struct Ctx {
     files: Arc<dyn GameFiles>,
     permissions: Vec<Permission>,
     log: Vec<LogLine>,
+    /// The call is a `modify` action: `write-mod-file` works.
+    may_write: bool,
+    writes: Vec<ModWrite>,
+    /// Bytes in `writes`, against [`MAX_WRITES`].
+    written: usize,
 }
 
 impl Ctx {
@@ -330,6 +372,24 @@ impl wit_host::Host for Ctx {
 
     fn log(&mut self, level: Level, message: String) {
         push_log(&mut self.log, level, &message);
+    }
+
+    fn write_mod_file(&mut self, vpath: String, data: Vec<u8>) -> Result<(), String> {
+        self.require(Permission::WriteMods)?;
+        if !self.may_write {
+            return Err("game files can only be changed in actions of kind \"modify\"".into());
+        }
+        let vpath = checked_vpath(&vpath)?;
+        // The same file again: the last content wins.
+        if let Some(i) = self.writes.iter().position(|w| w.vpath.eq_ignore_ascii_case(&vpath)) {
+            self.written -= self.writes.remove(i).data.len();
+        }
+        if self.written + data.len() > MAX_WRITES {
+            return Err(format!("an action may change at most {} MB of files", MAX_WRITES >> 20));
+        }
+        self.written += data.len();
+        self.writes.push(ModWrite { vpath, data });
+        Ok(())
     }
 }
 

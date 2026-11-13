@@ -51,15 +51,18 @@ jobs:
           key: release
       - name: Build
         run: cargo build --release --locked -p openrage-cli -p openrage-gui
-      # The example plugin ships in `plugins/` next to the programs (off until
-      # the user enables it). The same .wasm works on every system.
-      - name: Build the example plugin
+      # The example plugins ship in `plugins/` next to the programs (off until
+      # the user enables them). The same .wasm works on every system.
+      - name: Build the example plugins
         shell: bash
         run: |
-          cargo build --release --locked --manifest-path plugins/Cargo.toml --target wasm32-wasip2 -p strings
-          mkdir -p shipped-plugins/strings
-          cp plugins/examples/strings/plugin.toml plugins/target/wasm32-wasip2/release/strings.wasm shipped-plugins/strings/
-          cp plugins/LICENSE-MIT plugins/LICENSE-APACHE shipped-plugins/strings/
+          cargo build --release --locked --manifest-path plugins/Cargo.toml --target wasm32-wasip2 -p strings -p gxt2-patch
+          for p in strings:strings gxt2-patch:gxt2_patch; do
+            dir="${p%%:*}" wasm="${p##*:}"
+            mkdir -p "shipped-plugins/$dir"
+            cp "plugins/examples/$dir/plugin.toml" "plugins/target/wasm32-wasip2/release/$wasm.wasm" "shipped-plugins/$dir/"
+            cp plugins/LICENSE-MIT plugins/LICENSE-APACHE "shipped-plugins/$dir/"
+          done
       - name: Package
         shell: bash
         run: |

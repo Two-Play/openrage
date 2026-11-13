@@ -6,7 +6,8 @@ How to write one: **[Writing plugins](https://two-play.github.io/openrage/plugin
 | Folder | |
 |---|---|
 | `sdk/` | `openrage-plugin-sdk`: write plugins in Rust |
-| `examples/strings/` | example: the readable text in any file, as a preview and an export |
+| `examples/strings/` | example: the readable text in any file, as a preview and an export (also of whole folders) |
+| `examples/gxt2-patch/` | example: applies an OpenIV `.oxt` text file to a `.gxt2`, writing into the `mods` folder |
 | `tests/probe/` | test plugin for the host's sandbox and limits (not shipped) |
 
 The interface itself is [`crates/openrage-plugins/wit/plugin.wit`](../crates/openrage-plugins/wit/plugin.wit).

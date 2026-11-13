@@ -47,7 +47,7 @@ pub use bindings::Guest as Plugin;
 
 /// Everything a plugin usually needs.
 pub mod prelude {
-    pub use crate::host::{current_game, list_dir, read_file};
+    pub use crate::host::{current_game, list_dir, read_file, write_mod_file};
     pub use crate::{
         DirEntry, Game, Image, Info, Input, Level, OutputFile, Plugin, Preview, Table, TreeNode, View, log,
     };

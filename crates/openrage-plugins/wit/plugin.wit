@@ -8,7 +8,7 @@
 // The API is not stable before 1.0: a plugin names the version it was built
 // for (`api` in plugin.toml) and OpenRAGE refuses plugins for another one.
 
-package openrage:plugin@0.1.0;
+package openrage:plugin@0.2.0;
 
 interface types {
     /// The game that is open.
@@ -76,6 +76,10 @@ interface types {
         /// name when it comes from outside the game.
         vpath: string,
         data: list<u8>,
+        /// The user chose it from disk because the action asks for files
+        /// (`pick` in plugin.toml), e.g. a patch to apply; `vpath` is then
+        /// its file name.
+        picked: bool,
     }
 
     /// A file an action produced. OpenRAGE saves it where the user chooses;
@@ -111,6 +115,15 @@ interface host {
 
     /// Writes a line to OpenRAGE's log (shown by `openrage plugin`).
     log: func(level: level, message: string);
+
+    /// Changes a file of the game, e.g. `x64a.rpf/data/lang/x.gxt2`. The
+    /// change goes into the `mods` folder (archives are copied there first),
+    /// never into the game's own files. Changes are applied together once
+    /// the action has succeeded, as one change the user can undo; writing
+    /// the same path twice keeps the last content.
+    /// Needs the `write-mods` permission and works only in actions of kind
+    /// `modify`.
+    write-mod-file: func(vpath: string, data: list<u8>) -> result<_, string>;
 }
 
 world plugin {
