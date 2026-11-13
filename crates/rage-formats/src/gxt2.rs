@@ -9,13 +9,17 @@
 //! strings with real line breaks keep them as `\n` (and `\r`, `\\` for a
 //! backslash), so converting back gives the identical file.
 
+use rage_core::bytes::LeRead;
 use rage_core::hash::joaat;
 
 pub const MAGIC: &[u8; 4] = b"2TXG";
 
 #[derive(Debug, thiserror::Error)]
-#[error("invalid text table: {0}")]
-pub struct Gxt2Error(String);
+#[non_exhaustive]
+pub enum Gxt2Error {
+    #[error("invalid text table: {0}")]
+    Invalid(String),
+}
 
 /// One string: the hash of its label and the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,25 +33,25 @@ pub fn is_gxt2(data: &[u8]) -> bool {
 }
 
 fn u32_at(d: &[u8], at: usize) -> Result<u32, Gxt2Error> {
-    d.get(at..at + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .ok_or_else(|| Gxt2Error(format!("offset {at:#x} beyond the end")))
+    d.u32_at(at).ok_or_else(|| Gxt2Error::Invalid(format!("offset {at:#x} beyond the end")))
 }
 
 pub fn parse(data: &[u8]) -> Result<Vec<Entry>, Gxt2Error> {
     if !is_gxt2(data) {
-        return Err(Gxt2Error("missing 2TXG header".into()));
+        return Err(Gxt2Error::Invalid("missing 2TXG header".into()));
     }
     let count = u32_at(data, 4)? as usize;
     if 8 + count.saturating_mul(8) > data.len() {
-        return Err(Gxt2Error(format!("{count} entries do not fit")));
+        return Err(Gxt2Error::Invalid(format!("{count} entries do not fit")));
     }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let hash = u32_at(data, 8 + i * 8)?;
         let offset = u32_at(data, 12 + i * 8)? as usize;
-        let tail = data.get(offset..).ok_or_else(|| Gxt2Error(format!("string offset {offset:#x} beyond the end")))?;
-        let end = tail.iter().position(|&b| b == 0).ok_or_else(|| Gxt2Error("unterminated string".into()))?;
+        let tail = data
+            .get(offset..)
+            .ok_or_else(|| Gxt2Error::Invalid(format!("string offset {offset:#x} beyond the end")))?;
+        let end = tail.iter().position(|&b| b == 0).ok_or_else(|| Gxt2Error::Invalid("unterminated string".into()))?;
         out.push(Entry { hash, text: String::from_utf8_lossy(&tail[..end]).into_owned() });
     }
     Ok(out)
@@ -99,14 +103,13 @@ pub fn from_oxt(text: &str) -> Result<Vec<Entry>, Gxt2Error> {
         let (label, value) = line
             .split_once(" = ")
             .or_else(|| line.split_once('='))
-            .ok_or_else(|| Gxt2Error(format!("line {}: expected `label = text`", n + 1)))?;
+            .ok_or_else(|| Gxt2Error::Invalid(format!("line {}: expected `label = text`", n + 1)))?;
         let label = label.trim();
         let hash = match label.strip_prefix("0x").or_else(|| label.strip_prefix("0X")) {
-            Some(hex) => {
-                u32::from_str_radix(hex, 16).map_err(|_| Gxt2Error(format!("line {}: bad hash {label}", n + 1)))?
-            }
+            Some(hex) => u32::from_str_radix(hex, 16)
+                .map_err(|_| Gxt2Error::Invalid(format!("line {}: bad hash {label}", n + 1)))?,
             None if !label.is_empty() => joaat(label),
-            None => return Err(Gxt2Error(format!("line {}: empty label", n + 1))),
+            None => return Err(Gxt2Error::Invalid(format!("line {}: empty label", n + 1))),
         };
         out.push(Entry { hash, text: unescape(value) });
     }

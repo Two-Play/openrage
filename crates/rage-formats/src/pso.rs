@@ -14,6 +14,7 @@
 //! (bits 0–11) and the offset (bits 12–31).
 //! Arrays are 16 bytes: pointer, count (u16), capacity (u16), unused.
 
+use rage_core::bytes::BeRead;
 use std::collections::HashMap;
 
 use crate::names;
@@ -23,8 +24,11 @@ pub const MAGIC: &[u8; 4] = b"PSIN";
 const ARRAYINFO: u32 = 0x100;
 
 #[derive(Debug, thiserror::Error)]
-#[error("invalid PSO file: {0}")]
-pub struct PsoError(String);
+#[non_exhaustive]
+pub enum PsoError {
+    #[error("invalid PSO file: {0}")]
+    Invalid(String),
+}
 
 mod ty {
     pub const BOOL: u8 = 0x00;
@@ -101,26 +105,24 @@ pub fn is_pso(data: &[u8]) -> bool {
     data.starts_with(MAGIC)
 }
 
-fn be<const N: usize>(d: &[u8], at: usize) -> Result<[u8; N], String> {
-    d.get(at..at + N)
-        .and_then(|s| s.try_into().ok())
-        .ok_or_else(|| format!("read of {N} bytes at {at:#x} beyond data of {:#x}", d.len()))
+fn be<T>(d: &[u8], at: usize, n: usize, v: Option<T>) -> Result<T, String> {
+    v.ok_or_else(|| format!("read of {n} bytes at {at:#x} beyond data of {:#x}", d.len()))
 }
 
 fn u16_at(d: &[u8], at: usize) -> Result<u16, String> {
-    be::<2>(d, at).map(u16::from_be_bytes)
+    be(d, at, 2, d.u16_be_at(at))
 }
 
 fn u32_at(d: &[u8], at: usize) -> Result<u32, String> {
-    be::<4>(d, at).map(u32::from_be_bytes)
+    be(d, at, 4, d.u32_be_at(at))
 }
 
 fn u64_at(d: &[u8], at: usize) -> Result<u64, String> {
-    be::<8>(d, at).map(u64::from_be_bytes)
+    be(d, at, 8, d.u64_be_at(at))
 }
 
 fn f32_at(d: &[u8], at: usize) -> Result<f32, String> {
-    be::<4>(d, at).map(f32::from_be_bytes)
+    be(d, at, 4, d.f32_be_at(at))
 }
 
 /// A pointer: the first big-endian word, plus the next two bytes as a
@@ -164,7 +166,7 @@ pub fn parse_rdr2(file: &[u8]) -> Result<Pso, PsoError> {
 }
 
 fn parse_with(file: &[u8], offset_shift: u32) -> Result<Pso, PsoError> {
-    let err = |m: String| PsoError(m);
+    let err = |m: String| PsoError::Invalid(m);
     let mut data = None;
     let mut map = None;
     let mut schema = None;

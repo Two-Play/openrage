@@ -22,6 +22,8 @@
 //! named after the channel. The data is cut into 2048-byte units of Vorbis
 //! packets, each with a 16-bit length.
 
+use rage_core::bytes::LeRead;
+
 const MAGIC: u32 = 0x5441_4441; // "ADAT"
 
 /// Decrypts a buffer in place with the AWC key.
@@ -42,6 +44,7 @@ pub const CHUNK_FORMAT_RDR2: u8 = 0x76;
 pub const CHUNK_VORBIS_HEADERS: u8 = 0x7F;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AwcError {
     #[error("not an audio container")]
     NotAwc,
@@ -132,15 +135,15 @@ pub struct Awc {
 }
 
 fn u16_at(d: &[u8], o: usize) -> Result<u16, AwcError> {
-    d.get(o..o + 2).map(|b| u16::from_le_bytes(b.try_into().unwrap())).ok_or_else(|| damaged("truncated"))
+    d.u16_at(o).ok_or_else(|| damaged("truncated"))
 }
 
 fn u32_at(d: &[u8], o: usize) -> Result<u32, AwcError> {
-    d.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).ok_or_else(|| damaged("truncated"))
+    d.u32_at(o).ok_or_else(|| damaged("truncated"))
 }
 
 fn u64_at(d: &[u8], o: usize) -> Result<u64, AwcError> {
-    d.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).ok_or_else(|| damaged("truncated"))
+    d.u64_at(o).ok_or_else(|| damaged("truncated"))
 }
 
 impl Awc {

@@ -19,6 +19,7 @@
 //! new pixel data is appended. Texture structures never move, because the
 //! model's shaders point at them; a texture a shader uses cannot be removed.
 
+use rage_core::bytes::LeRead;
 use rage_resource::{Resource, ResourceError};
 
 use crate::texture::Texture;
@@ -46,8 +47,8 @@ fn put_u16(buf: &mut [u8], at: usize, v: u16) {
     buf[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
 
-fn get_u32(buf: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(buf[at..at + 4].try_into().expect("4 bytes"))
+fn get_u32(buf: &[u8], at: usize) -> Result<u32, ResourceError> {
+    buf.u32_at(at).ok_or_else(|| bad(format!("read at {at:#x} outside memory")))
 }
 
 /// Applies `edits` to a GTA IV dictionary read from `res`. `kind` and
@@ -219,7 +220,7 @@ fn apply_inner(
 
         let template = &dict.stored[original.unwrap_or(0)];
         // The data pointer sits at 0x48, or 0x44 in a few older dictionaries.
-        let data_field = if get_u32(&template.template, 0x48) as u64 == template.data_ptr { 0x48 } else { 0x44 };
+        let data_field = if get_u32(&template.template, 0x48)? as u64 == template.data_ptr { 0x48 } else { 0x44 };
         let addr = match original {
             Some(i) => addresses[*i],
             None => {
@@ -256,9 +257,10 @@ fn apply_inner(
     let pointers: Vec<u8> = tex_addrs.iter().flat_map(|a| a.to_le_bytes()).collect();
     let root_at = (root as u32).checked_sub(SYSTEM_BASE).ok_or_else(|| bad("dictionary outside memory"))? as usize;
     for (at, bytes) in [(root_at + 0x10, hashes), (root_at + 0x18, pointers)] {
-        let capacity = u16::from_le_bytes([sys[at + 6], sys[at + 7]]);
-        let ptr = if count <= capacity && get_u32(&sys, at) >= SYSTEM_BASE {
-            let ptr = get_u32(&sys, at);
+        let capacity = sys.u16_at(at + 6).ok_or_else(|| bad("list outside memory"))?;
+        let old = get_u32(&sys, at)?;
+        let ptr = if count <= capacity && old >= SYSTEM_BASE {
+            let ptr = old;
             let off = (ptr - SYSTEM_BASE) as usize;
             sys.get_mut(off..off + bytes.len()).ok_or_else(|| bad("list outside memory"))?.copy_from_slice(&bytes);
             ptr
@@ -390,7 +392,7 @@ mod tests {
         // Same layout 0x200 further on: shift every system pointer by 0x200.
         sys[0x200..0x300].copy_from_slice(&res.system[..0x100]);
         for at in [0x210, 0x218, 0x240, 0x280 + 0x14] {
-            let v = get_u32(&sys, at) + 0x200;
+            let v = get_u32(&sys, at).unwrap() + 0x200;
             put_u32(&mut sys, at, v);
         }
         let mut gfx = vec![0x11u8; 0x1000]; // "vertex data"

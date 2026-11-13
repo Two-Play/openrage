@@ -2,11 +2,15 @@
 //! Bink videos (`.bik`). Neither is played back; this reads their headers
 //! (and, for `.gfx`, the names it exports and the images it loads).
 
+use rage_core::bytes::LeRead;
 use std::io::Read;
 
 #[derive(Debug, thiserror::Error)]
-#[error("invalid media file: {0}")]
-pub struct MediaError(String);
+#[non_exhaustive]
+pub enum MediaError {
+    #[error("invalid media file: {0}")]
+    Invalid(String),
+}
 
 /// A Bink video's header.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,17 +33,15 @@ impl Bink {
 }
 
 fn u32_at(d: &[u8], at: usize) -> Result<u32, MediaError> {
-    d.get(at..at + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .ok_or_else(|| MediaError(format!("header ends before {at:#x}")))
+    d.u32_at(at).ok_or_else(|| MediaError::Invalid(format!("header ends before {at:#x}")))
 }
 
 /// Reads a Bink (1 or 2) header: signature, file size, frames, largest frame,
 /// frames again, width, height, fps numerator and denominator, flags, audio tracks.
 pub fn bink(data: &[u8]) -> Result<Bink, MediaError> {
-    let sig = data.get(..4).ok_or_else(|| MediaError("too short".into()))?;
+    let sig = data.get(..4).ok_or_else(|| MediaError::Invalid("too short".into()))?;
     if &sig[..3] != b"BIK" && &sig[..3] != b"KB2" {
-        return Err(MediaError("not a Bink video".into()));
+        return Err(MediaError::Invalid("not a Bink video".into()));
     }
     let (num, den) = (u32_at(data, 0x1C)?, u32_at(data, 0x20)?);
     Ok(Bink {
@@ -108,11 +110,11 @@ fn pstr(d: &[u8], at: &mut usize) -> String {
 /// Reads a `.gfx` movie: `GFX` (or zlib-compressed `CFX`), version, length,
 /// frame rectangle, frame rate, frame count, then tags.
 pub fn gfx(data: &[u8]) -> Result<Gfx, MediaError> {
-    let sig = data.get(..8).ok_or_else(|| MediaError("too short".into()))?;
+    let sig = data.get(..8).ok_or_else(|| MediaError::Invalid("too short".into()))?;
     let compressed = match &sig[..3] {
         b"GFX" | b"FWS" => false,
         b"CFX" | b"CWS" => true,
-        _ => return Err(MediaError("not a Scaleform movie".into())),
+        _ => return Err(MediaError::Invalid("not a Scaleform movie".into())),
     };
     let length = u32_at(data, 4)? as usize;
     let body: Vec<u8> = if compressed {
@@ -120,7 +122,7 @@ pub fn gfx(data: &[u8]) -> Result<Gfx, MediaError> {
         flate2::read::ZlibDecoder::new(&data[8..])
             .take(256 << 20)
             .read_to_end(&mut out)
-            .map_err(|e| MediaError(format!("cannot decompress: {e}")))?;
+            .map_err(|e| MediaError::Invalid(format!("cannot decompress: {e}")))?;
         out
     } else {
         data[8..].to_vec()
@@ -193,7 +195,7 @@ pub fn gfx_to_swf(data: &[u8]) -> Result<Vec<u8>, MediaError> {
         Some(b"GFX") => out[..3].copy_from_slice(b"FWS"),
         Some(b"CFX") => out[..3].copy_from_slice(b"CWS"),
         Some(b"FWS" | b"CWS") => {}
-        _ => return Err(MediaError("not a Scaleform movie".into())),
+        _ => return Err(MediaError::Invalid("not a Scaleform movie".into())),
     }
     Ok(out)
 }

@@ -18,6 +18,7 @@
 //! Pointers inside block data are packed: bits 0–11 the 1-based block, bits 12–31
 //! the offset in it. Arrays are 16 bytes: pointer, count (u16), capacity (u16).
 
+use rage_core::bytes::{LeRead, f16_to_f32};
 use std::collections::HashMap;
 
 use rage_resource::{Resource, ResourceError};
@@ -35,6 +36,7 @@ pub const VERSION_RDR2: u32 = 3;
 const ARRAYINFO: u32 = 0x100;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MetaError {
     #[error(transparent)]
     Resource(#[from] ResourceError),
@@ -191,38 +193,24 @@ pub fn to_xml(res: &Resource) -> Result<(String, Vec<String>), MetaError> {
     Ok(parse(res)?.to_xml())
 }
 
-fn le<const N: usize>(data: &[u8], at: usize) -> Result<[u8; N], String> {
-    data.get(at..at + N)
-        .and_then(|s| s.try_into().ok())
-        .ok_or_else(|| format!("read of {N} bytes at {at:#x} beyond block of {:#x}", data.len()))
+fn le<T>(data: &[u8], at: usize, n: usize, v: Option<T>) -> Result<T, String> {
+    v.ok_or_else(|| format!("read of {n} bytes at {at:#x} beyond block of {:#x}", data.len()))
 }
 
 fn u16_at(d: &[u8], at: usize) -> Result<u16, String> {
-    le::<2>(d, at).map(u16::from_le_bytes)
+    le(d, at, 2, d.u16_at(at))
 }
 
 fn u32_at(d: &[u8], at: usize) -> Result<u32, String> {
-    le::<4>(d, at).map(u32::from_le_bytes)
+    le(d, at, 4, d.u32_at(at))
 }
 
 fn u64_at(d: &[u8], at: usize) -> Result<u64, String> {
-    le::<8>(d, at).map(u64::from_le_bytes)
-}
-
-/// IEEE half-precision float.
-fn half(h: u16) -> f32 {
-    let sign = if h >> 15 == 1 { -1.0 } else { 1.0 };
-    let exp = i32::from((h >> 10) & 0x1F);
-    let man = f32::from(h & 0x3FF);
-    sign * match exp {
-        0 => man * 2f32.powi(-24),
-        31 => f32::INFINITY,
-        e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
-    }
+    le(d, at, 8, d.u64_at(at))
 }
 
 fn f32_at(d: &[u8], at: usize) -> Result<f32, String> {
-    le::<4>(d, at).map(f32::from_le_bytes)
+    le(d, at, 4, d.f32_at(at))
 }
 
 fn vector(d: &[u8], at: usize, n: usize) -> Result<Vec<f32>, String> {
@@ -450,7 +438,7 @@ impl Meta {
                 w.string(level, ename, &self.enum_string(entry, v));
             }
             ty::ULONG | ty::ULONG2 => w.value(level, ename, &u64_at(data, at)?.to_string()),
-            ty::HALF => w.value(level, ename, &xml::float(half(u16_at(data, at)?))),
+            ty::HALF => w.value(level, ename, &xml::float(f16_to_f32(u16_at(data, at)?))),
             ty::VEC3_PADDED => w.empty(level, &vector_attrs(ename, &vector(data, at, 3)?)),
             ty::MATRIX => {
                 let m = vector(data, at, 16)?;
