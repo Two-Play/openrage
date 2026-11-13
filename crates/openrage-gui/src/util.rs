@@ -72,10 +72,18 @@ pub(crate) fn game_dir() -> Option<std::path::PathBuf> {
     with_app(|a| a.game_dir.clone())
 }
 
+/// Shows an error in the status bar: in the error colour for as long as it is
+/// the status, with the whole text in a tooltip (long messages are cut off).
+pub(crate) fn show_error(ui: &AppWindow, msg: String) {
+    let msg = SharedString::from(msg);
+    ui.set_status_error(msg.clone());
+    ui.set_status(msg);
+}
+
 /// Saves the settings; a failure shows in the status bar.
 pub(crate) fn save_settings(ui: &AppWindow) {
     if let Err(e) = with_app(|a| a.cfg.save()) {
-        ui.set_status(format!("Could not save the settings: {e}").into());
+        show_error(ui, format!("Could not save the settings: {e}"));
     }
 }
 

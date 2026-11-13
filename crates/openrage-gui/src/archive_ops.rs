@@ -251,7 +251,7 @@ pub(crate) fn run_archive_ops(
                     }
                     ui.set_status(msg.into());
                 }
-                Err(e) => ui.set_status(format!("{description} failed: {e:#}").into()),
+                Err(e) => show_error(&ui, format!("{description} failed: {e:#}")),
             }
         });
     });
@@ -290,7 +290,7 @@ pub(crate) fn archive_import(ui: &AppWindow, dropped: Option<Vec<PathBuf>>) {
         let select = (ops.len() == 1).then(|| ops[0].0.rsplit('/').next().unwrap_or_default().to_owned());
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if let Some(p) = problems.first() {
-                ui.set_status(format!("Could not read {p}").into());
+                show_error(&ui, format!("Could not read {p}"));
             }
             if !ops.is_empty() {
                 run_archive_ops(&ui, ops, description, select);
@@ -309,7 +309,7 @@ pub(crate) fn archive_replace(ui: &AppWindow) {
             Ok(data) => {
                 run_archive_ops(&ui, vec![(vpath, OpTarget::Op(Op::Set(data)))], format!("Replaced {name}"), Some(name))
             }
-            Err(e) => ui.set_status(format!("Could not read {}: {e}", file.display()).into()),
+            Err(e) => show_error(&ui, format!("Could not read {}: {e}", file.display())),
         });
     });
 }

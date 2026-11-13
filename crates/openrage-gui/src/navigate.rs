@@ -171,7 +171,7 @@ fn show_listing(
             false
         }
         Err(e) => {
-            ui.set_status(format!("{e}").into());
+            show_error(ui, format!("{e}"));
             false
         }
     };

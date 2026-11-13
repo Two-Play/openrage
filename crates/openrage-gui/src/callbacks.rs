@@ -348,7 +348,7 @@ fn wire_plugins(ui: &AppWindow) {
         with_ui(&w, |ui| {
             let result = with_app(|a| plugins::set_enabled(&mut a.cfg, &id, on));
             if let Err(e) = result {
-                ui.set_status(format!("Cannot change plugin {id}: {e:#}").into());
+                show_error(ui, format!("Cannot change plugin {id}: {e:#}"));
             }
             after_plugins_change(ui);
         });
@@ -414,7 +414,7 @@ fn wire_plugins(ui: &AppWindow) {
         with_ui(&w, |ui| {
             let Some(dir) = plugins::user_folder() else { return };
             if let Err(e) = std::fs::create_dir_all(&dir) {
-                return ui.set_status(format!("Cannot create {}: {e}", dir.display()).into());
+                return show_error(ui, format!("Cannot create {}: {e}", dir.display()));
             }
             let opened = if cfg!(target_os = "windows") {
                 std::process::Command::new("explorer").arg(&dir).spawn()
@@ -424,7 +424,7 @@ fn wire_plugins(ui: &AppWindow) {
                 std::process::Command::new("xdg-open").arg(&dir).spawn()
             };
             if let Err(e) = opened {
-                ui.set_status(format!("Cannot open {}: {e}", dir.display()).into());
+                show_error(ui, format!("Cannot open {}: {e}", dir.display()));
             }
         });
     });
@@ -441,7 +441,7 @@ fn wire_settings(ui: &AppWindow) {
             });
             refresh_games(ui);
             if let Err(e) = saved {
-                ui.set_status(format!("Could not save the settings: {e}").into());
+                show_error(ui, format!("Could not save the settings: {e}"));
             }
         })
     });
@@ -566,7 +566,7 @@ fn wire_archive(ui: &AppWindow) {
                     }
                     .into(),
                 ),
-                Err(e) => ui.set_status(format!("{e:#}").into()),
+                Err(e) => show_error(ui, format!("{e:#}")),
             }
             show_write_target(ui);
         })

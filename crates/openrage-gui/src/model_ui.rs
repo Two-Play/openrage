@@ -169,7 +169,7 @@ pub(crate) fn open_model_with_animation(ui: &AppWindow, model: String, ycd: Stri
                 viewer::open_with(&ui, viewer::Content::Model(Arc::new(m)), labels, Some(ycd));
                 ui.set_status(SharedString::new());
             }
-            Err(e) => ui.set_status(format!("Cannot open {model}: {e:#}").into()),
+            Err(e) => show_error(&ui, format!("Cannot open {model}: {e:#}")),
         });
     });
 }

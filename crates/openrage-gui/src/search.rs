@@ -72,7 +72,7 @@ pub(crate) fn start_search(ui: &AppWindow, query: String, record: bool) {
         }
         let _ = weak.upgrade_in_event_loop(move |ui| match result {
             Ok(results) => show_search_results(&ui, query, results, ms, record),
-            Err(e) => ui.set_status(format!("Search failed: {e}").into()),
+            Err(e) => show_error(&ui, format!("Search failed: {e}")),
         });
     });
 }
