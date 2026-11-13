@@ -117,6 +117,10 @@ impl GameFiles for GameDir {
         Ok(to_plugin_model(&*self.loaded_model(vpath)?))
     }
 
+    fn xml(&self, vpath: &str) -> Result<String> {
+        Ok(crate::metadata::load(&self.dir, self.keys.clone(), vpath)?.text)
+    }
+
     fn build_model(&self, template: &str, model: &Model) -> Result<Vec<u8>> {
         use rage_formats::ydr_write;
         let Node::ArchiveFile(rpf, id) = self.resolve(template)? else {

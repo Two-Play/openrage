@@ -59,6 +59,10 @@ pub trait GameFiles: Send + Sync {
     fn texture(&self, vpath: &str, name: &str) -> Result<ImageView> {
         bail!("{vpath}: textures of {name} cannot be read here")
     }
+    /// A metadata file as XML (see `load-xml`).
+    fn xml(&self, vpath: &str) -> Result<String> {
+        bail!("{vpath}: metadata cannot be read here")
+    }
     /// A model file built from `model` on top of `template` (see `build-model`).
     fn build_model(&self, template: &str, model: &Model) -> Result<Vec<u8>> {
         let _ = model;
@@ -501,6 +505,11 @@ impl wit_host::Host for Ctx {
     fn load_texture(&mut self, vpath: String, name: String) -> Result<ImageView, String> {
         let vpath = self.readable(&vpath)?;
         self.files.texture(&vpath, &name).map_err(|e| format!("{e:#}"))
+    }
+
+    fn load_xml(&mut self, vpath: String) -> Result<String, String> {
+        let vpath = self.readable(&vpath)?;
+        self.files.xml(&vpath).map_err(|e| format!("{e:#}"))
     }
 
     fn build_model(&mut self, template: String, model: Model) -> Result<Vec<u8>, String> {

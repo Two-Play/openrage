@@ -30,6 +30,7 @@ memory and a time limit. The same `.wasm` runs on Linux and Windows.
 | **Batch** actions on whole folders and archives, with progress and cancel | ✅ (`batch = true`) |
 | **Ask for files** from disk for an action, e.g. a patch to apply | ✅ (`pick`) |
 | **Read** any file of the game (archives included, with the changes in `mods/`) | ✅ with the `read-game` permission |
+| **Metadata as XML** (`.ymt`, `.ymap`, `.ytyp`, `.meta`, PSO, RBF): no binary parsing in the plugin | ✅ (`load-xml`, read only) |
 | **Change** game files: into the `mods` folder, as one step the user can undo | ✅ with `write-mods`, in `modify` actions |
 | openFormats export, importers into game formats | planned |
 
@@ -205,6 +206,10 @@ OpenRAGE offers:
   texture and a colour. Same permission rule as `read-file`.
 - `load-texture(vpath, name)`: a texture as RGBA pixels: from a texture dictionary (`.ytd`, `.wtd`), or a texture of a
   model (embedded, or in the dictionaries next to it that the explorer uses, such as `vehshare.ytd`).
+- `load-xml(vpath)`: a metadata file (`.ymt`, `.ymap`, `.ytyp`, `.meta`, PSO, RBF and the other files the explorer
+  shows as XML) as that XML text, so plugins need not parse the binary formats. Writing XML back into a game file is
+  not supported yet. Same permission rule as `read-file`. Added to API 0.3 after its first release: OpenRAGE versions
+  without it refuse plugins that use it.
 - `build-model(template, model)`: a game model file built from `model` on top of the model at `template` (so far a
   GTA V Enhanced `.ydr`): the template keeps its settings, OpenRAGE writes the meshes (normals if missing, tangents,
   bounds). Every material gets its own copy of a template shader: in order, or shader `n` for a material named `#n`.
