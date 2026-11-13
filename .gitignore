@@ -1,4 +1,5 @@
 /target
+/plugins/target
 
 # Never commit game data or key material.
 *.rpf

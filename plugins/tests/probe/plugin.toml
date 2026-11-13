@@ -1,0 +1,17 @@
+# Test plugin used by crates/openrage-plugins/tests; not shipped.
+id = "probe"
+name = "Probe"
+version = "0.1.0"
+api = "0.1"
+license = "MIT OR Apache-2.0"
+wasm = "probe.wasm"
+permissions = ["read-game"]
+
+[[preview]]
+extensions = ["tree", "table", "image", "badimage", "probe"]
+
+[[actions]]
+id = "run"
+title = "Run a probe"
+kind = "tool"
+extensions = ["*"]

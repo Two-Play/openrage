@@ -1,6 +1,6 @@
 +++
 title = "User guide"
-description = "Everything the OpenRAGE explorer can do: search, textures, models, audio, metadata, collisions, paths, cutscenes, scripts, game text, editing archives, .oiv packages and the mods folder."
+description = "Everything the OpenRAGE explorer can do: search, textures, models, audio, metadata, collisions, paths, cutscenes, scripts, game text, editing archives, .oiv packages, the mods folder and plugins."
 
 [extra]
 lead = "Everything the explorer can do, format by format."
@@ -139,6 +139,20 @@ OpenRAGE understands the `mods` folder used by OpenIV.asi, where a file at `mods
 - **Mods** (toolbar toggle) shows the game the way it sees itself: replaced files are marked *mod*, files only in `mods` *new*, and folders containing mods *has mods*.
 - Inside a modded archive every folder is compared with the original: entries are marked *added* (green), *changed* (orange) or *removed* (red, shown greyed out with a preview of the original).
 - **Changes** lists every difference of all mods at once, across nested archives — including complete copies of game archives that contain no change at all and can simply be deleted.
+
+## Plugins
+
+Plugins add previews and actions for file types OpenRAGE does not handle itself. They are WebAssembly programs that
+run in a sandbox: a plugin sees only the files you open with it and, if you allow it, reads the game's files. It cannot
+change anything, open other files or go online, and a plugin that hangs or crashes is stopped without taking OpenRAGE
+with it.
+
+Put a plugin's folder into your plugin folder (`~/.config/openrage/plugins` on Linux, `%APPDATA%\openrage\plugins` on
+Windows, or `plugins` next to the program). New plugins are off until you enable them; enabling shows the permissions
+the plugin asks for. For now, plugins are used from the [command line](@/cli.md#plugins); the explorer follows (preview
+pane, context menu and a plugin page in the settings).
+
+Want to write one? See [Writing plugins](@/plugins.md).
 
 ## GTA IV
 

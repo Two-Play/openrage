@@ -1,0 +1,10 @@
+[package]
+name = "openrage-plugin-sdk"
+description = "Write OpenRAGE plugins in Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wit-bindgen = "0.63"

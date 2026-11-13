@@ -1,6 +1,6 @@
 +++
 title = "Command line"
-description = "The openrage command-line tool: browse, search and extract archives, convert formats, edit archives, install .oiv packages and verify the whole game."
+description = "The openrage command-line tool: browse, search and extract archives, convert formats, edit archives, install .oiv packages, run plugins and verify the whole game."
 
 [extra]
 lead = "`openrage` comes in the same download as the GUI: for scripts, automation and everyone who prefers a terminal."
@@ -101,6 +101,22 @@ openrage undo                                  # revert the newest change
 openrage mods                                  # files in the OpenIV mods folder
 openrage mods --changes [--deep]               # every added/removed/modified entry
 ```
+
+## Plugins
+
+```
+openrage plugin list                           # installed plugins, their state, the plugin folders
+openrage plugin info strings                   # what a plugin adds and the permissions it asks for
+openrage plugin enable strings                 # enable it, granting its permissions (asks first; -y to skip)
+openrage plugin disable strings
+openrage plugin preview x64a.rpf/data/x.dat    # show a file the way a plugin previews it
+openrage plugin preview --file x.bin --plugin strings
+openrage plugin preview --file x.xyz --png x.png   # save an image preview
+openrage plugin run strings export x64a.rpf/data/x.dat --out exported/
+```
+
+Previews and actions also work without a game set up, on files from disk (`--file`). See
+[Writing plugins](@/plugins.md) for the plugin folders and how to write your own.
 
 ## About and licenses
 

@@ -1,0 +1,25 @@
+[package]
+name = "openrage-plugins"
+description = "Plugin host of OpenRAGE: finds, checks and runs sandboxed WebAssembly plugins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+dirs.workspace = true
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+# Only what running components needs: no profiling (ittapi), cache, WAT
+# parser or debugger support.
+wasmtime = { version = "50", default-features = false, features = [
+    "cranelift",
+    "component-model",
+    "runtime",
+    "std",
+    "parallel-compilation",
+    "anyhow",
+] }
+# The WASI interfaces Rust's standard library imports. Plugins get them
+# without files, network, environment or arguments (see runtime.rs).
+wasmtime-wasi = { version = "50", default-features = false, features = ["p2"] }

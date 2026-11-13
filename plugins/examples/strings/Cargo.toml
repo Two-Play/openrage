@@ -1,0 +1,13 @@
+[package]
+name = "strings"
+description = "OpenRAGE example plugin: the readable strings in any file"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+openrage-plugin-sdk.workspace = true

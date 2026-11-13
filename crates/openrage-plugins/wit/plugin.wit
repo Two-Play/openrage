@@ -1,0 +1,127 @@
+// The interface between OpenRAGE and its plugins.
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//
+// This file is under MIT OR Apache-2.0 (unlike the rest of OpenRAGE, which is
+// GPL-3.0-only), so plugins built against it may use any licence.
+//
+// The API is not stable before 1.0: a plugin names the version it was built
+// for (`api` in plugin.toml) and OpenRAGE refuses plugins for another one.
+
+package openrage:plugin@0.1.0;
+
+interface types {
+    /// The game that is open.
+    enum game {
+        gta5,
+        rdr2,
+        gta4,
+        /// No game is open, or one OpenRAGE does not know.
+        other,
+    }
+
+    /// A file or folder in a directory listing.
+    record dir-entry {
+        name: string,
+        is-dir: bool,
+        /// Size in bytes once read (0 for folders).
+        size: u64,
+    }
+
+    /// One line of the info panel next to the preview.
+    record info {
+        key: string,
+        value: string,
+    }
+
+    /// A node of a tree view. Nodes are listed parents first; `parent` is the
+    /// index of the parent node, or none for a top-level node.
+    record tree-node {
+        parent: option<u32>,
+        label: string,
+        /// Shown next to the label; may be empty.
+        value: string,
+    }
+
+    record table {
+        columns: list<string>,
+        /// Each row has one cell per column.
+        rows: list<list<string>>,
+    }
+
+    /// An image as 8-bit RGBA pixels, row by row from the top
+    /// (`width * height * 4` bytes).
+    record image {
+        width: u32,
+        height: u32,
+        rgba: list<u8>,
+    }
+
+    /// How a file is shown in the preview pane.
+    variant view {
+        text(string),
+        tree(list<tree-node>),
+        table(table),
+        image(image),
+    }
+
+    record preview {
+        info: list<info>,
+        view: option<view>,
+    }
+
+    /// A file the user picked to run an action on.
+    record input {
+        /// Its path in the game (as shown in the address bar), or its file
+        /// name when it comes from outside the game.
+        vpath: string,
+        data: list<u8>,
+    }
+
+    /// A file an action produced. OpenRAGE saves it where the user chooses;
+    /// `name` may contain `/` for sub-folders but no `..`.
+    record output-file {
+        name: string,
+        data: list<u8>,
+    }
+
+    enum level {
+        debug,
+        info,
+        warn,
+        error,
+    }
+}
+
+/// What OpenRAGE offers a plugin.
+interface host {
+    use types.{game, dir-entry, level};
+
+    /// The game that is open.
+    current-game: func() -> game;
+
+    /// Reads a file of the game (with the changes in `mods/`), by its path
+    /// relative to the game folder, e.g. `x64a.rpf/levels/gta5/x.ytd`.
+    /// Needs the `read-game` permission.
+    read-file: func(vpath: string) -> result<list<u8>, string>;
+
+    /// Lists a folder of the game ("" for the game folder itself).
+    /// Needs the `read-game` permission.
+    list-dir: func(vpath: string) -> result<list<dir-entry>, string>;
+
+    /// Writes a line to OpenRAGE's log (shown by `openrage plugin`).
+    log: func(level: level, message: string);
+}
+
+world plugin {
+    use types.{preview, input, output-file};
+
+    import host;
+
+    /// Shows a file of a type the plugin registered with `[[preview]]`.
+    /// `vpath` names the file; `data` is its content.
+    export preview: func(vpath: string, data: list<u8>) -> result<preview, string>;
+
+    /// Runs one of the plugin's `[[action]]`s on the files the user picked.
+    export run-action: func(action: string, inputs: list<input>) -> result<list<output-file>, string>;
+}

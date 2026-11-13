@@ -77,7 +77,11 @@ Credits for format knowledge and ported code go into `NOTICE.md` by hand; the Ab
 | `rage-formats` | game formats: textures, models, audio, animations, metadata (meta/PSO/RBF → XML), text tables |
 | `rage-mods` | OpenIV `mods` folder: overlay resolution, folder comparison, change lists |
 | `openrage-app` | settings, key setup, game detection, extraction, model and format logic shared by CLI and GUI |
+| `openrage-plugins` | plugin host: manifests, discovery, permissions, the wasmtime sandbox; the plugin interface (`wit/plugin.wit`) |
 | `openrage-cli` | the `openrage` command-line tool |
 | `openrage-gui` | the Slint explorer (`openrage-gui`) |
+
+`plugins/` is a separate Cargo workspace built for `wasm32-wasip2`: the plugin SDK, the example plugins and a test
+plugin. `cargo test` builds them and runs them in the host (`crates/openrage-plugins/tests`).
 
 The UI language is English; the GUI is built with Slint's translation support so further languages can be added.
