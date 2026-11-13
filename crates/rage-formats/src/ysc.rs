@@ -7,6 +7,25 @@
 //! by `(code length + index) % 64`), name hash `0x58`, name `0x60`, string
 //! pages `0x68`, string size `0x70`.
 
+/// Why a compiled script (GTA V `.ysc` or GTA IV `.sco`) could not be read
+/// or disassembled.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ScriptError {
+    #[error("not a GTA IV script")]
+    NotScript,
+    #[error("script needs {need} bytes, the file has {have}")]
+    Truncated { need: usize, have: usize },
+    #[error("the script is encrypted and no key is loaded")]
+    NoKey,
+    #[error("unknown opcode {opcode} at {at:#x}")]
+    UnknownOpcode { opcode: u8, at: usize },
+    #[error("{name} at {at:#x} runs past the end")]
+    PastEnd { name: String, at: usize },
+    #[error("{name} at {at:#x} points into an instruction ({target:#x})")]
+    BadTarget { name: String, at: usize, target: usize },
+}
+
 use rage_resource::{Resource, ResourceError};
 
 const PAGE: usize = 0x4000;
@@ -289,22 +308,22 @@ impl Script {
     }
 
     /// Decodes the code with the detected table (or the current one).
-    pub fn disassemble(&self) -> Result<Vec<Instruction>, String> {
+    pub fn disassemble(&self) -> Result<Vec<Instruction>, ScriptError> {
         self.disassemble_with(self.table.unwrap_or(Table::Current))
     }
 
     /// Decodes the code. Fails at an unknown opcode or an instruction that runs
     /// past the end (which means the opcode table does not fit).
-    pub fn disassemble_with(&self, t: Table) -> Result<Vec<Instruction>, String> {
+    pub fn disassemble_with(&self, t: Table) -> Result<Vec<Instruction>, ScriptError> {
         let opcodes = table(t);
         let c = &self.code;
         let mut out = Vec::new();
         let mut pc = 0;
         while pc < c.len() {
             let op = c[pc];
-            let (name, kind) = *opcodes.get(op as usize).ok_or_else(|| format!("unknown opcode {op} at {pc:#x}"))?;
-            let at = |n: usize| -> Result<&[u8], String> {
-                c.get(pc + 1..pc + 1 + n).ok_or_else(|| format!("{name} at {pc:#x} runs past the end"))
+            let (name, kind) = *opcodes.get(op as usize).ok_or(ScriptError::UnknownOpcode { opcode: op, at: pc })?;
+            let at = |n: usize| -> Result<&[u8], ScriptError> {
+                c.get(pc + 1..pc + 1 + n).ok_or_else(|| ScriptError::PastEnd { name: name.to_owned(), at: pc })
             };
             let mut targets = Vec::new();
             let mut function = None;
@@ -400,7 +419,7 @@ impl Script {
 
     /// Disassembly as text: functions with their names, labels at jump
     /// targets, strings and native hashes resolved.
-    pub fn listing(&self, native_name: impl Fn(u64) -> Option<String>) -> Result<String, String> {
+    pub fn listing(&self, native_name: impl Fn(u64) -> Option<String>) -> Result<String, ScriptError> {
         let code = self.disassemble()?;
         let mut labels: Vec<usize> = code.iter().flat_map(|i| i.targets.iter().copied()).collect();
         labels.sort_unstable();
@@ -441,18 +460,18 @@ impl Script {
     }
 
     /// Checks the disassembly: every jump and call lands on an instruction.
-    pub fn check(&self) -> Result<usize, String> {
+    pub fn check(&self) -> Result<usize, ScriptError> {
         self.check_with(self.table.unwrap_or(Table::Current))
     }
 
-    fn check_with(&self, t: Table) -> Result<usize, String> {
+    fn check_with(&self, t: Table) -> Result<usize, ScriptError> {
         let code = self.disassemble_with(t)?;
         let starts: Vec<usize> = code.iter().map(|i| i.offset).collect();
         for ins in &code {
             for t in &ins.targets {
                 // Jumping to the very end (after a function's last LEAVE) is fine.
                 if *t != self.code.len() && starts.binary_search(t).is_err() {
-                    return Err(format!("{} at {:#x} points into an instruction ({t:#x})", ins.name, ins.offset));
+                    return Err(ScriptError::BadTarget { name: ins.name.to_owned(), at: ins.offset, target: *t });
                 }
             }
         }

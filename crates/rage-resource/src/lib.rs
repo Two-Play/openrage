@@ -13,6 +13,7 @@ const SYSTEM_BASE: u64 = 0x5000_0000;
 const GRAPHICS_BASE: u64 = 0x6000_0000;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ResourceError {
     #[error("pointer {0:#x} is not a valid resource address")]
     BadPointer(u64),

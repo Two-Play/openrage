@@ -14,8 +14,11 @@ use crate::xml::{self, Writer};
 pub const MAGIC: &[u8; 4] = b"RBF0";
 
 #[derive(Debug, thiserror::Error)]
-#[error("invalid RBF file: {0}")]
-pub struct RbfError(String);
+#[non_exhaustive]
+pub enum RbfError {
+    #[error("invalid RBF file: {0}")]
+    Invalid(String),
+}
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -65,7 +68,7 @@ struct Reader<'a> {
 
 impl Reader<'_> {
     fn take(&mut self, n: usize) -> Result<&[u8], RbfError> {
-        let s = self.d.get(self.pos..self.pos + n).ok_or_else(|| RbfError("unexpected end of file".into()))?;
+        let s = self.d.get(self.pos..self.pos + n).ok_or_else(|| RbfError::Invalid("unexpected end of file".into()))?;
         self.pos += n;
         Ok(s)
     }
@@ -90,7 +93,7 @@ impl Reader<'_> {
 /// Parses the file into its root element.
 pub fn parse(data: &[u8]) -> Result<Element, RbfError> {
     if !is_rbf(data) {
-        return Err(RbfError("missing RBF0 header".into()));
+        return Err(RbfError::Invalid("missing RBF0 header".into()));
     }
     let mut r = Reader { d: data, pos: 4 };
     let mut names: Vec<String> = Vec::new();
@@ -100,9 +103,9 @@ pub fn parse(data: &[u8]) -> Result<Element, RbfError> {
         match index {
             0xFF => {
                 if r.u8()? != 0xFF {
-                    return Err(RbfError("bad close tag".into()));
+                    return Err(RbfError::Invalid("bad close tag".into()));
                 }
-                let done = stack.pop().ok_or_else(|| RbfError("close tag without element".into()))?;
+                let done = stack.pop().ok_or_else(|| RbfError::Invalid("close tag without element".into()))?;
                 match stack.last_mut() {
                     Some(parent) => parent.add(Value::Element(done)),
                     None => return Ok(done),
@@ -110,13 +113,13 @@ pub fn parse(data: &[u8]) -> Result<Element, RbfError> {
             }
             0xFD => {
                 if r.u8()? != 0xFF {
-                    return Err(RbfError("bad content marker".into()));
+                    return Err(RbfError::Invalid("bad content marker".into()));
                 }
                 let n = r.u32()? as usize;
                 let bytes = r.take(n)?.to_vec();
                 stack
                     .last_mut()
-                    .ok_or_else(|| RbfError("content outside element".into()))?
+                    .ok_or_else(|| RbfError::Invalid("content outside element".into()))?
                     .children
                     .push(Value::Bytes(bytes));
             }
@@ -125,8 +128,10 @@ pub fn parse(data: &[u8]) -> Result<Element, RbfError> {
                 if index as usize == names.len() {
                     names.push(r.string()?);
                 }
-                let name =
-                    names.get(index as usize).cloned().ok_or_else(|| RbfError(format!("unknown name {index}")))?;
+                let name = names
+                    .get(index as usize)
+                    .cloned()
+                    .ok_or_else(|| RbfError::Invalid(format!("unknown name {index}")))?;
                 let value = match kind {
                     0x00 => {
                         let _ = (r.u16()?, r.u16()?);
@@ -140,13 +145,13 @@ pub fn parse(data: &[u8]) -> Result<Element, RbfError> {
                     0x40 => Value::Float(name, r.f32()?),
                     0x50 => Value::Float3(name, [r.f32()?, r.f32()?, r.f32()?]),
                     0x60 => Value::Str(name, r.string()?),
-                    t => return Err(RbfError(format!("unsupported data type {t:#04x}"))),
+                    t => return Err(RbfError::Invalid(format!("unsupported data type {t:#04x}"))),
                 };
-                stack.last_mut().ok_or_else(|| RbfError("value outside element".into()))?.add(value);
+                stack.last_mut().ok_or_else(|| RbfError::Invalid("value outside element".into()))?.add(value);
             }
         }
     }
-    Err(RbfError("unexpected end of file".into()))
+    Err(RbfError::Invalid("unexpected end of file".into()))
 }
 
 /// Parses the file and writes it as XML (CodeWalker-style).
