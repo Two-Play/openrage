@@ -3,7 +3,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bump when the schema or the indexing rules change; older databases are rebuilt.
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "2";
 
 pub fn prepare(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
