@@ -61,10 +61,7 @@ fn wire_navigation(ui: &AppWindow) {
         with_ui(&w, |ui| {
             let Some(vpath) = with_app(|a| a.tree.nodes.get(i as usize).map(|n| n.vpath.clone())) else { return };
             match action.as_str() {
-                "extract" => {
-                    navigate(ui, &vpath, true);
-                    start_extract(ui);
-                }
+                "extract" => navigate_then(ui, &vpath, true, start_extract),
                 "copy-path" => {
                     let msg = match copy_to_clipboard(&vpath) {
                         Ok(()) => format!("Copied {vpath}"),
@@ -775,15 +772,18 @@ pub(crate) fn row_action(ui: &AppWindow, row: usize, action: &str) {
                 _ => {
                     if let Some(v) = vpath {
                         let folder = browser::parent(&v).unwrap_or_default();
-                        navigate(ui, &folder, true);
                         let file = v.rsplit('/').next().unwrap_or(&v).to_owned();
-                        let row = with_app(|a| {
-                            let l = a.listing.as_ref()?;
-                            a.visible.iter().position(|&i| l.items[i].name.eq_ignore_ascii_case(&file))
+                        navigate_then(ui, &folder, true, move |ui| {
+                            let row = with_app(|a| {
+                                let l = a.listing.as_ref()?;
+                                a.visible
+                                    .iter()
+                                    .position(|&i| l.items.get(i).is_some_and(|it| it.name.eq_ignore_ascii_case(&file)))
+                            });
+                            if let Some(row) = row {
+                                ui.invoke_select_row(row as i32);
+                            }
                         });
-                        if let Some(row) = row {
-                            ui.invoke_select_row(row as i32);
-                        }
                     }
                 }
             }

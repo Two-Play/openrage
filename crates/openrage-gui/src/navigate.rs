@@ -50,23 +50,98 @@ pub(crate) fn rebuild_tree(ui: &AppWindow) {
     refresh_tree(ui, None);
 }
 
+/// Opens a folder (or archive) in the file list. Listing it can take a while
+/// (a nested archive, a texture dictionary or an audio container is decoded),
+/// so that runs off the UI thread: the window stays responsive, a slow folder
+/// shows "Opening …", and a newer navigation drops the result of an older one.
 pub(crate) fn navigate(ui: &AppWindow, path: &str, record: bool) {
-    if let Some(query) = browser::search_query(path) {
-        start_search(ui, query.to_owned(), record);
+    navigate_then(ui, path, record, |_| {});
+}
+
+/// [`navigate`], then `then` once the folder is shown (not when listing it
+/// failed or a newer navigation took its place).
+pub(crate) fn navigate_then(ui: &AppWindow, path: &str, record: bool, then: impl FnOnce(&AppWindow) + Send + 'static) {
+    if navigate_special(ui, path, record) {
+        then(ui);
         return;
     }
-    if path.trim() == browser::CHANGES_PATH {
-        start_changes(ui, record);
-        return;
-    }
-    if path.trim() == browser::HISTORY_PATH {
-        show_history(ui, record);
-        return;
-    }
-    let Some((dir, keys, overlay)) = with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone(), a.overlay))) else {
+    let Some((dir, keys, overlay, counter)) =
+        with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone(), a.overlay, Arc::clone(&a.navigate_generation))))
+    else {
         return;
     };
-    match browser::list(&dir, path, keys.clone(), overlay) {
+    let generation = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    let done = Arc::new(AtomicBool::new(false));
+    {
+        let (counter, done, weak) = (Arc::clone(&counter), Arc::clone(&done), ui.as_weak());
+        let label = browser::normalize(path);
+        let label = if label.is_empty() { "the game folder".to_owned() } else { label };
+        slint::Timer::single_shot(Duration::from_millis(150), move || {
+            if !done.load(Ordering::Relaxed)
+                && counter.load(Ordering::Relaxed) == generation
+                && let Some(ui) = weak.upgrade()
+            {
+                ui.set_status(format!("Opening {label}…").into());
+            }
+        });
+    }
+    let weak = ui.as_weak();
+    let path = path.to_owned();
+    std::thread::spawn(move || {
+        let result = browser::list(&dir, &path, keys.clone(), overlay);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            done.store(true, Ordering::Relaxed);
+            if counter.load(Ordering::Relaxed) != generation {
+                return;
+            }
+            if show_listing(&ui, result, &dir, keys, overlay, record) {
+                then(&ui);
+            }
+        });
+    });
+}
+
+/// [`navigate`] on the UI thread, for code that reads the new listing right
+/// away (after writing into an archive, after undo).
+pub(crate) fn navigate_now(ui: &AppWindow, path: &str, record: bool) {
+    if navigate_special(ui, path, record) {
+        return;
+    }
+    let Some((dir, keys, overlay)) = with_app(|a| {
+        // Drops the result of a navigation still running.
+        a.navigate_generation.fetch_add(1, Ordering::Relaxed);
+        a.game_dir.clone().map(|d| (d, a.keys.clone(), a.overlay))
+    }) else {
+        return;
+    };
+    let result = browser::list(&dir, path, keys.clone(), overlay);
+    show_listing(ui, result, &dir, keys, overlay, record);
+}
+
+/// Search results, changes and history are not folders; true when `path` was one.
+fn navigate_special(ui: &AppWindow, path: &str, record: bool) -> bool {
+    if let Some(query) = browser::search_query(path) {
+        start_search(ui, query.to_owned(), record);
+    } else if path.trim() == browser::CHANGES_PATH {
+        start_changes(ui, record);
+    } else if path.trim() == browser::HISTORY_PATH {
+        show_history(ui, record);
+    } else {
+        return false;
+    }
+    true
+}
+
+/// Shows a listed folder (or why it could not be listed); true when shown.
+fn show_listing(
+    ui: &AppWindow,
+    result: Result<(Listing, Option<String>), RpfError>,
+    dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    overlay: bool,
+    record: bool,
+) -> bool {
+    let shown = match result {
         Ok((listing, select)) => {
             let vpath = listing.vpath.clone();
             with_app(|a| {
@@ -80,7 +155,7 @@ pub(crate) fn navigate(ui: &AppWindow, path: &str, record: bool) {
             ui.set_filter(SharedString::new());
             ui.set_search_mode(false);
             set_location(ui, &vpath);
-            let tree_idx = with_app(|a| a.tree.reveal(&vpath, &dir, keys, overlay));
+            let tree_idx = with_app(|a| a.tree.reveal(&vpath, dir, keys, overlay));
             refresh_tree(ui, tree_idx);
             ui.set_location_title(with_app(|a| a.listing.as_ref().map(location_title)).unwrap_or_default().into());
             refresh_files(ui, select.as_deref());
@@ -89,11 +164,19 @@ pub(crate) fn navigate(ui: &AppWindow, path: &str, record: bool) {
             }
             ui.set_status(SharedString::new());
             start_folder_diff(ui);
+            true
         }
-        Err(RpfError::KeysRequired(_)) => show_setup(ui, true),
-        Err(e) => ui.set_status(format!("{e}").into()),
-    }
+        Err(RpfError::KeysRequired(_)) => {
+            show_setup(ui, true);
+            false
+        }
+        Err(e) => {
+            ui.set_status(format!("{e}").into());
+            false
+        }
+    };
     update_nav_buttons(ui);
+    shown
 }
 
 pub(crate) fn update_nav_buttons(ui: &AppWindow) {

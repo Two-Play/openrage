@@ -89,6 +89,9 @@ struct App {
     tree: Tree,
     history: History,
     preview_generation: Arc<AtomicU64>,
+    /// Bumped by each navigation; a folder listed in the background is shown
+    /// only if no newer navigation started meanwhile.
+    navigate_generation: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
     busy: bool,
     /// Text language for search hits in localized files (None = all).
@@ -168,6 +171,7 @@ fn main() -> anyhow::Result<()> {
             tree: Tree::default(),
             history: History::default(),
             preview_generation: Arc::new(AtomicU64::new(0)),
+            navigate_generation: Arc::new(AtomicU64::new(0)),
             cancel: Arc::new(AtomicBool::new(false)),
             busy: false,
             language: game_language_from_locale().map(str::to_owned),
