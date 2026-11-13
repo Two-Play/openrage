@@ -1,6 +1,8 @@
 //! OpenRAGE graphical explorer.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
+// Slint's generated code allows `unsafe` for itself; our own code may not use it.
+#![deny(unsafe_code)]
 
 mod accent;
 mod audio;
@@ -24,10 +26,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use openrage_app::config::Config;
+use openrage_app::detect::{self, is_rdr2_dir};
 use openrage_app::extract::{extract_entry, human_size};
+use openrage_app::gta4::is_gta4_dir;
 use openrage_app::install::{self, Op};
 use openrage_app::setup::{self, KeyBlobRequired, KeySource};
-use openrage_app::{detect, game_language_from_locale, index_path, load_keys, suggest};
+use openrage_app::{game_language_from_locale, index_path, load_keys, suggest};
 use rage_crypto::GtaVKeys;
 use rage_index::{EntryTag, HitReason, Index, LANGUAGES};
 use rage_rpf::vfs::{self, Node};
@@ -934,11 +938,9 @@ fn wire_callbacks(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_accent_chosen(move |mode, color| {
         accent::set(mode, color);
-        with_app(|a| {
-            a.cfg.accent = Some(accent::to_setting(mode, color));
-            let _ = a.cfg.save();
-        });
+        with_app(|a| a.cfg.accent = Some(accent::to_setting(mode, color)));
         if let Some(ui) = w.upgrade() {
+            save_settings(&ui);
             accent::apply(&ui);
         }
         viewer::set_accent();
@@ -948,11 +950,10 @@ fn wire_callbacks(ui: &AppWindow) {
     });
     ui.on_color_hex(accent::hex_string);
     ui.on_parse_hex(|s| accent::parse_hex(&s).unwrap_or(slint::Color::from_argb_u8(0, 0, 0, 0)));
-    ui.on_theme_changed(|mode| {
-        with_app(|a| {
-            a.cfg.theme = Some(theme_name(mode).to_owned());
-            let _ = a.cfg.save();
-        });
+    let w = ui.as_weak();
+    ui.on_theme_changed(move |mode| {
+        with_app(|a| a.cfg.theme = Some(theme_name(mode).to_owned()));
+        with_ui(&w, save_settings);
         viewer::set_theme(mode);
         editor::set_theme(mode);
         xmlview::set_theme(mode);
@@ -1061,11 +1062,10 @@ fn wire_callbacks(ui: &AppWindow) {
             }
         })
     });
-    ui.on_history_window_changed(|on| {
-        with_app(|a| {
-            a.cfg.history_window = Some(on);
-            let _ = a.cfg.save();
-        })
+    let w = ui.as_weak();
+    ui.on_history_window_changed(move |on| {
+        with_app(|a| a.cfg.history_window = Some(on));
+        with_ui(&w, save_settings);
     });
     let w = ui.as_weak();
     ui.on_install_oiv(move || with_ui(&w, pick_package));
@@ -1141,7 +1141,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
     if let Some(index) = action.strip_prefix("plugin:").and_then(|i| i.parse::<usize>().ok()) {
         let target = with_app(|a| {
             let listing = a.listing.as_ref()?;
-            let item = &listing.items[*a.visible.get(row)?];
+            let item = listing.items.get(*a.visible.get(row)?)?;
             let vpath = item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name));
             Some((item.name.clone(), vpath, plugin_target(item)?))
         });
@@ -1159,7 +1159,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "edit" | "system" => {
             let vpath = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = vpath {
@@ -1173,7 +1173,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "swf" => {
             let vpath = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = vpath {
@@ -1183,7 +1183,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "text-export" => {
             let vpath = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = vpath {
@@ -1193,7 +1193,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "xml-view" | "xml" => {
             let vpath = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = vpath {
@@ -1222,7 +1222,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "copy-hash" | "search-name" | "show-in-folder" => {
             let item = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some((item.name.clone(), item.vpath.clone()))
             });
             let Some((name, vpath)) = item else { return };
@@ -1256,7 +1256,7 @@ fn row_action(ui: &AppWindow, row: usize, action: &str) {
         "copy-name" | "copy-path" => {
             let text = with_app(|a| {
                 let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(row)?];
+                let item = listing.items.get(*a.visible.get(row)?)?;
                 Some(if action == "copy-name" {
                     item.name.clone()
                 } else {
@@ -1895,7 +1895,7 @@ fn select_row(ui: &AppWindow, row: usize) {
         let listing = a.listing.as_ref()?;
         let idx = *a.visible.get(row)?;
         a.selected = Some(idx);
-        let item = listing.items[idx].clone();
+        let item = listing.items.get(idx)?.clone();
         let source = match (&listing.location, item.entry) {
             (Location::History, _) => None,
             (_, None) if item.mark == Some(Mark::Removed) => {
@@ -2196,7 +2196,7 @@ fn run_plugin_action(ui: &AppWindow, action: plugins::ActionRef, vpath: String) 
             }
         }
         let start = format!("{title}…");
-        let _ = weak.upgrade_in_event_loop(move |ui| set_busy(&ui, true, start));
+        let _ = weak.upgrade_in_event_loop(move |ui| set_busy_cancellable(&ui, start));
         let mut last = Instant::now();
         let result = plugins::run(&action, &game, &vpath, &picked, &mut |done, total, path| {
             if last.elapsed() > Duration::from_millis(100) {
@@ -4470,6 +4470,12 @@ fn open_with_system(ui: &AppWindow, vpath: String) {
         }
     };
     let name = vpath.rsplit('/').next().unwrap_or("file").to_owned();
+    // Archive contents are untrusted: the system would run programs and
+    // scripts instead of showing them.
+    if openrage_app::plugins::is_executable(&name) {
+        ui.set_status(format!("{name} could run as a program; export it instead to look at it").into());
+        return;
+    }
     let result = (|| -> std::io::Result<PathBuf> {
         let dir = std::env::temp_dir().join("openrage-open").join(format!("{:x}", rage_core::hash::joaat(&vpath)));
         std::fs::create_dir_all(&dir)?;
@@ -4494,7 +4500,9 @@ fn open_with_system(ui: &AppWindow, vpath: String) {
         }
     };
     let launched = if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd").args(["/C", "start", ""]).arg(&path).spawn()
+        // Not `cmd /C start`: cmd.exe would interpret `&`, `|` and `^` in the
+        // file name (which comes from the archive) as commands.
+        std::process::Command::new("explorer.exe").arg(&path).spawn()
     } else if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(&path).spawn()
     } else {
@@ -5131,7 +5139,7 @@ fn start_extract(ui: &AppWindow) {
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let Some(out) = rfd::FileDialog::new().set_title("Extract to folder").pick_folder() else { return };
-        let _ = weak.upgrade_in_event_loop(|ui| set_busy(&ui, true, "Extracting…".into()));
+        let _ = weak.upgrade_in_event_loop(|ui| set_busy_cancellable(&ui, "Extracting…".into()));
         let mut last = Instant::now();
         let result = extract_entry(&rpf, id, &out, false, &cancel, &mut |s, path| {
             if last.elapsed() > Duration::from_millis(100) {
@@ -5172,7 +5180,7 @@ fn spawn_extract(
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let Some(out) = rfd::FileDialog::new().set_title("Extract to folder").pick_folder() else { return };
-        let _ = weak.upgrade_in_event_loop(|ui| set_busy(&ui, true, "Extracting…".into()));
+        let _ = weak.upgrade_in_event_loop(|ui| set_busy_cancellable(&ui, "Extracting…".into()));
         let mut last = Instant::now();
         let result = job(&out, &cancel, &mut |s, path| {
             if last.elapsed() > Duration::from_millis(100) {
@@ -5302,10 +5310,26 @@ fn filter_about(ui: &AppWindow, filter: &str) {
     }
 }
 
+/// Saves the settings; a failure shows in the status bar.
+fn save_settings(ui: &AppWindow) {
+    if let Err(e) = with_app(|a| a.cfg.save()) {
+        ui.set_status(format!("Could not save the settings: {e}").into());
+    }
+}
+
+/// Marks a task as running (or done) that cannot stop halfway: the status bar
+/// shows a spinner but no Cancel button.
 fn set_busy(ui: &AppWindow, busy: bool, status: String) {
     with_app(|a| a.busy = busy);
     ui.set_busy(busy);
+    ui.set_cancellable(false);
     ui.set_status(status.into());
+}
+
+/// Marks a task as running that watches `App::cancel`: the status bar offers Cancel.
+fn set_busy_cancellable(ui: &AppWindow, status: String) {
+    set_busy(ui, true, status);
+    ui.set_cancellable(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -5363,32 +5387,15 @@ fn open_game(ui: &AppWindow, index: usize, remember: bool) {
     }
 }
 
-/// Whether a folder is a GTA IV installation (the folder holding `GTAIV.exe`).
-fn is_gta4_dir(dir: &Path) -> bool {
-    openrage_app::gta4::is_gta4_dir(dir)
-}
-
-/// Whether a folder is a Red Dead Redemption 2 installation.
-fn is_rdr2_dir(dir: &Path) -> bool {
-    dir.join("RDR2.exe").is_file()
-}
-
 /// Loads the RDR2 archive keys (from `openrage rdr2-keys`) and the cached file
-/// names for archives opened through the virtual file system; false without keys.
+/// names for archives opened through the virtual file system; false without
+/// keys. A damaged key file is reported on stderr and counts as no keys (the
+/// setup then asks for them again).
 fn register_rdr2(game_dir: &Path) -> bool {
-    use rage_rpf::rpf8_keys::KeyStore;
-    use rage_rpf::rpf8_names::NameIndex;
-    let keys = KeyStore::default_path()
-        .and_then(|p| KeyStore::load(&p).ok().flatten())
-        .and_then(|s| s.to_keys())
-        .map(Arc::new);
-    let names = NameIndex::default_path(game_dir).and_then(|p| NameIndex::load(&p).ok().flatten()).map(Arc::new);
-    let ok = keys.is_some();
-    if let Some(n) = &names {
-        openrage_app::rdr2::register_names(n);
-    }
-    rage_rpf::rpf8::set_defaults(keys, names);
-    ok
+    openrage_app::rdr2::register(game_dir).unwrap_or_else(|e| {
+        eprintln!("RDR2 keys: {e:#}");
+        false
+    })
 }
 
 fn show_setup(ui: &AppWindow, can_cancel: bool) {

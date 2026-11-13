@@ -7,6 +7,7 @@
 //! Pointers inside the resource address these segments virtually:
 //! `0x5xxxxxxx` is an offset into system memory, `0x6xxxxxxx` into graphics
 //! memory, and `0` means null.
+#![forbid(unsafe_code)]
 
 const SYSTEM_BASE: u64 = 0x5000_0000;
 const GRAPHICS_BASE: u64 = 0x6000_0000;
@@ -22,6 +23,10 @@ pub enum ResourceError {
     #[error("{0}")]
     Format(String),
 }
+
+/// Most bytes the pages of one resource may inflate to; a crafted resource
+/// could otherwise exhaust memory (the game's largest are a few hundred MB).
+pub const MAX_PAGES: u64 = 2 << 30;
 
 /// Total size described by an RSC7 page flag word: a base page size
 /// (`0x200 << shift`) times a weighted count of pages in nine size buckets.
@@ -136,6 +141,7 @@ impl Resource {
         let word = |i: usize| u32::from_le_bytes(file[i..i + 4].try_into().unwrap());
         let mut pages = Vec::new();
         flate2::read::DeflateDecoder::new(&file[16..])
+            .take(MAX_PAGES)
             .read_to_end(&mut pages)
             .map_err(|e| ResourceError::Format(format!("cannot inflate resource: {e}")))?;
         Self::from_pages(word(4), word(8), word(12), pages)

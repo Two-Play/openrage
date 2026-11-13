@@ -134,3 +134,34 @@ fn reports_blockers() {
     assert!(install(&game, None, &pkg).is_err());
     assert!(!game.join("mods").exists());
 }
+
+#[test]
+fn refuses_paths_outside_the_game() {
+    let game = fake_game("traversal");
+    let escape = |content: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<package version="2.2" id="{{1}}" target="Five">
+  <metadata><name>Evil</name><version><major>1</major><minor>0</minor></version>
+    <author><displayName>Me</displayName></author><description>x</description></metadata>
+  <content>{content}</content>
+</package>"#
+        )
+    };
+    let cases = [
+        r#"<add source="x.txt">..\..\outside.txt</add>"#,
+        r#"<add source="x.txt">C:\Windows\x.txt</add>"#,
+        r#"<delete>../../outside.txt</delete>"#,
+        r#"<text path="../../../.bashrc" createIfNotExist="True"><add>evil</add></text>"#,
+        r#"<archive path="..\..\x.rpf" createIfNotExist="True" type="RPF7"><add source="x.txt">a.txt</add></archive>"#,
+        r#"<archive path="update\update.rpf" createIfNotExist="False" type="RPF7"><add source="x.txt">..\..\x.txt</add></archive>"#,
+    ];
+    for content in cases {
+        let pkg = package(&escape(content), &[("x.txt", b"x")]);
+        let plan = preview(&game, None, &pkg).unwrap();
+        assert!(plan.blockers.iter().any(|b| b.contains("leaves the game folder")), "{content}: {:?}", plan.blockers);
+        assert!(install(&game, None, &pkg).is_err(), "{content}");
+    }
+    assert!(!game.parent().unwrap().join("outside.txt").exists());
+    assert!(!game.join("mods").exists());
+}

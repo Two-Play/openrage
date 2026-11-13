@@ -49,6 +49,19 @@ fn norm(p: &str) -> String {
     p.replace('\\', "/").split('/').filter(|s| !s.is_empty() && *s != ".").collect::<Vec<_>>().join("/")
 }
 
+/// The path of a command if it could reach outside the folder it is meant for
+/// (`..`, a drive or an absolute path, control characters). Packages come from
+/// the internet; a step like that is never what a mod needs.
+fn escaping_path(cmd: &Command) -> Option<&str> {
+    let raw = match cmd {
+        Command::Add { target, .. } | Command::Delete { target } => target,
+        Command::Archive { path, .. } | Command::Text { path, .. } | Command::Xml { path, .. } => path,
+        Command::Pso { .. } | Command::Defragment { .. } => return None,
+    };
+    let n = norm(raw);
+    (!n.is_empty() && vfs::safe_relative_path(&n).is_none()).then_some(raw.as_str())
+}
+
 fn join(a: &str, b: &str) -> String {
     match (a.is_empty(), b.is_empty()) {
         (true, _) => b.to_owned(),
@@ -200,6 +213,12 @@ impl Run<'_> {
 
     fn walk(&mut self, commands: &[Command], scope: &Scope) -> Result<()> {
         for cmd in commands {
+            if let Some(raw) = escaping_path(cmd) {
+                self.report
+                    .blockers
+                    .push(format!("\"{raw}\" leaves the game folder; the package is not safe to install"));
+                continue;
+            }
             match cmd {
                 Command::Add { source, target } => {
                     let Some(data) = self.pkg.file(source).map(<[u8]>::to_vec) else {

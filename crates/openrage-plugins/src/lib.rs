@@ -7,6 +7,7 @@
 //! the user picked and, with the `read-game` permission, the game's files
 //! (read-only). They have no access to other files, the network or the
 //! environment, and each call has a memory and a time limit.
+#![forbid(unsafe_code)]
 
 pub mod manifest;
 pub mod package;

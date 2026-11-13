@@ -285,6 +285,8 @@ pub struct Rpf8 {
     keys: Option<Arc<Rdr2Keys>>,
     /// Names found in the game's files, handed on to nested archives.
     names: Option<Arc<crate::rpf8_names::NameIndex>>,
+    /// 0 for a file on disk, 1 for an archive inside it, and so on.
+    depth: u8,
 }
 
 impl Rpf8 {
@@ -399,8 +401,17 @@ impl Rpf8 {
         if entry.ext_id != 0 || entry.compression != Compression::None || entry.is_encrypted() {
             return Err(RpfError::NotAnArchive(display));
         }
+        // Strictly inside this archive: an entry spanning all of it would be
+        // this archive again, and walking it would never end.
+        if entry.offset == 0 || entry.size_on_disk >= self.size {
+            return Err(RpfError::NotAnArchive(display));
+        }
+        if self.depth >= crate::MAX_NESTING {
+            return Err(RpfError::TooDeep(display));
+        }
         let mut child =
             Self::open_range(&self.path, self.base + entry.offset, entry.size_on_disk, display, self.keys.clone())?;
+        child.depth = self.depth + 1;
         if let Some(names) = &self.names {
             child.set_names(Arc::clone(names));
         }
@@ -472,7 +483,7 @@ impl Rpf8 {
             }
             Some(entries)
         };
-        Ok(Rpf8 { path: path.to_path_buf(), base, display: name, header, size, entries, keys, names: None })
+        Ok(Rpf8 { path: path.to_path_buf(), base, display: name, header, size, entries, keys, names: None, depth: 0 })
     }
 
     pub fn header(&self) -> Header {
@@ -546,12 +557,21 @@ impl Rpf8 {
             Compression::Deflate => {
                 let mut out = Vec::new();
                 flate2::read::DeflateDecoder::new(&data[..])
+                    .take(entry.size().min(crate::MAX_UNPACKED))
                     .read_to_end(&mut out)
                     .map_err(|source| RpfError::Inflate { archive, entry: name, source })?;
                 Ok(out)
             }
             Compression::Oodle => {
-                let expected = entry.size() as usize;
+                let expected = entry.size();
+                if expected > crate::MAX_UNPACKED {
+                    return Err(RpfError::Inflate {
+                        archive,
+                        entry: name,
+                        source: std::io::Error::other(format!("implausible unpacked size {expected}")),
+                    });
+                }
+                let expected = expected as usize;
                 let mut out = vec![0u8; expected];
                 // oozextract panics on some damaged input instead of failing.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

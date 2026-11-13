@@ -2,39 +2,88 @@
 
 use super::package::{Condition, TextCmd};
 
-/// Delphi-style mask (as used by OpenIV): `*` any run, `?` any character,
-/// `[abc]` / `[a-z]` character sets; case-insensitive.
-fn mask_matches(mask: &str, text: &str) -> bool {
-    fn rec(m: &[char], t: &[char]) -> bool {
-        match m.first() {
-            None => t.is_empty(),
-            Some('*') => (0..=t.len()).any(|i| rec(&m[1..], &t[i..])),
-            Some('?') => !t.is_empty() && rec(&m[1..], &t[1..]),
-            Some('[') => {
-                let Some(close) = m.iter().position(|&c| c == ']') else {
-                    return !t.is_empty() && t[0] == '[' && rec(&m[1..], &t[1..]);
-                };
-                let Some(&c) = t.first() else { return false };
-                let set = &m[1..close];
-                let mut hit = false;
-                let mut i = 0;
-                while i < set.len() {
-                    if i + 2 < set.len() && set[i + 1] == '-' {
-                        hit |= (set[i]..=set[i + 2]).contains(&c);
-                        i += 3;
+/// One element of a mask.
+enum Token {
+    /// `*`: any run of characters.
+    Any,
+    /// `?`: any one character.
+    One,
+    /// `[a-z0]`: one character from the ranges.
+    Set(Vec<(char, char)>),
+    Char(char),
+}
+
+fn tokens(mask: &[char]) -> Vec<Token> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < mask.len() {
+        let close = (mask[i] == '[').then(|| mask[i..].iter().position(|&c| c == ']').map(|p| i + p)).flatten();
+        match (mask[i], close) {
+            ('*', _) => out.push(Token::Any),
+            ('?', _) => out.push(Token::One),
+            ('[', Some(close)) => {
+                let set = &mask[i + 1..close];
+                let mut ranges = Vec::new();
+                let mut j = 0;
+                while j < set.len() {
+                    if j + 2 < set.len() && set[j + 1] == '-' {
+                        ranges.push((set[j], set[j + 2]));
+                        j += 3;
                     } else {
-                        hit |= set[i] == c;
-                        i += 1;
+                        ranges.push((set[j], set[j]));
+                        j += 1;
                     }
                 }
-                hit && rec(&m[close + 1..], &t[1..])
+                out.push(Token::Set(ranges));
+                i = close;
             }
-            Some(&c) => t.first() == Some(&c) && rec(&m[1..], &t[1..]),
+            (c, _) => out.push(Token::Char(c)),
         }
+        i += 1;
     }
+    out
+}
+
+/// Delphi-style mask (as used by OpenIV): `*` any run, `?` any character,
+/// `[abc]` / `[a-z]` character sets; case-insensitive.
+///
+/// Iterative, backtracking only to the last `*`: linear stack and at most
+/// mask × text steps, whatever a package puts in its masks.
+fn mask_matches(mask: &str, text: &str) -> bool {
     let m: Vec<char> = mask.to_lowercase().chars().collect();
     let t: Vec<char> = text.to_lowercase().chars().collect();
-    rec(&m, &t)
+    let m = tokens(&m);
+    let one = |token: &Token, c: char| match token {
+        Token::Any => false,
+        Token::One => true,
+        Token::Set(ranges) => ranges.iter().any(|&(a, b)| (a..=b).contains(&c)),
+        Token::Char(x) => *x == c,
+    };
+    let (mut mi, mut ti) = (0, 0);
+    // The last `*` seen and the text position it currently stands for.
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        match m.get(mi) {
+            Some(Token::Any) => {
+                star = Some((mi, ti));
+                mi += 1;
+            }
+            Some(token) if one(token, t[ti]) => {
+                mi += 1;
+                ti += 1;
+            }
+            _ => match star {
+                // Let the last `*` take one more character and try again.
+                Some((s, at)) => {
+                    star = Some((s, at + 1));
+                    mi = s + 1;
+                    ti = at + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    m[mi..].iter().all(|token| matches!(token, Token::Any))
 }
 
 fn matches(line: &str, pattern: &str, condition: Condition) -> bool {
@@ -129,6 +178,22 @@ mod tests {
         assert!(mask_matches("*line*", "# THIS LINE"));
         assert!(mask_matches("l?ne [0-9]", "Line 7"));
         assert!(!mask_matches("#*", "Line"));
+        assert!(mask_matches("a*b*c", "aXXbYYc"));
+        assert!(!mask_matches("a*b*c", "aXXbYY"));
+        assert!(mask_matches("*", ""));
+        assert!(mask_matches("[ab]x", "bx") && !mask_matches("[ab]x", "cx"));
+        assert!(mask_matches("[x", "[x"), "an unclosed set is a literal [");
+        assert!(mask_matches("**a", "a"));
+    }
+
+    #[test]
+    fn hostile_masks_finish() {
+        // Recursion used to overflow the stack on a long mask and backtrack
+        // for a very long time on many stars.
+        let long = "?".repeat(1_000_000);
+        assert!(!mask_matches(&long, "short"));
+        let stars = "*a".repeat(200) + "b";
+        assert!(!mask_matches(&stars, &"a".repeat(5_000)));
         let (out, notes) = apply(
             "a\r\nb\r\n",
             &[TextCmd::Replace { line: "x".into(), condition: Condition::Equal, text: "y".into() }],

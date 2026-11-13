@@ -119,6 +119,14 @@ pub struct Package {
     files: HashMap<String, Vec<u8>>,
 }
 
+/// Most files in a package.
+const MAX_FILES: usize = 200_000;
+/// Most bytes all files of a package may take once unpacked (the package is
+/// held in memory while it is checked and installed).
+const MAX_UNPACKED: u64 = 8 << 30;
+/// Most bytes reserved for one file before reading it.
+const PREALLOCATE: u64 = 64 << 20;
+
 impl Package {
     pub fn open(path: &Path) -> Result<Self> {
         let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
@@ -130,14 +138,28 @@ impl Package {
         let mut files = HashMap::new();
         let mut assembly = None;
         let mut icon = None;
+        if zip.len() > MAX_FILES {
+            bail!("the package has more than {MAX_FILES} files");
+        }
+        let mut total = 0u64;
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i)?;
             if entry.is_dir() {
                 continue;
             }
             let name = entry.name()?.replace('\\', "/");
-            let mut data = Vec::with_capacity(entry.size() as usize);
-            entry.read_to_end(&mut data).with_context(|| format!("reading {name} from the package"))?;
+            // The declared size cannot be trusted (ZIP bombs): never reserve
+            // more than a little up front, and read at most what is left.
+            let left = MAX_UNPACKED - total;
+            let mut data = Vec::with_capacity(entry.size().min(PREALLOCATE) as usize);
+            (&mut entry)
+                .take(left + 1)
+                .read_to_end(&mut data)
+                .with_context(|| format!("reading {name} from the package"))?;
+            total += data.len() as u64;
+            if total > MAX_UNPACKED {
+                bail!("the package unpacks to more than {} GB", MAX_UNPACKED >> 30);
+            }
             let lower = name.to_ascii_lowercase();
             if lower == "assembly.xml" {
                 assembly = Some(data);
@@ -206,7 +228,7 @@ fn inner_xml(source: &str, node: roxmltree::Node<'_, '_>) -> String {
     lines
         .iter()
         .enumerate()
-        .map(|(i, l)| if i == 0 || l.len() < indent { l.trim_start() } else { &l[indent..] })
+        .map(|(i, l)| if i == 0 { l.trim_start() } else { l.get(indent..).unwrap_or_else(|| l.trim_start()) })
         .collect::<Vec<_>>()
         .join("\n")
 }

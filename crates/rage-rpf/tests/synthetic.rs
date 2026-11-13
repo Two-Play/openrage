@@ -237,3 +237,35 @@ fn writer_round_trip_including_raw_copies() {
         assert_eq!(rpf.entry(id).resource_version(), Some(0x23));
     }
 }
+
+#[test]
+fn refuses_archives_that_contain_themselves() {
+    let mut bytes = sample_archive();
+    // Point `inner.rpf` (entry 3) at the whole outer archive: offset 0, full size.
+    let e = 16 + 3 * 16;
+    bytes[e + 5..e + 8].fill(0);
+    let len = bytes.len() as u32;
+    bytes[e + 8..e + 12].copy_from_slice(&len.to_le_bytes());
+    let path = write_temp("self", &bytes);
+    let rpf = Rpf7::open(&path, None).expect("open");
+    assert!(matches!(rpf.open_child(3), Err(RpfError::NotAnArchive(_))));
+}
+
+#[test]
+fn stops_at_deeply_nested_archives() {
+    let mut archive = build(&[
+        Item::Dir { name: "", first: 1, count: 1 },
+        Item::File { name: "deep.txt", data: b"x".to_vec(), compress: false },
+    ]);
+    for _ in 0..rage_rpf::MAX_NESTING + 2 {
+        archive = build(&[
+            Item::Dir { name: "", first: 1, count: 1 },
+            Item::File { name: "x.rpf", data: archive, compress: false },
+        ]);
+    }
+    let path = write_temp("deep", &archive);
+    let rpf = Rpf7::open(&path, None).expect("open");
+    let mut errors = Vec::new();
+    vfs::walk(&rpf, Rpf7::ROOT, "", true, &mut |_, _, _| {}, &mut |e| errors.push(e));
+    assert!(matches!(errors.as_slice(), [RpfError::TooDeep(_)]), "{errors:?}");
+}

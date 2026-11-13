@@ -66,10 +66,18 @@ pub fn is_gta5_dir(dir: &Path) -> bool {
     EXECUTABLES.iter().any(|exe| dir.join(exe).is_file())
 }
 
+/// The program that marks a Red Dead Redemption 2 installation.
+pub const RDR2_EXE: &str = "RDR2.exe";
+
+/// Whether a folder is a Red Dead Redemption 2 installation.
+pub fn is_rdr2_dir(dir: &Path) -> bool {
+    dir.join(RDR2_EXE).is_file()
+}
+
 /// Short name of the game installed in `dir`: "GTA V Enhanced", "GTA V",
 /// "GTA IV", "RDR2", or `None` when no known executable is there.
 pub fn game_name(dir: &Path) -> Option<&'static str> {
-    if dir.join("RDR2.exe").is_file() {
+    if is_rdr2_dir(dir) {
         Some("RDR2")
     } else if dir.join("GTA5_Enhanced.exe").is_file() {
         Some("GTA V Enhanced")
@@ -80,6 +88,30 @@ pub fn game_name(dir: &Path) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Adds the archives (files with one of `extensions`) below `dir` to `out`,
+/// sorted, skipping OpenRAGE's own folder (journal and kept originals are not
+/// part of the game).
+pub fn collect_archives(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    let mut items: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    items.sort();
+    for p in items {
+        if p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(rage_mods::overlay::OPENRAGE_FOLDER)) {
+            continue;
+        }
+        if p.is_dir() {
+            collect_archives(&p, extensions, out);
+        } else if p.extension().is_some_and(|e| extensions.iter().any(|x| e.eq_ignore_ascii_case(x))) {
+            out.push(p);
+        }
+    }
+}
+
+/// [`collect_archives`] for `.rpf` files.
+pub fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
+    collect_archives(dir, &["rpf"], out);
 }
 
 #[cfg(test)]

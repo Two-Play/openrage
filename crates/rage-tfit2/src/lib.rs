@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 // SPDX-License-Identifier: AGPL-3.0-only
 //
 // Ported to Rust from RDR2-RPF-Tool by amrshaheen61

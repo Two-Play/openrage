@@ -557,7 +557,8 @@ pub fn remove_loose(game_dir: &Path, vpath: &str, description: &str) -> Result<(
 /// Creates a new, empty top-level archive in the mods folder (e.g. a new DLC pack).
 pub fn create_archive(game_dir: &Path, archive: &str, description: &str, group: Option<&str>) -> Result<PathBuf> {
     let mods = mods_dir_or_create(game_dir)?;
-    let dest = mods.join(archive.replace('\\', "/"));
+    let safe = vfs::safe_relative_path(archive).with_context(|| format!("{archive}: not a valid path"))?;
+    let dest = mods.join(safe);
     if dest.exists() {
         bail!("{} already exists", dest.display());
     }

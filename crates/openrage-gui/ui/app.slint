@@ -1016,6 +1016,8 @@ export component AppWindow inherits Window {
     // Status / background task
     in property <string> status;
     in property <bool> busy;
+    // The running task stops when asked (extraction, plugin runs); others finish.
+    in property <bool> cancellable;
     in property <bool> can-extract;
 
     // Setup overlay
@@ -2468,13 +2470,13 @@ export component AppWindow inherits Window {
                     text: root.index-status;
                     font-size: Theme.font-small;
                     vertical-alignment: center;
-                    color: Theme.text-faint;
+                    color: Theme.text-muted;
                 }
                 if root.busy: Spinner {
                     width: 16px;
                     indeterminate: true;
                 }
-                if root.busy: Button {
+                if root.busy && root.cancellable: Button {
                     text: @tr("Cancel");
                     clicked => { root.cancel-task(); }
                 }
@@ -3877,7 +3879,10 @@ export component ViewerWindow inherits Window {
                                                 height: 34px;
                                                 y: (parent.height - self.height) / 2;
                                                 border-radius: 17px;
-                                                background: Theme.accent;
+                                                background: anim-play-ta.has-hover ? Theme.accent.darker(0.1) : Theme.accent;
+                                                accessible-role: button;
+                                                accessible-label: root.anim-playing ? @tr("Pause") : @tr("Play");
+                                                accessible-action-default => { root.anim-toggle(); }
                                                 Image {
                                                     width: 16px;
                                                     height: 16px;
@@ -3886,7 +3891,7 @@ export component ViewerWindow inherits Window {
                                                     source: root.anim-playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
                                                     colorize: Palette.accent-foreground;
                                                 }
-                                                TouchArea {
+                                                anim-play-ta := TouchArea {
                                                     clicked => { root.anim-toggle(); }
                                                 }
                                             }
@@ -4353,7 +4358,7 @@ export component XmlWindow inherits Window {
     public function show-line(line: int) {
         root.tab = 1;
         root.marked-line = line;
-        xml-list.viewport-y = -max(0px, (line - 3) * 18px);
+        xml-list.content-y = -max(0px, (line - 3) * 18px);
     }
 
     changed theme-mode => { root.apply-theme(); }

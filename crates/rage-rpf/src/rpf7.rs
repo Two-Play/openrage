@@ -142,6 +142,8 @@ pub struct Rpf7 {
     size: u64,
     encryption: Encryption,
     entries: Vec<Entry>,
+    /// 0 for a file on disk, 1 for an archive inside it, and so on.
+    depth: u8,
 }
 
 impl Rpf7 {
@@ -150,7 +152,7 @@ impl Rpf7 {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        Self::open_at(Arc::new(file), 0, size, name, path.display().to_string(), keys)
+        Self::open_at(Arc::new(file), 0, size, name, path.display().to_string(), keys, 0)
     }
 
     fn open_at(
@@ -160,6 +162,7 @@ impl Rpf7 {
         name: String,
         display_path: String,
         keys: Option<Arc<GtaVKeys>>,
+        depth: u8,
     ) -> Result<Self, RpfError> {
         let corrupt = |reason: &str| RpfError::CorruptToc { archive: display_path.clone(), reason: reason.into() };
 
@@ -277,7 +280,7 @@ impl Rpf7 {
             }
         }
 
-        Ok(Self { file, keys, name, display_path, base, size, encryption, entries })
+        Ok(Self { file, keys, name, display_path, base, size, encryption, entries, depth })
     }
 
     pub fn name(&self) -> &str {
@@ -376,11 +379,10 @@ impl Rpf7 {
                 if stored_size == 0 {
                     return Ok(data);
                 }
-                let mut out = Vec::with_capacity(size as usize);
-                DeflateDecoder::new(&data[..]).read_to_end(&mut out).map_err(|source| RpfError::Inflate {
-                    archive: self.display_path.clone(),
-                    entry: self.path_of(id),
-                    source,
+                // `size` comes from the archive: reserve little, inflate no more than it says.
+                let mut out = Vec::with_capacity(u64::from(size).min(crate::PREALLOCATE) as usize);
+                DeflateDecoder::new(&data[..]).take(u64::from(size)).read_to_end(&mut out).map_err(|source| {
+                    RpfError::Inflate { archive: self.display_path.clone(), entry: self.path_of(id), source }
                 })?;
                 Ok(out)
             }
@@ -431,10 +433,8 @@ impl Rpf7 {
         let container = self.read(id)?;
         let body = container.get(RESOURCE_HEADER..).unwrap_or(&[]);
         let mut out = Vec::new();
-        DeflateDecoder::new(body).read_to_end(&mut out).map_err(|source| RpfError::Inflate {
-            archive: self.display_path.clone(),
-            entry: self.path_of(id),
-            source,
+        DeflateDecoder::new(body).take(crate::MAX_UNPACKED).read_to_end(&mut out).map_err(|source| {
+            RpfError::Inflate { archive: self.display_path.clone(), entry: self.path_of(id), source }
         })?;
         Ok(out)
     }
@@ -459,8 +459,14 @@ impl Rpf7 {
         let EntryKind::Binary { offset, stored_size: 0, size, encrypted: false } = entry.kind else {
             return Err(RpfError::NotAnArchive(self.path_of(id)));
         };
-        if !entry.is_archive() || offset + size as u64 > self.size {
+        // Strictly inside this archive: an entry spanning all of it would be
+        // this archive again, and walking it would never end.
+        let inside = offset > 0 && offset.checked_add(u64::from(size)).is_some_and(|end| end <= self.size);
+        if !entry.is_archive() || !inside {
             return Err(RpfError::NotAnArchive(self.path_of(id)));
+        }
+        if self.depth >= crate::MAX_NESTING {
+            return Err(RpfError::TooDeep(format!("{}/{}", self.display_path, self.path_of(id))));
         }
         Rpf7::open_at(
             Arc::clone(&self.file),
@@ -469,6 +475,7 @@ impl Rpf7 {
             entry.name.clone(),
             format!("{}/{}", self.display_path, self.path_of(id)),
             self.keys.clone(),
+            self.depth + 1,
         )
     }
 }

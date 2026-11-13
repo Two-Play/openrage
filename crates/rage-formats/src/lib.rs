@@ -5,6 +5,7 @@
 //! * [`dds`], [`png`]: export, compatible with OpenIV/CodeWalker output
 //! * [`gxt2`], [`ldb`]: text tables (GTA V, RDR2)
 //! * [`meta`], [`pso`], [`rbf`]: metadata (`.ymap`, `.ytyp`, `.ymt`, `.cut`, …) as XML
+#![forbid(unsafe_code)]
 
 pub mod awc;
 pub mod clip;

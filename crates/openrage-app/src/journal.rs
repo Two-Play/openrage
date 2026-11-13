@@ -126,8 +126,9 @@ impl Journal {
     /// Writes a loose file (relative to the game folder if `in_game`, else to
     /// the mods folder), recording its previous content first.
     pub fn write_file(&self, in_game: bool, rel: &str, data: &[u8], description: &str) -> Result<PathBuf> {
+        let safe = vfs::safe_relative_path(rel).with_context(|| format!("{rel}: not a valid relative path"))?;
         let root = if in_game { self.game_dir() } else { self.mods.clone() };
-        let path = vfs::find_case_insensitive(&root, rel).unwrap_or_else(|| root.join(rel));
+        let path = vfs::find_case_insensitive(&root, rel).unwrap_or_else(|| root.join(safe));
         let previous = path.is_file().then(|| fs::read(&path)).transpose()?;
         self.write(&Kind::FileWritten { in_game, existed: previous.is_some() }, rel, description, previous.as_deref())?;
         if let Some(dir) = path.parent() {
@@ -139,6 +140,7 @@ impl Journal {
 
     /// Deletes a loose file in the mods folder, keeping its content for undo.
     pub fn delete_file(&self, rel: &str, description: &str) -> Result<()> {
+        vfs::safe_relative_path(rel).with_context(|| format!("{rel}: not a valid relative path"))?;
         let path = vfs::find_case_insensitive(&self.mods, rel).filter(|p| p.is_file()).context("no such file")?;
         let previous = fs::read(&path)?;
         // Recorded as "written, existed": undo restores the content.

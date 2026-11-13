@@ -62,7 +62,7 @@ openrage verify --animations                   # every .wad, every frame of ever
 openrage put admiral.wtd pc/models/cdimages/vehicles.img/   # edit: GTA IV uses the update folder (needs FusionFix)
 openrage put handling.dat common/data/          # loose files go to update/<same path>
 openrage write-target game                     # GTA IV: write into the game files instead (originals kept)
-openrage originals [--restore PATH | --restore-all]   # GTA IV: kept originals, put them back
+openrage originals [--restore PATH | --restore-all] [-y]   # GTA IV: kept originals, put them back
 ```
 
 ## Formats: textures, models, audio, animations, metadata, text
@@ -116,7 +116,7 @@ openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --out new.ydr --shader 
 openrage replace-model x64i.rpf/…/prop_x.ydr hi.obj --lod med.obj --lod low.obj --mods   # with detail levels
 openrage oiv info mod.oiv                      # what a package would change
 openrage oiv install mod.oiv                   # install into the mods folder
-openrage oiv list / oiv uninstall "Name 1.0"   # installed packages, uninstall
+openrage oiv list / oiv uninstall "Name 1.0" [-y]   # installed packages, uninstall
 openrage history                               # changes made to the mods folder
 openrage undo                                  # revert the newest change
 openrage mods                                  # files in the OpenIV mods folder
@@ -131,7 +131,7 @@ openrage plugin info strings                   # what a plugin adds and the perm
 openrage plugin enable strings                 # enable it, granting its permissions (asks first; -y to skip)
 openrage plugin disable strings
 openrage plugin install obj-tools.orp          # install a plugin package (shows what it is and its SHA-256 first)
-openrage plugin uninstall obj-tools            # remove it from your plugin folder
+openrage plugin uninstall obj-tools [-y]       # remove it from your plugin folder
 openrage plugin pack my-plugin/ --wasm target/wasm32-wasip2/release/my_plugin.wasm   # make a package
 openrage plugin preview x64a.rpf/data/x.dat    # show a file the way a plugin previews it
 openrage plugin preview --file x.bin --plugin strings
@@ -176,3 +176,9 @@ openrage verify --media                        # read every Scaleform movie and 
 ```
 
 Set up the keys first: `openrage --game "/path/to/Grand Theft Auto V" keys`, or see [Getting started](@/getting-started.md).
+
+## In scripts
+
+Commands that install, uninstall or put originals back ask first; `-y`/`--yes` answers for you. Without a terminal to ask on (in a script or a pipe) they stop instead of guessing.
+
+The exit code is `0` when everything worked, `2` for wrong arguments and `1` for everything else, also when only some files could not be extracted or a question was answered with no. Messages go to standard error, results to standard output.

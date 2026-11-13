@@ -2,6 +2,7 @@
 //!
 //! Supports RPF7 (GTA V Legacy and Enhanced, including nested archives),
 //! RPF8 (RDR2) and the GTA IV archives (IMG3, RPF2, RPF3).
+#![forbid(unsafe_code)]
 
 pub mod editor;
 mod error;
@@ -16,6 +17,17 @@ pub mod rpf8_names;
 mod toc;
 pub mod vfs;
 pub mod writer;
+
+/// How deep archives may be nested in each other. The game nests at most a
+/// few levels; a crafted archive that contains itself would recurse forever.
+pub const MAX_NESTING: u8 = 16;
+
+/// Most bytes one entry may unpack to. The largest files of the games are a
+/// few hundred MB; the limit keeps a crafted entry from exhausting memory.
+pub const MAX_UNPACKED: u64 = 2 << 30;
+
+/// Most bytes reserved up front for an entry whose size comes from the archive.
+pub(crate) const PREALLOCATE: u64 = 64 << 20;
 
 pub use editor::{ArchiveEditor, Backup, CommitStats};
 pub use error::RpfError;
