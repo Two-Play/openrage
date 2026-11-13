@@ -118,6 +118,18 @@ export struct Crumb {
     path: string,
 }
 
+// An installed plugin on the settings page.
+export struct PluginRow {
+    id: string,
+    title: string,
+    description: string,
+    status: string,
+    permissions: string,
+    enabled: bool,
+    // The folder could not be loaded (`permissions` holds the reason).
+    broken: bool,
+}
+
 export struct FileRow {
     // Mod status: 0 none, 1 added/new, 2 changed, 3 contains mods, 4 removed.
     mark: int,
@@ -141,6 +153,8 @@ export struct FileRow {
     is-table: bool,
     // Scaleform movie (.gfx): exportable as .swf.
     is-gfx: bool,
+    // Context-menu entries added by plugins.
+    plugin-actions: [string],
 }
 
 component FormatIcon inherits Rectangle {
@@ -374,6 +388,12 @@ component FileItem inherits Rectangle {
                 title: @tr("Export XML…");
                 icon: @image-url("icons/menu/export.svg");
                 activated => { root.action("xml"); }
+            }
+            if item.plugin-actions.length > 0: MenuSeparator {}
+            for title[i] in item.plugin-actions: MenuItem {
+                title: title;
+                icon: @image-url("icons/menu/export.svg");
+                activated => { root.action("plugin:" + i); }
             }
             if !root.history-mode && item.kind != "Folder": MenuItem {
                 title: @tr("Open with system app (read-only copy)");
@@ -1055,6 +1075,13 @@ export component AppWindow inherits Window {
     in property <bool> ask-game: true;
     callback game-chosen(int, bool);
     callback ask-game-changed(bool);
+    // Plugins on the settings page.
+    in property <[PluginRow]> plugins;
+    in property <string> plugin-folder;
+    in property <bool> settings-scroll-end;
+    callback plugin-toggled(string, bool);
+    callback open-plugin-folder();
+    callback reload-plugins();
     in-out property <bool> settings-visible;
     // The configured game for the settings page: short name and folder.
     in property <string> settings-game;
@@ -2821,6 +2848,12 @@ export component AppWindow inherits Window {
         property <color> chosen: root.parse-hex(root.accent-hex);
         ScrollView {
             vertical-stretch: 1;
+            // Debug snapshots of the plugin list (`OPENRAGE_SETTINGS=plugins`).
+            changed content-height => {
+                if root.settings-scroll-end {
+                    self.content-y = self.visible-height - self.content-height;
+                }
+            }
             VerticalLayout {
                 spacing: Theme.space-m;
                 padding-right: Theme.space-m;
@@ -3004,6 +3037,74 @@ export component AppWindow inherits Window {
                     toggled => {
                         root.mods-overlay = self.checked;
                         root.overlay-toggled(self.checked);
+                    }
+                }
+                Rectangle {
+                    height: 1px;
+                    background: Theme.border;
+                }
+                Text {
+                    text: @tr("Plugins");
+                    font-size: Theme.font-title;
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                Text {
+                    text: @tr("Plugins add previews and actions for more file types. They run in a sandbox: they see only the files you open with them, plus the game's files if you allow it, and cannot change anything or go online. New plugins stay off until you turn them on.");
+                    wrap: word-wrap;
+                    color: Theme.text-muted;
+                }
+                if root.plugins.length == 0: Text {
+                    text: @tr("No plugins installed. Put a plugin's folder into the plugin folder, then reload.");
+                    wrap: word-wrap;
+                    color: Theme.text-muted;
+                }
+                for p in root.plugins: HorizontalLayout {
+                    spacing: Theme.space-s;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 2px;
+                        Text {
+                            text: p.title + "  ·  " + p.status;
+                            font-weight: 600;
+                            color: p.broken ? Theme.danger : Theme.text;
+                        }
+                        if p.description != "": Text {
+                            text: p.description;
+                            font-size: Theme.font-small;
+                            wrap: word-wrap;
+                            color: Theme.text-muted;
+                        }
+                        Text {
+                            text: p.permissions;
+                            font-size: Theme.font-small;
+                            wrap: word-wrap;
+                            color: p.broken ? Theme.danger : Theme.text-muted;
+                        }
+                    }
+                    if !p.broken: CheckBox {
+                        text: @tr("On");
+                        checked: p.enabled;
+                        accessible-label: @tr("Enable {}", p.title);
+                        toggled => { root.plugin-toggled(p.id, self.checked); }
+                    }
+                }
+                Text {
+                    text: root.plugin-folder;
+                    font-size: Theme.font-small;
+                    wrap: char-wrap;
+                    color: Theme.text-muted;
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: Theme.space-s;
+                    Button {
+                        text: @tr("Open plugin folder");
+                        clicked => { root.open-plugin-folder(); }
+                    }
+                    Button {
+                        text: @tr("Reload plugins");
+                        clicked => { root.reload-plugins(); }
                     }
                 }
             }

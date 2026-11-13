@@ -4027,6 +4027,7 @@ dependencies = [
  "bytemuck",
  "i-slint-backend-testing",
  "openrage-app",
+ "openrage-plugins",
  "pollster 1.0.1",
  "rage-core",
  "rage-crypto",

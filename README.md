@@ -63,7 +63,7 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 | **GTA VI** | 🔜 next: as fast as possible once it comes to PC | – |
 | **GTA IV** (Complete Edition) | ✅ read (IMG3, RPF2, RPF3), key from your own `GTAIV.exe` | ◐ textures · models · collisions · animations · text · maps in 3D (read-only) |
 
-**Plugins** (API 0.1, preview): sandboxed WebAssembly plugins add file previews (text, tree, table, image) and export actions, for every game. ✅ command line (`openrage plugin`) · 🔜 explorer integration, writing into `mods`, batch tools, 3D, importers (openFormats), plugin packages. [Writing plugins](https://two-play.github.io/openrage/plugins/)
+**Plugins** (API 0.1, preview): sandboxed WebAssembly plugins add file types, previews (text, tree, table, image) and export actions, for every game. ✅ explorer (file list, preview, context menu, Settings → Plugins) and command line (`openrage plugin`), example plugin included · 🔜 writing into `mods`, batch tools, 3D, importers (openFormats), plugin packages. [Writing plugins](https://two-play.github.io/openrage/plugins/)
 
 ## Installation
 

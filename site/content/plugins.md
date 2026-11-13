@@ -14,9 +14,9 @@ memory and a time limit. The same `.wasm` runs on Linux and Windows.
 
 > [!NOTE]
 > The plugin API is at version **0.1** and may still change: plugins name the version they were built for and
-> OpenRAGE only loads plugins for its own version. For now plugins work from the [command line](@/cli.md#plugins).
-> Next: in the explorer (preview pane, context menu, settings), then writing into the `mods` folder, batch tools, 3D
-> models and installable plugin packages.
+> OpenRAGE only loads plugins for its own version. Plugins work in the explorer (file list, preview pane, context
+> menu, **Settings → Plugins**) and from the [command line](@/cli.md#plugins). Next: writing into the `mods` folder,
+> batch tools, 3D models, importers and installable plugin packages.
 
 ## What plugins can do
 
@@ -74,8 +74,9 @@ impl Plugin for Hello {
 openrage_plugin_sdk::export_plugin!(Hello);
 ```
 
-Install it by putting the manifest and the built `.wasm` into a folder of its own in a plugin folder, then enable it.
-New plugins are off until the user enables them:
+Install it by putting the manifest and the built `.wasm` into a folder of its own in a plugin folder, then turn it
+on in **Settings → Plugins** (after **Reload plugins**) or from the command line. New plugins are off until the user
+enables them:
 
 ```sh
 mkdir -p ~/.config/openrage/plugins/strings
@@ -160,7 +161,8 @@ OpenRAGE offers:
 - `current-game()`: `gta5`, `rdr2`, `gta4` or `other`.
 - `read-file(vpath)` and `list-dir(vpath)`: paths relative to the game folder, through archives
   (`x64a.rpf/levels/gta5/x.ytd`), with the changes in `mods/`. Absolute paths and `..` are refused.
-- `log(level, message)`: shown by `openrage plugin` (and later in the explorer). Whatever the plugin prints to stdout
+- `log(level, message)`: shown by `openrage plugin`, and in the explorer's info panel next to a preview (the last
+  lines) or in the status bar when an action fails. Whatever the plugin prints to stdout
   or stderr ends up there too, panics included.
 
 Each call starts a fresh instance: plugins keep no state between calls. Limits per call: 1 GiB of memory and 60
@@ -181,6 +183,15 @@ required. Plugins are not part of OpenRAGE; their authors are responsible for th
 
 Never put Rockstar's files or keys into a plugin. Read what you need from the user's game at runtime, with the
 `read-game` permission.
+
+## How the explorer uses a plugin
+
+- **File types** (`[[file-types]]`) name and give an icon to extensions OpenRAGE does not know itself.
+- **Previews** (`[[preview]]`) are used for files OpenRAGE has no viewer for. A plugin naming the extension wins over
+  one registered for `*`; `*` plugins are only asked about binary files. Files larger than 256 MB are not handed to
+  plugins for a preview. Trees and tables are shown as indented text and aligned columns for now.
+- **Actions** (`[[actions]]`) appear in the context menu of matching files. One output file is saved with a save
+  dialog, several into a folder the user picks.
 
 ## Tips
 

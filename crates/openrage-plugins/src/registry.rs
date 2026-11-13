@@ -52,13 +52,16 @@ pub struct Registry {
 /// Where plugins are looked for, in order (the first plugin with an id wins):
 /// the folders in `OPENRAGE_PLUGIN_PATH`, the user's `openrage/plugins`
 /// config folder, and `plugins` next to the executable (portable installs).
+/// The user's own plugin folder: `<config dir>/openrage/plugins`.
+pub fn user_dir() -> Option<PathBuf> {
+    Some(dirs::config_dir()?.join("openrage").join("plugins"))
+}
+
 pub fn search_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("OPENRAGE_PLUGIN_PATH")
         .map(|v| std::env::split_paths(&v).filter(|p| !p.as_os_str().is_empty()).collect())
         .unwrap_or_default();
-    if let Some(config) = dirs::config_dir() {
-        dirs.push(config.join("openrage").join("plugins"));
-    }
+    dirs.extend(user_dir());
     if let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
         dirs.push(exe_dir.join("plugins"));
     }

@@ -26,7 +26,18 @@ pub fn icon(name: &str, kind: ItemKind) -> (&'static str, Color) {
         ItemKind::Sound => return ("audio", rgb(0xDB4F8A)),
         _ => {}
     }
-    match extension(name).as_str() {
+    if let Some(icon) = core_icon(&extension(name)) {
+        return icon;
+    }
+    match crate::plugins::file_type(name) {
+        Some((_, category)) => category_icon(&category),
+        None => ("file", NEUTRAL),
+    }
+}
+
+/// Icons of the file types OpenRAGE knows itself.
+fn core_icon(ext: &str) -> Option<(&'static str, Color)> {
+    Some(match ext {
         "ytd" | "wtd" | "dds" | "png" | "jpg" | "bmp" | "tga" => ("texture", rgb(0x9061D8)),
         "ydr" | "ydd" | "yft" | "yld" | "wdr" | "wdd" | "wft" => ("model", rgb(0x3B82F6)),
         "ypt" => ("particles", rgb(0xE0679B)),
@@ -41,18 +52,57 @@ pub fn icon(name: &str, kind: ItemKind) -> (&'static str, Color) {
         "ysc" | "sco" | "asi" | "dll" | "lua" | "cs" => ("script", rgb(0xE05252)),
         "gxt2" | "gxt" => ("lang", rgb(0x5B76DE)),
         "oiv" | "zip" | "7z" | "rar" => ("package", rgb(0xD9822B)),
+        _ => return None,
+    })
+}
+
+/// Icon and tint of a plugin's file-type category (`plugin.toml`).
+fn category_icon(category: &str) -> (&'static str, Color) {
+    match category {
+        "texture" => ("texture", rgb(0x9061D8)),
+        "model" => ("model", rgb(0x3B82F6)),
+        "map" => ("map", rgb(0x2FA866)),
+        "data" => ("data", rgb(0x2FA866)),
+        "text" => ("text", rgb(0x7C8592)),
+        "lang" => ("lang", rgb(0x5B76DE)),
+        "audio" => ("audio", rgb(0xDB4F8A)),
+        "anim" => ("anim", rgb(0xDB4F8A)),
+        "script" => ("script", rgb(0xE05252)),
+        "package" => ("package", rgb(0xD9822B)),
         _ => ("file", NEUTRAL),
     }
+}
+
+/// Whether OpenRAGE itself knows this file type (plugins only fill the gaps).
+pub fn is_known(name: &str) -> bool {
+    let ext = extension(name);
+    !known_name(&ext).is_empty() || core_icon(&ext).is_some()
 }
 
 /// Descriptive type column text.
 pub fn type_name(name: &str, kind: ItemKind) -> String {
     let ext = extension(name);
-    let known = match ext.as_str() {
-        _ if kind == ItemKind::Dir => "Folder",
-        _ if kind == ItemKind::Archive => "Archive",
-        _ if kind == ItemKind::Texture => "Texture",
-        _ if kind == ItemKind::Sound => "Sound",
+    let known = match kind {
+        ItemKind::Dir => "Folder",
+        ItemKind::Archive => "Archive",
+        ItemKind::Texture => "Texture",
+        ItemKind::Sound => "Sound",
+        _ => known_name(&ext),
+    };
+    if !known.is_empty() {
+        known.into()
+    } else if let Some((plugin_name, _)) = crate::plugins::file_type(name) {
+        plugin_name
+    } else if ext.is_empty() {
+        "File".into()
+    } else {
+        format!("{} file", ext.to_ascii_uppercase())
+    }
+}
+
+/// The name of a file type OpenRAGE knows ("" if it does not).
+fn known_name(ext: &str) -> &'static str {
+    match ext {
         "ytd" | "wtd" => "Texture dictionary",
         "ydr" | "wdr" => "Drawable",
         "ydd" | "wdd" => "Drawable dict",
@@ -84,12 +134,5 @@ pub fn type_name(name: &str, kind: ItemKind) -> String {
         "rel" | "dat151" | "dat54" => "Audio data",
         "txt" => "Text",
         _ => "",
-    };
-    if !known.is_empty() {
-        known.into()
-    } else if ext.is_empty() {
-        "File".into()
-    } else {
-        format!("{} file", ext.to_ascii_uppercase())
     }
 }

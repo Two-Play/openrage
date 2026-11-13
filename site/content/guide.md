@@ -147,10 +147,23 @@ run in a sandbox: a plugin sees only the files you open with it and, if you allo
 change anything, open other files or go online, and a plugin that hangs or crashes is stopped without taking OpenRAGE
 with it.
 
-Put a plugin's folder into your plugin folder (`~/.config/openrage/plugins` on Linux, `%APPDATA%\openrage\plugins` on
-Windows, or `plugins` next to the program). New plugins are off until you enable them; enabling shows the permissions
-the plugin asks for. For now, plugins are used from the [command line](@/cli.md#plugins); the explorer follows (preview
-pane, context menu and a plugin page in the settings).
+**Settings → Plugins** lists the installed plugins with what they do, their licence and the permissions they ask for,
+and turns them on and off. New plugins are off until you turn them on; turning one on grants what it asks for. If a
+new version asks for more, it is off again until you confirm. Plugins that cannot be loaded are listed with the
+reason. **Open plugin folder** opens your plugin folder (`~/.config/openrage/plugins` on Linux,
+`%APPDATA%\openrage\plugins` on Windows): put a plugin's folder there and press **Reload plugins**. Plugins in
+`plugins` next to the program work too; the download comes with the example plugin *Strings* there.
+
+Once on, a plugin:
+
+- names the file types it adds in the file list and gives them an icon,
+- shows them in the preview pane (as text, a tree, a table or a picture); the info panel names the plugin, and its
+  messages and errors. Plugins only fill gaps: files OpenRAGE shows itself keep its own preview. A plugin for every
+  file type (like *Strings*) is only asked about binary files nothing else can show,
+- adds entries to the context menu of the files it handles, e.g. **Export strings…**. Their results are saved where
+  you choose: one file with a save dialog, several into a folder.
+
+Everything also works from the [command line](@/cli.md#plugins).
 
 Want to write one? See [Writing plugins](@/plugins.md).
 
