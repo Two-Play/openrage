@@ -262,6 +262,10 @@ enum Command {
         /// Write the text to this file instead of printing it.
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// GTA IV placement file (.wpl): read this edited text and write the file back
+        /// (update folder, or the game files when chosen; undo with `openrage undo`).
+        #[arg(long, value_name = "TEXT", conflicts_with = "out")]
+        import: Option<PathBuf>,
     },
     /// Replace the meshes of a GTA V Enhanced drawable (.ydr) with a Wavefront OBJ model. The
     /// drawable's shaders and textures stay; OBJ materials go to its shaders in order.
@@ -688,7 +692,8 @@ fn run() -> Result<()> {
         Command::Media { path, swf } => cmd_media(&game_dir, &path, swf.as_deref(), keys),
         Command::Script { path, out, strings } => cmd_script(&game_dir, &path, out.as_deref(), strings, keys),
         Command::Particles { path } => cmd_particles(&game_dir, &path, keys),
-        Command::Text { path, out } => cmd_text(&game_dir, &path, out.as_deref(), keys),
+        Command::Text { path, out, import: None } => cmd_text(&game_dir, &path, out.as_deref(), keys),
+        Command::Text { path, import: Some(file), .. } => cmd_import_wpl(&game_dir, &path, &file, keys),
         Command::Xml { path, out, tree } => cmd_xml(&game_dir, &path, out.as_deref(), tree, keys),
         Command::Audio { path, export } => cmd_audio(&game_dir, &path, export.as_deref(), keys),
         Command::Put { file, target } => cmd_put(&game_dir, &file, &target, keys),
@@ -3072,6 +3077,26 @@ fn cmd_verify_particles(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys
     Ok(())
 }
 
+/// Writes an edited placement text back into the `.wpl` at `path`.
+fn cmd_import_wpl(game_dir: &Path, path: &str, file: &Path, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    if !path.to_ascii_lowercase().ends_with(".wpl") {
+        bail!("--import works for GTA IV placement files (.wpl)");
+    }
+    let text = fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let original = match rage_mods::resolve(game_dir, path, keys.clone())?.0 {
+        Node::Gta4File(a, id) => a.read(id)?,
+        Node::PlainFile(p) => fs::read(p)?,
+        _ => bail!("{path} is not a file"),
+    };
+    let data = openrage_app::gta4::wpl_from_text(&text, Some(&original))?;
+    if data == original {
+        outln!("No changes.");
+        return Ok(());
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    cmd_edit(game_dir, path, Op::Set(data), &format!("Edited {name}"), keys)
+}
+
 fn cmd_text(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     use openrage_app::texttable::{self, Kind};
     if path.to_ascii_lowercase().ends_with(".wpl") {
@@ -4249,7 +4274,7 @@ fn cmd_verify_gta4_text(game_dir: &Path, within: &str) -> Result<()> {
     let mut disk = Vec::new();
     collect_archives(&dir, &["gxt", "wpl"], &mut disk);
     let mut errors = Vec::new();
-    let (mut tables, mut strings, mut placements, mut records, mut scripts) = (0, 0, 0, 0, 0);
+    let (mut tables, mut strings, mut placements, mut records, mut scripts, mut lossy) = (0, 0, 0, 0, 0, 0);
     for p in &disk {
         let rel = p.strip_prefix(game_dir).unwrap_or(p).to_string_lossy().replace('\\', "/");
         let data = fs::read(p)?;
@@ -4269,9 +4294,12 @@ fn cmd_verify_gta4_text(game_dir: &Path, within: &str) -> Result<()> {
             }
         } else {
             placements += 1;
-            match rage_formats::wpl::parse(&data) {
-                Ok(w) => records += rage_formats::wpl::record_count(&w),
-                Err(e) => errors.push(format!("{rel}: {e}")),
+            match openrage_app::gta4::wpl_round_trip(Some(game_dir), &data) {
+                Ok((n, l)) => {
+                    records += n;
+                    lossy += l;
+                }
+                Err(e) => errors.push(format!("{rel}: {e:#}")),
             }
         }
     }
@@ -4282,8 +4310,15 @@ fn cmd_verify_gta4_text(game_dir: &Path, within: &str) -> Result<()> {
             let lower = a.entry(id).name.to_ascii_lowercase();
             if lower.ends_with(".wpl") {
                 placements += 1;
-                match a.read(id).map_err(anyhow::Error::from).and_then(|d| Ok(rage_formats::wpl::parse(&d)?)) {
-                    Ok(w) => records += rage_formats::wpl::record_count(&w),
+                match a
+                    .read(id)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|d| openrage_app::gta4::wpl_round_trip(Some(game_dir), &d))
+                {
+                    Ok((n, l)) => {
+                        records += n;
+                        lossy += l;
+                    }
                     Err(e) => errors.push(format!("{p}: {e:#}")),
                 }
             } else if lower.ends_with(".sco") {
@@ -4297,6 +4332,9 @@ fn cmd_verify_gta4_text(game_dir: &Path, within: &str) -> Result<()> {
     for e in errors.iter().take(50) {
         outln!("FAIL {e}");
     }
+    outln!(
+        "placement files: text converts back byte for byte; {lossy} records keep leftover bytes only through the original"
+    );
     outln!(
         "{tables} text tables ({strings} strings), {placements} placement files ({records} records), {scripts} scripts, {} errors ({:.1}s)",
         errors.len(),

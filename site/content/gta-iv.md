@@ -117,12 +117,19 @@ TLAD and TBoGT models.
 - **Texts** (`common/text/<language>.gxt`, and the episodes' own) open in a read-only window: every table as a
   `[NAME]` section of `0xHASH = text` lines, in GTA V's `.oxt` form.
 - **Placement files** (`.wpl`) show as IPL-style text: one line per object with position, rotation, model name, flags
-  and LOD, then the other sections. `.ide` and `.ipl` files are plain text already.
+  and LOD, then the other sections. In edit mode, **Open in text editor** (right-click; double-click opens the map)
+  lets you move, add and remove objects; saving turns the text back into the `.wpl` (into the `update` folder, with
+  undo). Numbers are written exactly (floats always with a point, `5.0`), so an unchanged file saves byte for byte;
+  model names become their hash, `0x…` hashes work too, and mistakes are reported with their line. Objects name their
+  LOD by its position in the list, so add new ones at the end.
+- **Object definitions** (`.ide`) and `.ipl` files are plain text: they open in the text editor and save the same way.
+  New model names are picked up right after saving.
 - **Scripts** (`.sco`) show their facts and the strings they use; double-click opens the disassembly. Most are
   encrypted with the archive key, which OpenRAGE already has. Functions are named `func_N` and natives shown by hash:
   GTA IV keeps neither name. Every jump target gets a label.
 
-**Checked:** 5,498 text tables (671,627 strings, converting back identically), 1,151 placement files, 941 scripts
+**Checked:** 5,498 text tables (671,627 strings, converting back identically), 1,151 placement files (458,048
+records, each file converting from text back to the same bytes), 941 scripts
 (14.5 million instructions; every jump, call and switch case lands on an instruction).
 
 ## Maps

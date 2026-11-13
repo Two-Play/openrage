@@ -46,9 +46,10 @@ openrage model pc/models/cdimages/vehicles.img/admiral.wft --export admiral.glb 
 openrage verify --models                       # parse every .wdr, .wdd and .wft
 openrage text common/text/german.gxt -o german.txt   # text table as [TABLE] sections of 0xHASH = text
 openrage text pc/data/maps/manhat/manhat01.wpl # placement file as IPL-style text
+openrage text pc/data/maps/manhat/manhat01.wpl --import edited.txt   # write the edited text back (update folder)
 openrage script common/data/cdimages/script.img/main.sco   # disassembly (--strings: only the strings)
 openrage verify --scripts                      # disassemble every .sco, check every jump
-openrage verify --text                         # every .gxt (to text and back), .wpl and .sco
+openrage verify --text                         # every .gxt and .wpl (to text and back), and .sco
 openrage map pc/data/maps/manhat/manhat03.img --render manhat03.png --export manhat03.glb   # a map archive in 3D
 openrage map pc/data/maps/manhat/manhat03.img/manhat03_stream0.wpl                      # one placement file
 openrage map --check                           # every placement file: how many objects have a model
