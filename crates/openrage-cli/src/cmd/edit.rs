@@ -314,22 +314,35 @@ pub(crate) fn cmd_mv(game_dir: &Path, from: &str, to: &str, keys: Option<Arc<Gta
 }
 
 pub(crate) fn cmd_history(game_dir: &Path) -> Result<()> {
-    let Some(mods) = rage_mods::mods_dir(game_dir) else {
-        outln!("No mods folder.");
-        return Ok(());
+    use openrage_app::journal::Kind;
+    let entries = match rage_mods::mods_dir(game_dir) {
+        Some(mods) => openrage_app::journal::Journal::new(&mods).entries()?,
+        None if json() => Vec::new(),
+        None => {
+            outln!("No mods folder.");
+            return Ok(());
+        }
     };
-    let entries = openrage_app::journal::Journal::new(&mods).entries()?;
-    if entries.is_empty() {
+    if entries.is_empty() && !json() {
         outln!("No recorded changes.");
     }
+    let mut out = Rows::start();
     for e in entries {
-        use openrage_app::journal::Kind;
-        let place = match e.kind {
-            Kind::Edited { in_game: true, .. } | Kind::FileWritten { in_game: true, .. } => " (game folder)",
-            _ => "",
-        };
-        outln!("#{:<4} {}{place}  {}", e.id, e.archive, e.description);
+        let in_game = matches!(e.kind, Kind::Edited { in_game: true, .. } | Kind::FileWritten { in_game: true, .. });
+        let place = if in_game { " (game folder)" } else { "" };
+        out.row(
+            || format!("#{:<4} {}{place}  {}", e.id, e.archive, e.description),
+            serde_json::json!({
+                "id": e.id,
+                "time": e.time,
+                "path": e.archive,
+                "in_game_folder": in_game,
+                "description": e.description,
+                "group": e.group,
+            }),
+        );
     }
+    out.finish();
     Ok(())
 }
 

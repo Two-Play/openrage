@@ -9,6 +9,10 @@ pub(crate) struct Cli {
     #[arg(long, global = true, env = "OPENRAGE_GAME_DIR")]
     pub(crate) game: Option<PathBuf>,
 
+    /// Print results as JSON instead of text (ls, search, history).
+    #[arg(long, global = true)]
+    pub(crate) json: bool,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -116,7 +120,7 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = -130.0, allow_hyphen_values = true)]
         yaw: f32,
         /// Write the map file's objects as one glTF scene (.glb), centred on the origin.
-        #[arg(long)]
+        #[arg(short = 'o', long, visible_alias = "out")]
         export: Option<PathBuf>,
         /// Check every map file of the game: how many of its objects have a model.
         #[arg(long, conflicts_with_all = ["path", "render", "export"])]
@@ -270,7 +274,7 @@ pub(crate) enum Command {
         /// Virtual path of the model.
         path: String,
         /// Write the model (the first drawable of a .ydd) as .glb.
-        #[arg(long)]
+        #[arg(short = 'o', long, visible_alias = "out")]
         export: Option<PathBuf>,
         /// Render a preview image (PNG).
         #[arg(long)]
@@ -298,7 +302,7 @@ pub(crate) enum Command {
         /// Virtual path of the .awc file.
         path: String,
         /// Export every sound into this folder as .wav.
-        #[arg(long)]
+        #[arg(short = 'o', long, visible_alias = "out")]
         export: Option<PathBuf>,
     },
     /// List the textures of a texture dictionary (.ytd) and optionally export them.
@@ -306,7 +310,7 @@ pub(crate) enum Command {
         /// Virtual path of the .ytd file.
         path: String,
         /// Export all textures into this folder (DDS, like OpenIV).
-        #[arg(long)]
+        #[arg(short = 'o', long, visible_alias = "out")]
         export: Option<PathBuf>,
         /// Export PNG images instead of DDS (top mip level only).
         #[arg(long)]

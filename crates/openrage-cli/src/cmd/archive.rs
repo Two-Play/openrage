@@ -12,12 +12,20 @@ pub(crate) fn cmd_gta4_keys(game_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_gta4_entry(archive: &rage_rpf::Gta4Archive, id: rage_rpf::Gta4EntryId, path: &str) {
+/// One row of `openrage ls`: the text line and its JSON form.
+fn ls_row(out: &mut Rows, kind: &str, size: Option<u64>, version: &str, path: &str, folder: bool) {
+    let slash = if folder { "/" } else { "" };
+    out.row(
+        || format!("{kind:<8} {:>8} {version:>4}  {path}{slash}", size.map(human).unwrap_or_default()),
+        serde_json::json!({ "kind": kind, "size": size, "version": version, "path": path, "folder": folder }),
+    );
+}
+
+pub(crate) fn print_gta4_entry(out: &mut Rows, archive: &rage_rpf::Gta4Archive, id: rage_rpf::Gta4EntryId, path: &str) {
     let e = archive.entry(id);
     let kind = openrage_app::gta4::kind_label(archive, id);
     let ty = e.resource_type().map(|t| format!("t{t}")).unwrap_or_default();
-    let slash = if e.is_dir() { "/" } else { "" };
-    outln!("{kind:<8} {:>8} {ty:>4}  {path}{slash}", human(e.size()));
+    ls_row(out, kind, Some(e.size()), &ty, path, e.is_dir());
 }
 
 pub(crate) fn cmd_licenses(text: Option<&str>, all: bool) -> Result<()> {
@@ -109,15 +117,16 @@ pub(crate) fn cmd_keys(game_dir: &Path, exe: Option<&Path>, magic: Option<&Path>
     Ok(())
 }
 
-pub(crate) fn print_entry(rpf: &Rpf7, id: EntryId, path: &str) {
+pub(crate) fn print_entry(out: &mut Rows, rpf: &Rpf7, id: EntryId, path: &str) {
     let e = rpf.entry(id);
     let version = e.resource_version().map(|v| format!("v{v}")).unwrap_or_default();
-    let suffix = if e.is_dir() || e.is_archive() { "/" } else { "" };
-    outln!("{:<8} {:>8} {:>4}  {path}{suffix}", e.kind_label(), human(e.size()), version);
+    ls_row(out, e.kind_label(), Some(e.size()), &version, path, e.is_dir() || e.is_archive());
 }
 
 pub(crate) fn cmd_ls(game_dir: &Path, path: &str, recursive: bool, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
-    match vfs::resolve(game_dir, path, keys)? {
+    let node = vfs::resolve(game_dir, path, keys)?;
+    let mut out = Rows::start();
+    match node {
         Node::Dir(dir) => {
             let mut items: Vec<_> = fs::read_dir(&dir)?.flatten().collect();
             items.sort_by_key(|e| e.file_name());
@@ -134,46 +143,48 @@ pub(crate) fn cmd_ls(game_dir: &Path, path: &str, recursive: bool, keys: Option<
                 } else {
                     "file"
                 };
-                let slash = if kind == "file" { "" } else { "/" };
-                outln!("{kind:<8} {:>8}       {name}{slash}", human(meta.len()));
+                ls_row(&mut out, kind, Some(meta.len()), "", &name, kind != "file");
             }
         }
-        Node::PlainFile(p) => outln!("file     {:>8}       {}", human(fs::metadata(&p)?.len()), p.display()),
-        Node::ArchiveFile(rpf, id) => print_entry(&rpf, id, &rpf.path_of(id)),
-        Node::Rpf8File(rpf, i) => print_rpf8_entry(&rpf, i, &rpf.entry_name(i)),
+        Node::PlainFile(p) => {
+            ls_row(&mut out, "file", Some(fs::metadata(&p)?.len()), "", &p.display().to_string(), false)
+        }
+        Node::ArchiveFile(rpf, id) => print_entry(&mut out, &rpf, id, &rpf.path_of(id)),
+        Node::Rpf8File(rpf, i) => print_rpf8_entry(&mut out, &rpf, i, &rpf.entry_name(i)),
         Node::Rpf8Dir(rpf, dir) => {
             let (dirs, files) = rpf.list_dir(&dir);
             for d in dirs {
-                outln!("{:<8} {:>8}       {d}/", "dir", "");
+                ls_row(&mut out, "dir", None, "", &d, true);
             }
             for i in files {
                 let name = rpf.entry_name(i);
-                print_rpf8_entry(&rpf, i, name.rsplit('/').next().unwrap_or(&name));
+                print_rpf8_entry(&mut out, &rpf, i, name.rsplit('/').next().unwrap_or(&name));
             }
         }
-        Node::Gta4File(a, id) => print_gta4_entry(&a, id, &a.entry_path(id)),
+        Node::Gta4File(a, id) => print_gta4_entry(&mut out, &a, id, &a.entry_path(id)),
         Node::Gta4Dir(a, dir) => {
             if recursive {
-                vfs::walk_gta4(&a, dir, "", &mut |id, p| print_gta4_entry(&a, id, p));
+                vfs::walk_gta4(&a, dir, "", &mut |id, p| print_gta4_entry(&mut out, &a, id, p));
             } else {
                 for id in a.children(dir) {
-                    print_gta4_entry(&a, id, &a.entry(id).name);
+                    print_gta4_entry(&mut out, &a, id, &a.entry(id).name);
                 }
             }
         }
         Node::ArchiveDir(rpf, dir) => {
             if recursive {
-                vfs::walk(&rpf, dir, "", true, &mut |a, id, p| print_entry(a, id, p), &mut |e| {
+                vfs::walk(&rpf, dir, "", true, &mut |a, id, p| print_entry(&mut out, a, id, p), &mut |e| {
                     eprintln!("warning: {e}")
                 });
             } else {
                 for id in rpf.children(dir) {
-                    print_entry(&rpf, id, &rpf.entry(id).name);
+                    print_entry(&mut out, &rpf, id, &rpf.entry(id).name);
                 }
             }
         }
         _ => bail!("{path}: not supported"),
     }
+    out.finish();
     Ok(())
 }
 
@@ -301,17 +312,17 @@ pub(crate) fn extraction_result(failures: usize) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_rpf8_entry(rpf: &rage_rpf::Rpf8, i: usize, name: &str) {
-    let e = &rpf.entries().expect("entries")[i];
-    let (kind, slash) = if e.ext_id == 0 {
-        ("rpf", "/")
+pub(crate) fn print_rpf8_entry(out: &mut Rows, rpf: &rage_rpf::Rpf8, i: usize, name: &str) {
+    let Some(e) = rpf.entries().and_then(|all| all.get(i)) else { return };
+    let kind = if e.ext_id == 0 {
+        "rpf"
     } else if e.is_resource {
-        ("resource", "")
+        "resource"
     } else {
-        ("file", "")
+        "file"
     };
     let version = e.resource_version().map(|v| format!("v{v}")).unwrap_or_default();
-    outln!("{kind:<8} {:>8} {version:>4}  {name}{slash}", human(e.size()));
+    ls_row(out, kind, Some(e.size()), &version, name, e.ext_id == 0);
 }
 
 pub(crate) fn cmd_extract(
