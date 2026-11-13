@@ -146,7 +146,7 @@ openrage --game "/path/to/Grand Theft Auto IV" keys
 openrage ls pc/models/cdimages
 ```
 
-GTA IV is read-only for now: browse, preview and extract; view textures and models and export them (DDS/PNG, glTF); read texts and placement files. Maps follow.
+GTA IV is read-only for now: browse, preview and extract; view textures and models and export them (DDS/PNG, glTF); read texts and placement files; see maps in 3D (double-click a `.wpl`).
 
 ## Using the GUI
 

@@ -159,12 +159,26 @@ pub fn resource_type_name(t: u32) -> &'static str {
 pub struct TextureIndex {
     /// `.wtd` name (lower case, without extension) → archives holding one.
     dictionaries: HashMap<String, Vec<PathBuf>>,
+    /// Model name (lower case, without extension) → archives and the entry's name there.
+    models: HashMap<String, Vec<(PathBuf, String)>>,
     /// Model name → texture dictionary name (from the `.ide` files), lower case.
     model_txd: HashMap<String, String>,
     /// Texture dictionary → its parent (`txdp` sections), lower case.
     parent: HashMap<String, String>,
     /// Model names by hash (joaat of the lower-case name), as the `.ide` files write them.
     model_names: HashMap<u32, String>,
+    /// Models inside drawable dictionaries (`.wdd`): name hash → archive and
+    /// dictionary entry. Read on first use (a few seconds).
+    members: OnceLock<HashMap<u32, (PathBuf, String)>>,
+}
+
+/// Where a model's drawable is: a file of its own, or one entry of a drawable dictionary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelSource {
+    /// Virtual path of a `.wdr`, `.wft` or `.wdd`.
+    File(String),
+    /// Virtual path of a `.wdd` and the model's name hash in it.
+    Member { dictionary: String, hash: u32 },
 }
 
 impl TextureIndex {
@@ -185,9 +199,12 @@ impl TextureIndex {
                 && let Ok(a) = Gta4Archive::open_default(&path)
             {
                 for id in a.children(Gta4Archive::ROOT) {
-                    let name = a.entry(id).name.to_ascii_lowercase();
+                    let entry = &a.entry(id).name;
+                    let name = entry.to_ascii_lowercase();
                     if let Some(stem) = name.strip_suffix(".wtd") {
                         index.dictionaries.entry(stem.to_owned()).or_default().push(path.clone());
+                    } else if let Some((stem, "wdr" | "wft" | "wdd")) = name.rsplit_once('.') {
+                        index.models.entry(stem.to_owned()).or_default().push((path.clone(), entry.clone()));
                     }
                 }
             }
@@ -249,6 +266,65 @@ impl TextureIndex {
         out
     }
 
+    /// The virtual path (relative to `game`) of a model file, preferring one
+    /// below `near` (the placement file's folder or episode).
+    pub fn model_path(&self, name: &str, near: &Path, game: &Path) -> Option<String> {
+        let found = self.models.get(&name.to_ascii_lowercase())?;
+        let rank = |p: &Path| {
+            near.ancestors().take_while(|a| a.starts_with(game)).position(|a| p.starts_with(a)).unwrap_or(usize::MAX)
+        };
+        let (archive, entry) = found.iter().min_by_key(|(p, _)| rank(p))?;
+        let rel = archive.strip_prefix(game).ok()?.to_string_lossy().replace('\\', "/");
+        Some(format!("{rel}/{entry}"))
+    }
+
+    /// The models inside the game's drawable dictionaries (peds' excluded),
+    /// read once.
+    pub fn dictionary_members(&self) -> &HashMap<u32, (PathBuf, String)> {
+        use rayon::prelude::*;
+        self.members.get_or_init(|| {
+            let mut by_archive: HashMap<PathBuf, Vec<String>> = HashMap::new();
+            for (path, entry) in self.models.values().flatten() {
+                let peds = path.file_name().is_some_and(|n| n.eq_ignore_ascii_case("componentpeds.img"));
+                if !peds && entry.to_ascii_lowercase().ends_with(".wdd") {
+                    by_archive.entry(path.clone()).or_default().push(entry.clone());
+                }
+            }
+            by_archive
+                .into_par_iter()
+                .flat_map_iter(|(path, entries)| {
+                    let mut found = Vec::new();
+                    if let Ok(a) = Gta4Archive::open_default(&path) {
+                        for entry in entries {
+                            let Some(id) = a.find_child(Gta4Archive::ROOT, &entry) else { continue };
+                            let Ok(res) = a.read_resource(id) else { continue };
+                            let root = rage_resource::Resource::ROOT;
+                            let (Ok(list), Ok(count)) = (res.u32(root + 0x10), res.u16(root + 0x1C)) else { continue };
+                            for k in 0..count as u64 {
+                                if let Ok(hash) = res.u32(list as u64 + k * 4) {
+                                    found.push((hash, (path.clone(), entry.clone())));
+                                }
+                            }
+                        }
+                    }
+                    found
+                })
+                .collect()
+        })
+    }
+
+    /// Where the model `name` is, preferring files below `near`; models
+    /// without a file of their own are looked up in the drawable dictionaries.
+    pub fn model_source(&self, name: &str, near: &Path, game: &Path) -> Option<ModelSource> {
+        if let Some(p) = self.model_path(name, near, game) {
+            return Some(ModelSource::File(p));
+        }
+        let hash = rage_core::hash::joaat(name);
+        let (archive, entry) = self.dictionary_members().get(&hash)?;
+        let rel = archive.strip_prefix(game).ok()?.to_string_lossy().replace('\\', "/");
+        Some(ModelSource::Member { dictionary: format!("{rel}/{entry}"), hash })
+    }
+
     /// Archives that hold `<name>.wtd`, those below `prefer` first (an
     /// episode's own files before the base game's).
     pub fn archives_of(&self, name: &str, prefer: &Path) -> Vec<PathBuf> {
@@ -282,6 +358,123 @@ pub fn texture_index(game: &Path) -> Arc<TextureIndex> {
         c.insert(game.to_owned(), index.clone());
     }
     index
+}
+
+/// Whether a model is a low-detail stand-in (`lod…`, `slod…`).
+pub fn is_lod_model(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("lod") || n.starts_with("slod")
+}
+
+/// Puts a placement file (`.wpl`, a virtual path) — or a map archive (`.img`)
+/// with all of its placement files — together as a scene: every
+/// model it places, loaded once with its textures, with all its placements.
+/// Low-detail stand-ins are left out unless the file holds nothing else.
+pub fn load_map(game: &Path, vpath: &str, progress: &(dyn Fn(usize, usize) + Sync)) -> Result<crate::world::MapScene> {
+    use rayon::prelude::*;
+    // A placement file, or a map archive (`.img`) with all of its placement files.
+    let files: Vec<Vec<u8>> = match vfs::resolve(game, vpath, None)? {
+        vfs::Node::Gta4File(a, id) => vec![a.read(id)?],
+        vfs::Node::PlainFile(p) => vec![fs::read(p)?],
+        vfs::Node::Gta4Dir(a, dir) => a
+            .children(dir)
+            .filter(|&i| a.entry(i).name.to_ascii_lowercase().ends_with(".wpl"))
+            .map(|i| a.read(i))
+            .collect::<Result<_, _>>()?,
+        _ => bail!("{vpath} is neither a placement file nor a map archive"),
+    };
+    let mut instances = Vec::new();
+    for data in &files {
+        instances.extend(rage_formats::wpl::parse(data)?.instances);
+    }
+    if instances.is_empty() {
+        bail!("{vpath} places no objects");
+    }
+    let index = texture_index(game);
+    let named: Vec<(String, &rage_formats::wpl::Instance)> = instances
+        .iter()
+        .map(|i| (index.model_name(i.model_hash).unwrap_or_else(|| format!("0x{:08X}", i.model_hash)), i))
+        .collect();
+    let detailed = named.iter().any(|(n, _)| !is_lod_model(n));
+    let mut by_model: HashMap<String, Vec<rage_formats::math::Mat4>> = HashMap::new();
+    for (name, i) in &named {
+        if detailed && is_lod_model(name) {
+            continue;
+        }
+        // Placement files store the inverse rotation (as GTA San Andreas and GTA V do).
+        let q = [-i.rotation[0], -i.rotation[1], -i.rotation[2], i.rotation[3]];
+        by_model.entry(name.clone()).or_default().push(rage_formats::math::from_trs(i.position, q, [1.0; 3]));
+    }
+    let objects = by_model.values().map(Vec::len).sum();
+    // Models next to the placement file (same folder, then same episode) first.
+    let full = game.join(vpath);
+    let near = full.ancestors().find(|p| p.is_dir()).map(Path::to_owned).unwrap_or_else(|| game.to_owned());
+    type Placements = Vec<rage_formats::math::Mat4>;
+    type Loaded = Vec<(String, crate::models::LoadedModel, Placements)>;
+    enum Job {
+        /// A model file of its own: name, virtual path, placements.
+        File(String, String, Placements),
+        /// A drawable dictionary and the (name, hash, placements) wanted from it.
+        Dictionary(String, Vec<(String, u32, Placements)>),
+    }
+    // Models with a file of their own are loaded one by one; those inside a
+    // drawable dictionary together with the others from the same dictionary.
+    let mut singles: Vec<(String, String, Placements)> = Vec::new();
+    let mut dictionaries: HashMap<String, Vec<(String, u32, Placements)>> = HashMap::new();
+    let mut missing: Vec<(String, usize)> = Vec::new();
+    for (name, transforms) in by_model {
+        match index.model_source(&name, &near, game) {
+            Some(ModelSource::File(vpath)) => singles.push((name, vpath, transforms)),
+            Some(ModelSource::Member { dictionary, hash }) => {
+                dictionaries.entry(dictionary).or_default().push((name, hash, transforms))
+            }
+            None => missing.push((name, transforms.len())),
+        }
+    }
+    let jobs: Vec<Job> = singles
+        .into_iter()
+        .map(|(n, p, t)| Job::File(n, p, t))
+        .chain(dictionaries.into_iter().map(|(d, m)| Job::Dictionary(d, m)))
+        .collect();
+    let (total, done) = (jobs.len(), std::sync::atomic::AtomicUsize::new(0));
+    progress(0, total);
+    let results: Vec<(Loaded, Vec<(String, usize)>)> = jobs
+        .into_par_iter()
+        .map(|job| {
+            let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
+            progress(finished, total);
+            match job {
+                Job::File(name, vpath, transforms) => match crate::models::load(game, None, &vpath) {
+                    Ok(m) => (vec![(name, m, transforms)], Vec::new()),
+                    Err(_) => (Vec::new(), vec![(name, transforms.len())]),
+                },
+                Job::Dictionary(dictionary, members) => {
+                    let wanted: Vec<(String, u32)> = members.iter().map(|(n, h, _)| (n.clone(), *h)).collect();
+                    let mut loaded: HashMap<String, crate::models::LoadedModel> =
+                        crate::models::load_gta4_members(game, &dictionary, &wanted)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect();
+                    let mut ok = Vec::new();
+                    let mut lost = Vec::new();
+                    for (name, _, transforms) in members {
+                        match loaded.remove(&name) {
+                            Some(m) => ok.push((name, m, transforms)),
+                            None => lost.push((name, transforms.len())),
+                        }
+                    }
+                    (ok, lost)
+                }
+            }
+        })
+        .collect();
+    let mut models = Vec::new();
+    for (ok, lost) in results {
+        models.extend(ok);
+        missing.extend(lost);
+    }
+    missing.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    Ok(crate::world::MapScene { models, objects, missing })
 }
 
 /// A placement file (`.wpl`) as IPL-style text, with model names from the
@@ -379,6 +572,13 @@ mod tests {
         assert_eq!(index.dictionaries_for("ADMIRAL"), ["admiral"]);
         assert!(index.dictionaries_for("unknown").is_empty());
         assert_eq!(index.model_name(rage_core::hash::joaat("nge_det_mh1")).as_deref(), Some("NGE_Det_MH1"));
+    }
+
+    #[test]
+    fn recognises_low_detail_models() {
+        assert!(is_lod_model("LOD_PylonA_MH11"));
+        assert!(is_lod_model("slodbxe_07"));
+        assert!(!is_lod_model("hk_bagelshop_mh3"));
     }
 
     #[test]

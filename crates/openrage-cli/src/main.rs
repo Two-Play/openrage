@@ -128,7 +128,7 @@ enum Command {
     /// Put a map file (.ymap) together: its objects with their models and textures
     /// (builds the world cache on first use).
     Map {
-        /// Virtual path of the .ymap (none with --check).
+        /// Virtual path of the .ymap (GTA IV: .wpl; none with --check).
         path: Option<String>,
         /// Render a picture of the whole map file (PNG).
         #[arg(long)]
@@ -522,6 +522,9 @@ fn run() -> Result<()> {
                 outln!("  {n:>4} × {a}");
             }
             Ok(())
+        }
+        Command::Map { path, render, yaw, export, check } if gta4 => {
+            cmd_map_gta4(&game_dir, path.as_deref(), render.as_deref(), yaw, export.as_deref(), check)
         }
         Command::Map { path, render, yaw, export, check } => {
             cmd_map(&game_dir, path.as_deref(), render.as_deref(), yaw, export.as_deref(), check, keys)
@@ -1513,6 +1516,129 @@ fn cmd_map(
         fs::write(out, rage_formats::png(1280, 800, &rgba)?)?;
         outln!("Rendered {}", out.display());
     }
+    Ok(())
+}
+
+/// A GTA IV placement file (`.wpl`) as a scene: summary, glTF export, picture.
+/// With `check`, every placement file of the game: how many objects have a model.
+fn cmd_map_gta4(
+    game_dir: &Path,
+    path: Option<&str>,
+    render: Option<&Path>,
+    yaw: f32,
+    export: Option<&Path>,
+    check: bool,
+) -> Result<()> {
+    use openrage_app::gta4;
+    let started = Instant::now();
+    if check {
+        return check_maps_gta4(game_dir, started);
+    }
+    let path = path.context("which placement file (.wpl)? (or --check for all)")?;
+    let scene = gta4::load_map(game_dir, path, &|done, total| {
+        if done % 25 == 0 || done == total {
+            eprint!("\rloading models: {done}/{total}");
+        }
+    })?;
+    eprintln!();
+    let placed: usize = scene.models.iter().map(|(_, _, t)| t.len()).sum();
+    outln!(
+        "{path}: {} objects, {} models loaded ({placed} placed), {} models not found ({:.1}s)",
+        scene.objects,
+        scene.models.len(),
+        scene.missing.len(),
+        started.elapsed().as_secs_f32()
+    );
+    for (name, n) in scene.missing.iter().take(10) {
+        outln!("  no model: {n:>3} × {name}");
+    }
+    let looks: Vec<openrage_app::models::Look> = scene.models.iter().map(|(_, m, _)| m.default_look()).collect();
+    let items: Vec<(&openrage_app::models::LoadedModel, &openrage_app::models::Look, &[rage_formats::math::Mat4])> =
+        scene.models.iter().zip(&looks).map(|((_, m, t), l)| (m, l, t.as_slice())).collect();
+    let (lo, hi) = openrage_app::world::scene_bounds(&items).context("nothing to show")?;
+    let center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, lo[2]];
+    outln!(
+        "extent {:.0} × {:.0} × {:.0} m around ({:.0}, {:.0}, {:.0})",
+        hi[0] - lo[0],
+        hi[1] - lo[1],
+        hi[2] - lo[2],
+        center[0],
+        center[1],
+        center[2]
+    );
+    let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("map");
+    if let Some(out) = export {
+        let glb = openrage_app::models::scene_to_glb(stem, &items, center).context("nothing to export")?;
+        fs::write(out, &glb)?;
+        outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
+    }
+    if let Some(out) = render {
+        use openrage_app::render;
+        let materials: Vec<render::Materials> =
+            scene.models.iter().map(|(_, m, _)| render::Materials::new(m)).collect();
+        let mut soft = Vec::new();
+        for (((_, m, ts), l), mat) in scene.models.iter().zip(&looks).zip(&materials) {
+            for t in ts {
+                soft.push(render::SceneItem { model: m, look: l, materials: mat, transform: *t, skin: None });
+            }
+        }
+        let camera = render::orbit_camera(lo, hi, render::View { yaw: yaw.to_radians(), ..Default::default() });
+        let rgba = render::render_scene(&soft, &camera, 1280, 800);
+        fs::write(out, rage_formats::png(1280, 800, &rgba)?)?;
+        outln!("Rendered {}", out.display());
+    }
+    Ok(())
+}
+
+/// Every GTA IV placement file: how many of its objects name a model the
+/// game's `.ide` files define and an archive holds.
+fn check_maps_gta4(game_dir: &Path, started: Instant) -> Result<()> {
+    use openrage_app::gta4;
+    let index = gta4::texture_index(game_dir);
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut disk = Vec::new();
+    collect_archives(game_dir, &["wpl"], &mut disk);
+    for p in disk {
+        let rel = p.strip_prefix(game_dir).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+        files.push((rel, fs::read(&p)?));
+    }
+    let (starts, _) = gta4_starts(game_dir, "")?;
+    for (prefix, a, root) in &starts {
+        vfs::walk_gta4(a, *root, prefix, &mut |id, p| {
+            if a.entry(id).name.to_ascii_lowercase().ends_with(".wpl")
+                && let Ok(d) = a.read(id)
+            {
+                files.push((p.to_owned(), d));
+            }
+        });
+    }
+    let (mut objects, mut unnamed, mut no_file) = (0usize, 0usize, 0usize);
+    let mut missing: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (_, data) in &files {
+        let Ok(wpl) = rage_formats::wpl::parse(data) else { continue };
+        for i in &wpl.instances {
+            objects += 1;
+            match index.model_name(i.model_hash) {
+                None => unnamed += 1,
+                Some(n) if index.model_source(&n, game_dir, game_dir).is_none() => {
+                    no_file += 1;
+                    *missing.entry(n).or_default() += 1;
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    let mut missing: Vec<(String, usize)> = missing.into_iter().collect();
+    missing.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (name, n) in missing.iter().take(15) {
+        outln!("  no model file: {n:>4} × {name}");
+    }
+    outln!(
+        "{} placement files, {objects} objects: {} with a model, {unnamed} with an unknown model name, {no_file} whose model was not found ({:.1}s)",
+        files.len(),
+        objects - unnamed - no_file,
+        started.elapsed().as_secs_f32()
+    );
     Ok(())
 }
 

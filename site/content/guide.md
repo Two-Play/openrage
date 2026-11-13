@@ -178,8 +178,17 @@ LOD, then the other sections (garages, cull zones, blocks, …) field by field, 
 and `.ipl` files are plain text already. **Scripts** (`.sco`) show their header (code size, variables, signature);
 they cannot be disassembled yet. `openrage verify --text` reads every text table and checks that its text form converts
 back identically (5,498 tables, 671,627 strings), every placement file (1,151 files, 458,048 records) and every script
-header (941), with no errors. Collision files, animations and maps follow in the next steps. The search index is GTA V
-only for now.
+header (941), with no errors.
+
+**Maps**: double-click a placement file (`.wpl`) to see its objects in 3D, with the object list and glTF export of
+GTA V's map scenes. A map archive (`pc/data/maps/…/<area>.img`) is mostly a set of streamed placement files;
+`openrage map <archive>` puts all of them together (`--render`, `--export`), e.g. a whole part of Algonquin with
+2,483 objects. Models come from the archive next to the placement file first, then from anywhere in the game (episode
+files preferred for TLAD and TBoGT); many small objects are kept in drawable dictionaries (`.wdd`), which OpenRAGE
+indexes once per session. Low-detail stand-ins (`lod…`, `slod…`) are left out unless a file holds nothing else.
+Placement files store the inverse of each object's rotation, as GTA San Andreas and GTA V do. `openrage map --check`
+counts, over all 1,151 placement files, how many of the 435,116 objects have a model: all but the 1,434 whose model
+name no `.ide` file gives. Collision files and animations follow; the search index is GTA V only for now.
 
 ## Red Dead Redemption 2
 

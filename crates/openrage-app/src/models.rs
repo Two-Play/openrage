@@ -1112,6 +1112,42 @@ fn load_gta4(archive: &Arc<rage_rpf::Gta4Archive>, id: rage_rpf::Gta4EntryId) ->
     Ok(model)
 }
 
+/// Models out of a GTA IV drawable dictionary (`.wdd` at `vpath`): one
+/// model per wanted (name, name hash), each textured on its own.
+pub fn load_gta4_members(game: &Path, vpath: &str, wanted: &[(String, u32)]) -> Result<Vec<(String, LoadedModel)>> {
+    let Node::Gta4File(archive, id) = rage_rpf::vfs::resolve(game, vpath, None)? else {
+        bail!("{vpath} is not a file inside a GTA IV archive")
+    };
+    let all = rage_formats::wdr::parse_wdd(&archive.read_resource(id)?)?;
+    let mut out = Vec::new();
+    for (name, hash) in wanted {
+        let Some((_, d)) = all.iter().find(|(h, _)| h == hash) else { continue };
+        let used: Vec<String> = d.shaders.iter().flat_map(|s| s.textures.iter().cloned()).collect();
+        let external = crate::gta4::model_textures(&archive, name, &used, false);
+        let part = Part {
+            name: name.clone(),
+            group: String::new(),
+            drawable: 0,
+            transform: math::IDENTITY,
+            visible: true,
+            bone: None,
+        };
+        let mut model = LoadedModel {
+            drawables: vec![(name.clone(), d.clone())],
+            parts: vec![part],
+            external,
+            materials: Vec::new(),
+            shader_material: Vec::new(),
+            skeleton: d.skeleton.clone(),
+            expressions: Vec::new(),
+            ped: None,
+        };
+        model.collect_materials();
+        out.push((name.clone(), model));
+    }
+    Ok(out)
+}
+
 fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
     let entries = rpf.entries().context("archive table not readable")?;
     let entry = &entries[i];
