@@ -156,8 +156,14 @@ pub fn write_glb_scene<'a>(
                 }
             }
             let label = tex_name.unwrap_or_else(|| format!("{dname}_shader_{si}"));
+            // Skin shaders keep other data in the texture's alpha.
+            let alpha = if crate::shaders::alpha_is_not_opacity(shader.name_hash) {
+                "\"alphaMode\":\"OPAQUE\""
+            } else {
+                "\"alphaMode\":\"MASK\",\"alphaCutoff\":0.3"
+            };
             materials.push(format!(
-                "{{\"name\":\"{}\",\"pbrMetallicRoughness\":{{{pbr}}},\"alphaMode\":\"MASK\",\"alphaCutoff\":0.3,\"doubleSided\":true}}",
+                "{{\"name\":\"{}\",\"pbrMetallicRoughness\":{{{pbr}}},{alpha},\"doubleSided\":true}}",
                 esc(&label)
             ));
         }

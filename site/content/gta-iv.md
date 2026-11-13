@@ -114,14 +114,22 @@ Fragments (`.wft`: vehicles, peds, breakable props) carry their collision: switc
 ## Animations
 
 Animation dictionaries (`.wad`, in `pc/anim/anim.img`, cutscenes in `cuts.img`) open like GTA V's clip dictionaries:
-one clip per animation, with the ped models to play it on. Every GTA IV ped shares one skeleton.
+one clip per animation, with the models to play it on. Every GTA IV ped shares one skeleton, and so do the cutscene
+characters (`cs_*` in `cutsprops.img`), whose faces have a fuller rig.
 
-- Translations, rotations and the mover are read; facial and custom tracks are skipped.
+- Translations, rotations and the mover are read. A few tracks of other values that move no bone (flags and weights
+  for the game) are skipped.
+- **Faces:** `facials@…` (moods, gestures, pain, looks) and `visemes@…` (mouth shapes for speech) move the face bones
+  like any other animation. The `…_lo` dictionaries fit the peds' face rig, the `…_hi` ones the cutscene characters':
+  selecting one offers the fitting models.
+- The cutscene characters' skin shaders (`gta_ped_skin…`) keep other data in the texture's alpha channel; OpenRAGE
+  draws them opaque (also in the glTF export), so their heads show.
 - Twist and roll helper bones follow the bone they rest on, so arms stay in one piece.
 
 ```
 openrage clips <path to .wad>
 openrage model <ped> --anim <wad>:<clip>[@seconds] --render pose.png
+openrage model pc/anim/cutsprops.img/cs_andrei.wdd --anim "pc/anim/anim.img/facials@m_hi.wad:angry_c@0.6" --render angry.png
 ```
 
 **Checked:** 1,772 dictionaries, 22,866 animations, every frame evaluated, no errors.

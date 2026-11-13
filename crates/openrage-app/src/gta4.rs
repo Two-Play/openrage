@@ -477,39 +477,69 @@ pub fn load_map(game: &Path, vpath: &str, progress: &(dyn Fn(usize, usize) + Syn
     Ok(crate::world::MapScene { models, objects, missing })
 }
 
-/// Ped models an animation can be played on: the drawable dictionaries of
-/// `componentpeds.img` (base game first, then the episodes'), when the
-/// animation moves bones of the ped skeleton; empty for other animations.
+/// Models an animation can be played on: the drawable dictionaries of the
+/// peds (`componentpeds.img`, base game first, then the episodes') and of
+/// the cutscene characters (`cs_*` in `cutsprops.img`, whose full facial rig
+/// the `…_hi` facial animations move). Each group shares one skeleton; a
+/// group is offered when it has at least half the bones the animation moves,
+/// the better fitting group first.
 pub fn animation_models(game: &Path, tags: &std::collections::HashSet<u16>) -> Vec<String> {
-    static SKELETON: OnceLock<Option<std::collections::HashSet<u16>>> = OnceLock::new();
-    let mut archives = Vec::new();
-    for dir in ["pc/models/cdimages", "TLAD/pc/models/cdimages", "TBoGT/pc/models/cdimages"] {
-        if let Some(p) = vfs::find_case_insensitive(game, &format!("{dir}/componentpeds.img")) {
-            archives.push((dir, p));
+    type Skeleton = Option<std::collections::HashSet<u16>>;
+    static SKELETONS: OnceLock<[Skeleton; 2]> = OnceLock::new();
+    let list = |places: &[(&str, &str)], prefix: &str| -> Vec<String> {
+        let mut models = Vec::new();
+        for (dir, file) in places {
+            let Some(path) = vfs::find_case_insensitive(game, &format!("{dir}/{file}")) else { continue };
+            let Ok(a) = Gta4Archive::open_default(&path) else { continue };
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let mut found: Vec<String> = a
+                .children(Gta4Archive::ROOT)
+                .map(|i| a.entry(i).name.clone())
+                .filter(|n| {
+                    let l = n.to_ascii_lowercase();
+                    l.ends_with(".wdd") && l.starts_with(prefix)
+                })
+                .map(|n| format!("{dir}/{name}/{n}"))
+                .collect();
+            found.sort();
+            models.extend(found);
         }
-    }
-    let mut models: Vec<String> = Vec::new();
-    for (dir, path) in &archives {
-        let Ok(a) = Gta4Archive::open_default(path) else { continue };
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let mut found: Vec<String> = a
-            .children(Gta4Archive::ROOT)
-            .map(|i| a.entry(i).name.clone())
-            .filter(|n| n.to_ascii_lowercase().ends_with(".wdd"))
-            .map(|n| format!("{dir}/{name}/{n}"))
-            .collect();
-        found.sort();
-        models.extend(found);
-    }
-    let skeleton = SKELETON.get_or_init(|| {
-        let first = models.first()?;
-        let model = crate::models::load(game, None, first).ok()?;
-        Some(model.skeleton?.bones.iter().map(|b| b.tag).collect())
+        models
+    };
+    let groups = [
+        list(
+            &[
+                ("pc/models/cdimages", "componentpeds.img"),
+                ("TLAD/pc/models/cdimages", "componentpeds.img"),
+                ("TBoGT/pc/models/cdimages", "componentpeds.img"),
+            ],
+            "",
+        ),
+        list(
+            &[("pc/anim", "cutsprops.img"), ("TLAD/pc/anim", "cutsprops.img"), ("TBoGT/pc/anim", "cutsprops.img")],
+            "cs_",
+        ),
+    ];
+    let skeletons = SKELETONS.get_or_init(|| {
+        groups.clone().map(|g| {
+            let model = crate::models::load(game, None, g.first()?).ok()?;
+            Some(model.skeleton?.bones.iter().map(|b| b.tag).collect())
+        })
     });
-    let Some(skeleton) = skeleton else { return Vec::new() };
     let bones: Vec<&u16> = tags.iter().filter(|t| **t != 0).collect();
-    let fits = !bones.is_empty() && bones.iter().filter(|t| skeleton.contains(t)).count() * 2 >= bones.len();
-    if fits { models } else { Vec::new() }
+    if bones.is_empty() {
+        return Vec::new();
+    }
+    let mut fitting: Vec<(usize, Vec<String>)> = groups
+        .into_iter()
+        .zip(skeletons)
+        .filter_map(|(models, skeleton)| {
+            let have = bones.iter().filter(|t| skeleton.as_ref().is_some_and(|s| s.contains(t))).count();
+            (have * 2 >= bones.len()).then_some((have, models))
+        })
+        .collect();
+    fitting.sort_by_key(|f| std::cmp::Reverse(f.0));
+    fitting.into_iter().flat_map(|(_, m)| m).collect()
 }
 
 /// A placement file (`.wpl`) as IPL-style text, with model names from the

@@ -333,9 +333,22 @@ pub fn is_paint(hash: u32) -> bool {
     name(hash).is_some_and(|n| n.starts_with("vehicle_paint"))
 }
 
+/// Shaders whose base texture keeps other data than opacity in its alpha
+/// channel (GTA IV's skin shaders), so the texture is drawn opaque.
+pub fn alpha_is_not_opacity(hash: u32) -> bool {
+    static OPAQUE: OnceLock<[u32; 2]> = OnceLock::new();
+    OPAQUE.get_or_init(|| [joaat("gta_ped_skin"), joaat("gta_ped_skin_blendshape")]).contains(&hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gta4_skin_shaders_are_opaque() {
+        assert!(alpha_is_not_opacity(0x5fef7400)); // gta_ped_skin_blendshape
+        assert!(!alpha_is_not_opacity(0x8f1b78e6)); // gta_ped
+    }
 
     #[test]
     fn known_names() {
