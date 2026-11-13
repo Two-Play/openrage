@@ -107,6 +107,8 @@ openrage put new.meta x64e.rpf/data/            # import into an archive (mods f
 openrage mv x64e.rpf/a.xml x64e.rpf/b.xml       # rename / move inside an archive
 openrage rm x64e.rpf/levels/gta5/paths.rpf       # remove a file or folder
 openrage mkdir x64e.rpf/my_folder
+openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --mods   # new geometry for an Enhanced .ydr (preview)
+openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --out new.ydr --shader 0
 openrage oiv info mod.oiv                      # what a package would change
 openrage oiv install mod.oiv                   # install into the mods folder
 openrage oiv list / oiv uninstall "Name 1.0"   # installed packages, uninstall
@@ -156,6 +158,7 @@ openrage licenses --all                        # every license text
 openrage verify                                # decode every entry of every archive
 openrage verify --textures [--rebuild]         # decode (and rebuild) every texture dictionary
 openrage verify --models                       # parse every model of the game
+openrage verify --models --rebuild             # write every Enhanced .ydr anew with its meshes, read back identical
 openrage verify --audio                        # decode every sound of the game
 openrage verify --animations                   # parse every clip dictionary, evaluate all frames
 openrage verify --meta                         # convert every metadata file of the game
