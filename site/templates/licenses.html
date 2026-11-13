@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{#- The licenses page: the Markdown text of content/licenses.md, then every
+    third-party crate and license text from the generated data file
+    (copied to site/data/ by the website workflow). -#}
+
+{% block main %}
+{%- set data = load_data(path="data/third_party_licenses.json") %}
+<main id="main" class="doc">
+  <div class="wrap">
+    <header class="doc-head">
+      <h1>{{ page.title }}</h1>
+      <p class="lead">{{ page.extra.lead | markdown(inline=true) | safe }}</p>
+    </header>
+    <article class="prose">
+      {{ page.content | safe }}
+
+      <h2 id="crates">Third-party crates ({{ data.crates | length }})</h2>
+      <table>
+        <thead><tr><th>Crate</th><th>Version</th><th>License</th><th>Texts</th></tr></thead>
+        <tbody>
+          {%- for c in data.crates %}
+          <tr>
+            <td>{% if c.repository %}<a href="{{ c.repository }}">{{ c.name }}</a>{% else %}{{ c.name }}{% endif %}</td>
+            <td>{{ c.version }}</td>
+            <td>{{ c.license }}</td>
+            <td>{% for t in c.texts %}<a href="#license-{{ t + 1 }}">#{{ t + 1 }}</a>{% if not loop.last %} {% endif %}{% endfor %}</td>
+          </tr>
+          {%- endfor %}
+        </tbody>
+      </table>
+
+      <h2 id="texts">License texts</h2>
+      {%- for t in data.licenses %}
+      {%- set i = loop.index0 %}
+      <details id="license-{{ loop.index }}">
+        <summary>#{{ loop.index }} {{ t.name }} ({{ t.id }}) — used by
+          {%- for c in data.crates %}{% if i in c.texts %} {{ c.name }}{% endif %}{% endfor %}</summary>
+        <pre>{{ t.text }}</pre>
+      </details>
+      {%- endfor %}
+    </article>
+  </div>
+</main>
+{% endblock main %}

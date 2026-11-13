@@ -1,0 +1,39 @@
+# cargo-deny configuration: `cargo deny check licenses` runs in CI.
+#
+# OpenRAGE is GPL-3.0-only, so every dependency must come under a licence
+# that can be combined with it. Adding a dependency with a licence not listed
+# here fails CI; check it is GPL-3-compatible before adding it to the list.
+
+[graph]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    # OpenRAGE itself; Slint (GPL-3.0-only OR its own licences) is used under the GPL.
+    "GPL-3.0-only",
+]
+
+# The TFIT2 cipher port stays under the AGPL-3.0 (see NOTICE.md); no other
+# crate may bring in the AGPL.
+[[licenses.exceptions]]
+crate = "rage-tfit2"
+allow = ["AGPL-3.0-only"]
+
+[licenses.private]
+# The workspace crates are not published; their licence is still checked.
+ignore = false

@@ -68,6 +68,13 @@ component InfoValue inherits TextInput {
     selection-foreground-color: self.color;
 }
 
+// A third-party crate in the About dialog.
+export struct DepRow {
+    name: string,
+    version: string,
+    license: string,
+}
+
 export struct PartRow {
     name: string,
     visible: bool,
@@ -943,6 +950,18 @@ export component AppWindow inherits Window {
     in property <float> preview-progress: -1;
     in property <string> preview-progress-text;
     in-out property <bool> shortcuts-visible;
+    // About dialog: version, licence notice, credits (NOTICE.md sections:
+    // key = title, value = text) and the third-party crates.
+    in-out property <bool> about-visible;
+    in property <string> about-version;
+    in property <string> about-notice;
+    in property <[InfoRow]> about-credits;
+    in property <[DepRow]> about-deps;
+    in property <string> about-deps-summary;
+    in-out property <int> about-selected: -1;
+    in property <string> about-text;
+    in-out property <string> about-filter;
+    in-out property <int> about-tab;
     // History opens in its own window (else in the file list).
     in-out property <bool> history-in-window: true;
 
@@ -1006,6 +1025,12 @@ export component AppWindow inherits Window {
     callback texture-replace();
     // Import a natives.json for script disassembly.
     callback load-natives();
+    callback about-open();
+    callback about-filter-edited(string);
+    callback about-select(int);
+    // "gpl", "agpl" or "notice": shows that text in the licences tab.
+    callback about-show(string);
+    callback about-open-source();
     callback texture-add();
     callback texture-remove();
     callback cancel-task();
@@ -1350,6 +1375,10 @@ export component AppWindow inherits Window {
             MenuItem {
                 title: @tr("Load native names…");
                 activated => { root.load-natives(); }
+            }
+            MenuItem {
+                title: @tr("About OpenRAGE");
+                activated => { root.about-open(); }
             }
         }
     }
@@ -2549,6 +2578,156 @@ export component AppWindow inherits Window {
         }
         Rectangle {
             vertical-stretch: 1;
+        }
+    }
+
+    if root.about-visible: Dialog {
+        title: @tr("About OpenRAGE");
+        subtitle: root.about-version;
+        panel-width: 980px;
+        panel-height: 680px;
+        close => { root.about-visible = false; }
+        TabWidget {
+            vertical-stretch: 1;
+            current-index <=> root.about-tab;
+            Tab {
+                title: @tr("OpenRAGE");
+                VerticalLayout {
+                    padding: Theme.space-l;
+                    spacing: Theme.space-l;
+                    HorizontalLayout {
+                        spacing: Theme.space-l;
+                        Image {
+                            source: @image-url("logo.svg");
+                            width: 72px;
+                            height: 72px;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: Theme.space-xs;
+                            Text {
+                                text: "OpenRAGE";
+                                font-size: Theme.font-heading;
+                                font-weight: 700;
+                                color: Theme.text;
+                            }
+                            Text {
+                                text: root.about-version + " · GPL-3.0-only";
+                                color: Theme.text-muted;
+                            }
+                            Text {
+                                text: @tr("Open-source explorer and mod tool for RAGE engine games");
+                                color: Theme.text-muted;
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.about-notice;
+                        wrap: word-wrap;
+                        color: Theme.text;
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.space-s;
+                        alignment: start;
+                        Button {
+                            text: @tr("Source code");
+                            clicked => { root.about-open-source(); }
+                        }
+                        Button {
+                            text: @tr("GPL-3.0 text");
+                            clicked => { root.about-show("gpl"); }
+                        }
+                        Button {
+                            text: @tr("AGPL-3.0 text (rage-tfit2)");
+                            clicked => { root.about-show("agpl"); }
+                        }
+                        Button {
+                            text: @tr("Third-party licenses");
+                            clicked => { root.about-tab = 2; }
+                        }
+                    }
+                    Rectangle {
+                        vertical-stretch: 1;
+                    }
+                }
+            }
+            Tab {
+                title: @tr("Credits");
+                ScrollView {
+                    VerticalLayout {
+                        padding: Theme.space-l;
+                        spacing: Theme.space-l;
+                        for c in root.about-credits: VerticalLayout {
+                            spacing: Theme.space-xs;
+                            Text {
+                                text: c.key;
+                                font-weight: 700;
+                                color: Theme.text;
+                            }
+                            Text {
+                                text: c.value;
+                                wrap: word-wrap;
+                                color: Theme.text-muted;
+                            }
+                        }
+                    }
+                }
+            }
+            Tab {
+                title: @tr("Third-party licenses");
+                HorizontalLayout {
+                    padding: Theme.space-s;
+                    spacing: Theme.space-m;
+                    VerticalLayout {
+                        width: 360px;
+                        spacing: Theme.space-s;
+                        LineEdit {
+                            placeholder-text: @tr("Filter crates and licenses");
+                            text <=> root.about-filter;
+                            edited(t) => { root.about-filter-edited(t); }
+                        }
+                        Text {
+                            text: root.about-deps-summary;
+                            font-size: Theme.font-small;
+                            color: Theme.text-muted;
+                            wrap: word-wrap;
+                        }
+                        ListView {
+                            vertical-stretch: 1;
+                            for d[i] in root.about-deps: Rectangle {
+                                height: 40px;
+                                background: i == root.about-selected ? Theme.accent-subtle : dta.has-hover ? Theme.hover : Math.mod(i, 2) == 1 ? Theme.stripe : transparent;
+                                dta := TouchArea {
+                                    clicked => { root.about-select(i); }
+                                }
+                                VerticalLayout {
+                                    padding-left: Theme.space-s;
+                                    padding-right: Theme.space-s;
+                                    alignment: center;
+                                    Text {
+                                        text: d.name + "  " + d.version;
+                                        overflow: elide;
+                                        color: Theme.text;
+                                    }
+                                    Text {
+                                        text: d.license;
+                                        overflow: elide;
+                                        font-size: Theme.font-small;
+                                        color: Theme.text-muted;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    TextEdit {
+                        horizontal-stretch: 1;
+                        read-only: true;
+                        wrap: word-wrap;
+                        font-size: 12px;
+                        text: root.about-text;
+                    }
+                }
+            }
         }
     }
 

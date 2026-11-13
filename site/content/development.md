@@ -42,6 +42,29 @@ It reuses the release's archives instead of building again and adds its checksum
 (*Actions → Release bundle → Run workflow*) with a tag to make the bundle for an older release; with *upload* off it is
 only kept as a workflow artifact.
 
+## Licenses
+
+OpenRAGE is GPL-3.0-only, so every dependency must come under a license that can be combined with it.
+`deny.toml` lists the allowed licenses; CI runs `cargo deny check licenses` on every change. A new dependency
+with another license fails CI: check that it is GPL-3-compatible before adding it to the list.
+
+`THIRD_PARTY_LICENSES.md` (shipped with every release) and `crates/openrage-app/src/third_party_licenses.json`
+(shown in *Help → About OpenRAGE*, by `openrage licenses` and on the [licenses page](@/licenses.md)) are generated
+from `Cargo.lock` with [cargo-about](https://github.com/EmbarkStudios/cargo-about) (configured in `about.toml`).
+After changing dependencies, regenerate them:
+
+```
+cargo install --locked --features cli cargo-about
+cargo fetch --locked
+python3 dev/third_party_licenses.py
+```
+
+CI checks that both files are current (`python3 dev/third_party_licenses.py --check`). The licenses page copies the
+JSON into `site/data/` when the website is built; do the same (`mkdir -p site/data && cp
+crates/openrage-app/src/third_party_licenses.json site/data/`) before `zola serve`.
+
+Credits for format knowledge and ported code go into `NOTICE.md` by hand; the About dialog shows its sections.
+
 ## Project layout
 
 | Crate | Purpose |

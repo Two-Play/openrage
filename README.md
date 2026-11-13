@@ -85,6 +85,6 @@ The website lives in [`site/`](site/) and is built from Markdown.
 
 ## License
 
-GPL-3.0-only, except `crates/rage-tfit2` (the RDR2 archive cipher, ported from an AGPL-3.0 project), which is AGPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for third-party attributions.
+GPL-3.0-only, except `crates/rage-tfit2` (the RDR2 archive cipher, ported from an AGPL-3.0 project), which is AGPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for third-party attributions, and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for the licenses of all third-party crates in the programs (generated from `Cargo.lock`, checked in CI). The same is in the app under **Help → About OpenRAGE**, via `openrage licenses` and on the [licenses page](https://two-play.github.io/openrage/licenses/).
 
 Grand Theft Auto, Red Dead Redemption, RAGE and Rockstar Games are trademarks of Take-Two Interactive Software, Inc. The screenshots show OpenRAGE displaying files from the author's own copy of the game.

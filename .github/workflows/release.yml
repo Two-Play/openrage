@@ -57,7 +57,7 @@ jobs:
           ref="${GITHUB_REF_NAME//\//-}"
           dir="openrage-${ref}-${{ matrix.name }}"
           mkdir -p "$dir" out
-          cp README.md LICENSE NOTICE.md "$dir/"
+          cp README.md LICENSE NOTICE.md THIRD_PARTY_LICENSES.md "$dir/"
           cp crates/rage-tfit2/LICENSE "$dir/LICENSE-AGPL-3.0"
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp target/release/openrage.exe target/release/openrage-gui.exe "$dir/"
@@ -81,7 +81,7 @@ jobs:
           cp packaging/openrage.png "$app/openrage.png"
           cp packaging/openrage.png "$app/.DirIcon"
           cp packaging/openrage.png "$app/usr/share/icons/hicolor/256x256/apps/"
-          cp README.md LICENSE NOTICE.md "$app/usr/share/doc/openrage/"
+          cp README.md LICENSE NOTICE.md THIRD_PARTY_LICENSES.md "$app/usr/share/doc/openrage/"
           cp crates/rage-tfit2/LICENSE "$app/usr/share/doc/openrage/LICENSE-AGPL-3.0"
           curl -sSfL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool

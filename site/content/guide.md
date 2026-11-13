@@ -31,6 +31,13 @@ The explorer shows a folder tree in which archives (including nested ones) behav
 
 **Settings** (gear button or File → Settings…, Ctrl+,): light, dark or system theme; the accent color — the style's default, OpenRAGE orange (the logo's), a preset or any color of your own; the configured game (GTA V, GTA V Enhanced or RDR2, shown in the address bar) with *Switch game…*, *Add or change a game…* and whether to ask which game to open at start; and whether the history opens in its own window and the mods overlay is shown.
 
+## About and licenses
+
+**Help → About OpenRAGE** shows the version, OpenRAGE's license (with the full GPL-3.0 and, for the TFIT2 cipher,
+AGPL-3.0 texts), a link to the source code, the credits from `NOTICE.md`, and every third-party crate in the program
+with its license and full license text, filterable by name or license. The same list is on the
+[licenses page](@/licenses.md) and in `THIRD_PARTY_LICENSES.md` next to the programs.
+
 ## Search
 
 OpenRAGE keeps a search index of the whole game (built once in about 30 seconds, then updated incrementally — only archives that changed after a game update are re-read). The search field accepts:
