@@ -90,6 +90,30 @@ pub fn game_name(dir: &Path) -> Option<&'static str> {
     }
 }
 
+/// Adds the archives (files with one of `extensions`) below `dir` to `out`,
+/// sorted, skipping OpenRAGE's own folder (journal and kept originals are not
+/// part of the game).
+pub fn collect_archives(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    let mut items: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    items.sort();
+    for p in items {
+        if p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(rage_mods::overlay::OPENRAGE_FOLDER)) {
+            continue;
+        }
+        if p.is_dir() {
+            collect_archives(&p, extensions, out);
+        } else if p.extension().is_some_and(|e| extensions.iter().any(|x| e.eq_ignore_ascii_case(x))) {
+            out.push(p);
+        }
+    }
+}
+
+/// [`collect_archives`] for `.rpf` files.
+pub fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
+    collect_archives(dir, &["rpf"], out);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,28 +138,4 @@ mod tests {
             [PathBuf::from("/home/user/.local/share/Steam"), PathBuf::from("D:\\SteamLibrary")]
         );
     }
-}
-
-/// Adds the archives (files with one of `extensions`) below `dir` to `out`,
-/// sorted, skipping OpenRAGE's own folder (journal and kept originals are not
-/// part of the game).
-pub fn collect_archives(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
-    let Ok(rd) = fs::read_dir(dir) else { return };
-    let mut items: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-    items.sort();
-    for p in items {
-        if p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(rage_mods::overlay::OPENRAGE_FOLDER)) {
-            continue;
-        }
-        if p.is_dir() {
-            collect_archives(&p, extensions, out);
-        } else if p.extension().is_some_and(|e| extensions.iter().any(|x| e.eq_ignore_ascii_case(x))) {
-            out.push(p);
-        }
-    }
-}
-
-/// [`collect_archives`] for `.rpf` files.
-pub fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
-    collect_archives(dir, &["rpf"], out);
 }
