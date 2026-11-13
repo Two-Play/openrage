@@ -223,7 +223,10 @@ fn main() -> anyhow::Result<()> {
         match openrage_app::progress::get() {
             Some((label, done, total)) if total > 0 => {
                 ui.set_preview_progress(done as f32 / total as f32);
-                ui.set_preview_progress_text(format!("{label} {}/{total} · {} %", done + 1, done * 100 / total).into());
+                let step = (done + 1).min(total);
+                ui.set_preview_progress_text(
+                    format!("{label} {step}/{total} · {} %", done.min(total) * 100 / total).into(),
+                );
             }
             Some((label, _, _)) => {
                 ui.set_preview_progress(-1.0);

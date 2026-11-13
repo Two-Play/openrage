@@ -20,6 +20,7 @@ rage-mods.workspace = true
 rage-formats.workspace = true
 rage-resource.workspace = true
 anyhow.workspace = true
+rayon.workspace = true
 rfd = "0.15"
 wgpu = "30"
 rodio = { version = "0.23", default-features = false, features = ["playback"] }

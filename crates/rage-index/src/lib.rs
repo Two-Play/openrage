@@ -136,4 +136,13 @@ impl Index {
             updated_at: schema::get_meta(&self.conn, "updated_at")?.and_then(|v| v.parse().ok()),
         })
     }
+
+    /// Unix time the indexed archives last changed (added, changed or
+    /// removed), not merely when they were last checked. Caches built from the
+    /// index compare against it. Indexes from before it was recorded give the
+    /// time of their last update.
+    pub fn changed_at(&self) -> Result<Option<i64>, IndexError> {
+        let get = |key| schema::get_meta(&self.conn, key).map(|v| v.and_then(|v| v.parse().ok()));
+        Ok(get("changed_at")?.or(get("updated_at")?))
+    }
 }

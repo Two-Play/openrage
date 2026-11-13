@@ -188,8 +188,13 @@ pub fn build(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> Result<World> {
     Ok(world)
 }
 
-fn save(world: &World, path: &Path) -> Result<()> {
-    let mut s = String::from(CACHE_VERSION);
+/// The first line of the cache: its format and the index state it was built from.
+fn cache_header(index_changed: Option<i64>) -> String {
+    format!("{CACHE_VERSION}\t{}", index_changed.unwrap_or(0))
+}
+
+fn save(world: &World, path: &Path, index_changed: Option<i64>) -> Result<()> {
+    let mut s = cache_header(index_changed);
     s.push('\n');
     for (p, lo, hi) in &world.maps {
         s.push_str(&format!("Y\t{p}\t{} {} {}\t{} {} {}\n", lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]));
@@ -216,10 +221,10 @@ fn floats<const N: usize>(s: &str) -> Option<[f32; N]> {
     v.try_into().ok()
 }
 
-fn load_cache(path: &Path) -> Option<World> {
+fn load_cache(path: &Path, index_changed: Option<i64>) -> Option<World> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
-    if lines.next()? != CACHE_VERSION {
+    if lines.next()? != cache_header(index_changed) {
         return None;
     }
     let mut w = World::default();
@@ -242,7 +247,7 @@ fn load_cache(path: &Path) -> Option<World> {
 }
 
 /// The world, from the cache or read from the game (and cached). The cache is
-/// rebuilt when the search index is newer.
+/// rebuilt when the indexed archives changed.
 pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> Result<World> {
     // Archetype names are hashes in the files; the index knows the names.
     if rage_formats::names::registered() == 0
@@ -252,16 +257,17 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> Result<World> {
         rage_formats::names::register(names);
     }
     let path = cache_path(game_dir).context("no cache directory")?;
-    let index_time = crate::index_path(game_dir).and_then(|p| std::fs::metadata(p).ok()?.modified().ok());
-    let cache_time = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-    if cache_time.is_some()
-        && cache_time >= index_time.or(cache_time)
-        && let Some(w) = load_cache(&path)
-    {
+    // Rebuilt when the game's archives changed (as the index saw them), not
+    // each time the index merely checked them: building reads every map file
+    // of the game.
+    let index_changed = crate::index_path(game_dir)
+        .filter(|p| p.exists())
+        .and_then(|p| rage_index::Index::open(&p).ok()?.changed_at().ok().flatten());
+    if let Some(w) = load_cache(&path, index_changed) {
         return Ok(w);
     }
     let world = build(game_dir, keys)?;
-    let _ = save(&world, &path);
+    let _ = save(&world, &path, index_changed);
     Ok(world)
 }
 
@@ -275,25 +281,34 @@ pub fn objects_near(
     radius: f32,
 ) -> Vec<Placed> {
     let within = |p: [f32; 3], r: f32| (0..3).map(|k| (p[k] - center[k]).powi(2)).sum::<f32>() <= r * r;
-    let mut out = Vec::new();
-    for (vpath, lo, hi) in &world.maps {
-        if (0..3).any(|k| center[k] + radius < lo[k] || center[k] - radius > hi[k]) {
-            continue;
-        }
-        let Some(xml) = read_map(game_dir, keys.clone(), vpath) else { continue };
-        for e in map_entities(world, &xml) {
-            if !e.high_detail {
-                continue;
-            }
-            // Room shells are large and placed by a corner: a wider reach.
-            let reach = if e.in_interior && e.placed.archetype.contains("shell") { radius * 2.5 } else { radius };
-            let t = e.placed.transform;
-            if within([t[12], t[13], t[14]], reach) {
-                out.push(e.placed);
-            }
-        }
-    }
-    out
+    let nearby: Vec<&String> = world
+        .maps
+        .iter()
+        .filter(|(_, lo, hi)| (0..3).all(|k| center[k] + radius >= lo[k] && center[k] - radius <= hi[k]))
+        .map(|(vpath, ..)| vpath)
+        .collect();
+    // Each map file is read and converted on its own; in parallel, in the
+    // order of the world's list.
+    nearby
+        .par_iter()
+        .map(|vpath| {
+            let Some(xml) = read_map(game_dir, keys.clone(), vpath) else { return Vec::new() };
+            map_entities(world, &xml)
+                .into_iter()
+                .filter(|e| {
+                    // Room shells are large and placed by a corner: a wider reach.
+                    let reach =
+                        if e.in_interior && e.placed.archetype.contains("shell") { radius * 2.5 } else { radius };
+                    let t = e.placed.transform;
+                    e.high_detail && within([t[12], t[13], t[14]], reach)
+                })
+                .map(|e| e.placed)
+                .collect()
+        })
+        .collect::<Vec<Vec<Placed>>>()
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// An entity of a map file.
@@ -472,7 +487,7 @@ fn load_placed(
             let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             progress(finished, total);
             let vpath = files.models.get(name)?;
-            let mut model = crate::models::load(game_dir, keys.clone(), vpath).ok()?;
+            let mut model = crate::progress::quietly(|| crate::models::load(game_dir, keys.clone(), vpath)).ok()?;
             if let Some(txd) = world.archetypes.get(name).and_then(|a| a.textures.as_ref())
                 && let Some(tpath) = files.textures.get(txd)
                 && let Ok((Node::ArchiveFile(rpf, id), _)) = rage_mods::resolve(game_dir, tpath, keys.clone())
