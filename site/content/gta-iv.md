@@ -1,6 +1,6 @@
 +++
 title = "GTA IV"
-description = "GTA IV and its episodes in OpenRAGE: setup, archives, textures, models, texts, placement files, maps, collisions and animations."
+description = "GTA IV and its episodes in OpenRAGE: setup, archives, textures, models, texts, placement files, maps, collisions, animations, scripts and search."
 
 [extra]
 docs = true
@@ -33,8 +33,22 @@ openrage ls pc/models/cdimages
 | Collisions | `.wbn`, `.wbd`, in `.wft` | view, export glTF |
 | Animations | `.wad` | play on peds |
 | Scripts | `.sco` | read the disassembly |
+| Search | everything above, `.ide`, `.dat`, `.gxt` | names, hashes and full text |
 
-Changing GTA IV files and the search index are not available yet.
+Changing GTA IV files is not available yet.
+
+## Search
+
+The search box works as for GTA V: file names, hashes (a model's hash from a placement file finds its `.wdr`) and the
+full text of the game's `.ide`, `.dat`, `.ipl`, `.csv` and other text files and of its text tables (`.gxt`, with the
+language filter). GTA IV keeps much of this outside its archives, so loose files are indexed with their text too. The
+index is built in the background the first time you open the game (a few seconds) and updated when archives change.
+
+```
+openrage index
+openrage search admiral                        # vehicles.img/admiral.wft, handling.dat, vehicles.ide, …
+openrage search "Spieler ist unbesiegbar" --lang german
+```
 
 ## Archives
 

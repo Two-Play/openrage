@@ -81,7 +81,8 @@ pub const LANGUAGES: [&str; 13] = [
 pub fn language_of(vpath: &str) -> Option<&'static str> {
     vpath.split('/').find_map(|seg| {
         let seg = seg.to_ascii_lowercase();
-        let base = seg.strip_suffix(".rpf").unwrap_or(&seg);
+        // GTA IV keeps its text tables loose: `common/text/german.gxt`.
+        let base = seg.strip_suffix(".rpf").or_else(|| seg.strip_suffix(".gxt")).unwrap_or(&seg);
         let base = base.strip_suffix("dlc").or_else(|| base.strip_suffix("_rel")).unwrap_or(base);
         LANGUAGES.iter().find(|&&l| l == base).copied()
     })

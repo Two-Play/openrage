@@ -17,7 +17,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rage_core::hash::joaat;
 use rage_crypto::GtaVKeys;
-use rage_rpf::{EntryKind, Rpf7, vfs};
+use rage_rpf::{EntryKind, Gta4Archive, Rpf7, vfs};
 use rayon::prelude::*;
 use rusqlite::params;
 
@@ -49,7 +49,12 @@ struct DiskArchive {
     path: std::path::PathBuf,
     size: i64,
     mtime: i64,
+    /// A GTA IV archive (`.img`, RPF2/RPF3) rather than RPF7.
+    gta4: bool,
 }
+
+/// Largest loose file whose text is indexed (GTA IV's text tables are ~6 MB).
+const MAX_LOOSE_TEXT: u64 = 16 << 20;
 
 struct Record {
     vpath: String,
@@ -77,7 +82,10 @@ fn mtime_of(meta: &fs::Metadata) -> i64 {
 }
 
 /// Lists loose files/folders and top-level archives below the game directory.
-fn scan_disk(game_dir: &Path) -> (Vec<Record>, Vec<DiskArchive>) {
+/// Loose text files (GTA IV keeps `.ide`, `.dat` and `.gxt` outside its
+/// archives) are indexed with their text.
+fn scan_disk(game_dir: &Path) -> (Vec<Record>, Vec<DiskArchive>, HashSet<String>) {
+    let mut dictionary = HashSet::new();
     let mut records = Vec::new();
     let mut archives = Vec::new();
     let mut stack = vec![(game_dir.to_path_buf(), String::new())];
@@ -90,7 +98,11 @@ fn scan_disk(game_dir: &Path) -> (Vec<Record>, Vec<DiskArchive>) {
                 continue; // OpenRAGE's journal inside the mods folder
             }
             let rel = if rel_dir.is_empty() { name.clone() } else { format!("{rel_dir}/{name}") };
-            let is_rpf = !meta.is_dir() && name.to_ascii_lowercase().ends_with(".rpf");
+            let lower = name.to_ascii_lowercase();
+            let gta4 = !meta.is_dir()
+                && (lower.ends_with(".img") || lower.ends_with(".rpf"))
+                && Gta4Archive::file_is_gta4(&entry.path());
+            let is_rpf = !meta.is_dir() && (lower.ends_with(".rpf") || gta4);
             let kind = if meta.is_dir() {
                 EntryTag::Dir
             } else if is_rpf {
@@ -98,15 +110,67 @@ fn scan_disk(game_dir: &Path) -> (Vec<Record>, Vec<DiskArchive>) {
             } else {
                 EntryTag::File
             };
-            records.push(Record { vpath: rel.clone(), name, kind, size: meta.len(), body: None });
+            let mut body = None;
+            if kind == EntryTag::File
+                && is_indexable(&name)
+                && meta.len() <= MAX_LOOSE_TEXT
+                && let Ok(data) = fs::read(entry.path())
+                && let Some((text, words)) = content_for(&name, &data)
+            {
+                body = Some(text);
+                dictionary.extend(words);
+            }
+            records.push(Record { vpath: rel.clone(), name, kind, size: meta.len(), body });
             if meta.is_dir() {
                 stack.push((entry.path(), rel));
             } else if is_rpf {
-                archives.push(DiskArchive { rel, path: entry.path(), size: meta.len() as i64, mtime: mtime_of(&meta) });
+                archives.push(DiskArchive {
+                    rel,
+                    path: entry.path(),
+                    size: meta.len() as i64,
+                    mtime: mtime_of(&meta),
+                    gta4,
+                });
             }
         }
     }
-    (records, archives)
+    (records, archives, dictionary)
+}
+
+/// Reads one GTA IV archive (`.img`, RPF2/RPF3) into a batch, with the key
+/// registered by the application.
+fn read_gta4_archive(archive: &DiskArchive, mut batch: Batch) -> Batch {
+    let a = match Gta4Archive::open_default(&archive.path) {
+        Ok(a) => a,
+        Err(_) => {
+            batch.errors += 1;
+            return batch;
+        }
+    };
+    vfs::walk_gta4(&a, Gta4Archive::ROOT, &archive.rel, &mut |id, path| {
+        let e = a.entry(id);
+        let kind = if e.is_dir() {
+            EntryTag::Dir
+        } else if e.resource_type().is_some() {
+            EntryTag::Resource
+        } else {
+            EntryTag::File
+        };
+        let mut body = None;
+        if kind == EntryTag::File && is_indexable(&e.name) {
+            match a.read(id) {
+                Ok(data) => {
+                    if let Some((text, words)) = content_for(&e.name, &data) {
+                        body = Some(text);
+                        batch.dictionary.extend(words);
+                    }
+                }
+                Err(_) => batch.errors += 1,
+            }
+        }
+        batch.records.push(Record { vpath: path.to_owned(), name: e.name.clone(), kind, size: e.size(), body });
+    });
+    batch
 }
 
 /// Reads one top-level archive (and everything nested in it) into a batch.
@@ -119,6 +183,9 @@ fn read_archive(archive: &DiskArchive, keys: Option<Arc<GtaVKeys>>) -> Batch {
         dictionary: HashSet::new(),
         errors: 0,
     };
+    if archive.gta4 {
+        return read_gta4_archive(archive, batch);
+    }
     let rpf = match Rpf7::open(&archive.path, keys) {
         Ok(r) => r,
         Err(_) => {
@@ -171,7 +238,7 @@ impl Index {
     ) -> Result<UpdateStats, IndexError> {
         let started = Instant::now();
         let mut stats = UpdateStats::default();
-        let (loose, archives) = scan_disk(game_dir);
+        let (loose, archives, loose_words) = scan_disk(game_dir);
 
         // Which archives changed?
         let stored: HashMap<String, (i64, i64, i64)> = {
@@ -210,7 +277,7 @@ impl Index {
                 tx.execute("DELETE FROM sources WHERE id = ?1", [id])?;
             }
             let loose_batch =
-                Batch { rel: String::new(), size: 0, mtime: 0, records: loose, dictionary: HashSet::new(), errors: 0 };
+                Batch { rel: String::new(), size: 0, mtime: 0, records: loose, dictionary: loose_words, errors: 0 };
             write_batch(&tx, &loose_batch)?;
             tx.commit()?;
         }
@@ -288,4 +355,59 @@ fn write_batch(tx: &rusqlite::Transaction<'_>, batch: &Batch) -> Result<u64, Ind
         dict.execute(params![joaat(word) as i64, word])?;
     }
     Ok(batch.records.len() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plain IMG3 archive with a text file and a (fake) resource.
+    fn img(files: &[(&str, &[u8], bool)]) -> Vec<u8> {
+        let names: Vec<u8> = files.iter().flat_map(|(n, _, _)| n.bytes().chain([0])).collect();
+        let toc_len = files.len() * 16 + names.len();
+        let mut out = Vec::new();
+        for w in [0xA94E_2A52u32, 3, files.len() as u32, toc_len as u32] {
+            out.extend(w.to_le_bytes());
+        }
+        out.extend(16u16.to_le_bytes());
+        out.extend(0u16.to_le_bytes());
+        for (k, (_, data, resource)) in files.iter().enumerate() {
+            let size = if *resource { 0xC000_0000 } else { data.len() as u32 };
+            out.extend(size.to_le_bytes());
+            out.extend((if *resource { 110u32 } else { 0 }).to_le_bytes());
+            out.extend((k as u32 + 1).to_le_bytes());
+            out.extend(1u16.to_le_bytes());
+            out.extend(0u16.to_le_bytes());
+        }
+        out.extend(&names);
+        for (_, data, _) in files {
+            out.resize(out.len().div_ceil(2048) * 2048, 0);
+            out.extend(*data);
+        }
+        out.resize(out.len().div_ceil(2048) * 2048, 0);
+        out
+    }
+
+    #[test]
+    fn indexes_gta4_archives_and_loose_text() {
+        let dir = std::env::temp_dir().join(format!("openrage-index-gta4-{}", std::process::id()));
+        let game = dir.join("game");
+        fs::create_dir_all(game.join("pc/data/maps")).unwrap();
+        fs::create_dir_all(game.join("common/data")).unwrap();
+        let data = img(&[
+            ("area.ide", b"objs\nlamp_post_01, area_txd, 100, 0\nend\n", false),
+            ("lamp_post_01.wdr", b"RSC\x05", true),
+        ]);
+        fs::write(game.join("pc/data/maps/area.img"), data).unwrap();
+        fs::write(game.join("common/data/handling.dat"), b"ADMIRAL 1600.0 2.0\n").unwrap();
+        let mut index = Index::open(&dir.join("index.sqlite")).unwrap();
+        let stats = index.update(&game, None, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!((stats.archives_indexed, stats.read_errors), (1, 0));
+        let hits =
+            |q: &str| -> Vec<String> { index.search(q, 20, None).unwrap().hits.into_iter().map(|h| h.vpath).collect() };
+        assert!(hits("lamp_post_01").contains(&"pc/data/maps/area.img/lamp_post_01.wdr".to_owned()));
+        assert!(hits("area_txd").contains(&"pc/data/maps/area.img/area.ide".to_owned()));
+        assert!(hits("ADMIRAL").contains(&"common/data/handling.dat".to_owned()));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

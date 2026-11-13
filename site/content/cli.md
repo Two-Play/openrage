@@ -35,6 +35,7 @@ openrage --game "/path/to/Grand Theft Auto IV" keys
 openrage ls pc/models/cdimages/vehicles.img     # .img archives open like folders
 openrage info pc/models/cdimages/vehicles.img/admiral.wft
 openrage extract pc/data/maps/manhat/manhat01.img -o out/
+openrage index && openrage search admiral       # search index: names, hashes, .ide/.dat/.gxt text
 openrage verify                                # read every entry of every .img and .rpf
 openrage textures pc/models/cdimages/vehicles.img/admiral.wtd --export out/ --png
 openrage verify --textures                     # parse every .wtd and decode every texture
