@@ -5,5 +5,11 @@ version.workspace = true
 edition.workspace = true
 # Ported from RDR2-RPF-Tool (AGPL-3.0); combined with the GPL-3.0 rest of OpenRAGE under GPL-3.0 section 13.
 license = "AGPL-3.0-only"
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["rage", "rdr2", "rpf", "tfit2", "cipher"]
+categories = ["cryptography", "game-development"]
 
 [dependencies]

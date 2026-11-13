@@ -8,16 +8,19 @@ edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/Two-Play/openrage"
 authors = ["OpenRAGE contributors"]
+# The toolchain OpenRAGE is built and tested with (rust-toolchain.toml); an
+# older one may work but is not checked.
+rust-version = "1.99"
 
 [workspace.dependencies]
-rage-core = { path = "crates/rage-core" }
-rage-crypto = { path = "crates/rage-crypto" }
-rage-tfit2 = { path = "crates/rage-tfit2" }
-rage-rpf = { path = "crates/rage-rpf" }
-rage-index = { path = "crates/rage-index" }
-rage-mods = { path = "crates/rage-mods" }
-rage-resource = { path = "crates/rage-resource" }
-rage-formats = { path = "crates/rage-formats" }
+rage-core = { path = "crates/rage-core", version = "0.2.0" }
+rage-crypto = { path = "crates/rage-crypto", version = "0.2.0" }
+rage-tfit2 = { path = "crates/rage-tfit2", version = "0.2.0" }
+rage-rpf = { path = "crates/rage-rpf", version = "0.2.0", features = ["rdr2"] }
+rage-index = { path = "crates/rage-index", version = "0.2.0" }
+rage-mods = { path = "crates/rage-mods", version = "0.2.0" }
+rage-resource = { path = "crates/rage-resource", version = "0.2.0" }
+rage-formats = { path = "crates/rage-formats", version = "0.2.0" }
 
 aes = "0.8"
 anyhow = "1"
