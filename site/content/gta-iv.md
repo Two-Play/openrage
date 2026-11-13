@@ -32,7 +32,7 @@ openrage ls pc/models/cdimages
 | Placement files and maps | `.wpl`, map archives | view as text and in 3D, export glTF |
 | Collisions | `.wbn`, `.wbd`, in `.wft` | view, export glTF |
 | Animations | `.wad` | play on peds |
-| Scripts | `.sco` | header only |
+| Scripts | `.sco` | read the disassembly |
 
 Changing GTA IV files and the search index are not available yet.
 
@@ -83,9 +83,12 @@ TLAD and TBoGT models.
   `[NAME]` section of `0xHASH = text` lines, in GTA V's `.oxt` form.
 - **Placement files** (`.wpl`) show as IPL-style text: one line per object with position, rotation, model name, flags
   and LOD, then the other sections. `.ide` and `.ipl` files are plain text already.
-- **Scripts** (`.sco`) show their header (code size, variables, signature). They cannot be disassembled yet.
+- **Scripts** (`.sco`) show their facts and the strings they use; double-click opens the disassembly. Most are
+  encrypted with the archive key, which OpenRAGE already has. Functions are named `func_N` and natives shown by hash:
+  GTA IV keeps neither name. Every jump target gets a label.
 
-**Checked:** 5,498 text tables (671,627 strings, converting back identically), 1,151 placement files, 941 script headers.
+**Checked:** 5,498 text tables (671,627 strings, converting back identically), 1,151 placement files, 941 scripts
+(14.5 million instructions; every jump, call and switch case lands on an instruction).
 
 ## Maps
 

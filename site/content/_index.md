@@ -177,7 +177,7 @@ variant = "Complete Edition"
 archives_status = "ok"
 archives = "IMG3, RPF2 and RPF3 read: decryption with the key from your own GTAIV.exe, browsing and extracting in the GUI"
 formats_status = "partial"
-formats = "textures, models, collisions, animations and maps in 3D (DDS/PNG and glTF export), texts (.gxt), placement files (.wpl) and script headers, read-only"
+formats = "textures, models, collisions, animations and maps in 3D (DDS/PNG and glTF export), texts (.gxt), placement files (.wpl) and scripts (disassembly), read-only"
 
 # ------------------------------------------------------------- Why OpenRAGE
 

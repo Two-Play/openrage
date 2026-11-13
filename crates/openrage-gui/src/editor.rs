@@ -284,7 +284,9 @@ pub fn open(ui: &AppWindow, doc: Document) {
         };
         let new = if converted && openrage_app::texttable::is_rdr2_text_table(&vpath) {
             crate::read_rdr2_text_table(&vpath).map(|text| Some(Document::rdr2_text_table(vpath, text)))
-        } else if converted && vpath.to_ascii_lowercase().ends_with(".ysc") {
+        } else if converted
+            && (vpath.to_ascii_lowercase().ends_with(".ysc") || vpath.to_ascii_lowercase().ends_with(".sco"))
+        {
             crate::read_script_listing(&ui, &vpath).map(|text| Some(Document::script(vpath, text)))
         } else if converted {
             crate::read_xml(&ui, &vpath).map(|x| Some(Document::converted(vpath, x.text, x.encoding.name())))

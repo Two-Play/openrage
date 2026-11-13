@@ -524,14 +524,46 @@ pub fn wpl_to_text(game: Option<&Path>, data: &[u8]) -> Result<(String, usize)> 
 /// Header details of a compiled script (`.sco`) as (label, value) rows.
 pub fn sco_rows(data: &[u8]) -> Option<Vec<(String, String)>> {
     let h = rage_formats::sco::header(data)?;
-    Some(vec![
+    let mut rows = vec![
         ("Format".into(), format!("GTA IV script ({})", h.format_name())),
         ("Code".into(), format!("{} bytes", h.code_size)),
         ("Static variables".into(), h.statics.to_string()),
         ("Global variables".into(), h.globals.to_string()),
         ("Flags".into(), format!("0x{:08X}", h.flags)),
         ("Signature".into(), format!("0x{:08X}", h.signature)),
-    ])
+    ];
+    if let Ok(s) = read_sco(data)
+        && let Ok(code) = s.disassemble()
+    {
+        rows.push(("Instructions".into(), code.len().to_string()));
+        rows.push(("Functions".into(), code.iter().filter(|i| i.name == "ENTER").count().to_string()));
+        rows.push(("Natives".into(), s.natives().len().to_string()));
+        rows.push(("Strings".into(), s.strings().len().to_string()));
+    }
+    Some(rows)
+}
+
+/// Reads a script (`.sco`), decrypting it with the registered archive key.
+pub fn read_sco(data: &[u8]) -> Result<rage_formats::sco::Sco> {
+    let key = rage_rpf::gta4::default_key();
+    let decrypt = key.as_ref().map(|k| move |b: &mut [u8]| k.decrypt(b));
+    let decrypt: Option<rage_formats::sco::Decrypt> = decrypt.as_ref().map(|f| f as &dyn Fn(&mut [u8]));
+    rage_formats::sco::parse(data, decrypt).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// A script's disassembly as text, with a short header.
+pub fn sco_listing(name: &str, data: &[u8]) -> Result<String> {
+    let s = read_sco(data)?;
+    let header = format!(
+        "// {name}: {} bytes of code, {} statics, {} globals, {} natives, {} strings\n\
+         // Native calls show the native's hash (GTA IV keeps no native names).\n",
+        s.code.len(),
+        s.statics.len(),
+        s.globals.len(),
+        s.natives().len(),
+        s.strings().len()
+    );
+    Ok(header + &s.listing().map_err(|e| anyhow::anyhow!(e))?)
 }
 
 /// The GTA IV game folder an archive belongs to (the folder holding `GTAIV.exe`).
