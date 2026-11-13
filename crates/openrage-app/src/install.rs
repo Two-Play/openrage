@@ -303,9 +303,29 @@ fn apply_gta4_rpf(
         })
         .collect::<Result<_>>()?;
     let key = rage_rpf::gta4::default_key();
-    commit_gta4(game_dir, mods, archive, description, journal, &mut |path, before| {
+    let applied = commit_gta4(game_dir, mods, archive, description, journal, &mut |path, before| {
         commit_rpf_with(path, key.as_deref(), &edits, before)
-    })
+    })?;
+    // Audio packages store only hashes: keep the names of new entries.
+    let mut magic = [0u8; 4];
+    let rpf3 = std::fs::File::open(&applied.path)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
+        .is_ok_and(|_| &magic == b"RPF3");
+    if rpf3 {
+        let names: Vec<String> = edits
+            .iter()
+            .filter_map(|e| match e {
+                RpfEdit::Set { path, .. } | RpfEdit::CreateDir { path } => Some(path.as_str()),
+                RpfEdit::Rename { to, .. } => Some(to.as_str()),
+                RpfEdit::Remove { .. } => None,
+            })
+            .flat_map(|p| p.split('/'))
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+            .collect();
+        crate::gta4::remember_audio_names(game_dir, &names)?;
+    }
+    Ok(applied)
 }
 
 type Commit<'a> = dyn FnMut(

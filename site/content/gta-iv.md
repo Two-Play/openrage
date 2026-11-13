@@ -57,7 +57,9 @@ Most files are in `.img` archives, a few in `.rpf` archives (the audio archives 
 - Archives open like folders: file details, a text preview for plain files, the resource type and memory sizes.
 - *Extract…* saves files, folders and whole archives. Files are saved as stored, like OpenIV does: resources as RSC5
   files with their header.
-- RPF3 archives keep only a hash of each name, so their entries show as hexadecimal numbers.
+- RPF3 (audio) archives keep only a hash of each name. OpenRAGE names them from the game's own audio configuration
+  (`pc/audio/config` and the episodes'), which names nearly all of them (`general/music_ringtones`,
+  `resident/amb_resident`); the rest show their hash as eight hex digits. Paths work with either.
 
 **Checked:** `openrage verify` reads all 303 archives of the game (46,889 resources, no errors).
 
@@ -189,8 +191,10 @@ ignores the `update` folder, and OpenRAGE says so when you make a change.
   Resources (`.wtd`, `.wdr`, `.wft`, …) keep their type and flags from their header. The table of an `.rpf` is written
   the way the game's own are (same order, encrypted again with the key from your `GTAIV.exe`); `openrage verify
   --rebuild` checks this against every `.rpf` of the game without writing anything.
-- **Audio (`.rpf`, RPF3):** these archives store only a hash of each name, shown as eight hex digits. Replace an entry
-  by importing a file under the same hex name; new entries need a hex name too.
+- **Audio (`.rpf`, RPF3):** these archives store only a hash of each name (joaat of the lower-case name); OpenRAGE
+  shows the names the game's audio configuration gives. Replace an entry by importing a file under its name (or its
+  hash, `061b65da`); a new entry's name is hashed, and OpenRAGE remembers it (in `update/.openrage/audio-names.txt`)
+  so it shows by name from then on.
 - **Loose files** (`.dat`, `.ide`, `.gxt`, …) are written to the `update` folder under the same path.
 - **Texts:** `.gxt` files open in the text editor and save into the `update` folder.
 - **Changes and history:** **Changes** lists every file and archive entry that differs from the game, **History**
@@ -202,7 +206,7 @@ openrage put admiral.wtd pc/models/cdimages/vehicles.img/       # import into a 
 openrage mv pc/models/cdimages/vehicles.img/a.wft pc/models/cdimages/vehicles.img/b.wft
 openrage rm pc/models/cdimages/vehicles.img/biff.wft
 openrage put niko_feet.wdr pc/models/cdimages/playerped.rpf/feet_000_u.wdr   # .rpf archives work the same way
-openrage put 061b65da pc/audio/sfx/general.rpf/6b34fe60/                     # audio: entries named by hash
+openrage put music_ringtones pc/audio/sfx/general.rpf/general/              # audio: by name (or by hash)
 openrage put handling.dat common/data/                          # a loose file, written to update/common/data/
 openrage mods --changes                                         # everything that differs from the game
 openrage history

@@ -96,8 +96,10 @@ fn corrupt(path: &Path, reason: impl Into<String>) -> RpfError {
     RpfError::CorruptToc { archive: path.display().to_string(), reason: reason.into() }
 }
 
-fn hash_of(name: &str) -> Option<u32> {
-    (name.len() == 8).then(|| u32::from_str_radix(name, 16).ok()).flatten()
+/// Whether two entry names mean the same entry: RPF3 compares name hashes
+/// (a name and its hash match), RPF2 names ignoring ASCII case.
+fn same_name(rpf3: bool, a: &str, b: &str) -> bool {
+    if rpf3 { crate::gta4::audio_hash(a) == crate::gta4::audio_hash(b) } else { a.eq_ignore_ascii_case(b) }
 }
 
 fn read_package(file: &File, path: &Path, key: Option<&Gta4Key>) -> Result<Package, RpfError> {
@@ -171,18 +173,13 @@ fn read_package(file: &File, path: &Path, key: Option<&Gta4Key>) -> Result<Packa
 
 /// Sort key of a child: RPF2 by lowercase name, RPF3 by name hash.
 fn sort_key(rpf3: bool, name: &str) -> (u32, String) {
-    if rpf3 { (hash_of(name).unwrap_or(0), String::new()) } else { (0, name.to_ascii_lowercase()) }
+    if rpf3 { (crate::gta4::audio_hash(name), String::new()) } else { (0, name.to_ascii_lowercase()) }
 }
 
 impl Package {
     fn check_name(&self, name: &str) -> Result<(), RpfError> {
         if name.is_empty() || name.contains(['/', '\\', '\0']) {
             return Err(RpfError::Edit(format!("{name:?} is not a valid name")));
-        }
-        if self.rpf3 && hash_of(name).is_none() {
-            return Err(RpfError::Edit(format!(
-                "{name}: audio packages name their entries by eight hex digits (e.g. 061b65da)"
-            )));
         }
         Ok(())
     }
@@ -192,10 +189,11 @@ impl Package {
         for s in segs {
             self.check_name(s)?;
         }
+        let rpf3 = self.rpf3;
         let mut node = &mut self.root;
         for seg in segs {
             let Kind::Dir { children, .. } = &mut node.kind else { unreachable!("folders only") };
-            let pos = match children.iter().position(|c| c.name.eq_ignore_ascii_case(seg)) {
+            let pos = match children.iter().position(|c| same_name(rpf3, &c.name, seg)) {
                 Some(p) => p,
                 None if create => {
                     children.push(Node {
@@ -216,22 +214,24 @@ impl Package {
     }
 
     fn take(&mut self, path: &str) -> Result<Node, RpfError> {
+        let rpf3 = self.rpf3;
         let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let (name, parent) = segs.split_last().ok_or_else(|| RpfError::Edit("cannot change the root".into()))?;
         let children = self.dir_mut(parent, false)?;
         let pos = children
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(name))
+            .position(|c| same_name(rpf3, &c.name, name))
             .ok_or_else(|| RpfError::NotFound(path.to_owned()))?;
         Ok(children.remove(pos))
     }
 
     fn put(&mut self, path: &str, mut node: Node, replace: bool) -> Result<(), RpfError> {
+        let rpf3 = self.rpf3;
         let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         let (name, parent) = segs.split_last().ok_or_else(|| RpfError::Edit("cannot change the root".into()))?;
         self.check_name(name)?;
         let children = self.dir_mut(parent, true)?;
-        match children.iter().position(|c| c.name.eq_ignore_ascii_case(name)) {
+        match children.iter().position(|c| same_name(rpf3, &c.name, name)) {
             Some(p) if replace && !matches!(children[p].kind, Kind::Dir { .. }) => {
                 node.name = children[p].name.clone();
                 children[p] = node;
@@ -319,7 +319,7 @@ impl Package {
         let mut names = Vec::new();
         for ((node, first), offset) in order.iter().zip(offsets) {
             let w0 = if self.rpf3 {
-                hash_of(&node.name).unwrap_or(0)
+                crate::gta4::audio_hash(&node.name)
             } else {
                 let at = names.len() as u32;
                 names.extend_from_slice(node.name.as_bytes());
@@ -579,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_names_are_hashes() {
+    fn audio_names_match_their_hashes() {
         let pkg = Package {
             rpf3: true,
             head: [0; 24],
@@ -590,6 +590,9 @@ mod tests {
             toc_key: None,
         };
         assert!(pkg.check_name("061b65da").is_ok());
-        assert!(pkg.check_name("speech.ivaud").is_err());
+        assert!(pkg.check_name("amb_resident").is_ok());
+        assert!(same_name(true, "general", "6b34fe60"));
+        assert!(same_name(true, "GENERAL", "general"));
+        assert!(!same_name(false, "general", "6b34fe60"));
     }
 }
