@@ -471,6 +471,15 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
     });
 
     let w = win.as_weak();
+    let wp = win.as_weak();
+    win.on_copy_path(move || {
+        if let Some(win) = wp.upgrade() {
+            let path = win.get_path();
+            if let Err(e) = crate::copy_to_clipboard(&path) {
+                eprintln!("Cannot copy to the clipboard: {e}");
+            }
+        }
+    });
     win.on_close_viewer(move || {
         if let Some(win) = w.upgrade() {
             let _ = win.hide();
