@@ -8,4 +8,4 @@ Icon=openrage
 Terminal=false
 Categories=Development;
 Keywords=GTA;RDR2;OpenIV;mod;rpf;
-StartupWMClass=openrage-gui
+StartupWMClass=openrage

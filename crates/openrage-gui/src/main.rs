@@ -141,6 +141,12 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> R {
 
 fn main() -> anyhow::Result<()> {
     let ui = AppWindow::new()?;
+    // Wayland shows a window's icon only through its app id and the desktop
+    // entry of the same name (`openrage.desktop`, icon `openrage`); X11 uses
+    // it as WM_CLASS. Must be set before the first window is shown.
+    if let Err(e) = slint::set_xdg_app_id("openrage") {
+        eprintln!("app id: {e}");
+    }
     let cfg = Config::load();
     plugins::reload(&cfg);
     let keys = load_keys().unwrap_or(None);

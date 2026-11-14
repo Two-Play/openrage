@@ -57,6 +57,13 @@ cargo build --release
 </div>
 </div>
 
+On Linux, `dev/install-desktop-entry.sh` adds the build to the application menu (`~/.local/share`), so the window
+and the task bar show OpenRAGE's icon: on Wayland a window gets its icon only from the desktop entry named like its
+app id (`openrage`). It points at `target/release/openrage-gui`, or at the program you pass it.
+
+Measure speed with `--release`: a debug build optimises the dependencies but not OpenRAGE's own crates, so loading
+models, maps and textures is several times slower there.
+
 ## Reproducible build environment
 
 For the system libraries there is a container image based on Fedora's toolbx image, `dev/Containerfile`:
