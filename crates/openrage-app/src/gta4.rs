@@ -358,6 +358,12 @@ impl TextureIndex {
         Some(format!("{rel}/{entry}"))
     }
 
+    /// Every model file named `name` (any case, without extension): the
+    /// archive and the entry's name there.
+    pub fn model_files(&self, name: &str) -> &[(PathBuf, String)] {
+        self.models.get(&name.to_ascii_lowercase()).map_or(&[], Vec::as_slice)
+    }
+
     /// The models inside the game's drawable dictionaries (peds' excluded),
     /// read once.
     pub fn dictionary_members(&self) -> &HashMap<u32, (PathBuf, String)> {

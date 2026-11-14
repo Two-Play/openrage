@@ -5,9 +5,13 @@
 //! * Animation: `0x08` frame count (u16), `0x0C` duration (seconds), `0x1C`
 //!   name (`pack:/<name>.anim`), `0x20` tracks (pointer list, count at `0x24`).
 //! * Track (16 bytes): kind (u8: 0 bone translation, 1 bone rotation, 5 and 6
-//!   mover translation and rotation, 128 and up other values), bone tag (u16
-//!   at `0x02`), channel group (pointer at `0x08`) → group: channels (up to
-//!   four pointers from `0x04`), channel count `0x14`.
+//!   mover translation and rotation, 7 and 8 camera translation and rotation,
+//!   128 and up other values, 136 the camera's field of view), bone tag (u16
+//!   at `0x02`), frames per block minus one (`0x04`), channel groups
+//!   (pointer list at `0x08`, one per block, count u16 at `0x0C`) → group:
+//!   channels (up to four pointers from `0x04`), channel count `0x14`.
+//!   Animations longer than a block (240 frames, 8 seconds) have several;
+//!   each block starts on the last frame of the one before.
 //! * Channel: type at `0x05`:
 //!   1 raw floats (data `0x08`, count `0x0C`),
 //!   4 a constant float (`0x08`),
@@ -18,7 +22,9 @@
 //!   Types 7, 11 and 12 only occur in the non-bone tracks, which are skipped.
 //!
 //! A vector track has three float channels or one vector channel, a
-//! quaternion track four float channels or one quaternion channel.
+//! quaternion track four float channels or one quaternion channel. The field
+//! of view (degrees) is one float channel, kept as a vector `(fov, 0, 0)`
+//! under [`TRACK_CAMERA_FOV`], the track GTA V's cutscene cameras use.
 
 use rage_resource::{Resource, ResourceError};
 
@@ -41,6 +47,12 @@ const KIND_TRANSLATION: u8 = 0;
 const KIND_ROTATION: u8 = 1;
 const KIND_MOVER_TRANSLATION: u8 = 5;
 const KIND_MOVER_ROTATION: u8 = 6;
+const KIND_CAMERA_TRANSLATION: u8 = 7;
+const KIND_CAMERA_ROTATION: u8 = 8;
+const KIND_CAMERA_FOV: u8 = 136;
+
+/// The track a camera's field of view is kept under (GTA V's number for it).
+pub const TRACK_CAMERA_FOV: u8 = 27;
 
 /// One float channel, decoded for every frame.
 fn float_channel(res: &Resource, ch: u64, frames: usize) -> Result<Vec<f32>, ResourceError> {
@@ -88,14 +100,54 @@ type Track = (BoneTrack, Vec<[f32; 4]>);
 fn track_values(res: &Resource, track: u64, frames: usize) -> Result<Option<Track>, ResourceError> {
     let kind = res.u8(track)?;
     let quat = match kind {
-        KIND_TRANSLATION | KIND_MOVER_TRANSLATION => false,
-        KIND_ROTATION | KIND_MOVER_ROTATION => true,
+        KIND_TRANSLATION | KIND_MOVER_TRANSLATION | KIND_CAMERA_TRANSLATION | KIND_CAMERA_FOV => false,
+        KIND_ROTATION | KIND_MOVER_ROTATION | KIND_CAMERA_ROTATION => true,
         _ => return Ok(None),
     };
     let bone = res.u16(track + 0x02)?;
-    let group = ptr(res, ptr(res, track + 0x08)?)?;
+    // Blocks of `stride + 1` frames, each starting on the last frame of the one before.
+    let stride = res.u32(track + 0x04)? as usize;
+    let blocks = (res.u16(track + 0x0C)? as usize).max(1);
+    let slots = ptr(res, track + 0x08)?;
+    if stride == 0 && blocks > 1 || blocks > 1 << 12 {
+        return Err(bad(format!("track in {blocks} blocks of {stride} frames")));
+    }
+    let mut values: Vec<[f32; 4]> = Vec::with_capacity(frames);
+    for b in 0..blocks {
+        let start = b * stride;
+        if start >= frames {
+            break;
+        }
+        let len = if blocks == 1 { frames } else { (stride + 1).min(frames - start) };
+        let group = ptr(res, slots + b as u64 * 4)?;
+        let Some(block) = block_values(res, group, kind, quat, len)? else { return Ok(None) };
+        // The first frame repeats the previous block's last.
+        values.extend(block.into_iter().skip(usize::from(b > 0)));
+    }
+    let Some(&last) = values.last() else { return Ok(None) };
+    values.resize(frames, last);
+    let track = match kind {
+        KIND_CAMERA_FOV => BoneTrack { bone, format: 0, track: TRACK_CAMERA_FOV },
+        _ => BoneTrack { bone, format: quat as u8, track: kind },
+    };
+    Ok(Some((track, values)))
+}
+
+/// One block of a track: `frames` values from its channel group, or `None`
+/// for layouts that are skipped.
+fn block_values(
+    res: &Resource,
+    group: u64,
+    kind: u8,
+    quat: bool,
+    frames: usize,
+) -> Result<Option<Vec<[f32; 4]>>, ResourceError> {
     let count = res.u32(group + 0x14)? as u64;
     let channels: Vec<u64> = (0..count.min(4)).map(|k| ptr(res, group + 0x04 + k * 4)).collect::<Result<_, _>>()?;
+    if kind == KIND_CAMERA_FOV {
+        let [ch] = channels.as_slice() else { return Ok(None) };
+        return Ok(Some(float_channel(res, *ch, frames)?.into_iter().map(|v| [v, 0.0, 0.0, 0.0]).collect()));
+    }
     let values: Vec<[f32; 4]> = match (quat, channels.as_slice()) {
         (true, [ch]) if res.u8(ch + 0x05)? == 9 => {
             let at = ptr(res, ch + 0x08)?;
@@ -126,7 +178,7 @@ fn track_values(res: &Resource, track: u64, frames: usize) -> Result<Option<Trac
         // A handful of rotations in Euler form and other rare layouts.
         _ => return Ok(None),
     };
-    Ok(Some((BoneTrack { bone, format: quat as u8, track: kind }, values)))
+    Ok(Some(values))
 }
 
 fn read_animation(res: &Resource, a: u64) -> Result<(String, Animation), ResourceError> {
@@ -259,5 +311,40 @@ mod tests {
         assert_eq!((a.tracks[0].bone, a.tracks[0].format, a.tracks[0].track), (0x1A1, 1, 1));
         assert_eq!(a.value(0, 2.0), Some([0.0, 0.0, 0.0, 1.0]));
         assert_eq!(a.value(1, 1.0), Some([1.0, 11.0, 21.0, 0.0]));
+    }
+
+    #[test]
+    fn keeps_the_camera_field_of_view() {
+        let mut res = wad();
+        // Track 1 becomes a field of view: one channel (0, 1, 2 degrees).
+        res.system[0xA0] = 136;
+        res.system[0x210 + 0x14] = 1;
+        let a = &parse_wad(&res).unwrap().animations[0];
+        assert_eq!((a.tracks[1].track, a.tracks[1].format), (TRACK_CAMERA_FOV, 0));
+        assert_eq!(a.value(1, 2.0), Some([2.0, 0.0, 0.0, 0.0]));
+    }
+
+    #[test]
+    fn joins_blocks() {
+        let mut res = wad();
+        let put = |res: &mut Resource, at: usize, v: u32| res.system[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        // Track 1 in two blocks of two frames (stride 1): the second block starts on frame 1.
+        put(&mut res, 0xA4, 1);
+        res.system[0xAC] = 2;
+        put(&mut res, 0x204, S + 0x2A0);
+        put(&mut res, 0x2A0 + 0x14, 3);
+        for (k, ch) in [0x2C0usize, 0x2E0, 0x300].into_iter().enumerate() {
+            put(&mut res, 0x2A4 + k * 4, S + ch as u32);
+            res.system[ch + 5] = 1;
+            put(&mut res, ch + 8, S + ch as u32 + 0x10);
+            res.system[ch + 0x0C] = 2;
+            for f in 0..2 {
+                put(&mut res, ch + 0x10 + f * 4, ((k * 10 + 5 + f) as f32).to_bits());
+            }
+        }
+        let a = &parse_wad(&res).unwrap().animations[0];
+        assert_eq!(a.value(1, 0.0), Some([0.0, 10.0, 20.0, 0.0]));
+        assert_eq!(a.value(1, 1.0), Some([1.0, 11.0, 21.0, 0.0]));
+        assert_eq!(a.value(1, 2.0), Some([6.0, 16.0, 26.0, 0.0]), "the second block's second frame");
     }
 }

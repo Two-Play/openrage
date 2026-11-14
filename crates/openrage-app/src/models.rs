@@ -1090,6 +1090,10 @@ fn load_gta4(archive: &Arc<rage_rpf::Gta4Archive>, id: rage_rpf::Gta4EntryId) ->
     let lower = name.to_ascii_lowercase();
     let stem = name.split('.').next().unwrap_or(&name).to_owned();
     let res = archive.read_resource(id)?;
+    if lower == "player.wft" && archive.find_child(rage_rpf::Gta4Archive::ROOT, "head_000_r.wdr").is_some() {
+        let skeleton = wdr::parse_wft(&res)?.drawable.skeleton.context("the player has no skeleton")?;
+        return gta4_player(archive, skeleton);
+    }
     let (mut drawables, parts) = if lower.ends_with(".wdr") {
         let part = Part {
             name: stem.clone(),
@@ -1208,6 +1212,69 @@ fn load_gta4(archive: &Arc<rage_rpf::Gta4Archive>, id: rage_rpf::Gta4EntryId) ->
         materials: Vec::new(),
         shader_material: Vec::new(),
         skeleton,
+        expressions: Vec::new(),
+        ped: None,
+    };
+    model.collect_materials();
+    Ok(model)
+}
+
+/// Component groups of GTA IV's player shown by default (suits, `suse`, are left out).
+const GTA4_PLAYER_GROUPS: &[&str] = &["head", "hair", "uppr", "lowr", "hand", "feet", "teef"];
+
+/// GTA IV's player (`playerped.rpf/player.wft`): the fragment holds only the
+/// skeleton; the body is the first variant of every component next to it
+/// (`head_000_r.wdr`, `uppr_000_u.wdr`, …) with its first texture variant
+/// (`head_diff_000_a_whi.wtd`).
+fn gta4_player(archive: &rage_rpf::Gta4Archive, skeleton: drawable::Skeleton) -> Result<LoadedModel> {
+    use rage_rpf::Gta4Archive;
+    let files: Vec<(String, rage_rpf::Gta4EntryId)> =
+        archive.children(Gta4Archive::ROOT).map(|c| (archive.entry(c).name.to_ascii_lowercase(), c)).collect();
+    let first = |prefix: &str, ext: &str| {
+        files.iter().filter(|(n, _)| n.starts_with(prefix) && n.ends_with(ext)).min_by(|a, b| a.0.cmp(&b.0))
+    };
+    let read_textures = |id| archive.read_resource(id).ok().and_then(|r| rage_formats::ytd::parse_gta4(&r).ok());
+    let (mut drawables, mut parts, mut external) = (Vec::new(), Vec::new(), Vec::new());
+    if let Some((name, id)) = first("player.", ".wtd")
+        && let Some(dict) = read_textures(*id)
+    {
+        external.push((name.clone(), dict));
+    }
+    for group in GTA4_PLAYER_GROUPS {
+        let Some((name, id)) = first(&format!("{group}_"), ".wdr") else { continue };
+        let Ok(d) =
+            archive.read_resource(*id).map_err(anyhow::Error::from).and_then(|r| Ok(rage_formats::wdr::parse_wdr(&r)?))
+        else {
+            continue;
+        };
+        let stem = name.trim_end_matches(".wdr").to_owned();
+        let variant = stem.split('_').nth(1).unwrap_or("000");
+        if let Some((tname, tid)) = first(&format!("{group}_diff_{variant}_a"), ".wtd")
+            && let Some(dict) = read_textures(*tid)
+        {
+            external.push((tname.clone(), dict));
+        }
+        parts.push(Part {
+            name: stem.clone(),
+            group: ped_group(&stem),
+            drawable: drawables.len(),
+            transform: math::IDENTITY,
+            visible: true,
+            bone: None,
+        });
+        drawables.push((stem, d));
+    }
+    if drawables.is_empty() {
+        bail!("no body parts (head_000_r.wdr, …) next to player.wft");
+    }
+    fit_to_skeleton(&mut drawables, &skeleton);
+    let mut model = LoadedModel {
+        drawables,
+        parts,
+        external,
+        materials: Vec::new(),
+        shader_material: Vec::new(),
+        skeleton: Some(skeleton),
         expressions: Vec::new(),
         ped: None,
     };

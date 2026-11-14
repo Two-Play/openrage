@@ -189,9 +189,13 @@ pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
         return;
     }
     if let Ok(cut) = std::env::var("OPENRAGE_SCENE") {
-        open_xml_view(ui, cut);
-        if let Some(x) = xmlview::newest() {
-            x.invoke_play_scene();
+        if with_app(|a| a.game_dir.as_deref().is_some_and(openrage_app::gta4::is_gta4_dir)) {
+            scene::open_gta4(ui, cut);
+        } else {
+            open_xml_view(ui, cut);
+            if let Some(x) = xmlview::newest() {
+                x.invoke_play_scene();
+            }
         }
         if let Ok(at) = std::env::var("OPENRAGE_SCENE_SNAP_AT") {
             let path = path.clone();

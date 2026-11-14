@@ -125,6 +125,17 @@ fn wire_files(ui: &AppWindow) {
                 scene::open_map(ui, vpath);
                 return;
             }
+            // GTA IV cutscenes play in a scene (their text stays in the context menu).
+            let cutscene = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(i as usize)?];
+                (item.kind == ItemKind::File && item.mark != Some(Mark::Removed) && navigate::is_gta4_cutscene(item))
+                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = cutscene {
+                scene::open_gta4(ui, vpath);
+                return;
+            }
             let text = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];

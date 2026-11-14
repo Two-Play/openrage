@@ -4785,6 +4785,8 @@ export component SceneWindow inherits Window {
     in property <string> time-text;
     in property <bool> cut-camera: true;
     in property <bool> has-camera;
+    // The subtitle shown now (GTA IV cutscenes); empty for none.
+    in property <string> subtitle;
     in property <string> status;
     // The map around the scene: 0 not loaded yet, 1 shown, 2 hidden.
     in property <int> surroundings;
@@ -4897,6 +4899,23 @@ export component SceneWindow inherits Window {
                         horizontal-alignment: center;
                         text: root.load-text != "" ? root.load-text : @tr("Loading the cast …");
                         color: #ffffff;
+                    }
+                }
+                if root.subtitle != "": Rectangle {
+                    x: (parent.width - self.width) / 2;
+                    y: parent.height - self.height - 3 * Theme.space-l;
+                    width: min(subtitle-text.preferred-width + 2 * Theme.space-m, parent.width - 2 * Theme.space-l);
+                    height: subtitle-text.preferred-height + 2 * Theme.space-s;
+                    border-radius: 6px;
+                    background: #000000a0;
+                    subtitle-text := Text {
+                        x: Theme.space-m;
+                        width: parent.width - 2 * Theme.space-m;
+                        text: root.subtitle;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                        color: #ffffff;
+                        font-size: Theme.font-title;
                     }
                 }
                 // The surroundings load while the scene already plays.

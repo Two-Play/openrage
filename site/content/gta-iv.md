@@ -32,6 +32,7 @@ openrage ls pc/models/cdimages
 | Placement files and maps | `.wpl`, map archives | view as text and in 3D, export glTF |
 | Collisions | `.wbn`, `.wbd`, in `.wft` | view, export glTF |
 | Animations | `.wad` | play on peds |
+| Cutscenes | `.cut` with the `.wad` next to it | play with cast, camera and subtitles; view as text |
 | Scripts | `.sco` | read the disassembly |
 | Search | everything above, `.ide`, `.dat`, `.gxt` | names, hashes and full text |
 
@@ -161,8 +162,9 @@ Animation dictionaries (`.wad`, in `pc/anim/anim.img`, cutscenes in `cuts.img`) 
 one clip per animation, with the models to play it on. Every GTA IV ped shares one skeleton, and so do the cutscene
 characters (`cs_*` in `cutsprops.img`), whose faces have a fuller rig.
 
-- Translations, rotations and the mover are read. A few tracks of other values that move no bone (flags and weights
-  for the game) are skipped.
+- Translations, rotations, the mover and the cutscene camera (position, rotation, field of view) are read, also in
+  animations longer than eight seconds, which the game stores in blocks of 240 frames. A few tracks of other values
+  that move no bone (flags and weights for the game) are skipped.
 - **Faces:** `facials@…` (moods, gestures, pain, looks) and `visemes@…` (mouth shapes for speech) move the face bones
   like any other animation. The `…_lo` dictionaries fit the peds' face rig, the `…_hi` ones the cutscene characters':
   selecting one offers the fitting models.
@@ -177,6 +179,29 @@ openrage model pc/anim/cutsprops.img/cs_andrei.wdd --anim "pc/anim/anim.img/faci
 ```
 
 **Checked:** 1,772 dictionaries, 22,866 animations, every frame evaluated, no errors.
+
+## Cutscenes
+
+A cutscene (`.cut` in `pc/anim/cuts.img`, and the episodes' own) is a text file; double-clicking it plays it in the
+scene window, the way GTA V cutscenes play. Its sections (`b_1_0.wad`, `b_1_1.wad`, …) run one after another:
+
+- **The cast:** the cutscene characters and props from `cutsprops.img`, other people from `componentpeds.img`,
+  vehicles and map objects by name. The player is put together from `playerped.rpf` — Niko, Johnny or Luis, after
+  the episode the cutscene belongs to. People play their body and facial clips; actors a section leaves out are
+  hidden while it plays.
+- **The camera** of each section, with its field of view, or a free camera (drag or scroll).
+- **Subtitles** from the episode's `american.gxt`.
+
+The map around the scene is not shown yet. The text stays reachable through the context menu (**Open in text editor**).
+
+```
+openrage cutscene pc/anim/cuts.img/b_1.cut     # sections, cast with their models, subtitles
+openrage verify --cutscenes                    # every .cut: sections, clips, camera and models
+```
+
+**Checked:** 344 cutscenes (8.4 hours, 803 sections, 2,942 actors), every model found. Two cutscenes lack a piece in
+the game's own files: `TBoGT/…/gt11_xa.cut` has no `gt11_xa_0.wad`, and `int_ae.cut` names a clip its dictionary
+does not have.
 
 ## Editing
 
