@@ -24,9 +24,25 @@ use crate::{AppWindow, ModelPreview, SceneWindow};
 struct SceneActor {
     preview: Arc<ModelPreview>,
     look: Look,
+    /// Outfits it changes into (GTA IV): from when, dressed so.
+    costumes: Vec<(f32, Arc<ModelPreview>, Look)>,
+    /// Accessories on its bones (GTA IV hats, glasses): the model, the bone
+    /// and the bone's rest pose (the accessory sits in the bone's space).
+    attachments: Vec<(Arc<ModelPreview>, Look, usize, Mat4)>,
     clip: usize,
     /// Bone binding per part (section) of the clip; empty without a skeleton.
     bindings: Vec<Option<Binding>>,
+}
+
+impl SceneActor {
+    /// The model as dressed at `time`.
+    fn dressed(&self, time: f32) -> (&Arc<ModelPreview>, &Look) {
+        self.costumes
+            .iter()
+            .rev()
+            .find(|(from, ..)| *from <= time)
+            .map_or((&self.preview, &self.look), |(_, p, l)| (p, l))
+    }
 }
 
 struct State {
@@ -50,10 +66,41 @@ struct State {
     object_shown: Vec<bool>,
     /// The cutscene's lights, ready for the renderer; `show_lights` switches them.
     lights: Vec<crate::gpu::SceneLight>,
+    /// Animated lights (GTA IV): their clips, and the brightest intensity
+    /// any reaches (their strengths are relative to it).
+    light_clips: Vec<usize>,
+    brightest_light: f32,
     show_lights: bool,
     /// Subtitles: (start, end, text) in seconds.
     subtitles: Vec<(f32, f32, String)>,
+    /// The cutscene's sound (GTA IV), from its start, and where it plays
+    /// while the scene does and the sound is on.
+    audio: Option<Arc<rage_formats::awc::Pcm>>,
+    output: Option<crate::audio::Output>,
+    sound_on: bool,
     timer: slint::Timer,
+}
+
+impl State {
+    /// Makes the sound follow the scene: playing from the scene's time while
+    /// it plays and the sound is on, stopped otherwise.
+    fn sync_sound(&mut self) {
+        let wanted = self.playing && self.sound_on;
+        match (&self.output, &self.audio) {
+            (Some(out), _) if wanted && !out.finished() => {
+                let at = Duration::from_secs_f32(self.time);
+                if (out.position().as_secs_f32() - self.time).abs() > 0.15 {
+                    out.seek(at);
+                }
+                out.resume();
+            }
+            (Some(out), _) if !wanted => out.pause(),
+            (_, Some(pcm)) if wanted && self.time < pcm.duration_secs() => {
+                self.output = crate::audio::Output::play(Arc::clone(pcm), Duration::from_secs_f32(self.time)).ok();
+            }
+            _ => {}
+        }
+    }
 }
 
 type Shared = Rc<RefCell<Option<State>>>;
@@ -112,7 +159,20 @@ pub fn open(ui: &AppWindow, cut_path: String, cut: Cutscene, models: Vec<Option<
         Box::new(move |game_dir, keys, progress| {
             let (dict, previews) = load(game_dir, keys, &path, &cut.actors, &models, progress)?;
             let clips = cutscene::actor_clips(&cut.actors, &dict);
-            Ok(Loaded { dict, previews, clips, cut, subtitles: Vec::new(), surroundings: true, problems: Vec::new() })
+            Ok(Loaded {
+                dict,
+                previews,
+                clips,
+                cut,
+                subtitles: Vec::new(),
+                surroundings: Surroundings::World,
+                problems: Vec::new(),
+                audio: None,
+                light_clips: Vec::new(),
+                costumes: Vec::new(),
+                props: Vec::new(),
+                paints: Vec::new(),
+            })
         }),
     );
 }
@@ -136,9 +196,10 @@ pub fn open_gta4(ui: &AppWindow, cut_path: String) {
                 .models
                 .par_iter()
                 .zip(actors)
-                .map(|(location, actor)| {
+                .zip(&scene.outfits)
+                .map(|((location, actor), outfit)| {
                     let loaded = openrage_app::progress::quietly(|| {
-                        gta4_cutscene::load_model(game_dir, &actor.name, location.as_ref()?).ok()
+                        gta4_cutscene::load_model(game_dir, &actor.name, location.as_ref()?, outfit).ok()
                     });
                     if location.is_some() {
                         progress.step(done.fetch_add(1, Ordering::Relaxed) + 1, total);
@@ -146,16 +207,58 @@ pub fn open_gta4(ui: &AppWindow, cut_path: String) {
                     loaded.map(preview)
                 })
                 .collect();
+            // Outfits changed into later: the model again, dressed so.
+            let costumes = scene
+                .models
+                .par_iter()
+                .zip(actors)
+                .zip(&scene.outfit_changes)
+                .map(|((location, actor), changes)| {
+                    let Some(location) = location else { return Vec::new() };
+                    changes
+                        .iter()
+                        .filter_map(|(from, outfit)| {
+                            let loaded = openrage_app::progress::quietly(|| {
+                                gta4_cutscene::load_model(game_dir, &actor.name, location, outfit).ok()
+                            })?;
+                            Some((*from, preview(loaded)))
+                        })
+                        .collect()
+                })
+                .collect();
+            let props = actors
+                .par_iter()
+                .zip(&scene.props)
+                .map(|(actor, chosen)| {
+                    openrage_app::progress::quietly(|| gta4_cutscene::load_props(game_dir, &path, &actor.name, chosen))
+                        .into_iter()
+                        .map(|(m, bone)| (preview(m), bone))
+                        .collect()
+                })
+                .collect();
             let clips = (0..actors.len()).map(Some).collect();
             Ok(Loaded {
+                costumes,
+                props,
+                paints: scene.paints.clone(),
                 dict: scene.animated.dict,
                 previews,
                 clips,
                 cut: scene.cutscene,
                 subtitles: scene.subtitles,
-                // The map around GTA IV cutscenes is not put together (yet).
-                surroundings: false,
-                problems: scene.animated.problems,
+                surroundings: Surroundings::Gta4 {
+                    episode: openrage_app::gta4_cutscene::episode(&path).to_owned(),
+                    origins: scene.cut.sections.iter().map(|s| s.offset).collect(),
+                    remove: scene.cut.sections.iter().flat_map(|s| s.remove.iter().cloned()).collect(),
+                },
+                problems: scene
+                    .animated
+                    .problems
+                    .into_iter()
+                    .chain(scene.missing_audio.iter().map(|n| format!("sound {n}")))
+                    .collect(),
+                audio: scene.audio,
+                light_clips: scene.animated.lights,
             })
         }),
     );
@@ -170,10 +273,30 @@ struct Loaded {
     cut: Cutscene,
     /// (start, end, text) in seconds.
     subtitles: Vec<(f32, f32, String)>,
-    /// Load the map around the scene.
-    surroundings: bool,
+    /// Which map to load around the scene.
+    surroundings: Surroundings,
     /// Animation pieces the game's files lack.
     problems: Vec<String>,
+    /// The sound (GTA IV), stereo, from the cutscene's start.
+    audio: Option<rage_formats::awc::Pcm>,
+    /// Animated lights' clips (GTA IV).
+    light_clips: Vec<usize>,
+    /// Per actor: the outfits it changes into, from when (GTA IV).
+    costumes: Vec<Vec<(f32, ModelPreview)>>,
+    /// Per actor: its accessories and the bones they sit on (GTA IV).
+    props: Vec<Vec<(ModelPreview, &'static str)>>,
+    /// Per actor: its paint (GTA IV vehicles).
+    paints: Vec<Option<[[f32; 3]; 3]>>,
+}
+
+/// The map around a cutscene.
+#[derive(Clone)]
+enum Surroundings {
+    /// GTA V: the world cache's objects near the scene.
+    World,
+    /// GTA IV: the objects the episode's placement files put near the
+    /// sections' origins (in the world), without those the cutscene removes.
+    Gta4 { episode: String, origins: Vec<[f32; 3]>, remove: Vec<([f32; 3], String)> },
 }
 
 type Loader = Box<dyn FnOnce(&std::path::Path, Option<Arc<GtaVKeys>>, &LoadProgress) -> anyhow::Result<Loaded> + Send>;
@@ -195,7 +318,12 @@ fn open_scene(ui: &AppWindow, cut_path: String, loader: Loader) {
     win.set_status("Loading the actors' models and the animation …".into());
     let state: Rc<RefCell<Option<State>>> = Rc::new(RefCell::new(None));
     wire(&win, &state);
-    win.window().on_close_requested(|| {
+    let closing = Rc::downgrade(&state);
+    win.window().on_close_requested(move || {
+        // The sound and the animation stop with the window.
+        if let Some(st) = closing.upgrade().as_ref().and_then(|s| s.borrow_mut().take()) {
+            st.timer.stop();
+        }
         forget_closed();
         slint::CloseRequestResponse::HideWindow
     });
@@ -274,11 +402,30 @@ fn load(
 }
 
 fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded: Loaded, progress: Arc<LoadProgress>) {
-    let Loaded { dict, previews, clips, cut, subtitles, surroundings, problems } = loaded;
+    let Loaded {
+        dict,
+        previews,
+        clips,
+        cut,
+        subtitles,
+        surroundings,
+        problems,
+        audio,
+        light_clips,
+        costumes,
+        props,
+        paints,
+    } = loaded;
     let cut = &cut;
     let mut actors = Vec::new();
     let (mut missing_model, mut missing_clip) = (0, 0);
+    let mut costumes = costumes.into_iter();
+    let mut props = props.into_iter();
+    let mut paints = paints.into_iter();
     for ((actor, preview), clip) in cut.actors.iter().zip(previews).zip(clips) {
+        let later = costumes.next().unwrap_or_default();
+        let worn = props.next().unwrap_or_default();
+        let paint = paints.next().flatten();
         if actor.kind.model_extensions().is_empty() {
             continue;
         }
@@ -302,11 +449,38 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
                 .collect(),
             None => Vec::new(),
         };
-        let mut look = preview.loaded.default_look();
-        if actor.kind == cutscene::Kind::Ped {
-            hide_oversized_parts(&preview, &mut look);
+        let dress = |preview: &ModelPreview| {
+            let mut look = preview.loaded.default_look();
+            if actor.kind == cutscene::Kind::Ped {
+                hide_oversized_parts(preview, &mut look);
+            }
+            look
+        };
+        let mut look = dress(&preview);
+        if let Some(colours) = &paint {
+            openrage_app::gta4_cutscene::paint(&preview.loaded, &mut look, colours);
         }
-        actors.push(SceneActor { preview: Arc::new(preview), look, clip, bindings });
+        let costumes = later
+            .into_iter()
+            .map(|(from, p)| {
+                let look = dress(&p);
+                (from, Arc::new(p), look)
+            })
+            .collect();
+        let attachments = match &preview.loaded.skeleton {
+            Some(sk) => {
+                let rest = sk.world_transforms();
+                worn.into_iter()
+                    .filter_map(|(p, bone)| {
+                        let b = sk.find_name(bone)?;
+                        let look = p.loaded.default_look();
+                        Some((Arc::new(p), look, b, rest[b]))
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        actors.push(SceneActor { preview: Arc::new(preview), look, costumes, attachments, clip, bindings });
     }
     let duration = dict.clips.iter().map(|c| c.duration()).fold(cut.duration, f32::max);
     let camera_clip = cutscene::camera_clip(&dict);
@@ -341,8 +515,24 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
     win.set_status(status.into());
     win.set_loading(false);
     win.set_has_camera(camera_clip.is_some());
-    win.set_has_lights(!cut.lights.is_empty());
-    win.set_lights_on(!cut.lights.is_empty());
+    let has_lights = !cut.lights.is_empty() || !light_clips.is_empty();
+    // The brightest any animated light gets, sampled every half second.
+    let brightest_light = light_clips
+        .iter()
+        .filter_map(|&c| dict.clips.get(c))
+        .flat_map(|clip| {
+            (0..=(clip.duration() * 2.0) as usize)
+                .filter_map(|k| openrage_app::gta4_cutscene::light_at(&dict, clip, k as f32 / 2.0))
+                .map(|l| l.intensity)
+                .collect::<Vec<_>>()
+        })
+        .fold(0.0f32, f32::max);
+    win.set_has_lights(has_lights);
+    // Debug snapshots stay silent.
+    let sound_on = !(cfg!(debug_assertions) && std::env::var_os("OPENRAGE_SNAPSHOT").is_some());
+    win.set_has_sound(audio.is_some());
+    win.set_sound_on(sound_on);
+    win.set_lights_on(has_lights);
     win.set_cut_camera(camera_clip.is_some());
     win.set_duration(duration.max(0.1));
     *state.borrow_mut() = Some(State {
@@ -361,18 +551,19 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
         surroundings_pending: true,
         object_shown: Vec::new(),
         lights: scene_lights(&cut.lights),
-        show_lights: !cut.lights.is_empty(),
+        show_lights: has_lights,
+        light_clips,
+        brightest_light,
         subtitles,
+        audio: audio.map(Arc::new),
+        output: None,
+        sound_on,
         timer: slint::Timer::default(),
     });
-    if surroundings {
-        load_surroundings(win, id, cut, (lo, hi), progress);
-    } else {
-        progress.set("", 0, 0);
-        if let Some(st) = state.borrow_mut().as_mut() {
-            st.surroundings_pending = false;
-        }
+    if let Some(st) = state.borrow_mut().as_mut() {
+        st.sync_sound();
     }
+    load_surroundings(win, id, cut, (lo, hi), surroundings, progress);
     win.set_playing(true);
     let (w, s) = (win.as_weak(), Rc::clone(state));
     if let Some(st) = state.borrow().as_ref() {
@@ -408,6 +599,7 @@ fn load_surroundings(
     id: u64,
     cut: &Cutscene,
     bounds: ([f32; 3], [f32; 3]),
+    which: Surroundings,
     progress: Arc<LoadProgress>,
 ) {
     let Some((game_dir, keys)) = crate::with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone()))) else {
@@ -425,18 +617,40 @@ fn load_surroundings(
     let centre = math::transform_point(&to_world, centre_local);
     let half = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt() / 2.0;
     let radius = (half + 25.0).clamp(30.0, 120.0);
+    let cut_offset = cut.offset;
     progress.set("Reading the map …", 0, 0);
     let weak = win.as_weak();
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<Vec<(ModelPreview, Vec<Mat4>)>> {
-            let world = openrage_app::world::load(&game_dir, keys.clone())?;
-            let files = openrage_app::world::files(&game_dir)?;
-            progress.set("Finding the map objects around the scene …", 0, 0);
-            let placed = openrage_app::world::objects_near(&world, &game_dir, keys.clone(), centre, radius);
-            progress.set("Loading the surroundings", 0, 0);
-            let models = openrage_app::world::load_models(&world, &files, &game_dir, keys, &placed, &|done, total| {
-                progress.step(done, total)
-            });
+            let models = match which {
+                Surroundings::World => {
+                    let world = openrage_app::world::load(&game_dir, keys.clone())?;
+                    let files = openrage_app::world::files(&game_dir)?;
+                    progress.set("Finding the map objects around the scene …", 0, 0);
+                    let placed = openrage_app::world::objects_near(&world, &game_dir, keys.clone(), centre, radius);
+                    progress.set("Loading the surroundings", 0, 0);
+                    openrage_app::world::load_models(&world, &files, &game_dir, keys, &placed, &|done, total| {
+                        progress.step(done, total)
+                    })
+                }
+                Surroundings::Gta4 { episode, origins, remove } => {
+                    // Around the actors in the first section, and around every other section's origin.
+                    let shift: [f32; 3] = std::array::from_fn(|k| centre[k] - cut_offset[k]);
+                    let centres: Vec<[f32; 3]> = std::iter::once(centre)
+                        .chain(origins.iter().skip(1).map(|o| std::array::from_fn(|k| o[k] + shift[k])))
+                        .collect();
+                    progress.set("Loading the surroundings", 0, 0);
+                    let scene = openrage_app::gta4::load_objects_near(
+                        &game_dir,
+                        &episode,
+                        &centres,
+                        radius,
+                        &remove,
+                        &|done, total| progress.step(done, total),
+                    )?;
+                    scene.models
+                }
+            };
             // Decoding the textures takes a while for hundreds of models: in parallel.
             Ok(models
                 .into_par_iter()
@@ -507,7 +721,12 @@ fn watch_progress(win: &SceneWindow) -> Arc<LoadProgress> {
 /// the game's renderer; they are scaled relative to the brightest light so
 /// the scene keeps the cutscene's key and fill lights.
 fn scene_lights(lights: &[cutscene::Light]) -> Vec<crate::gpu::SceneLight> {
-    let brightest = lights.iter().map(|l| l.intensity).fold(0.0f32, f32::max).max(1e-6);
+    scene_lights_scaled(lights, lights.iter().map(|l| l.intensity).fold(0.0f32, f32::max))
+}
+
+/// Like [`scene_lights`], relative to a given brightest intensity.
+fn scene_lights_scaled(lights: &[cutscene::Light], brightest: f32) -> Vec<crate::gpu::SceneLight> {
+    let brightest = brightest.max(1e-6);
     let mut out: Vec<crate::gpu::SceneLight> = lights
         .iter()
         .map(|l| {
@@ -534,8 +753,13 @@ fn tick(w: &slint::Weak<SceneWindow>, state: &Rc<RefCell<Option<State>>>) {
         let now = Instant::now();
         if st.playing {
             st.time += now.duration_since(st.last).as_secs_f32();
+            // The sound keeps the time while it plays.
+            if let Some(out) = st.output.as_ref().filter(|o| o.is_playing()) {
+                st.time = out.position().as_secs_f32();
+            }
             if st.time >= st.duration {
                 st.time = 0.0;
+                st.sync_sound();
             }
         }
         st.last = now;
@@ -577,20 +801,30 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         let model = cutscene::mover(&st.dict, clip, st.time);
         let skin = clip.part_at(st.time).and_then(|(i, part, at)| {
             let anim = st.dict.animations.get(part.animation)?;
-            let sk = a.preview.loaded.skeleton.as_ref()?;
+            let sk = a.dressed(st.time).0.loaded.skeleton.as_ref()?;
             Some(a.bindings.get(i)?.as_ref()?.skin(sk, anim, anim.frame_at(at)))
         });
         poses.push((model, skin));
     }
+    // Accessories where their bone is now.
+    let worn: Vec<(&Arc<ModelPreview>, &Look, Mat4)> = shown
+        .iter()
+        .zip(&poses)
+        .flat_map(|(a, (model, skin))| {
+            a.attachments.iter().filter_map(move |(p, look, bone, rest)| {
+                let at = skin.as_ref()?.get(*bone)?;
+                Some((p, look, math::mul(model, &math::mul(at, rest))))
+            })
+        })
+        .collect();
     let mut items: Vec<crate::gpu::SceneItem> = shown
         .iter()
         .zip(&poses)
-        .map(|(a, (model, skin))| crate::gpu::SceneItem {
-            preview: &a.preview,
-            look: &a.look,
-            model: *model,
-            skin: skin.as_deref(),
+        .map(|(a, (model, skin))| {
+            let (preview, look) = a.dressed(st.time);
+            crate::gpu::SceneItem { preview, look, model: *model, skin: skin.as_deref() }
         })
+        .chain(worn.iter().map(|(preview, look, at)| crate::gpu::SceneItem { preview, look, model: *at, skin: None }))
         .collect();
     if st.show_surroundings {
         for (k, (preview, look, placements)) in st.surroundings.iter().enumerate() {
@@ -605,7 +839,21 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
     let camera = if st.cut_camera { cut_camera(st) } else { None }
         .unwrap_or_else(|| render::orbit_camera(st.bounds.0, st.bounds.1, st.view));
     let gpu = if std::env::var_os("OPENRAGE_SOFTWARE_RENDERER").is_none() {
-        let lights: &[crate::gpu::SceneLight] = if st.show_lights { &st.lights } else { &[] };
+        // Animated lights (GTA IV) where they are now.
+        let animated: Vec<crate::gpu::SceneLight>;
+        let lights: &[crate::gpu::SceneLight] = if !st.show_lights {
+            &[]
+        } else if st.light_clips.is_empty() {
+            &st.lights
+        } else {
+            let now: Vec<cutscene::Light> = st
+                .light_clips
+                .iter()
+                .filter_map(|&c| openrage_app::gta4_cutscene::light_at(&st.dict, st.dict.clips.get(c)?, st.time))
+                .collect();
+            animated = scene_lights_scaled(&now, st.brightest_light);
+            &animated
+        };
         crate::gpu::render_scene(&items, lights, &camera, width, height)
     } else {
         None
@@ -618,13 +866,23 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
             let mut soft: Vec<render::SceneItem> = shown
                 .iter()
                 .zip(&poses)
-                .map(|(a, (model, skin))| render::SceneItem {
-                    model: &a.preview.loaded,
-                    look: &a.look,
-                    materials: &a.preview.materials,
-                    transform: *model,
-                    skin: skin.as_deref(),
+                .map(|(a, (model, skin))| {
+                    let (preview, look) = a.dressed(st.time);
+                    render::SceneItem {
+                        model: &preview.loaded,
+                        look,
+                        materials: &preview.materials,
+                        transform: *model,
+                        skin: skin.as_deref(),
+                    }
                 })
+                .chain(worn.iter().map(|(preview, look, at)| render::SceneItem {
+                    model: &preview.loaded,
+                    look,
+                    materials: &preview.materials,
+                    transform: *at,
+                    skin: None,
+                }))
                 .collect();
             // A map scene is all surroundings.
             if st.actors.is_empty() && st.show_surroundings {
@@ -791,7 +1049,12 @@ fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
         object_shown,
         lights: Vec::new(),
         show_lights: false,
+        light_clips: Vec::new(),
+        brightest_light: 0.0,
         subtitles: Vec::new(),
+        audio: None,
+        output: None,
+        sound_on: false,
         timer: slint::Timer::default(),
     });
     render_frame(win, state);
@@ -852,6 +1115,7 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
             st.playing = !st.playing;
             st.last = Instant::now();
             win.set_playing(st.playing);
+            st.sync_sound();
         }
         render_frame(&win, &s);
     });
@@ -860,8 +1124,18 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         let Some(win) = w.upgrade() else { return };
         if let Some(st) = s.borrow_mut().as_mut() {
             st.time = t.clamp(0.0, st.duration);
+            st.sync_sound();
         }
         render_frame(&win, &s);
+    });
+    let (w, s) = (win.as_weak(), Rc::clone(state));
+    win.on_toggle_sound(move || {
+        let Some(win) = w.upgrade() else { return };
+        if let Some(st) = s.borrow_mut().as_mut() {
+            st.sound_on = !st.sound_on && st.audio.is_some();
+            win.set_sound_on(st.sound_on);
+            st.sync_sound();
+        }
     });
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_camera(move || {
@@ -899,7 +1173,7 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         move || {
             let Some(win) = w.upgrade() else { return };
             if let Some(st) = s.borrow_mut().as_mut() {
-                st.show_lights = !st.show_lights && !st.lights.is_empty();
+                st.show_lights = !st.show_lights && (!st.lights.is_empty() || !st.light_clips.is_empty());
                 win.set_lights_on(st.show_lights);
             }
             render_frame(&win, &s);

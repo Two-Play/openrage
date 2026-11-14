@@ -309,6 +309,10 @@ pub(crate) enum Command {
         /// Also load every actor's model with its textures, as the scene window does, and time it.
         #[arg(long)]
         models: bool,
+        /// Also load the map objects around the cutscene (within this many metres), as the
+        /// scene window does, and time it.
+        #[arg(long)]
+        map: Option<f32>,
     },
     /// List the sounds of an audio container (.awc) and optionally export them as WAV.
     Audio {

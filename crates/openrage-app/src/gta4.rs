@@ -250,6 +250,17 @@ pub struct TextureIndex {
     /// Models inside drawable dictionaries (`.wdd`): name hash → archive and
     /// dictionary entry. Read on first use (a few seconds).
     members: OnceLock<HashMap<u32, (PathBuf, String)>>,
+    /// Interiors (`mlo` sections): name hash → the objects inside.
+    mlos: HashMap<u32, Vec<MloEntity>>,
+}
+
+/// An object inside an interior (`mlo` section of an `.ide`), in the
+/// interior's coordinates. The rotation is stored inverted, as in placement files.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MloEntity {
+    pub model: String,
+    pub position: [f32; 3],
+    pub rotation: [f32; 4],
 }
 
 /// Where a model's drawable is: a file of its own, or one entry of a drawable dictionary.
@@ -292,13 +303,56 @@ impl TextureIndex {
         index
     }
 
-    /// Reads the model → dictionary lines of an `.ide` file.
+    /// Reads the model → dictionary lines of an `.ide` file, and its interiors.
     pub fn add_ide(&mut self, text: &str) {
         let mut section = String::new();
+        // In an `mlo` section: the interior being read, and whether its
+        // rooms and portals (after its objects) have started.
+        let mut mlo: Option<u32> = None;
+        let mut rooms = false;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
+            }
+            if section == "mlo" {
+                let lower = line.to_ascii_lowercase();
+                match lower.as_str() {
+                    "mloroomstart" | "roomend" | "mloportalstart" => {
+                        rooms = true;
+                        continue;
+                    }
+                    "mloend" => {
+                        (mlo, rooms) = (None, false);
+                        continue;
+                    }
+                    _ => {}
+                }
+                if line.contains(',') {
+                    let f: Vec<&str> = line.split(',').map(str::trim).collect();
+                    match mlo {
+                        // `Portacabin, 2048, 2, 3, 22, -1, -1, -1`: a new interior.
+                        None => {
+                            let hash = rage_core::hash::joaat(f[0]);
+                            self.model_names.entry(hash).or_insert_with(|| f[0].to_owned());
+                            self.mlos.entry(hash).or_default().clear();
+                            mlo = Some(hash);
+                        }
+                        // `KM_PortacabinDoor, x, y, z, qx, qy, qz, qw, 0, 384,`: an object in it.
+                        Some(hash) if !rooms => {
+                            let v: Vec<f32> = f.iter().skip(1).take(7).filter_map(|v| v.parse().ok()).collect();
+                            if let ([x, y, z, qx, qy, qz, qw], false) = (v.as_slice(), f[0].is_empty()) {
+                                self.mlos.entry(hash).or_default().push(MloEntity {
+                                    model: f[0].to_owned(),
+                                    position: [*x, *y, *z],
+                                    rotation: [*qx, *qy, *qz, *qw],
+                                });
+                            }
+                        }
+                        Some(_) => {}
+                    }
+                    continue;
+                }
             }
             if !line.contains(',') {
                 section = if line.eq_ignore_ascii_case("end") { String::new() } else { line.to_ascii_lowercase() };
@@ -324,6 +378,11 @@ impl TextureIndex {
                 _ => {}
             }
         }
+    }
+
+    /// The objects inside an interior (a model placed like any other).
+    pub fn mlo_entities(&self, hash: u32) -> Option<&[MloEntity]> {
+        self.mlos.get(&hash).map(Vec::as_slice)
     }
 
     /// A model's name from its hash, if an `.ide` file defines it.
@@ -473,7 +532,6 @@ pub fn is_lod_model(name: &str) -> bool {
 /// model it places, loaded once with its textures, with all its placements.
 /// Low-detail stand-ins are left out unless the file holds nothing else.
 pub fn load_map(game: &Path, vpath: &str, progress: &(dyn Fn(usize, usize) + Sync)) -> Result<crate::world::MapScene> {
-    use rayon::prelude::*;
     // A placement file, or a map archive (`.img`) with all of its placement files.
     let files: Vec<Vec<u8>> = match vfs::resolve(game, vpath, None)? {
         vfs::Node::Gta4File(a, id) => vec![a.read(id)?],
@@ -493,24 +551,59 @@ pub fn load_map(game: &Path, vpath: &str, progress: &(dyn Fn(usize, usize) + Syn
         bail!("{vpath} places no objects");
     }
     let index = texture_index(game);
-    let named: Vec<(String, &rage_formats::wpl::Instance)> = instances
-        .iter()
-        .map(|i| (index.model_name(i.model_hash).unwrap_or_else(|| format!("0x{:08X}", i.model_hash)), i))
-        .collect();
+    let named = expand_interiors(&index, instances.iter());
     let detailed = named.iter().any(|(n, _)| !is_lod_model(n));
-    let mut by_model: HashMap<String, Vec<rage_formats::math::Mat4>> = HashMap::new();
-    for (name, i) in &named {
-        if detailed && is_lod_model(name) {
-            continue;
-        }
-        // Placement files store the inverse rotation (as GTA San Andreas and GTA V do).
-        let q = [-i.rotation[0], -i.rotation[1], -i.rotation[2], i.rotation[3]];
-        by_model.entry(name.clone()).or_default().push(rage_formats::math::from_trs(i.position, q, [1.0; 3]));
-    }
-    let objects = by_model.values().map(Vec::len).sum();
+    let named: Vec<(String, rage_formats::math::Mat4)> =
+        named.into_iter().filter(|(n, _)| !detailed || !is_lod_model(n)).collect();
     // Models next to the placement file (same folder, then same episode) first.
     let full = game.join(vpath);
     let near = full.ancestors().find(|p| p.is_dir()).map(Path::to_owned).unwrap_or_else(|| game.to_owned());
+    load_placed(game, &named, &near, progress)
+}
+
+/// Where a placed object stands: placement files store the inverse rotation
+/// (as GTA San Andreas and GTA V do).
+fn placement(position: [f32; 3], rotation: [f32; 4]) -> rage_formats::math::Mat4 {
+    let q = [-rotation[0], -rotation[1], -rotation[2], rotation[3]];
+    rage_formats::math::from_trs(position, q, [1.0; 3])
+}
+
+/// Placed objects by model name with where they stand; an interior (`mlo`)
+/// becomes the objects inside it. Models without a name keep their hash.
+fn expand_interiors<'a>(
+    index: &TextureIndex,
+    instances: impl Iterator<Item = &'a rage_formats::wpl::Instance>,
+) -> Vec<(String, rage_formats::math::Mat4)> {
+    let mut out = Vec::new();
+    for i in instances {
+        let at = placement(i.position, i.rotation);
+        match index.mlo_entities(i.model_hash) {
+            Some(inside) => out.extend(
+                inside
+                    .iter()
+                    .map(|e| (e.model.clone(), rage_formats::math::mul(&at, &placement(e.position, e.rotation)))),
+            ),
+            None => out.push((index.model_name(i.model_hash).unwrap_or_else(|| format!("0x{:08X}", i.model_hash)), at)),
+        }
+    }
+    out
+}
+
+/// Loads the models of placed objects (named), each once with its textures,
+/// with all its placements; models below `near` first.
+fn load_placed(
+    game: &Path,
+    named: &[(String, rage_formats::math::Mat4)],
+    near: &Path,
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<crate::world::MapScene> {
+    use rayon::prelude::*;
+    let index = texture_index(game);
+    let mut by_model: HashMap<String, Vec<rage_formats::math::Mat4>> = HashMap::new();
+    for (name, at) in named {
+        by_model.entry(name.clone()).or_default().push(*at);
+    }
+    let objects = by_model.values().map(Vec::len).sum();
     type Placements = Vec<rage_formats::math::Mat4>;
     type Loaded = Vec<(String, crate::models::LoadedModel, Placements)>;
     enum Job {
@@ -525,7 +618,7 @@ pub fn load_map(game: &Path, vpath: &str, progress: &(dyn Fn(usize, usize) + Syn
     let mut dictionaries: HashMap<String, Vec<(String, u32, Placements)>> = HashMap::new();
     let mut missing: Vec<(String, usize)> = Vec::new();
     for (name, transforms) in by_model {
-        match index.model_source(&name, &near, game) {
+        match index.model_source(&name, near, game) {
             Some(ModelSource::File(vpath)) => singles.push((name, vpath, transforms)),
             Some(ModelSource::Member { dictionary, hash }) => {
                 dictionaries.entry(dictionary).or_default().push((name, hash, transforms))
@@ -577,6 +670,138 @@ pub fn load_map(game: &Path, vpath: &str, progress: &(dyn Fn(usize, usize) + Syn
     }
     missing.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     Ok(crate::world::MapScene { models, objects, missing })
+}
+
+/// GTA IV's vehicle colours (the `col` section of `common/data/carcols.dat`,
+/// the episode's own first): RGB from 0 to 1, by number.
+pub fn car_colours(game: &Path, episode: &str) -> Vec<[f32; 3]> {
+    let text = [format!("{episode}common/data/carcols.dat"), "common/data/carcols.dat".to_owned()]
+        .iter()
+        .find_map(|rel| vfs::find_case_insensitive(game, rel).and_then(|p| fs::read(p).ok()))
+        .unwrap_or_default();
+    parse_car_colours(&String::from_utf8_lossy(&text))
+}
+
+fn parse_car_colours(text: &str) -> Vec<[f32; 3]> {
+    let mut out = Vec::new();
+    let mut in_col = false;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        match line {
+            "col" => in_col = true,
+            "end" => in_col = false,
+            _ if in_col && !line.is_empty() => {
+                let rgb: Vec<f32> = line.split(',').take(3).filter_map(|v| v.trim().parse::<f32>().ok()).collect();
+                if let [r, g, b] = rgb.as_slice() {
+                    out.push([r / 255.0, g / 255.0, b / 255.0]);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Every object the map files of an episode (`""` the base game, `TLAD/`,
+/// `TBoGT/`; each has a whole copy of the map) place: the placement files
+/// inside the map archives (`pc/data/maps/…/*.img`) and next to them. Read
+/// once per game and episode.
+pub fn map_placements(game: &Path, episode: &str) -> Arc<Vec<rage_formats::wpl::Instance>> {
+    type Cache = Mutex<HashMap<(PathBuf, String), Arc<Vec<rage_formats::wpl::Instance>>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let key = (game.to_owned(), episode.to_ascii_lowercase());
+    if let Some(found) = CACHE.get_or_init(Default::default).lock().ok().and_then(|c| c.get(&key).cloned()) {
+        return found;
+    }
+    use rayon::prelude::*;
+    let mut files = Vec::new();
+    if let Some(maps) = vfs::find_case_insensitive(game, &format!("{episode}pc/data/maps")) {
+        collect_placement_files(&maps, &mut files);
+    }
+    files.sort();
+    let all: Vec<rage_formats::wpl::Instance> = files
+        .par_iter()
+        .flat_map_iter(|path| {
+            let mut out = Vec::new();
+            let is_img = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("img"));
+            let datas: Vec<Vec<u8>> = if is_img {
+                Gta4Archive::open_default(path)
+                    .map(|a| {
+                        a.children(Gta4Archive::ROOT)
+                            .filter(|&i| a.entry(i).name.to_ascii_lowercase().ends_with(".wpl"))
+                            .filter_map(|i| a.read(i).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                fs::read(path).map(|d| vec![d]).unwrap_or_default()
+            };
+            for data in datas {
+                if let Ok(wpl) = rage_formats::wpl::parse(&data) {
+                    out.extend(wpl.instances);
+                }
+            }
+            out
+        })
+        .collect();
+    let all = Arc::new(all);
+    if let Ok(mut c) = CACHE.get_or_init(Default::default).lock() {
+        c.insert(key, Arc::clone(&all));
+    }
+    all
+}
+
+fn collect_placement_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_placement_files(&p, out);
+        } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("img") || e.eq_ignore_ascii_case("wpl")) {
+            out.push(p);
+        }
+    }
+}
+
+/// The map around a point (a cutscene): every detailed object an episode's
+/// map files place within `radius` metres (horizontally) of one of
+/// `centres`, its model loaded. Objects in `remove` (a position and a model
+/// name; the cutscene's own copies replace them) are left out.
+pub fn load_objects_near(
+    game: &Path,
+    episode: &str,
+    centres: &[[f32; 3]],
+    radius: f32,
+    remove: &[([f32; 3], String)],
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<crate::world::MapScene> {
+    let mut all = map_placements(game, episode);
+    if all.is_empty() && !episode.is_empty() {
+        all = map_placements(game, "");
+    }
+    let index = texture_index(game);
+    let near_any =
+        |p: &[f32; 3]| centres.iter().any(|c| (p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) <= radius * radius);
+    let removed = |name: &str, p: &[f32; 3]| {
+        remove.iter().any(|(at, n)| {
+            n.eq_ignore_ascii_case(name) && (0..3).map(|k| (at[k] - p[k]).powi(2)).sum::<f32>() < 2.0 * 2.0
+        })
+    };
+    let mut seen = std::collections::HashSet::new();
+    let placed = all
+        .iter()
+        .filter(|i| near_any(&i.position))
+        // The same object in a streamed and a loose placement file.
+        .filter(|i| seen.insert((i.model_hash, i.position.map(|v| (v * 100.0) as i32))));
+    let named: Vec<(String, rage_formats::math::Mat4)> = expand_interiors(&index, placed)
+        .into_iter()
+        .filter(|(n, at)| !n.starts_with("0x") && !is_lod_model(n) && !removed(n, &[at[12], at[13], at[14]]))
+        .collect();
+    if named.is_empty() {
+        bail!("no map objects within {radius:.0} m");
+    }
+    let near = game.join(episode.trim_end_matches('/'));
+    load_placed(game, &named, &near, progress)
 }
 
 /// Models an animation can be played on: the drawable dictionaries of the
@@ -816,6 +1041,47 @@ mod tests {
         assert_eq!(index.dictionaries_for("ADMIRAL"), ["admiral"]);
         assert!(index.dictionaries_for("unknown").is_empty());
         assert_eq!(index.model_name(rage_core::hash::joaat("nge_det_mh1")).as_deref(), Some("NGE_Det_MH1"));
+    }
+
+    #[test]
+    fn reads_interiors() {
+        let mut index = TextureIndex::default();
+        index.add_ide(
+            "mlo\nPortacabin, 2048, 2, 3, 2, -1, -1, -1\n\
+             \tKM_ElectPlug, -0.48291, -6.84359, 0.0874268, -0.707107, 0, 0, -0.707107, 0, 384,\n\
+             \tKM_PortacabinDoor, -2.40967, 0.384366, 1.24936, -0, -0, -0.707107, -0.707107, 0, 384,\n\
+             mloroomstart\n\tlimbo, 1, 3, 11.5, 1.4, 3.5, -2.4, -7.0, -0.1, 1, 0, 0\n\t20, -1, -1,\n\troomend\n\
+             mloportalstart\n\t1, 0, -2.46, -1.21, -0.1, -2.46, -1.21, 2.59, 21, -1, 73, 16777215, 1\nmloend\n\
+             Other, 0, 1, 1, 0, -1, -1, -1\nmloend\nend\nobjs\nBM_phone7_b, phone, 50, 0\nend\n",
+        );
+        let inside = index.mlo_entities(rage_core::hash::joaat("portacabin")).unwrap();
+        assert_eq!(inside.len(), 2);
+        assert_eq!(inside[1].model, "KM_PortacabinDoor");
+        assert_eq!(inside[1].position, [-2.40967, 0.384366, 1.24936]);
+        assert_eq!(index.mlo_entities(rage_core::hash::joaat("other")), Some(&[][..]));
+        assert_eq!(index.model_name(rage_core::hash::joaat("portacabin")).as_deref(), Some("Portacabin"));
+        assert_eq!(index.dictionaries_for("bm_phone7_b"), ["phone"]);
+        // Placed turned half around: the door lands where cutscene b_1 removes it.
+        let wpl = rage_formats::wpl::Instance {
+            position: [-1153.0557, 414.58282, 4.5726905],
+            rotation: [0.0, 0.0, -1.0, 0.0],
+            model_hash: rage_core::hash::joaat("portacabin"),
+            flags: 0,
+            lod: -1,
+            extra: [0; 2],
+        };
+        let placed = expand_interiors(&index, std::iter::once(&wpl));
+        let door = placed[1].1;
+        assert!((door[12] + 1150.6).abs() < 0.1 && (door[13] - 414.2).abs() < 0.1 && (door[14] - 5.8).abs() < 0.1);
+    }
+
+    #[test]
+    fn reads_car_colours() {
+        let colours = parse_car_colours(
+            "# colours\ncol\n#BLACK's\n10,10,10,-,black\t\t# 0 black\n255,0,51,bright,red # 1\nend\ncar\nbiff, 0,1\nend\n",
+        );
+        assert_eq!(colours.len(), 2);
+        assert_eq!(colours[1], [1.0, 0.0, 0.2]);
     }
 
     #[test]

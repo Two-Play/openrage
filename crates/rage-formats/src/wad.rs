@@ -25,6 +25,10 @@
 //! quaternion track four float channels or one quaternion channel. The field
 //! of view (degrees) is one float channel, kept as a vector `(fov, 0, 0)`
 //! under [`TRACK_CAMERA_FOV`], the track GTA V's cutscene cameras use.
+//!
+//! Cutscene lights move their root (kind 0) and have tracks of their own,
+//! kept under their kind: colour (139) and direction (143) as vectors,
+//! reach (140), intensity (141) and cone angle (142) as floats.
 
 use rage_resource::{Resource, ResourceError};
 
@@ -50,6 +54,22 @@ const KIND_MOVER_ROTATION: u8 = 6;
 const KIND_CAMERA_TRANSLATION: u8 = 7;
 const KIND_CAMERA_ROTATION: u8 = 8;
 const KIND_CAMERA_FOV: u8 = 136;
+
+/// A cutscene light's colour (vector).
+pub const TRACK_LIGHT_COLOUR: u8 = 139;
+/// A cutscene light's reach in metres (float).
+pub const TRACK_LIGHT_RANGE: u8 = 140;
+/// A cutscene light's intensity (float; 0 is off).
+pub const TRACK_LIGHT_INTENSITY: u8 = 141;
+/// A cutscene light's cone angle in degrees (float).
+pub const TRACK_LIGHT_CONE: u8 = 142;
+/// A cutscene light's direction (vector).
+pub const TRACK_LIGHT_DIRECTION: u8 = 143;
+
+/// Kinds with one float channel, kept as a vector `(value, 0, 0)`.
+fn is_float_kind(kind: u8) -> bool {
+    matches!(kind, KIND_CAMERA_FOV | TRACK_LIGHT_RANGE | TRACK_LIGHT_INTENSITY | TRACK_LIGHT_CONE)
+}
 
 /// The track a camera's field of view is kept under (GTA V's number for it).
 pub const TRACK_CAMERA_FOV: u8 = 27;
@@ -100,7 +120,12 @@ type Track = (BoneTrack, Vec<[f32; 4]>);
 fn track_values(res: &Resource, track: u64, frames: usize) -> Result<Option<Track>, ResourceError> {
     let kind = res.u8(track)?;
     let quat = match kind {
-        KIND_TRANSLATION | KIND_MOVER_TRANSLATION | KIND_CAMERA_TRANSLATION | KIND_CAMERA_FOV => false,
+        KIND_TRANSLATION
+        | KIND_MOVER_TRANSLATION
+        | KIND_CAMERA_TRANSLATION
+        | TRACK_LIGHT_COLOUR
+        | TRACK_LIGHT_DIRECTION => false,
+        k if is_float_kind(k) => false,
         KIND_ROTATION | KIND_MOVER_ROTATION | KIND_CAMERA_ROTATION => true,
         _ => return Ok(None),
     };
@@ -144,7 +169,7 @@ fn block_values(
 ) -> Result<Option<Vec<[f32; 4]>>, ResourceError> {
     let count = res.u32(group + 0x14)? as u64;
     let channels: Vec<u64> = (0..count.min(4)).map(|k| ptr(res, group + 0x04 + k * 4)).collect::<Result<_, _>>()?;
-    if kind == KIND_CAMERA_FOV {
+    if is_float_kind(kind) {
         let [ch] = channels.as_slice() else { return Ok(None) };
         return Ok(Some(float_channel(res, *ch, frames)?.into_iter().map(|v| [v, 0.0, 0.0, 0.0]).collect()));
     }

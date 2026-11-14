@@ -126,6 +126,56 @@ impl LoadedModel {
         drawable.textures.as_ref().and_then(find).or_else(|| self.external.iter().find_map(|(_, d)| find(d)))
     }
 
+    /// Dresses a GTA IV ped: for each (component, drawable, texture) — a
+    /// component like `hand`, its drawable number (`hand_001_r`) and texture
+    /// variant (0 `a`, 1 `b`, …) — shows that drawable instead of the
+    /// component's others and gives it that texture variant
+    /// (`hand_diff_001_b_whi`). Choices the model lacks are left out.
+    pub fn choose_gta4_components(&mut self, choices: &[(&str, u32, u32)]) {
+        for &(component, drawable, texture) in choices {
+            let wanted = format!("{component}_{drawable:03}_");
+            let of_component = |n: &str| {
+                n.len() == wanted.len() + 1
+                    && n.starts_with(&format!("{component}_"))
+                    && ped_component_names().contains_key(&joaat(n))
+            };
+            if !self.parts.iter().any(|p| p.name.starts_with(&wanted) && of_component(&p.name)) {
+                continue;
+            }
+            for p in self.parts.iter_mut().filter(|p| of_component(&p.name)) {
+                p.visible = p.name.starts_with(&wanted);
+            }
+            let Some(letter) = char::from_u32('a' as u32 + texture).filter(|c| c.is_ascii_lowercase()) else {
+                continue;
+            };
+            let diffuse = format!("{component}_diff_{drawable:03}_").to_ascii_lowercase();
+            let variant = format!("{diffuse}{letter}");
+            for k in 0..self.drawables.len() {
+                if !self.drawables[k].0.starts_with(&wanted) {
+                    continue;
+                }
+                let d = &self.drawables[k].1;
+                let found = d
+                    .textures
+                    .iter()
+                    .chain(self.external.iter().map(|(_, t)| t))
+                    .flat_map(|t| &t.textures)
+                    .find(|t| t.name.to_ascii_lowercase().starts_with(&variant))
+                    .map(|t| t.name.clone());
+                let Some(found) = found else { continue };
+                let rename = |n: &mut String| {
+                    if n.to_ascii_lowercase().starts_with(&diffuse) {
+                        n.clone_from(&found);
+                    }
+                };
+                for shader in &mut self.drawables[k].1.shaders {
+                    shader.textures.iter_mut().for_each(rename);
+                    shader.samplers.iter_mut().for_each(|(_, n)| rename(n));
+                }
+            }
+        }
+    }
+
     /// The default visibility of every part.
     pub fn default_visibility(&self) -> Vec<bool> {
         self.parts.iter().map(|p| p.visible).collect()
@@ -1293,7 +1343,13 @@ pub fn load_gta4_members(game: &Path, vpath: &str, wanted: &[(String, u32)]) -> 
     for (name, hash) in wanted {
         let Some((_, d)) = all.iter().find(|(h, _)| h == hash) else { continue };
         let used: Vec<String> = d.shaders.iter().flat_map(|s| s.textures.iter().cloned()).collect();
-        let external = crate::gta4::model_textures(&archive, name, &used, false);
+        let mut external = crate::gta4::model_textures(&archive, name, &used, false);
+        // Textures kept with the dictionary (`m_y_grus_lo_02_p.wtd` for its props).
+        if external.is_empty() {
+            let file = vpath.rsplit('/').next().unwrap_or(vpath);
+            let stem = file.rsplit_once('.').map_or(file, |(s, _)| s);
+            external = crate::gta4::model_textures(&archive, stem, &used, false);
+        }
         let part = Part {
             name: name.clone(),
             group: String::new(),
