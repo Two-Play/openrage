@@ -36,12 +36,17 @@ fn dir() -> Option<PathBuf> {
 
 impl Config {
     pub fn load() -> Self {
-        let mut cfg = Self::default();
-        let Some(dir) = dir() else { return cfg };
+        let Some(dir) = dir() else { return Self::default() };
         // `cli.conf` is the pre-GUI name of this file.
         let text = fs::read_to_string(dir.join("settings.conf"))
             .or_else(|_| fs::read_to_string(dir.join("cli.conf")))
             .unwrap_or_default();
+        Self::parse(&text)
+    }
+
+    /// Settings from the text of `settings.conf`.
+    fn parse(text: &str) -> Self {
+        let mut cfg = Self::default();
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
             let v = v.trim();
@@ -60,6 +65,11 @@ impl Config {
                 }
                 _ => {}
             }
+        }
+        // Older settings knew a game only as `game_dir`: keep it in the list,
+        // or opening another game would forget it.
+        if let Some(dir) = cfg.game_dir.clone() {
+            cfg.remember_game(&dir);
         }
         cfg
     }
@@ -118,5 +128,20 @@ impl Config {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_settings_keep_their_game() {
+        // Before the game list, the open game was only `game_dir`.
+        let cfg = Config::parse("game_dir=/games/GTA V\ngame=/games/RDR2\n");
+        assert_eq!(cfg.games, vec![PathBuf::from("/games/RDR2"), PathBuf::from("/games/GTA V")]);
+        let mut switched = cfg.clone();
+        switched.game_dir = Some(PathBuf::from("/games/RDR2"));
+        assert!(switched.known_games().contains(&PathBuf::from("/games/GTA V")), "switching keeps GTA V");
     }
 }

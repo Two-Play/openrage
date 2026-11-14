@@ -468,6 +468,13 @@ pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys
                 Err(e) => (vec![kv("Error", e)], String::new()),
             }
         }
+        // RDR2: RPF8, not RPF7.
+        PreviewSource::DiskArchive(path) if rage_rpf::Rpf8::file_is_rpf8(&path) => {
+            match rage_rpf::Rpf8::open_default(&path) {
+                Ok(rpf) => (rpf8_archive_info(&rpf), String::new()),
+                Err(e) => (vec![kv("Error", e)], String::new()),
+            }
+        }
         PreviewSource::DiskArchive(path) => match Rpf7::open(&path, keys) {
             Ok(rpf) => (archive_info(&rpf), String::new()),
             Err(e) => (vec![kv("Error", e)], String::new()),
@@ -759,6 +766,22 @@ pub(crate) fn gta4_preview(a: &rage_rpf::Gta4Archive, i: rage_rpf::Gta4EntryId) 
         }
         rage_rpf::Gta4EntryKind::Dir { .. } => (meta, String::new()),
     }
+}
+
+/// Overview of an RDR2 archive (RPF8).
+pub(crate) fn rpf8_archive_info(rpf: &rage_rpf::Rpf8) -> Meta {
+    let mut meta = vec![kv("Format", "RPF8")];
+    match rpf.entries() {
+        Some(entries) => {
+            let archives = entries.iter().filter(|e| e.ext_id == 0).count();
+            let resources = entries.iter().filter(|e| e.is_resource).count();
+            meta.push(kv("Entries", entries.len()));
+            meta.push(kv("Resources", resources));
+            meta.push(kv("Nested archives", archives));
+        }
+        None => meta.push(note("The entry table is encrypted: set up the RDR2 keys to see what is inside.")),
+    }
+    meta
 }
 
 pub(crate) fn archive_info(rpf: &Rpf7) -> Meta {
