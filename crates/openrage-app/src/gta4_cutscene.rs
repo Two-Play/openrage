@@ -90,6 +90,45 @@ pub struct Section {
     pub variations: Vec<Variation>,
     /// The lights' clips (`FillLight1_0`).
     pub lights: Vec<String>,
+    /// Accessories of the section's people (`[PROPS]`, before the section or in it).
+    pub props: Vec<PropChoice>,
+    /// Vehicle colours (`[VEHICLE_DETAILS]`: model, then four numbers of
+    /// `carcols.dat`'s colours; all 0 when the cutscene sets none).
+    pub vehicles: Vec<(u32, [u32; 4])>,
+}
+
+/// One `[PROPS]` line: `model variant anchor` (`1 0 1`: model 1's first
+/// glasses, `p_eyes_000`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PropChoice {
+    /// The model's number in the section's `[MODELS]`.
+    pub model: u32,
+    /// Where it sits: 0 head (hats), 1 eyes (glasses), 2 ears, … 6 left
+    /// wrist (watches).
+    pub anchor: u32,
+    pub variant: u32,
+}
+
+/// Prop anchors by number, as the props are named (`p_head_001`).
+const ANCHORS: [&str; 9] = ["head", "eyes", "ears", "mouth", "lhand", "rhand", "lwrist", "rwrist", "hip"];
+
+impl PropChoice {
+    /// The prop's name in the ped's prop dictionary (`p_eyes_000`).
+    pub fn name(&self) -> Option<String> {
+        Some(format!("p_{}_{:03}", ANCHORS.get(self.anchor as usize)?, self.variant))
+    }
+
+    /// The bone it sits on.
+    pub fn bone(&self) -> &'static str {
+        match self.anchor {
+            4 => "Char_L_Hand",
+            5 => "Char_R_Hand",
+            6 => "Char_L_Forearm",
+            7 => "Char_R_Forearm",
+            8 => "Char_Pelvis",
+            _ => "Char_Head",
+        }
+    }
 }
 
 /// One `[VARIATION]` line: `model component drawable texture [time]`.
@@ -194,6 +233,25 @@ impl Gta4Cutscene {
         out
     }
 
+    /// A vehicle's colours (numbers in `carcols.dat`), from the first section
+    /// it is in that sets them.
+    pub fn vehicle_colours(&self, actor: &str) -> Option<[u32; 4]> {
+        self.sections.iter().find_map(|s| {
+            let m = s.models.iter().find(|m| m.actor() == actor)?;
+            s.vehicles.iter().find(|(i, c)| *i == m.index && *c != [0; 4]).map(|(_, c)| *c)
+        })
+    }
+
+    /// The accessories an actor wears: those of the first section it is in.
+    pub fn props(&self, actor: &str) -> Vec<PropChoice> {
+        let Some((section, model)) =
+            self.sections.iter().find_map(|s| Some((s, s.models.iter().find(|m| m.actor() == actor)?)))
+        else {
+            return Vec::new();
+        };
+        section.props.iter().filter(|p| p.model == model.index).copied().collect()
+    }
+
     /// Every light (its clip's name without the section number, lower case)
     /// in the order they first appear.
     pub fn lights(&self) -> Vec<String> {
@@ -239,6 +297,7 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
     let mut section: Option<Section> = None;
     let mut block: Option<String> = None;
     let mut variations: Vec<Variation> = Vec::new();
+    let mut props: Vec<PropChoice> = Vec::new();
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
         let at = || format!("line {}", n + 1);
@@ -251,7 +310,11 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
                     bail!("{}: a section starts inside another one", at());
                 }
                 // Outfits given before the section are its own.
-                section = Some(Section { variations: std::mem::take(&mut variations), ..Section::default() });
+                section = Some(Section {
+                    variations: std::mem::take(&mut variations),
+                    props: std::mem::take(&mut props),
+                    ..Section::default()
+                });
                 block = None;
                 continue;
             }
@@ -334,6 +397,22 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
                 }
             }
             (Some(s), "LIGHTS") => s.lights.push(line.to_owned()),
+            (Some(s), "VEHICLE_DETAILS") => {
+                let f: Vec<u32> =
+                    line.split_whitespace().map(|v| v.parse()).collect::<Result<_, _>>().with_context(bad)?;
+                let [model, a, b, c, d, ..] = f[..] else { bail!(bad()) };
+                s.vehicles.push((model, [a, b, c, d]));
+            }
+            (s, "PROPS") => {
+                let f: Vec<u32> =
+                    line.split_whitespace().map(|v| v.parse()).collect::<Result<_, _>>().with_context(bad)?;
+                let &[model, variant, anchor] = f.as_slice() else { bail!(bad()) };
+                let p = PropChoice { model, anchor, variant };
+                match s {
+                    Some(s) => s.props.push(p),
+                    None => props.push(p),
+                }
+            }
             (Some(s), "REMOVE") => {
                 let (at, model) = line.rsplit_once(char::is_whitespace).with_context(bad)?;
                 s.remove.push((floats(at).with_context(bad)?, model.to_owned()));
@@ -610,6 +689,66 @@ fn actor_animation(body: &Animation, face: Option<&Animation>, shift: [f32; 3]) 
     Animation::from_frames(frames, body.duration, tracks, values)
 }
 
+/// Loads a person's accessories from its prop dictionary (`<model>_p.wdd`
+/// in `pedprops.img`, the episode's own first), each with the bone it sits
+/// on. Accessories the dictionary lacks are left out.
+pub fn load_props(
+    game: &Path,
+    cut_vpath: &str,
+    model: &str,
+    props: &[PropChoice],
+) -> Vec<(crate::models::LoadedModel, &'static str)> {
+    if props.is_empty() {
+        return Vec::new();
+    }
+    let index = crate::gta4::texture_index(game);
+    let ep = episode(cut_vpath).to_ascii_lowercase();
+    let in_episode = |p: &Path| {
+        let rel = p.strip_prefix(game).unwrap_or(p).to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+        if ep.is_empty() { !rel.starts_with("tlad/") && !rel.starts_with("tbogt/") } else { rel.starts_with(&ep) }
+    };
+    // `CS_Mallorie_D` (one of her outfits) has the props of `cs_mallorie_p`,
+    // `cs_Bernie_CraneC` those of `cs_bernie_crane_p`.
+    let mut shorter = vec![model.to_ascii_lowercase()];
+    while let Some((s, _)) = shorter.last().and_then(|s| s.rsplit_once('_')) {
+        shorter.push(s.to_owned());
+    }
+    let stems: Vec<String> =
+        shorter.iter().flat_map(|s| [s.clone(), s[..s.len().saturating_sub(1)].to_owned()]).collect();
+    let Some(vpath) = stems.iter().find_map(|stem| {
+        index
+            .model_files(&format!("{stem}_p"))
+            .iter()
+            .filter(|(_, e)| e.to_ascii_lowercase().ends_with(".wdd"))
+            .min_by_key(|(p, _)| !in_episode(p))
+            .and_then(|(p, e)| Some(format!("{}/{e}", p.strip_prefix(game).ok()?.to_string_lossy().replace('\\', "/"))))
+    }) else {
+        return Vec::new();
+    };
+    let wanted: Vec<(String, u32, &'static str)> = props
+        .iter()
+        .filter_map(|p| {
+            let name = p.name()?;
+            Some((name.clone(), rage_core::hash::joaat(&name), p.bone()))
+        })
+        .collect();
+    let names: Vec<(String, u32)> = wanted.iter().map(|(n, h, _)| (n.clone(), *h)).collect();
+    let loaded = crate::models::load_gta4_members(game, &vpath, &names).unwrap_or_default();
+    loaded.into_iter().filter_map(|(name, m)| Some((m, wanted.iter().find(|(n, ..)| *n == name)?.2))).collect()
+}
+
+/// Paints a GTA IV vehicle: its `gta_vehicle_paint1` to `…paint3`
+/// materials take the colours 1 to 3.
+pub fn paint(model: &crate::models::LoadedModel, look: &mut crate::models::Look, colours: &[[f32; 3]; 3]) {
+    for (slot, l) in model.materials.iter().zip(look.materials.iter_mut()) {
+        for (k, c) in colours.iter().enumerate() {
+            if slot.name_hash == rage_core::hash::joaat(&format!("gta_vehicle_paint{}", k + 1)) {
+                l.tint = [c[0], c[1], c[2], 1.0];
+            }
+        }
+    }
+}
+
 /// A cutscene light at `time` seconds into its clip, `None` while it is
 /// off or out of the section. Its root carries it (the mover, see
 /// [`actor_animation`]); the other tracks are its own (see
@@ -789,6 +928,10 @@ pub struct Scene {
     pub models: Vec<Option<ModelLocation>>,
     /// Per actor: what it wears (see [`Gta4Cutscene::outfit`]).
     pub outfits: Vec<Outfit>,
+    /// Per actor: its accessories (see [`Gta4Cutscene::props`]).
+    pub props: Vec<Vec<PropChoice>>,
+    /// Per actor: its paint (vehicles; colours 1 to 3 as RGB from 0 to 1).
+    pub paints: Vec<Option<[[f32; 3]; 3]>>,
     /// Per actor: its outfit changes after the start (see [`Gta4Cutscene::outfit_changes`]).
     pub outfit_changes: Vec<Vec<(f32, Outfit)>>,
     /// (start, end, text) in seconds.
@@ -829,8 +972,30 @@ pub fn load(game: &Path, vpath: &str) -> Result<Scene> {
     let subtitles = subtitles(game, vpath, &cut);
     let outfits = actors.iter().map(|(key, _)| cut.outfit(key)).collect();
     let outfit_changes = actors.iter().map(|(key, _)| cut.outfit_changes(key)).collect();
+    let props = actors.iter().map(|(key, _)| cut.props(key)).collect();
+    let colours = crate::gta4::car_colours(game, episode(vpath));
+    let paints = actors
+        .iter()
+        .map(|(key, _)| {
+            let c = cut.vehicle_colours(key)?;
+            let rgb = |i: usize| colours.get(c[i] as usize).copied();
+            Some([rgb(0)?, rgb(1)?, rgb(2)?])
+        })
+        .collect();
     let (audio, missing_audio) = audio(game, vpath, &cut);
-    Ok(Scene { cut, cutscene, animated, models, outfits, outfit_changes, subtitles, audio, missing_audio })
+    Ok(Scene {
+        cut,
+        cutscene,
+        animated,
+        models,
+        outfits,
+        outfit_changes,
+        props,
+        paints,
+        subtitles,
+        audio,
+        missing_audio,
+    })
 }
 
 #[cfg(test)]
@@ -906,6 +1071,32 @@ mod tests {
             ]
         );
         assert!(cut.outfit_changes("player").is_empty());
+    }
+
+    #[test]
+    fn reads_props() {
+        let cut = parse(
+            b"[PROPS]\n0 2 0\n1 0 1\n2 0 6\n[/PROPS]\n[SECTION_START]\n[MODELS]\n0 F_M_PEastEuro_01 F_M_PEastEuro_01_0\n\
+1 CS_Dmitri CS_Dmitri_0 cs_dmitri_head_0\n2 CS_Mallorie_D CS_Mallorie_D_0\n[/MODELS]\n[SECTION_END]\n",
+        )
+        .unwrap();
+        let hat = cut.props("f_m_peasteuro_01");
+        assert_eq!(hat, [PropChoice { model: 0, anchor: 0, variant: 2 }]);
+        assert_eq!((hat[0].name().as_deref(), hat[0].bone()), (Some("p_head_002"), "Char_Head"));
+        assert_eq!(cut.props("cs_dmitri")[0].name().as_deref(), Some("p_eyes_000"));
+        let watch = cut.props("cs_mallorie_d")[0];
+        assert_eq!((watch.name().as_deref(), watch.bone()), (Some("p_lwrist_000"), "Char_L_Forearm"));
+    }
+
+    #[test]
+    fn reads_vehicle_colours() {
+        let cut = parse(
+            b"[SECTION_START]\n[MODELS]\n0 Biff Biff_0\n1 Biff Biff-1_0\n[/MODELS]\n\
+[VEHICLE_DETAILS]\n0 130 114 37 45 0\n1 0 0 0 0 0\n[/VEHICLE_DETAILS]\n[SECTION_END]\n",
+        )
+        .unwrap();
+        assert_eq!(cut.vehicle_colours("biff"), Some([130, 114, 37, 45]));
+        assert_eq!(cut.vehicle_colours("biff-1"), None, "no colours set");
     }
 
     #[test]

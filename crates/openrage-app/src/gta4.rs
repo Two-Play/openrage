@@ -672,6 +672,36 @@ fn load_placed(
     Ok(crate::world::MapScene { models, objects, missing })
 }
 
+/// GTA IV's vehicle colours (the `col` section of `common/data/carcols.dat`,
+/// the episode's own first): RGB from 0 to 1, by number.
+pub fn car_colours(game: &Path, episode: &str) -> Vec<[f32; 3]> {
+    let text = [format!("{episode}common/data/carcols.dat"), "common/data/carcols.dat".to_owned()]
+        .iter()
+        .find_map(|rel| vfs::find_case_insensitive(game, rel).and_then(|p| fs::read(p).ok()))
+        .unwrap_or_default();
+    parse_car_colours(&String::from_utf8_lossy(&text))
+}
+
+fn parse_car_colours(text: &str) -> Vec<[f32; 3]> {
+    let mut out = Vec::new();
+    let mut in_col = false;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        match line {
+            "col" => in_col = true,
+            "end" => in_col = false,
+            _ if in_col && !line.is_empty() => {
+                let rgb: Vec<f32> = line.split(',').take(3).filter_map(|v| v.trim().parse::<f32>().ok()).collect();
+                if let [r, g, b] = rgb.as_slice() {
+                    out.push([r / 255.0, g / 255.0, b / 255.0]);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Every object the map files of an episode (`""` the base game, `TLAD/`,
 /// `TBoGT/`; each has a whole copy of the map) place: the placement files
 /// inside the map archives (`pc/data/maps/…/*.img`) and next to them. Read
@@ -1043,6 +1073,15 @@ mod tests {
         let placed = expand_interiors(&index, std::iter::once(&wpl));
         let door = placed[1].1;
         assert!((door[12] + 1150.6).abs() < 0.1 && (door[13] - 414.2).abs() < 0.1 && (door[14] - 5.8).abs() < 0.1);
+    }
+
+    #[test]
+    fn reads_car_colours() {
+        let colours = parse_car_colours(
+            "# colours\ncol\n#BLACK's\n10,10,10,-,black\t\t# 0 black\n255,0,51,bright,red # 1\nend\ncar\nbiff, 0,1\nend\n",
+        );
+        assert_eq!(colours.len(), 2);
+        assert_eq!(colours[1], [1.0, 0.0, 0.2]);
     }
 
     #[test]

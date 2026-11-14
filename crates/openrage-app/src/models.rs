@@ -1343,7 +1343,13 @@ pub fn load_gta4_members(game: &Path, vpath: &str, wanted: &[(String, u32)]) -> 
     for (name, hash) in wanted {
         let Some((_, d)) = all.iter().find(|(h, _)| h == hash) else { continue };
         let used: Vec<String> = d.shaders.iter().flat_map(|s| s.textures.iter().cloned()).collect();
-        let external = crate::gta4::model_textures(&archive, name, &used, false);
+        let mut external = crate::gta4::model_textures(&archive, name, &used, false);
+        // Textures kept with the dictionary (`m_y_grus_lo_02_p.wtd` for its props).
+        if external.is_empty() {
+            let file = vpath.rsplit('/').next().unwrap_or(vpath);
+            let stem = file.rsplit_once('.').map_or(file, |(s, _)| s);
+            external = crate::gta4::model_textures(&archive, stem, &used, false);
+        }
         let part = Part {
             name: name.clone(),
             group: String::new(),

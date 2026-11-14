@@ -26,6 +26,9 @@ struct SceneActor {
     look: Look,
     /// Outfits it changes into (GTA IV): from when, dressed so.
     costumes: Vec<(f32, Arc<ModelPreview>, Look)>,
+    /// Accessories on its bones (GTA IV hats, glasses): the model, the bone
+    /// and the bone's rest pose (the accessory sits in the bone's space).
+    attachments: Vec<(Arc<ModelPreview>, Look, usize, Mat4)>,
     clip: usize,
     /// Bone binding per part (section) of the clip; empty without a skeleton.
     bindings: Vec<Option<Binding>>,
@@ -167,6 +170,8 @@ pub fn open(ui: &AppWindow, cut_path: String, cut: Cutscene, models: Vec<Option<
                 audio: None,
                 light_clips: Vec::new(),
                 costumes: Vec::new(),
+                props: Vec::new(),
+                paints: Vec::new(),
             })
         }),
     );
@@ -221,9 +226,21 @@ pub fn open_gta4(ui: &AppWindow, cut_path: String) {
                         .collect()
                 })
                 .collect();
+            let props = actors
+                .par_iter()
+                .zip(&scene.props)
+                .map(|(actor, chosen)| {
+                    openrage_app::progress::quietly(|| gta4_cutscene::load_props(game_dir, &path, &actor.name, chosen))
+                        .into_iter()
+                        .map(|(m, bone)| (preview(m), bone))
+                        .collect()
+                })
+                .collect();
             let clips = (0..actors.len()).map(Some).collect();
             Ok(Loaded {
                 costumes,
+                props,
+                paints: scene.paints.clone(),
                 dict: scene.animated.dict,
                 previews,
                 clips,
@@ -266,6 +283,10 @@ struct Loaded {
     light_clips: Vec<usize>,
     /// Per actor: the outfits it changes into, from when (GTA IV).
     costumes: Vec<Vec<(f32, ModelPreview)>>,
+    /// Per actor: its accessories and the bones they sit on (GTA IV).
+    props: Vec<Vec<(ModelPreview, &'static str)>>,
+    /// Per actor: its paint (GTA IV vehicles).
+    paints: Vec<Option<[[f32; 3]; 3]>>,
 }
 
 /// The map around a cutscene.
@@ -381,13 +402,30 @@ fn load(
 }
 
 fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded: Loaded, progress: Arc<LoadProgress>) {
-    let Loaded { dict, previews, clips, cut, subtitles, surroundings, problems, audio, light_clips, costumes } = loaded;
+    let Loaded {
+        dict,
+        previews,
+        clips,
+        cut,
+        subtitles,
+        surroundings,
+        problems,
+        audio,
+        light_clips,
+        costumes,
+        props,
+        paints,
+    } = loaded;
     let cut = &cut;
     let mut actors = Vec::new();
     let (mut missing_model, mut missing_clip) = (0, 0);
     let mut costumes = costumes.into_iter();
+    let mut props = props.into_iter();
+    let mut paints = paints.into_iter();
     for ((actor, preview), clip) in cut.actors.iter().zip(previews).zip(clips) {
         let later = costumes.next().unwrap_or_default();
+        let worn = props.next().unwrap_or_default();
+        let paint = paints.next().flatten();
         if actor.kind.model_extensions().is_empty() {
             continue;
         }
@@ -418,7 +456,10 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
             }
             look
         };
-        let look = dress(&preview);
+        let mut look = dress(&preview);
+        if let Some(colours) = &paint {
+            openrage_app::gta4_cutscene::paint(&preview.loaded, &mut look, colours);
+        }
         let costumes = later
             .into_iter()
             .map(|(from, p)| {
@@ -426,7 +467,20 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
                 (from, Arc::new(p), look)
             })
             .collect();
-        actors.push(SceneActor { preview: Arc::new(preview), look, costumes, clip, bindings });
+        let attachments = match &preview.loaded.skeleton {
+            Some(sk) => {
+                let rest = sk.world_transforms();
+                worn.into_iter()
+                    .filter_map(|(p, bone)| {
+                        let b = sk.find_name(bone)?;
+                        let look = p.loaded.default_look();
+                        Some((Arc::new(p), look, b, rest[b]))
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        actors.push(SceneActor { preview: Arc::new(preview), look, costumes, attachments, clip, bindings });
     }
     let duration = dict.clips.iter().map(|c| c.duration()).fold(cut.duration, f32::max);
     let camera_clip = cutscene::camera_clip(&dict);
@@ -752,6 +806,17 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         });
         poses.push((model, skin));
     }
+    // Accessories where their bone is now.
+    let worn: Vec<(&Arc<ModelPreview>, &Look, Mat4)> = shown
+        .iter()
+        .zip(&poses)
+        .flat_map(|(a, (model, skin))| {
+            a.attachments.iter().filter_map(move |(p, look, bone, rest)| {
+                let at = skin.as_ref()?.get(*bone)?;
+                Some((p, look, math::mul(model, &math::mul(at, rest))))
+            })
+        })
+        .collect();
     let mut items: Vec<crate::gpu::SceneItem> = shown
         .iter()
         .zip(&poses)
@@ -759,6 +824,7 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
             let (preview, look) = a.dressed(st.time);
             crate::gpu::SceneItem { preview, look, model: *model, skin: skin.as_deref() }
         })
+        .chain(worn.iter().map(|(preview, look, at)| crate::gpu::SceneItem { preview, look, model: *at, skin: None }))
         .collect();
     if st.show_surroundings {
         for (k, (preview, look, placements)) in st.surroundings.iter().enumerate() {
@@ -810,6 +876,13 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
                         skin: skin.as_deref(),
                     }
                 })
+                .chain(worn.iter().map(|(preview, look, at)| render::SceneItem {
+                    model: &preview.loaded,
+                    look,
+                    materials: &preview.materials,
+                    transform: *at,
+                    skin: None,
+                }))
                 .collect();
             // A map scene is all surroundings.
             if st.actors.is_empty() && st.show_surroundings {

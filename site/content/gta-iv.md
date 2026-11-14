@@ -196,6 +196,9 @@ scene window, the way GTA V cutscenes play. Its sections (`b_1_0.wad`, `b_1_1.wa
 - **Outfits:** people wear what the cutscene's `[VARIATION]` lines give them — which variant of each part (head,
   upper body, legs, hands, …) and its texture variant — and change them where the cutscene says (a time into the
   section, or into the cutscene when it is longer than the section).
+- **Accessories** (`[PROPS]`): hats, glasses, earrings and watches from the person's prop dictionary
+  (`pedprops.img`), on the head or wrist they belong to.
+- **Vehicle colours** (`[VEHICLE_DETAILS]`) from `carcols.dat`: the paint materials take the cutscene's colours.
 - **The map around it**, interiors included, from the episode's placement files. Objects the cutscene replaces with
   its own copies (`[REMOVE]`, a door that opens, a phone that is picked up) are left out. Sections that move to
   another place are put where they play.
@@ -214,7 +217,8 @@ openrage cutscene pc/anim/cuts.img/b_1.cut [--models] [--map 40]   # sections, c
 openrage verify --cutscenes                    # every .cut: sections, clips, camera and models
 ```
 
-**Checked:** 344 cutscenes (8.4 hours, 803 sections, 2,942 actors), every model found, 493 minutes of sound decoded.
+**Checked:** 344 cutscenes (8.4 hours, 803 sections, 2,942 actors), every model found, 493 minutes of sound decoded,
+234 of 238 accessories found. Particle effects (`[EFFECTS]`: blood, shell casings) are not shown.
 Two cutscenes lack a piece in the game's own files: `TBoGT/…/gt11_xa.cut` has no `gt11_xa_0.wad`, and `int_ae.cut`
 names a clip its dictionary does not have. 72 sounds cutscenes name are not in the game (mostly those of the
 `…p1`/`…p2` part cutscenes of TBoGT, and the intro's `rom1_a`).
