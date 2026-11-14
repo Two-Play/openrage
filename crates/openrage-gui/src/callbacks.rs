@@ -113,6 +113,18 @@ fn wire_files(ui: &AppWindow) {
                 }
                 return;
             }
+            // GTA IV placement files open as a 3D scene (before the text check:
+            // they can also be edited as text, through the context menu).
+            let placement = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(i as usize)?];
+                (item.kind == ItemKind::File && item.name.to_ascii_lowercase().ends_with(".wpl"))
+                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = placement {
+                scene::open_map(ui, vpath);
+                return;
+            }
             let text = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
@@ -143,17 +155,6 @@ fn wire_files(ui: &AppWindow) {
             });
             if let Some(vpath) = script {
                 open_script_view(ui, vpath);
-                return;
-            }
-            // GTA IV placement files open as a 3D scene.
-            let placement = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(i as usize)?];
-                (item.kind == ItemKind::File && item.name.to_ascii_lowercase().ends_with(".wpl"))
-                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-            });
-            if let Some(vpath) = placement {
-                scene::open_map(ui, vpath);
                 return;
             }
             let video = with_app(|a| {

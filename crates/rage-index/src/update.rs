@@ -51,6 +51,8 @@ struct DiskArchive {
     mtime: i64,
     /// A GTA IV archive (`.img`, RPF2/RPF3) rather than RPF7.
     gta4: bool,
+    /// A Red Dead Redemption 2 archive (RPF8) rather than RPF7.
+    rdr2: bool,
 }
 
 /// Largest loose file whose text is indexed (GTA IV's text tables are ~6 MB).
@@ -130,6 +132,7 @@ fn scan_disk(game_dir: &Path) -> (Vec<Record>, Vec<DiskArchive>, HashSet<String>
                     size: meta.len() as i64,
                     mtime: mtime_of(&meta),
                     gta4,
+                    rdr2: !gta4 && rage_rpf::Rpf8::file_is_rpf8(&entry.path()),
                 });
             }
         }
@@ -173,6 +176,73 @@ fn read_gta4_archive(archive: &DiskArchive, mut batch: Batch) -> Batch {
     batch
 }
 
+/// Reads an RDR2 archive (RPF8) and the archives nested in it, with the keys
+/// and file names the application registered (`rpf8::set_defaults`). Without
+/// keys its entry table cannot be read: one read error.
+fn read_rdr2_archive(archive: &DiskArchive, mut batch: Batch) -> Batch {
+    use rage_rpf::Rpf8;
+    fn walk(rpf: &Rpf8, prefix: &str, depth: u8, batch: &mut Batch) {
+        let Some(entries) = rpf.entries() else {
+            batch.errors += 1;
+            return;
+        };
+        // RPF8 has no folders of its own: they come from the entries' paths.
+        let mut dirs: HashSet<String> = HashSet::new();
+        for (i, e) in entries.iter().enumerate() {
+            let name = rpf.entry_name(i);
+            let vpath = format!("{prefix}/{name}");
+            let mut parts: Vec<&str> = name.split('/').collect();
+            let base = parts.pop().unwrap_or_default().to_owned();
+            let mut dir = prefix.to_owned();
+            for part in parts {
+                dir = format!("{dir}/{part}");
+                if dirs.insert(dir.to_ascii_lowercase()) {
+                    batch.records.push(Record {
+                        vpath: dir.clone(),
+                        name: part.to_owned(),
+                        kind: EntryTag::Dir,
+                        size: 0,
+                        body: None,
+                    });
+                }
+            }
+            if e.ext_id == 0 {
+                batch.records.push(Record {
+                    vpath: vpath.clone(),
+                    name: base,
+                    kind: EntryTag::Archive,
+                    size: e.size(),
+                    body: None,
+                });
+                match rpf.open_child(e) {
+                    Ok(child) if depth < rage_rpf::MAX_NESTING => walk(&child, &vpath, depth + 1, batch),
+                    _ => batch.errors += 1,
+                }
+                continue;
+            }
+            let kind = if e.is_resource { EntryTag::Resource } else { EntryTag::File };
+            let mut body = None;
+            if kind == EntryTag::File && is_indexable(&base) {
+                match rpf.read(e) {
+                    Ok(data) => {
+                        if let Some((text, words)) = content_for(&base, &data) {
+                            body = Some(text);
+                            batch.dictionary.extend(words);
+                        }
+                    }
+                    Err(_) => batch.errors += 1,
+                }
+            }
+            batch.records.push(Record { vpath, name: base, kind, size: e.size(), body });
+        }
+    }
+    match Rpf8::open_default(&archive.path) {
+        Ok(rpf) => walk(&rpf, &archive.rel, 0, &mut batch),
+        Err(_) => batch.errors += 1,
+    }
+    batch
+}
+
 /// Reads one top-level archive (and everything nested in it) into a batch.
 fn read_archive(archive: &DiskArchive, keys: Option<Arc<GtaVKeys>>) -> Batch {
     let mut batch = Batch {
@@ -185,6 +255,9 @@ fn read_archive(archive: &DiskArchive, keys: Option<Arc<GtaVKeys>>) -> Batch {
     };
     if archive.gta4 {
         return read_gta4_archive(archive, batch);
+    }
+    if archive.rdr2 {
+        return read_rdr2_archive(archive, batch);
     }
     let rpf = match Rpf7::open(&archive.path, keys) {
         Ok(r) => r,
