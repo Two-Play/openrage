@@ -16,7 +16,7 @@ Each prepared crate has its own `README.md`, a `LICENSE` (a link to the
 workspace licence; `cargo package` copies the file), and, where code is
 derived from CodeWalker, a `NOTICE.md` with the MIT notice.
 
-Workspace path dependencies carry `version = "0.2.0"`, so crates.io resolves
+Workspace path dependencies carry `version = "0.3.0"`, so crates.io resolves
 them once the dependency is published. `cargo package` of a crate that
 depends on an unpublished workspace crate fails at "no matching package";
 publish bottom-up (`rage-core`, `rage-crypto`, `rage-resource`, `rage-tfit2`,
@@ -70,7 +70,7 @@ every caller in the CLI and GUI; that is left for later.
 
 * **Crate names.** `rage-*` names may be taken or confusing on crates.io;
   check availability (`cargo search rage-core`) or pick a prefix.
-* **Version.** The crates share the workspace version (0.2.0). Independent
+* **Version.** The crates share the workspace version (0.3.0). Independent
   versions per crate (and a 0.1.0 start) are an option.
 * **MSRV.** `rust-version = "1.99"` is the pinned toolchain, the only one
   checked. A lower MSRV (edition 2024 needs at least 1.85; the code uses
