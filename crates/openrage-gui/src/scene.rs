@@ -1,6 +1,7 @@
 //! A whole cutscene in one scene: every actor with its animation, through the
 //! cutscene camera or a free orbit camera (GPU only).
 
+use rayon::prelude::*;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -173,7 +174,8 @@ fn load(
                 let done = &done;
                 s.spawn(move || {
                     let path = m.as_ref()?;
-                    let loaded = openrage_app::models::load(game_dir, keys.clone(), path);
+                    let loaded =
+                        openrage_app::progress::quietly(|| openrage_app::models::load(game_dir, keys.clone(), path));
                     progress.step(done.fetch_add(1, Ordering::Relaxed) + 1, total);
                     let mut loaded = loaded.ok()?;
                     // Props whose textures live in the dictionary their archetype names.
@@ -351,8 +353,9 @@ fn load_surroundings(
             let models = openrage_app::world::load_models(&world, &files, &game_dir, keys, &placed, &|done, total| {
                 progress.step(done, total)
             });
+            // Decoding the textures takes a while for hundreds of models: in parallel.
             Ok(models
-                .into_iter()
+                .into_par_iter()
                 .map(|(name, loaded, transforms)| {
                     let materials = render::Materials::new(&loaded);
                     let look = std::sync::RwLock::new(loaded.default_look());
@@ -592,7 +595,7 @@ pub fn open_map(ui: &AppWindow, vpath: String) {
     let progress = watch_progress(&win);
     let weak = win.as_weak();
     std::thread::spawn(move || {
-        progress.set("Reading the world (once, a few seconds) …", 0, 0);
+        progress.set("Reading the game's map files (once after the game changed, up to a minute) …", 0, 0);
         let result = (|| -> anyhow::Result<MapLoaded> {
             let scene = if openrage_app::gta4::is_gta4_dir(&game_dir) {
                 // GTA IV: a placement file (.wpl) or a map archive (.img).
@@ -607,7 +610,7 @@ pub fn open_map(ui: &AppWindow, vpath: String) {
             };
             let models = scene
                 .models
-                .into_iter()
+                .into_par_iter()
                 .map(|(name, loaded, transforms)| {
                     let materials = render::Materials::new(&loaded);
                     let look = std::sync::RwLock::new(loaded.default_look());

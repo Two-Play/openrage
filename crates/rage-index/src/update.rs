@@ -316,6 +316,15 @@ impl Index {
         stats.cancelled = cancel.load(Ordering::Relaxed) && done < total;
         if !stats.cancelled {
             let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            // Caches built from the index (the world map) only need rebuilding
+            // when its contents changed, not after every check. Indexes from
+            // before `changed_at` last changed at their last update.
+            let changed = stats.archives_indexed > 0 || stats.archives_removed > 0;
+            let previous = schema::get_meta(&self.conn, "changed_at")?.or(schema::get_meta(&self.conn, "updated_at")?);
+            match previous {
+                Some(at) if !changed => schema::set_meta(&self.conn, "changed_at", &at)?,
+                _ => schema::set_meta(&self.conn, "changed_at", &now.to_string())?,
+            }
             schema::set_meta(&self.conn, "updated_at", &now.to_string())?;
             self.conn.execute_batch("PRAGMA optimize;")?;
         }
@@ -408,6 +417,33 @@ mod tests {
         assert!(hits("lamp_post_01").contains(&"pc/data/maps/area.img/lamp_post_01.wdr".to_owned()));
         assert!(hits("area_txd").contains(&"pc/data/maps/area.img/area.ide".to_owned()));
         assert!(hits("ADMIRAL").contains(&"common/data/handling.dat".to_owned()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changed_at_moves_only_when_archives_change() {
+        let dir = std::env::temp_dir().join(format!("openrage-index-changed-{}", std::process::id()));
+        let game = dir.join("game");
+        fs::create_dir_all(game.join("pc/data/maps")).unwrap();
+        let archive = game.join("pc/data/maps/area.img");
+        fs::write(&archive, img(&[("a.ide", b"objs\nend\n", false)])).unwrap();
+        let mut index = Index::open(&dir.join("index.sqlite")).unwrap();
+        let mut update = || index.update(&game, None, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        update();
+        let first = Index::open(&dir.join("index.sqlite")).unwrap().changed_at().unwrap();
+        assert!(first.is_some());
+        // Simulate an older index: rewrite the stamp, then check without changes.
+        let stamp = |index: &Index, value: &str| schema::set_meta(&index.conn, "changed_at", value).unwrap();
+        stamp(&Index::open(&dir.join("index.sqlite")).unwrap(), "100");
+        let mut index = Index::open(&dir.join("index.sqlite")).unwrap();
+        index.update(&game, None, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(index.changed_at().unwrap(), Some(100), "an unchanged game keeps the stamp");
+        // A changed archive (here: larger) moves it.
+        let big = vec![b'x'; 5000];
+        fs::write(&archive, img(&[("b.ide", b"objs\nend\n", false), ("c.dat", &big, false)])).unwrap();
+        let stats = index.update(&game, None, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(stats.archives_indexed, 1);
+        assert!(index.changed_at().unwrap() > Some(100));
         let _ = fs::remove_dir_all(&dir);
     }
 }

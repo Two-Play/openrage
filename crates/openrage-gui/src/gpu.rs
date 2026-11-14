@@ -646,10 +646,14 @@ pub fn render_scene(
         let gpu = st.gpu.as_ref()?.as_ref()?;
         let (w, h) = (w.clamp(1, 8192), h.clamp(1, 8192));
 
-        // Upload once per model; forget models that are gone.
+        // Upload once per model; forget models that are gone. A scene places
+        // the same model many times: look models up by pointer, not by a scan
+        // of every uploaded model for every placement.
         st.models.retain(|m| m.owner.strong_count() > 0);
+        let mut uploaded: std::collections::HashSet<*const crate::ModelPreview> =
+            st.models.iter().map(|m| m.owner.as_ptr()).collect();
         for item in items {
-            if !st.models.iter().any(|m| std::ptr::eq(m.owner.as_ptr(), Arc::as_ptr(item.preview))) {
+            if uploaded.insert(Arc::as_ptr(item.preview)) {
                 let (draws, textures) = upload(gpu, &item.preview.loaded, &item.preview.materials);
                 st.models.push(GpuModel { owner: Arc::downgrade(item.preview), draws, textures });
             }
