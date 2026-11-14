@@ -88,6 +88,8 @@ pub struct Section {
     /// Outfits of the section's people (`[VARIATION]`, before the section
     /// or in it).
     pub variations: Vec<Variation>,
+    /// The lights' clips (`FillLight1_0`).
+    pub lights: Vec<String>,
 }
 
 /// One `[VARIATION]` line: `model component drawable texture [time]`.
@@ -104,6 +106,10 @@ pub struct Variation {
     /// When it applies, seconds into the section (mostly 0).
     pub time: f32,
 }
+
+/// What a person wears: (component, drawable, texture variant) per part
+/// that differs from the first variant (see [`Variation`]).
+pub type Outfit = Vec<(&'static str, u32, u32)>;
 
 /// The names of GTA IV's ped components, by number.
 const COMPONENTS: [&str; 11] = ["head", "uppr", "lowr", "suse", "hand", "feet", "jckt", "hair", "sus2", "teef", "face"];
@@ -134,7 +140,7 @@ impl Gta4Cutscene {
     /// What an actor (see [`CutModel::actor`]) wears from the start: the
     /// outfit of the first section it is in, (component, drawable, texture).
     /// Changes later on are left out.
-    pub fn outfit(&self, actor: &str) -> Vec<(&'static str, u32, u32)> {
+    pub fn outfit(&self, actor: &str) -> Outfit {
         let Some((section, model)) =
             self.sections.iter().find_map(|s| Some((s, s.models.iter().find(|m| m.actor() == actor)?)))
         else {
@@ -146,6 +152,59 @@ impl Gta4Cutscene {
             .filter(|v| v.model == model.index && v.time <= 0.0)
             .filter_map(|v| Some((v.component_name()?, v.drawable, v.texture)))
             .collect()
+    }
+
+    /// How an actor's outfit changes after the start (see
+    /// [`Gta4Cutscene::outfit`]): when (seconds into the cutscene) and the
+    /// whole outfit from then on. Later sections may dress it anew, and a
+    /// line with a time changes a part partway through: seconds into its
+    /// section, or into the cutscene when that is longer than the section.
+    pub fn outfit_changes(&self, actor: &str) -> Vec<(f32, Outfit)> {
+        let total = self.duration();
+        // (when, part) of every change, in any order first.
+        let mut events: Vec<(f32, (&'static str, u32, u32))> = Vec::new();
+        let (mut start, mut first) = (0.0, true);
+        for s in &self.sections {
+            if let Some(m) = s.models.iter().find(|m| m.actor() == actor) {
+                for v in s.variations.iter().filter(|v| v.model == m.index && (!first || v.time > 0.0)) {
+                    let Some(component) = v.component_name() else { continue };
+                    let at = if v.time <= s.duration { start + v.time.max(0.0) } else { v.time };
+                    if at < total {
+                        events.push((at, (component, v.drawable, v.texture)));
+                    }
+                }
+                first = false;
+            }
+            start += s.duration;
+        }
+        events.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut current = self.outfit(actor);
+        let mut out: Vec<(f32, Outfit)> = Vec::new();
+        for (at, part) in events {
+            match current.iter_mut().find(|c| c.0 == part.0) {
+                Some(c) if *c == part => continue,
+                Some(c) => *c = part,
+                None => current.push(part),
+            }
+            match out.last_mut() {
+                Some((t, outfit)) if *t == at => outfit.clone_from(&current),
+                _ => out.push((at, current.clone())),
+            }
+        }
+        out
+    }
+
+    /// Every light (its clip's name without the section number, lower case)
+    /// in the order they first appear.
+    pub fn lights(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for l in self.sections.iter().flat_map(|s| &s.lights) {
+            let key = actor_key(l);
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        out
     }
 
     /// Every actor (see [`CutModel::actor`]) in the order they first appear,
@@ -274,6 +333,7 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
                     None => variations.push(v),
                 }
             }
+            (Some(s), "LIGHTS") => s.lights.push(line.to_owned()),
             (Some(s), "REMOVE") => {
                 let (at, model) = line.rsplit_once(char::is_whitespace).with_context(bad)?;
                 s.remove.push((floats(at).with_context(bad)?, model.to_owned()));
@@ -384,10 +444,13 @@ fn load_undressed(game: &Path, model: &str, location: &ModelLocation) -> Result<
 
 /// A cutscene's animation, its sections played in a row.
 pub struct Animated {
-    /// Clip `i` is actor `i`'s (of [`Gta4Cutscene::actors`]); the last clip,
-    /// `exportcamera`, is the camera. Each clip has one part per section; an
-    /// actor's part is an animation without tracks in sections it is not in.
+    /// Clip `i` is actor `i`'s (of [`Gta4Cutscene::actors`]); the next,
+    /// `exportcamera`, is the camera; the lights' follow (see
+    /// [`Animated::lights`]). Each clip has one part per section; an actor's
+    /// part is an animation without tracks in sections it is not in.
     pub dict: ClipDictionary,
+    /// The lights' clips (of [`Gta4Cutscene::lights`]).
+    pub lights: Vec<usize>,
     /// Sections without their animation dictionary and clips not found in it.
     pub problems: Vec<String>,
 }
@@ -405,7 +468,8 @@ pub fn animation(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Result<Animate
     let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_owned();
     let actors = cut.actors();
     let mut out = ClipDictionary { clips: Vec::new(), animations: vec![Animation::empty()] };
-    let mut parts: Vec<Vec<ClipPart>> = vec![Vec::new(); actors.len() + 1];
+    let lights = cut.lights();
+    let mut parts: Vec<Vec<ClipPart>> = vec![Vec::new(); actors.len() + 1 + lights.len()];
     let mut problems = Vec::new();
     for (n, section) in cut.sections.iter().enumerate() {
         let file = [format!("{}.wad", section.anim), format!("{stem}_{n}.wad")]
@@ -469,10 +533,33 @@ pub fn animation(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Result<Animate
             }
         };
         parts[actors.len()].push(part(index));
+        for (k, key) in lights.iter().enumerate() {
+            let index = match section.lights.iter().find(|l| actor_key(l) == *key) {
+                Some(name) => match clip(name) {
+                    Some(a) => {
+                        out.animations.push(actor_animation(a, None, shift));
+                        out.animations.len() - 1
+                    }
+                    None => {
+                        if dict.is_some() {
+                            problems.push(format!("section {n}: no light clip {name}"));
+                        }
+                        0
+                    }
+                },
+                None => 0,
+            };
+            parts[actors.len() + 1 + k].push(part(index));
+        }
     }
-    let names = actors.iter().map(|(k, _)| k.clone()).chain(std::iter::once("exportcamera".to_owned()));
+    let names = actors
+        .iter()
+        .map(|(k, _)| k.clone())
+        .chain(std::iter::once("exportcamera".to_owned()))
+        .chain(lights.iter().map(|l| format!("light:{l}")));
     out.clips = names.zip(parts).map(|(name, parts)| Clip { name, parts, sequential: true }).collect();
-    Ok(Animated { dict: out, problems })
+    let lights = (actors.len() + 1..out.clips.len()).collect();
+    Ok(Animated { dict: out, lights, problems })
 }
 
 /// An actor's (or the camera's) animation in a section: its body clip with
@@ -523,6 +610,33 @@ fn actor_animation(body: &Animation, face: Option<&Animation>, shift: [f32; 3]) 
     Animation::from_frames(frames, body.duration, tracks, values)
 }
 
+/// A cutscene light at `time` seconds into its clip, `None` while it is
+/// off or out of the section. Its root carries it (the mover, see
+/// [`actor_animation`]); the other tracks are its own (see
+/// [`rage_formats::wad::TRACK_LIGHT_COLOUR`] and the next).
+pub fn light_at(dict: &ClipDictionary, clip: &Clip, time: f32) -> Option<cutscene::Light> {
+    use rage_formats::wad::{
+        TRACK_LIGHT_COLOUR, TRACK_LIGHT_CONE, TRACK_LIGHT_DIRECTION, TRACK_LIGHT_INTENSITY, TRACK_LIGHT_RANGE,
+    };
+    let track = |t: u8| cutscene::track_at(dict, clip, 0, t, time);
+    let intensity = track(TRACK_LIGHT_INTENSITY).map_or(1.0, |v| v[0]);
+    if intensity <= 0.0 {
+        return None;
+    }
+    let position = track(5)?;
+    let cone = track(TRACK_LIGHT_CONE).map_or(180.0, |v| v[0]);
+    let direction = track(TRACK_LIGHT_DIRECTION).map_or([0.0, 0.0, -1.0], |v| [v[0], v[1], v[2]]);
+    Some(cutscene::Light {
+        position: [position[0], position[1], position[2]],
+        direction,
+        color: track(TRACK_LIGHT_COLOUR).map_or([1.0; 3], |v| [v[0], v[1], v[2]]),
+        intensity,
+        range: track(TRACK_LIGHT_RANGE).map_or(5.0, |v| v[0]).max(0.1),
+        cone,
+        spot: cone > 0.0 && cone < 179.0,
+    })
+}
+
 /// The cutscene's subtitles with their text, from the episode's
 /// `american.gxt`: (start, end, text), in seconds.
 pub fn subtitles(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Vec<(f32, f32, String)> {
@@ -567,6 +681,104 @@ fn plain_text(text: &str) -> String {
     out.trim().to_owned()
 }
 
+/// Stereo from a GTA IV stream's channels: the first is the middle
+/// (dialogue), the others alternate left and right; mono and stereo stay.
+pub fn to_stereo(pcm: &rage_formats::awc::Pcm) -> rage_formats::awc::Pcm {
+    let n = pcm.channels.max(1) as usize;
+    if n == 2 {
+        return pcm.clone();
+    }
+    let mut samples = Vec::with_capacity(pcm.samples.len() / n * 2);
+    for frame in pcm.samples.chunks_exact(n) {
+        let (mut l, mut r) = (0.0f32, 0.0f32);
+        if n == 1 {
+            (l, r) = (frame[0] as f32, frame[0] as f32);
+        } else {
+            let middle = frame[0] as f32 * 0.7;
+            for (k, &v) in frame.iter().enumerate().skip(1) {
+                if k % 2 == 1 { l += v as f32 } else { r += v as f32 }
+            }
+            (l, r) = (l + middle, r + middle);
+        }
+        samples.push(l.clamp(-32768.0, 32767.0) as i16);
+        samples.push(r.clamp(-32768.0, 32767.0) as i16);
+    }
+    rage_formats::awc::Pcm { sample_rate: pcm.sample_rate, channels: 2, samples }
+}
+
+/// Where a cutscene sound is: the episode's own sound archive first, then
+/// the base game's cutscene sounds.
+fn audio_paths(vpath: &str, name: &str) -> Vec<String> {
+    let name = name.to_ascii_lowercase();
+    let mut out = Vec::new();
+    match episode(vpath).to_ascii_lowercase().as_str() {
+        "tlad/" => out.push(format!("{}pc/audio/sfx/EP1_SFX.rpf/ep1_sfx/{name}", episode(vpath))),
+        "tbogt/" => out.push(format!("{}pc/audio/sfx/EP2_SFX.rpf/ep2_sfx/{name}", episode(vpath))),
+        _ => {}
+    }
+    out.push(format!("pc/audio/sfx/cutscenes.rpf/cutscenes/{name}"));
+    out
+}
+
+/// The cutscene's sound as one stereo track from its start: a section's
+/// `[AUDIO]` starts that sound where the section starts; a section without
+/// one (or with the same) lets the sound run on. Also returns the sounds not found.
+pub fn audio(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> (Option<rage_formats::awc::Pcm>, Vec<String>) {
+    // (start in the cutscene, sound name)
+    let mut segments: Vec<(f32, String)> = Vec::new();
+    let mut at = 0.0;
+    for s in &cut.sections {
+        if let Some(name) = s.audio.as_deref().filter(|n| !n.is_empty())
+            && segments.last().is_none_or(|(_, last)| !last.eq_ignore_ascii_case(name))
+        {
+            segments.push((at, name.to_owned()));
+        }
+        at += s.duration;
+    }
+    let total = cut.duration();
+    let mut missing = Vec::new();
+    // A sound the game lacks lets the one before run on.
+    let found: Vec<(f32, rage_formats::awc::Pcm)> = segments
+        .into_iter()
+        .filter_map(|(start, name)| {
+            let pcm = audio_paths(vpath, &name).into_iter().find_map(|p| {
+                let (Node::Gta4File(a, id), _) = rage_mods::resolve(game, &p, None).ok()? else { return None };
+                rage_formats::ivaud::decode(&a.read(id).ok()?).ok()
+            });
+            if pcm.is_none() {
+                missing.push(name);
+            }
+            Some((start, to_stereo(&pcm?)))
+        })
+        .collect();
+    let mut out: Option<rage_formats::awc::Pcm> = None;
+    for (i, (start, pcm)) in found.iter().enumerate() {
+        let end = found.get(i + 1).map_or(f32::MAX, |(s, _)| *s);
+        let track = out.get_or_insert_with(|| rage_formats::awc::Pcm {
+            sample_rate: pcm.sample_rate,
+            channels: 2,
+            samples: Vec::new(),
+        });
+        let rate = track.sample_rate as f32;
+        let frame = |t: f32| (t * rate) as usize * 2;
+        // Silence up to the segment's start, then the sound until the next one starts.
+        track.samples.resize(track.samples.len().max(frame(*start)), 0);
+        track.samples.truncate(frame(*start));
+        let step = pcm.sample_rate as f32 / rate;
+        let frames = ((end.min(total.max(*start)) - start).max(0.0) * rate) as usize;
+        let have = pcm.samples.len() / 2;
+        let take = if end == f32::MAX { have.max(frames) } else { frames };
+        for f in 0..take {
+            let k = (f as f32 * step) as usize;
+            if k >= have {
+                break;
+            }
+            track.samples.extend_from_slice(&pcm.samples[2 * k..2 * k + 2]);
+        }
+    }
+    (out, missing)
+}
+
 /// A GTA IV cutscene ready to play: what [`crate::cutscene`] describes for
 /// GTA V (length, cast, where it is), its animation, its models and subtitles.
 pub struct Scene {
@@ -576,9 +788,15 @@ pub struct Scene {
     /// Per actor: where its model is.
     pub models: Vec<Option<ModelLocation>>,
     /// Per actor: what it wears (see [`Gta4Cutscene::outfit`]).
-    pub outfits: Vec<Vec<(&'static str, u32, u32)>>,
+    pub outfits: Vec<Outfit>,
+    /// Per actor: its outfit changes after the start (see [`Gta4Cutscene::outfit_changes`]).
+    pub outfit_changes: Vec<Vec<(f32, Outfit)>>,
     /// (start, end, text) in seconds.
     pub subtitles: Vec<(f32, f32, String)>,
+    /// The sound, stereo, from the cutscene's start.
+    pub audio: Option<rage_formats::awc::Pcm>,
+    /// Sounds the cutscene names that the game does not have.
+    pub missing_audio: Vec<String>,
 }
 
 /// Reads the cutscene at `vpath` and finds its animation, models and subtitles.
@@ -610,7 +828,9 @@ pub fn load(game: &Path, vpath: &str) -> Result<Scene> {
     };
     let subtitles = subtitles(game, vpath, &cut);
     let outfits = actors.iter().map(|(key, _)| cut.outfit(key)).collect();
-    Ok(Scene { cut, cutscene, animated, models, outfits, subtitles })
+    let outfit_changes = actors.iter().map(|(key, _)| cut.outfit_changes(key)).collect();
+    let (audio, missing_audio) = audio(game, vpath, &cut);
+    Ok(Scene { cut, cutscene, animated, models, outfits, outfit_changes, subtitles, audio, missing_audio })
 }
 
 #[cfg(test)]
@@ -673,9 +893,19 @@ mod tests {
         assert_eq!(cut.sections[0].variations.len(), 2);
         assert_eq!(cut.sections[0].variations[1].time, 6.039);
         assert_eq!(cut.sections[1].variations[0].model, 1);
-        // Phil wears the first section's outfit; the change after six seconds is left out.
+        // Phil wears the first section's outfit from the start; the change comes later.
         assert_eq!(cut.outfit("cs_philb"), [("hand", 1, 0)]);
         assert!(cut.outfit("player").is_empty());
+        // After six seconds the upper body changes; the second section dresses Phil anew.
+        let second = cut.sections[0].duration;
+        assert_eq!(
+            cut.outfit_changes("cs_philb"),
+            [
+                (6.039, vec![("hand", 1, 0), ("uppr", 0, 2)]),
+                (second, vec![("hand", 1, 0), ("uppr", 0, 2), ("head", 3, 1)])
+            ]
+        );
+        assert!(cut.outfit_changes("player").is_empty());
     }
 
     #[test]
@@ -696,6 +926,22 @@ mod tests {
         assert_eq!(cut.player_start, Some([-1501.92, 283.1, 13.78]));
         assert_eq!(cut.subtitles.len(), 1);
         assert_eq!(cut.sections[0].models[0].face, None);
+    }
+
+    #[test]
+    fn mixes_streams_to_stereo() {
+        use rage_formats::awc::Pcm;
+        let three = Pcm { sample_rate: 32000, channels: 3, samples: vec![100, 10, 20, -100, 0, 0] };
+        let stereo = to_stereo(&three);
+        assert_eq!(stereo.channels, 2);
+        assert_eq!(stereo.samples, [80, 90, -70, -70]);
+        let mono = Pcm { sample_rate: 8000, channels: 1, samples: vec![5, -5] };
+        assert_eq!(to_stereo(&mono).samples, [5, 5, -5, -5]);
+        assert_eq!(
+            audio_paths("TLAD/pc/anim/cuts.img/ab01_aa.cut", "AB01_AA")[0],
+            "TLAD/pc/audio/sfx/EP1_SFX.rpf/ep1_sfx/ab01_aa"
+        );
+        assert_eq!(audio_paths("pc/anim/cuts.img/b_1.cut", "B_1"), ["pc/audio/sfx/cutscenes.rpf/cutscenes/b_1"]);
     }
 
     #[test]

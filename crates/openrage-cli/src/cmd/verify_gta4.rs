@@ -680,6 +680,8 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
         no_model: Vec<String>,
         problems: Vec<String>,
         seconds: f32,
+        /// Seconds of sound decoded.
+        sound: f32,
     }
     let results: Vec<(String, Result<Checked>)> = cuts
         .par_iter()
@@ -695,18 +697,23 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
                     .filter(|(_, m)| gta4_cutscene::find_model(game_dir, vpath, m).is_none())
                     .map(|(_, m)| m.clone())
                     .collect();
+                let (sound, missing_sound) = gta4_cutscene::audio(game_dir, vpath, &cut);
+                let mut problems = animated.problems;
+                problems.extend(missing_sound.into_iter().map(|n| format!("no sound {n}")));
                 Ok(Checked {
                     sections: cut.sections.len(),
                     actors: actors.len(),
                     no_model,
-                    problems: animated.problems,
+                    problems,
                     seconds: cut.duration(),
+                    sound: sound.map_or(0.0, |p| p.duration_secs()),
                 })
             })();
             (vpath.clone(), checked)
         })
         .collect();
     let (mut sections, mut actors, mut seconds, mut no_model, mut problems, mut ok) = (0, 0, 0.0, 0, 0, 0);
+    let mut sound = 0.0;
     for (vpath, r) in results {
         match r {
             Ok(c) => {
@@ -714,6 +721,7 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
                 sections += c.sections;
                 actors += c.actors;
                 seconds += c.seconds;
+                sound += c.sound;
                 no_model += c.no_model.len();
                 problems += c.problems.len();
                 if !c.no_model.is_empty() {
@@ -730,10 +738,11 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
         outln!("FAIL {e}");
     }
     outln!(
-        "{} cutscenes ({ok} read, {:.0} minutes), {sections} sections, {actors} actors, \
-         {no_model} without a model, {problems} clips or dictionaries missing, {} errors ({:.1}s)",
+        "{} cutscenes ({ok} read, {:.0} minutes, {:.0} minutes of sound), {sections} sections, {actors} actors, \
+         {no_model} without a model, {problems} clips, dictionaries or sounds missing, {} errors ({:.1}s)",
         cuts.len(),
         seconds / 60.0,
+        sound / 60.0,
         errors.len(),
         started.elapsed().as_secs_f32()
     );
@@ -785,6 +794,19 @@ pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool,
     }
     for p in &scene.animated.problems {
         outln!("missing: {p}");
+    }
+    for (actor, changes) in scene.cutscene.actors.iter().zip(&scene.outfit_changes) {
+        if !changes.is_empty() {
+            let at: Vec<String> = changes.iter().map(|(t, _)| format!("{t:.1}s")).collect();
+            outln!("  {} changes outfit at {}", actor.name, at.join(", "));
+        }
+    }
+    match &scene.audio {
+        Some(pcm) => outln!("sound: {:.1}s, {} Hz", pcm.duration_secs(), pcm.sample_rate),
+        None => outln!("sound: none"),
+    }
+    for name in &scene.missing_audio {
+        outln!("missing: sound {name}");
     }
     for (start, end, text) in scene.subtitles.iter().take(5) {
         outln!("  {start:7.2}–{end:7.2}s  {}", text.replace('\n', " / "));

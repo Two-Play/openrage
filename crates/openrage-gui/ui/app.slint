@@ -4794,6 +4794,10 @@ export component SceneWindow inherits Window {
     in property <bool> has-lights;
     in property <bool> lights-on;
     callback toggle-lights();
+    // The cutscene's sound (GTA IV): there is one, and it plays.
+    in property <bool> has-sound;
+    in property <bool> sound-on;
+    callback toggle-sound();
     // Cutscenes have a timeline; a map scene has none but a list of its objects.
     in property <bool> timeline: true;
     in property <[PartRow]> objects;
@@ -4850,6 +4854,10 @@ export component SceneWindow inherits Window {
                         overflow: elide;
                         color: Theme.text-muted;
                     }
+                }
+                if root.has-sound: Button {
+                    text: root.sound-on ? @tr("Sound off") : @tr("Sound on");
+                    clicked => { root.toggle-sound(); }
                 }
                 if root.has-lights: Button {
                     text: root.lights-on ? @tr("Lights off") : @tr("Lights on");
