@@ -1092,6 +1092,7 @@ export component AppWindow inherits Window {
     callback cancel-task();
     callback open-setup();
     callback setup-browse-game();
+    callback setup-game-dir-edited();
     callback setup-browse-magic();
     callback setup-pick-detected(string);
     callback setup-run();
@@ -3281,6 +3282,7 @@ export component AppWindow inherits Window {
                 LineEdit {
                     horizontal-stretch: 1;
                     text <=> root.setup-game-dir;
+                    edited => { root.setup-game-dir-edited(); }
                     accessible-label: @tr("Game directory");
                     placeholder-text: @tr("Folder containing GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe or RDR2.exe");
                 }

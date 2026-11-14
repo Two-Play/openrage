@@ -71,7 +71,9 @@ pub(crate) fn show_setup(ui: &AppWindow, can_cancel: bool) {
         let game = a.game_dir.clone().or_else(|| a.cfg.game_dir.clone()).map(|p| p.display().to_string());
         let game = game.or_else(|| detected.first().cloned()).unwrap_or_default();
         ui.set_setup_game_dir(game.into());
-        ui.set_setup_magic_path(a.cfg.magic_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default().into());
+        // A key blob that is gone (moved, or a temporary copy) is not offered again.
+        let magic = a.cfg.magic_path.as_ref().filter(|p| p.is_file());
+        ui.set_setup_magic_path(magic.map(|p| p.display().to_string()).unwrap_or_default().into());
         ui.set_setup_can_cancel(
             can_cancel
                 && (a.keys.is_some() || rage_rpf::rpf8::has_default_keys() || rage_rpf::gta4::default_key().is_some())
@@ -80,8 +82,27 @@ pub(crate) fn show_setup(ui: &AppWindow, can_cancel: bool) {
     });
     let model: Vec<SharedString> = detected.into_iter().map(Into::into).collect();
     ui.set_setup_detected(ModelRc::new(VecModel::from(model)));
-    ui.set_setup_log(SharedString::new());
+    show_folder_hint(ui);
     ui.set_setup_visible(true);
+}
+
+/// Says right away whether the folder in the setup holds a game OpenRAGE knows.
+pub(crate) fn show_folder_hint(ui: &AppWindow) {
+    let text = ui.get_setup_game_dir();
+    let dir = openrage_app::gta4::normalize_dir(&PathBuf::from(text.trim()));
+    let hint = if text.trim().is_empty() {
+        String::new()
+    } else if let Some(name) = detect::game_name(&dir) {
+        format!("Found {name}. Press Set up to continue.")
+    } else if dir.is_dir() {
+        format!(
+            "No supported game in {}: the folder must contain GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe or RDR2.exe.",
+            dir.display()
+        )
+    } else {
+        format!("{} does not exist.", dir.display())
+    };
+    ui.set_setup_log(hint.into());
 }
 
 pub(crate) fn pick_path(w: Weak<AppWindow>, file: bool, title: &'static str, apply: fn(&AppWindow, PathBuf)) {
@@ -153,6 +174,11 @@ pub(crate) fn run_setup(ui: &AppWindow) {
             format!("{} does not contain GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe or RDR2.exe.", game_dir.display())
                 .into(),
         );
+        return;
+    }
+    // Keys set up before that open this game: no scan, no key blob needed.
+    if let Some(keys) = setup::cached_keys_for(&game_dir) {
+        finish_setup(ui, game_dir, magic, keys);
         return;
     }
     ui.set_setup_running(true);

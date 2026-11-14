@@ -634,11 +634,19 @@ fn wire_setup(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_open_setup(move || with_ui(&w, |ui| show_setup(ui, true)));
     let w = ui.as_weak();
-    ui.on_setup_pick_detected(move |value| with_ui(&w, |ui| ui.set_setup_game_dir(value)));
+    ui.on_setup_pick_detected(move |value| {
+        with_ui(&w, |ui| {
+            ui.set_setup_game_dir(value);
+            show_folder_hint(ui);
+        })
+    });
+    let w = ui.as_weak();
+    ui.on_setup_game_dir_edited(move || with_ui(&w, show_folder_hint));
     let w = ui.as_weak();
     ui.on_setup_browse_game(move || {
-        pick_path(w.clone(), false, "Select the GTA V folder", |ui, p| {
-            ui.set_setup_game_dir(p.display().to_string().into())
+        pick_path(w.clone(), false, "Select the game folder", |ui, p| {
+            ui.set_setup_game_dir(p.display().to_string().into());
+            show_folder_hint(ui);
         })
     });
     let w = ui.as_weak();

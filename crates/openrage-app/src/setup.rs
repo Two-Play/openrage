@@ -12,6 +12,14 @@ use rage_rpf::Rpf7;
 /// Game executables, in order of preference.
 pub const EXECUTABLES: [&str; 2] = ["GTA5_Enhanced.exe", "GTA5.exe"];
 
+/// The GTA V keys set up before, if they open this game's archives: switching
+/// back to GTA V then needs neither a scan of the executable nor magic.dat.
+pub fn cached_keys_for(game_dir: &Path) -> Option<Arc<GtaVKeys>> {
+    let keys = crate::load_keys().ok().flatten()?;
+    let probe = game_dir.join("common.rpf");
+    (probe.is_file() && Rpf7::open(&probe, Some(Arc::clone(&keys))).is_ok()).then_some(keys)
+}
+
 pub fn find_exe(game_dir: &Path) -> Option<PathBuf> {
     EXECUTABLES.iter().map(|n| game_dir.join(n)).find(|p| p.is_file())
 }
