@@ -38,6 +38,8 @@ pub struct Subtitle {
 /// One line of a section's `[MODELS]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CutModel {
+    /// Its number in the section (what `[VARIATION]` lines refer to).
+    pub index: u32,
     /// The model (`CS_PhilB`, `player`, `csOldPhone`).
     pub model: String,
     /// Its clip in the section's animation (`CS_PhilB_0`).
@@ -80,6 +82,37 @@ pub struct Section {
     pub camera: Option<String>,
     /// The audio track (`B_1`).
     pub audio: Option<String>,
+    /// Map objects the cutscene hides (its own copies replace them): where
+    /// they are and their model.
+    pub remove: Vec<([f32; 3], String)>,
+    /// Outfits of the section's people (`[VARIATION]`, before the section
+    /// or in it).
+    pub variations: Vec<Variation>,
+}
+
+/// One `[VARIATION]` line: `model component drawable texture [time]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Variation {
+    /// The model's number in the section's `[MODELS]`.
+    pub model: u32,
+    /// The ped component: 0 head, 1 upper body, 2 legs, 3 `suse`, 4 hands,
+    /// 5 feet, 6 jacket, 7 hair, 8 `sus2`, 9 teeth, 10 face.
+    pub component: u32,
+    pub drawable: u32,
+    /// Texture variant: 0 `a`, 1 `b`, …
+    pub texture: u32,
+    /// When it applies, seconds into the section (mostly 0).
+    pub time: f32,
+}
+
+/// The names of GTA IV's ped components, by number.
+const COMPONENTS: [&str; 11] = ["head", "uppr", "lowr", "suse", "hand", "feet", "jckt", "hair", "sus2", "teef", "face"];
+
+impl Variation {
+    /// The component's name in the ped's drawables (`hand`).
+    pub fn component_name(&self) -> Option<&'static str> {
+        COMPONENTS.get(self.component as usize).copied()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -96,6 +129,23 @@ impl Gta4Cutscene {
     /// Length in seconds: all sections in a row.
     pub fn duration(&self) -> f32 {
         self.sections.iter().map(|s| s.duration).sum()
+    }
+
+    /// What an actor (see [`CutModel::actor`]) wears from the start: the
+    /// outfit of the first section it is in, (component, drawable, texture).
+    /// Changes later on are left out.
+    pub fn outfit(&self, actor: &str) -> Vec<(&'static str, u32, u32)> {
+        let Some((section, model)) =
+            self.sections.iter().find_map(|s| Some((s, s.models.iter().find(|m| m.actor() == actor)?)))
+        else {
+            return Vec::new();
+        };
+        section
+            .variations
+            .iter()
+            .filter(|v| v.model == model.index && v.time <= 0.0)
+            .filter_map(|v| Some((v.component_name()?, v.drawable, v.texture)))
+            .collect()
     }
 
     /// Every actor (see [`CutModel::actor`]) in the order they first appear,
@@ -129,6 +179,7 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
     let mut cut = Gta4Cutscene::default();
     let mut section: Option<Section> = None;
     let mut block: Option<String> = None;
+    let mut variations: Vec<Variation> = Vec::new();
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
         let at = || format!("line {}", n + 1);
@@ -140,7 +191,8 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
                 if section.is_some() {
                     bail!("{}: a section starts inside another one", at());
                 }
-                section = Some(Section::default());
+                // Outfits given before the section are its own.
+                section = Some(Section { variations: std::mem::take(&mut variations), ..Section::default() });
                 block = None;
                 continue;
             }
@@ -195,7 +247,8 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
                     .get(3)
                     .filter(|v| v.parse::<f32>().is_err() && !v.eq_ignore_ascii_case("null"))
                     .map(|v| (*v).to_owned());
-                s.models.push(CutModel { model: f[1].to_owned(), anim: f[2].to_owned(), face });
+                let index = f[0].parse().with_context(bad)?;
+                s.models.push(CutModel { index, model: f[1].to_owned(), anim: f[2].to_owned(), face });
             }
             (Some(s), "OFFSET") => s.offset = floats(line).with_context(bad)?,
             (Some(s), "ORIENT") => s.orient = floats::<1>(line).with_context(bad)?[0],
@@ -203,6 +256,28 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
             (Some(s), "ANIM") => s.anim = line.to_owned(),
             (Some(s), "CAMERA") => s.camera = Some(line.to_owned()),
             (Some(s), "AUDIO") => s.audio = Some(line.to_owned()),
+            (s, "VARIATION") => {
+                let f: Vec<f32> =
+                    line.split_whitespace().map(|v| v.parse()).collect::<Result<_, _>>().with_context(bad)?;
+                let (&[model, component, drawable, texture], time) = (&f[..f.len().min(4)], f.get(4)) else {
+                    bail!(bad())
+                };
+                let v = Variation {
+                    model: model as u32,
+                    component: component as u32,
+                    drawable: drawable as u32,
+                    texture: texture as u32,
+                    time: time.copied().unwrap_or(0.0) / 1000.0,
+                };
+                match s {
+                    Some(s) => s.variations.push(v),
+                    None => variations.push(v),
+                }
+            }
+            (Some(s), "REMOVE") => {
+                let (at, model) = line.rsplit_once(char::is_whitespace).with_context(bad)?;
+                s.remove.push((floats(at).with_context(bad)?, model.to_owned()));
+            }
             // Draw distances, lights, effects, vehicles, objects to remove, …
             _ => {}
         }
@@ -218,7 +293,7 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
 
 /// The folder of the episode a virtual path is in (`TLAD/`, `TBoGT/`), or
 /// `""` for the base game.
-fn episode(vpath: &str) -> &str {
+pub fn episode(vpath: &str) -> &str {
     match vpath.split_once('/') {
         Some((first, _)) if first.eq_ignore_ascii_case("TLAD") || first.eq_ignore_ascii_case("TBoGT") => {
             &vpath[..first.len() + 1]
@@ -282,8 +357,19 @@ pub fn find_model(game: &Path, cut_vpath: &str, model: &str) -> Option<ModelLoca
     Some(ModelLocation { source, kind: Kind::Prop })
 }
 
-/// Loads an actor's model.
-pub fn load_model(game: &Path, model: &str, location: &ModelLocation) -> Result<crate::models::LoadedModel> {
+/// Loads an actor's model, dressed in `outfit` (see [`Gta4Cutscene::outfit`]).
+pub fn load_model(
+    game: &Path,
+    model: &str,
+    location: &ModelLocation,
+    outfit: &[(&str, u32, u32)],
+) -> Result<crate::models::LoadedModel> {
+    let mut loaded = load_undressed(game, model, location)?;
+    loaded.choose_gta4_components(outfit);
+    Ok(loaded)
+}
+
+fn load_undressed(game: &Path, model: &str, location: &ModelLocation) -> Result<crate::models::LoadedModel> {
     match &location.source {
         ModelSource::File(vpath) => crate::models::load(game, None, vpath),
         ModelSource::Member { dictionary, hash } => {
@@ -340,6 +426,9 @@ pub fn animation(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Result<Animate
         let longest = dict.as_ref().map_or(0.0, |d| d.animations.iter().map(|a| a.duration).fold(0.0, f32::max));
         let length = if section.duration > 0.0 { section.duration } else { longest };
         let part = |animation| ClipPart { animation, start: 0.0, end: length, rate: 1.0 };
+        // Every section in the first one's frame (a few move to another place).
+        let origin = cut.sections[0].offset;
+        let shift: [f32; 3] = std::array::from_fn(|k| section.offset[k] - origin[k]);
         for (k, (key, _)) in actors.iter().enumerate() {
             let animation = section.models.iter().find(|m| m.actor() == *key).and_then(|m| {
                 let Some(body) = clip(&m.anim) else {
@@ -355,7 +444,7 @@ pub fn animation(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Result<Animate
                     }
                     found
                 });
-                Some(actor_animation(body, face))
+                Some(actor_animation(body, face, shift))
             });
             let index = match animation {
                 Some(a) => {
@@ -369,7 +458,7 @@ pub fn animation(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Result<Animate
         let camera = section.camera.as_deref().unwrap_or("camera_0");
         let index = match clip(camera) {
             Some(a) => {
-                out.animations.push(a.clone());
+                out.animations.push(actor_animation(a, None, shift));
                 out.animations.len() - 1
             }
             None => {
@@ -386,10 +475,11 @@ pub fn animation(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Result<Animate
     Ok(Animated { dict: out, problems })
 }
 
-/// An actor's animation in a section: its body clip with the facial clip's
-/// tracks added. Props move their root bone; that motion becomes the mover
-/// (where the model stands), as people's already is.
-fn actor_animation(body: &Animation, face: Option<&Animation>) -> Animation {
+/// An actor's (or the camera's) animation in a section: its body clip with
+/// the facial clip's tracks added, moved by `shift` (from the section's
+/// origin to the first section's). Props move their root bone; that motion
+/// becomes the mover (where the model stands), as people's already is.
+fn actor_animation(body: &Animation, face: Option<&Animation>, shift: [f32; 3]) -> Animation {
     use rage_formats::clip::{TRACK_BONE_ROTATION, TRACK_BONE_TRANSLATION};
     const MOVER_TRANSLATION: u8 = 5;
     const MOVER_ROTATION: u8 = 6;
@@ -418,6 +508,16 @@ fn actor_animation(body: &Animation, face: Option<&Animation>) -> Animation {
             values.push(
                 (0..frames).map(|f| face.value(t, face.frame_at(time(f))).unwrap_or([0.0, 0.0, 0.0, 1.0])).collect(),
             );
+        }
+    }
+    const CAMERA_TRANSLATION: u8 = 7;
+    if shift != [0.0; 3] {
+        for (t, v) in tracks.iter().zip(&mut values) {
+            if t.bone == 0 && matches!(t.track, MOVER_TRANSLATION | CAMERA_TRANSLATION) {
+                for p in v.iter_mut() {
+                    (0..3).for_each(|k| p[k] += shift[k]);
+                }
+            }
         }
     }
     Animation::from_frames(frames, body.duration, tracks, values)
@@ -475,6 +575,8 @@ pub struct Scene {
     pub animated: Animated,
     /// Per actor: where its model is.
     pub models: Vec<Option<ModelLocation>>,
+    /// Per actor: what it wears (see [`Gta4Cutscene::outfit`]).
+    pub outfits: Vec<Vec<(&'static str, u32, u32)>>,
     /// (start, end, text) in seconds.
     pub subtitles: Vec<(f32, f32, String)>,
 }
@@ -491,8 +593,10 @@ pub fn load(game: &Path, vpath: &str) -> Result<Scene> {
     let cutscene = cutscene::Cutscene {
         lights: Vec::new(),
         duration: cut.duration(),
+        // The animations are only moved by the offset; `[ORIENT]` turns
+        // the player's start, not the scene.
         offset: first.offset,
-        rotation: first.orient,
+        rotation: 0.0,
         actors: actors
             .iter()
             .zip(&models)
@@ -505,7 +609,8 @@ pub fn load(game: &Path, vpath: &str) -> Result<Scene> {
             .collect(),
     };
     let subtitles = subtitles(game, vpath, &cut);
-    Ok(Scene { cut, cutscene, animated, models, subtitles })
+    let outfits = actors.iter().map(|(key, _)| cut.outfit(key)).collect();
+    Ok(Scene { cut, cutscene, animated, models, outfits, subtitles })
 }
 
 #[cfg(test)]
@@ -517,14 +622,16 @@ mod tests {
 [TEXT]\r\n\r\n204\t696\tB1_CUT1_1\r\n1737\t763\tB1_CUT1_2\r\n[/TEXT]\r\n\r\n\
 [FLAGS]\r\n\r\nLONG_FADE_OUT\r\n[/FLAGS]\r\n\r\n\
 [PLAYER_START]\r\n\r\n-1153.120972 415.058014 4.570000\r\n[/PLAYER_START]\r\n\r\n\
+[VARIATION]\r\n0 4 1 0 0\r\n0 1 0 2 6039\r\n[/VARIATION]\r\n\
 [SECTION_START]\r\n\r\n[MODELS]\r\n\r\n\
 0 CS_PhilB CS_PhilB_0 cs_philb_head_0\r\n1 player player_0 player_head_0 0\r\n\r\n2 csOldPhone csOldPhone_0\r\n\
 [/MODELS]\r\n[LIGHTS]\r\n\r\n[/LIGHTS]\r\n[ORIENT]\r\n\r\n180.000000\r\n[/ORIENT]\r\n\
+[REMOVE]\r\n\r\n-1150.6 414.2 5.8 KM_PortacabinDoor\r\n[/REMOVE]\r\n\
 [OFFSET]\r\n-1153.120972 415.058014 4.570000\r\n[/OFFSET]\r\n\
 [DURATION]\r\n39066.667969\r\n[/DURATION]\r\n[AUDIO]\r\nB_1\r\n[/AUDIO]\r\n\
 [ANIM]\r\nB_1_0\r\n[/ANIM]\r\n[CAMERA]\r\ncamera_0\r\n[/CAMERA]\r\n[SECTION_END]\r\n\
 [SECTION_START]\r\n[MODELS]\r\n0 csCabaretCurtain csCabaretCurtain-2_1\r\n1 CS_PhilB CS_PhilB_1 cs_philb_head_1\r\n\
-[/MODELS]\r\n[DURATION]\r\n1000\r\n[/DURATION]\r\n[ANIM]\r\nB_1_1\r\n[/ANIM]\r\n[SECTION_END]\r\n";
+[/MODELS]\r\n[VARIATION]\r\n1 0 3 1\r\n[/VARIATION]\r\n[DURATION]\r\n1000\r\n[/DURATION]\r\n[ANIM]\r\nB_1_1\r\n[/ANIM]\r\n[SECTION_END]\r\n";
 
     #[test]
     fn reads_sections_and_subtitles() {
@@ -545,9 +652,10 @@ mod tests {
         assert!((s.duration - 39.066_67).abs() < 1e-4);
         assert_eq!(
             s.models[1],
-            CutModel { model: "player".into(), anim: "player_0".into(), face: Some("player_head_0".into()) }
+            CutModel { index: 1, model: "player".into(), anim: "player_0".into(), face: Some("player_head_0".into()) }
         );
         assert_eq!(s.models[2].face, None);
+        assert_eq!(s.remove, [([-1150.6, 414.2, 5.8], "KM_PortacabinDoor".to_owned())]);
         assert!((cut.duration() - 40.066_67).abs() < 1e-4);
     }
 
@@ -557,6 +665,17 @@ mod tests {
         let actors: Vec<String> = cut.actors().into_iter().map(|(k, _)| k).collect();
         assert_eq!(actors, ["cs_philb", "player", "csoldphone", "cscabaretcurtain-2"]);
         assert_eq!(actor_key("camera"), "camera");
+    }
+
+    #[test]
+    fn reads_outfits() {
+        let cut = parse(SAMPLE.as_bytes()).unwrap();
+        assert_eq!(cut.sections[0].variations.len(), 2);
+        assert_eq!(cut.sections[0].variations[1].time, 6.039);
+        assert_eq!(cut.sections[1].variations[0].model, 1);
+        // Phil wears the first section's outfit; the change after six seconds is left out.
+        assert_eq!(cut.outfit("cs_philb"), [("hand", 1, 0)]);
+        assert!(cut.outfit("player").is_empty());
     }
 
     #[test]
@@ -602,10 +721,13 @@ mod tests {
             vec![vec![[1.0, 2.0, 3.0, 0.0]; 2], vec![[0.0, 0.0, 0.0, 1.0]; 2], vec![[0.0, 0.0, 0.0, 1.0]; 2]],
         );
         let face = Animation::from_frames(3, 1.0, vec![track(9, 1, 1)], vec![vec![[0.0, 0.0, 1.0, 0.0]; 3]]);
-        let a = actor_animation(&body, Some(&face));
+        let a = actor_animation(&body, Some(&face), [0.0; 3]);
         let kinds: Vec<(u16, u8)> = a.tracks.iter().map(|t| (t.bone, t.track)).collect();
         assert_eq!(kinds, [(0, 5), (0, 6), (7, 1), (9, 1)]);
         assert_eq!(a.value(0, 1.0), Some([1.0, 2.0, 3.0, 0.0]));
         assert_eq!(a.value(3, 1.0), Some([0.0, 0.0, 1.0, 0.0]));
+        let moved = actor_animation(&body, None, [10.0, 0.0, -1.0]);
+        assert_eq!(moved.value(0, 0.0), Some([11.0, 2.0, 2.0, 0.0]), "the mover moves with the section");
+        assert_eq!(moved.value(1, 0.0), Some([0.0, 0.0, 0.0, 1.0]));
     }
 }

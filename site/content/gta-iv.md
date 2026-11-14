@@ -143,8 +143,11 @@ Double-click a placement file (`.wpl`) to see its objects in 3D, with the object
   puts them together, for example a whole part of Algonquin with 2,483 objects.
 - Models come from the archive next to the placement file first, then from anywhere in the game.
 - Low-detail stand-ins (`lod…`, `slod…`) are left out unless a file holds nothing else.
+- **Interiors** (offices, shops, bars, the portacabins of the docks) are placed as one object whose contents the
+  `.ide` files list (`mlo` sections): they show with everything inside.
 
-**Checked:** of 435,116 placed objects, all but 1,434 have a model (their names are in no `.ide` file).
+**Checked:** 1,375 placed interiors expanded; of the 492,802 objects then placed, all but 59 have a model (their names
+are in no `.ide` file).
 
 ## Collisions
 
@@ -170,7 +173,8 @@ characters (`cs_*` in `cutsprops.img`), whose faces have a fuller rig.
   selecting one offers the fitting models.
 - The cutscene characters' skin shaders (`gta_ped_skin…`) keep other data in the texture's alpha channel; OpenRAGE
   draws them opaque (also in the glTF export), so their heads show.
-- Twist and roll helper bones follow the bone they rest on, so arms stay in one piece.
+- Twist and roll helper bones follow the bone they rest on, keeping their own turn, so arms and wrists stay in one
+  piece.
 
 ```
 openrage clips <path to .wad>
@@ -189,13 +193,19 @@ scene window, the way GTA V cutscenes play. Its sections (`b_1_0.wad`, `b_1_1.wa
   vehicles and map objects by name. The player is put together from `playerped.rpf` — Niko, Johnny or Luis, after
   the episode the cutscene belongs to. People play their body and facial clips; actors a section leaves out are
   hidden while it plays.
+- **Outfits:** people wear what the cutscene's `[VARIATION]` lines give them — which variant of each part (head,
+  upper body, legs, hands, …) and its texture variant. A few cutscenes change an outfit partway through; the scene
+  keeps the first one.
+- **The map around it**, interiors included, from the episode's placement files. Objects the cutscene replaces with
+  its own copies (`[REMOVE]`, a door that opens, a phone that is picked up) are left out. Sections that move to
+  another place are put where they play.
 - **The camera** of each section, with its field of view, or a free camera (drag or scroll).
 - **Subtitles** from the episode's `american.gxt`.
 
-The map around the scene is not shown yet. The text stays reachable through the context menu (**Open in text editor**).
+The text stays reachable through the context menu (**Open in text editor**).
 
 ```
-openrage cutscene pc/anim/cuts.img/b_1.cut     # sections, cast with their models, subtitles
+openrage cutscene pc/anim/cuts.img/b_1.cut [--models] [--map 40]   # sections, cast, subtitles; outfits, map
 openrage verify --cutscenes                    # every .cut: sections, clips, camera and models
 ```
 

@@ -112,7 +112,15 @@ pub fn open(ui: &AppWindow, cut_path: String, cut: Cutscene, models: Vec<Option<
         Box::new(move |game_dir, keys, progress| {
             let (dict, previews) = load(game_dir, keys, &path, &cut.actors, &models, progress)?;
             let clips = cutscene::actor_clips(&cut.actors, &dict);
-            Ok(Loaded { dict, previews, clips, cut, subtitles: Vec::new(), surroundings: true, problems: Vec::new() })
+            Ok(Loaded {
+                dict,
+                previews,
+                clips,
+                cut,
+                subtitles: Vec::new(),
+                surroundings: Surroundings::World,
+                problems: Vec::new(),
+            })
         }),
     );
 }
@@ -136,9 +144,10 @@ pub fn open_gta4(ui: &AppWindow, cut_path: String) {
                 .models
                 .par_iter()
                 .zip(actors)
-                .map(|(location, actor)| {
+                .zip(&scene.outfits)
+                .map(|((location, actor), outfit)| {
                     let loaded = openrage_app::progress::quietly(|| {
-                        gta4_cutscene::load_model(game_dir, &actor.name, location.as_ref()?).ok()
+                        gta4_cutscene::load_model(game_dir, &actor.name, location.as_ref()?, outfit).ok()
                     });
                     if location.is_some() {
                         progress.step(done.fetch_add(1, Ordering::Relaxed) + 1, total);
@@ -153,8 +162,11 @@ pub fn open_gta4(ui: &AppWindow, cut_path: String) {
                 clips,
                 cut: scene.cutscene,
                 subtitles: scene.subtitles,
-                // The map around GTA IV cutscenes is not put together (yet).
-                surroundings: false,
+                surroundings: Surroundings::Gta4 {
+                    episode: openrage_app::gta4_cutscene::episode(&path).to_owned(),
+                    origins: scene.cut.sections.iter().map(|s| s.offset).collect(),
+                    remove: scene.cut.sections.iter().flat_map(|s| s.remove.iter().cloned()).collect(),
+                },
                 problems: scene.animated.problems,
             })
         }),
@@ -170,10 +182,20 @@ struct Loaded {
     cut: Cutscene,
     /// (start, end, text) in seconds.
     subtitles: Vec<(f32, f32, String)>,
-    /// Load the map around the scene.
-    surroundings: bool,
+    /// Which map to load around the scene.
+    surroundings: Surroundings,
     /// Animation pieces the game's files lack.
     problems: Vec<String>,
+}
+
+/// The map around a cutscene.
+#[derive(Clone)]
+enum Surroundings {
+    /// GTA V: the world cache's objects near the scene.
+    World,
+    /// GTA IV: the objects the episode's placement files put near the
+    /// sections' origins (in the world), without those the cutscene removes.
+    Gta4 { episode: String, origins: Vec<[f32; 3]>, remove: Vec<([f32; 3], String)> },
 }
 
 type Loader = Box<dyn FnOnce(&std::path::Path, Option<Arc<GtaVKeys>>, &LoadProgress) -> anyhow::Result<Loaded> + Send>;
@@ -365,14 +387,7 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
         subtitles,
         timer: slint::Timer::default(),
     });
-    if surroundings {
-        load_surroundings(win, id, cut, (lo, hi), progress);
-    } else {
-        progress.set("", 0, 0);
-        if let Some(st) = state.borrow_mut().as_mut() {
-            st.surroundings_pending = false;
-        }
-    }
+    load_surroundings(win, id, cut, (lo, hi), surroundings, progress);
     win.set_playing(true);
     let (w, s) = (win.as_weak(), Rc::clone(state));
     if let Some(st) = state.borrow().as_ref() {
@@ -408,6 +423,7 @@ fn load_surroundings(
     id: u64,
     cut: &Cutscene,
     bounds: ([f32; 3], [f32; 3]),
+    which: Surroundings,
     progress: Arc<LoadProgress>,
 ) {
     let Some((game_dir, keys)) = crate::with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone()))) else {
@@ -425,18 +441,40 @@ fn load_surroundings(
     let centre = math::transform_point(&to_world, centre_local);
     let half = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt() / 2.0;
     let radius = (half + 25.0).clamp(30.0, 120.0);
+    let cut_offset = cut.offset;
     progress.set("Reading the map …", 0, 0);
     let weak = win.as_weak();
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<Vec<(ModelPreview, Vec<Mat4>)>> {
-            let world = openrage_app::world::load(&game_dir, keys.clone())?;
-            let files = openrage_app::world::files(&game_dir)?;
-            progress.set("Finding the map objects around the scene …", 0, 0);
-            let placed = openrage_app::world::objects_near(&world, &game_dir, keys.clone(), centre, radius);
-            progress.set("Loading the surroundings", 0, 0);
-            let models = openrage_app::world::load_models(&world, &files, &game_dir, keys, &placed, &|done, total| {
-                progress.step(done, total)
-            });
+            let models = match which {
+                Surroundings::World => {
+                    let world = openrage_app::world::load(&game_dir, keys.clone())?;
+                    let files = openrage_app::world::files(&game_dir)?;
+                    progress.set("Finding the map objects around the scene …", 0, 0);
+                    let placed = openrage_app::world::objects_near(&world, &game_dir, keys.clone(), centre, radius);
+                    progress.set("Loading the surroundings", 0, 0);
+                    openrage_app::world::load_models(&world, &files, &game_dir, keys, &placed, &|done, total| {
+                        progress.step(done, total)
+                    })
+                }
+                Surroundings::Gta4 { episode, origins, remove } => {
+                    // Around the actors in the first section, and around every other section's origin.
+                    let shift: [f32; 3] = std::array::from_fn(|k| centre[k] - cut_offset[k]);
+                    let centres: Vec<[f32; 3]> = std::iter::once(centre)
+                        .chain(origins.iter().skip(1).map(|o| std::array::from_fn(|k| o[k] + shift[k])))
+                        .collect();
+                    progress.set("Loading the surroundings", 0, 0);
+                    let scene = openrage_app::gta4::load_objects_near(
+                        &game_dir,
+                        &episode,
+                        &centres,
+                        radius,
+                        &remove,
+                        &|done, total| progress.step(done, total),
+                    )?;
+                    scene.models
+                }
+            };
             // Decoding the textures takes a while for hundreds of models: in parallel.
             Ok(models
                 .into_par_iter()
