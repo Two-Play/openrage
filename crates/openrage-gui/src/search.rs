@@ -4,8 +4,7 @@ use crate::*;
 
 pub(crate) fn start_index_update(ui: &AppWindow) {
     let Some((game_dir, keys)) = with_app(|a| {
-        // The search index covers GTA V's and GTA IV's archives; RDR2 is browsed without it for now.
-        if a.index_running || a.game_dir.as_deref().is_some_and(is_rdr2_dir) {
+        if a.index_running {
             return None;
         }
         a.index_running = true;

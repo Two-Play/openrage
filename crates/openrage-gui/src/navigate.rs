@@ -334,7 +334,15 @@ pub(crate) fn is_text_file(item: &Item) -> bool {
         "wpl",
     ];
     let ext = item.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
-    matches!(item.kind, ItemKind::File) && item.mark != Some(Mark::Removed) && TEXT.contains(&ext.as_str())
+    matches!(item.kind, ItemKind::File)
+        && item.mark != Some(Mark::Removed)
+        && (TEXT.contains(&ext.as_str()) || is_gta4_cutscene(item))
+}
+
+/// A GTA IV cutscene (`.cut`): plain text in sections, unlike GTA V's
+/// binary metadata of the same extension.
+fn is_gta4_cutscene(item: &Item) -> bool {
+    item.name.to_ascii_lowercase().ends_with(".cut") && GAME_LABEL.with(|l| l.borrow().as_str() == "GTA IV")
 }
 
 /// Binary metadata files, shown as XML.
@@ -342,6 +350,7 @@ pub(crate) fn is_meta_file(item: &Item) -> bool {
     matches!(item.kind, ItemKind::File | ItemKind::Resource | ItemKind::Ped)
         && item.mark != Some(Mark::Removed)
         && openrage_app::metadata::is_metadata(&item.name)
+        && !is_gta4_cutscene(item)
 }
 
 /// Double-click navigates into it (or, for search hits and changes, to it).
