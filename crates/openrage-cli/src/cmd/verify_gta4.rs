@@ -659,3 +659,159 @@ pub(crate) fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: b
     }
     Ok(())
 }
+
+/// Reads every GTA IV cutscene (`.cut`): parses it, puts its animation
+/// together from the dictionaries next to it and looks for its models.
+pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result<()> {
+    use openrage_app::gta4_cutscene;
+    let (starts, mut errors) = gta4_starts(game_dir, within)?;
+    let started = Instant::now();
+    let mut cuts: Vec<String> = Vec::new();
+    for (prefix, a, dir) in &starts {
+        vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
+            if !a.entry(id).is_dir() && a.entry(id).name.to_ascii_lowercase().ends_with(".cut") {
+                cuts.push(p.to_owned());
+            }
+        });
+    }
+    struct Checked {
+        sections: usize,
+        actors: usize,
+        no_model: Vec<String>,
+        problems: Vec<String>,
+        seconds: f32,
+    }
+    let results: Vec<(String, Result<Checked>)> = cuts
+        .par_iter()
+        .map(|vpath| {
+            let checked = (|| -> Result<Checked> {
+                let (node, _) = rage_mods::resolve(game_dir, vpath, None)?;
+                let Node::Gta4File(a, id) = node else { bail!("not inside a GTA IV archive") };
+                let cut = gta4_cutscene::parse(&a.read(id)?)?;
+                let animated = gta4_cutscene::animation(game_dir, vpath, &cut)?;
+                let actors = cut.actors();
+                let no_model = actors
+                    .iter()
+                    .filter(|(_, m)| gta4_cutscene::find_model(game_dir, vpath, m).is_none())
+                    .map(|(_, m)| m.clone())
+                    .collect();
+                Ok(Checked {
+                    sections: cut.sections.len(),
+                    actors: actors.len(),
+                    no_model,
+                    problems: animated.problems,
+                    seconds: cut.duration(),
+                })
+            })();
+            (vpath.clone(), checked)
+        })
+        .collect();
+    let (mut sections, mut actors, mut seconds, mut no_model, mut problems, mut ok) = (0, 0, 0.0, 0, 0, 0);
+    for (vpath, r) in results {
+        match r {
+            Ok(c) => {
+                ok += 1;
+                sections += c.sections;
+                actors += c.actors;
+                seconds += c.seconds;
+                no_model += c.no_model.len();
+                problems += c.problems.len();
+                if !c.no_model.is_empty() {
+                    outln!("{vpath}: no model for {}", c.no_model.join(", "));
+                }
+                for p in &c.problems {
+                    outln!("{vpath}: {p}");
+                }
+            }
+            Err(e) => errors.push(format!("{vpath}: {e:#}")),
+        }
+    }
+    for e in errors.iter().take(50) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} cutscenes ({ok} read, {:.0} minutes), {sections} sections, {actors} actors, \
+         {no_model} without a model, {problems} clips or dictionaries missing, {} errors ({:.1}s)",
+        cuts.len(),
+        seconds / 60.0,
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() {
+        bail!("{} cutscenes could not be read", errors.len());
+    }
+    Ok(())
+}
+
+/// Shows a GTA IV cutscene: sections, cast with models and clips, subtitles.
+pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool) -> Result<()> {
+    use openrage_app::gta4_cutscene;
+    let started = Instant::now();
+    let scene = gta4_cutscene::load(game_dir, vpath)?;
+    let cut = &scene.cut;
+    outln!(
+        "{:.1} seconds in {} sections, {} actors, {} subtitles ({} with text, table {})",
+        cut.duration(),
+        cut.sections.len(),
+        scene.cutscene.actors.len(),
+        cut.subtitles.len(),
+        scene.subtitles.len(),
+        cut.text_table.as_deref().unwrap_or("-")
+    );
+    for (n, s) in cut.sections.iter().enumerate() {
+        outln!(
+            "section {n}: {}.wad, {:.1}s, camera {}, at ({:.1}, {:.1}, {:.1}) turned {:.0}°, {} models",
+            s.anim.to_ascii_lowercase(),
+            s.duration,
+            s.camera.as_deref().unwrap_or("-"),
+            s.offset[0],
+            s.offset[1],
+            s.offset[2],
+            s.orient,
+            s.models.len()
+        );
+    }
+    let dict = &scene.animated.dict;
+    for ((actor, location), clip) in scene.cutscene.actors.iter().zip(&scene.models).zip(&dict.clips) {
+        let shown = clip.parts.iter().filter(|p| !dict.animations[p.animation].tracks.is_empty()).count();
+        let model = match location {
+            Some(l) => match &l.source {
+                openrage_app::gta4::ModelSource::File(v) => v.clone(),
+                openrage_app::gta4::ModelSource::Member { dictionary, hash } => format!("{dictionary} #{hash:08x}"),
+            },
+            None => "(no model found)".into(),
+        };
+        outln!("  {:<8} {:<24} in {shown}/{} sections  {model}", actor.kind.label(), actor.name, clip.parts.len());
+    }
+    for p in &scene.animated.problems {
+        outln!("missing: {p}");
+    }
+    for (start, end, text) in scene.subtitles.iter().take(5) {
+        outln!("  {start:7.2}–{end:7.2}s  {}", text.replace('\n', " / "));
+    }
+    if scene.subtitles.len() > 5 {
+        outln!("  … {} more subtitles", scene.subtitles.len() - 5);
+    }
+    outln!("({:.2}s)", started.elapsed().as_secs_f32());
+    if load_models {
+        let started = Instant::now();
+        let loaded: Vec<Result<openrage_app::models::LoadedModel>> = scene
+            .models
+            .par_iter()
+            .zip(&scene.cutscene.actors)
+            .filter_map(|(l, a)| Some(gta4_cutscene::load_model(game_dir, &a.name, l.as_ref()?)))
+            .collect();
+        let textures: usize =
+            loaded.iter().flatten().map(|m| m.external.iter().map(|(_, d)| d.textures.len()).sum::<usize>()).sum();
+        for e in loaded.iter().filter_map(|r| r.as_ref().err()) {
+            outln!("FAIL {e:#}");
+        }
+        outln!(
+            "{} of {} models loaded, {textures} textures ({:.2}s)",
+            loaded.iter().filter(|r| r.is_ok()).count(),
+            loaded.len(),
+            started.elapsed().as_secs_f32()
+        );
+    }
+    Ok(())
+}

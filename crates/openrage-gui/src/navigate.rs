@@ -341,7 +341,7 @@ pub(crate) fn is_text_file(item: &Item) -> bool {
 
 /// A GTA IV cutscene (`.cut`): plain text in sections, unlike GTA V's
 /// binary metadata of the same extension.
-fn is_gta4_cutscene(item: &Item) -> bool {
+pub(crate) fn is_gta4_cutscene(item: &Item) -> bool {
     item.name.to_ascii_lowercase().ends_with(".cut") && GAME_LABEL.with(|l| l.borrow().as_str() == "GTA IV")
 }
 

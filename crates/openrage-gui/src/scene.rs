@@ -51,6 +51,8 @@ struct State {
     /// The cutscene's lights, ready for the renderer; `show_lights` switches them.
     lights: Vec<crate::gpu::SceneLight>,
     show_lights: bool,
+    /// Subtitles: (start, end, text) in seconds.
+    subtitles: Vec<(f32, f32, String)>,
     timer: slint::Timer,
 }
 
@@ -103,13 +105,93 @@ thread_local! {
 /// Opens the scene of the cutscene at `cut_path`; `models` holds a model path
 /// per actor (found through the search index), `None` where there is none.
 pub fn open(ui: &AppWindow, cut_path: String, cut: Cutscene, models: Vec<Option<String>>) {
+    let path = cut_path.clone();
+    open_scene(
+        ui,
+        cut_path,
+        Box::new(move |game_dir, keys, progress| {
+            let (dict, previews) = load(game_dir, keys, &path, &cut.actors, &models, progress)?;
+            let clips = cutscene::actor_clips(&cut.actors, &dict);
+            Ok(Loaded { dict, previews, clips, cut, subtitles: Vec::new(), surroundings: true, problems: Vec::new() })
+        }),
+    );
+}
+
+/// Opens a GTA IV cutscene (`.cut`) as a scene: its sections one after
+/// another, with the actors, the camera and the subtitles.
+pub fn open_gta4(ui: &AppWindow, cut_path: String) {
+    let path = cut_path.clone();
+    open_scene(
+        ui,
+        cut_path,
+        Box::new(move |game_dir, _keys, progress| {
+            use openrage_app::gta4_cutscene;
+            progress.set("Reading the cutscene and its animation …", 0, 0);
+            let scene = gta4_cutscene::load(game_dir, &path)?;
+            let actors = &scene.cutscene.actors;
+            let total = scene.models.iter().filter(|m| m.is_some()).count();
+            let done = AtomicUsize::new(0);
+            progress.set("Loading the actors' models", 0, total);
+            let previews = scene
+                .models
+                .par_iter()
+                .zip(actors)
+                .map(|(location, actor)| {
+                    let loaded = openrage_app::progress::quietly(|| {
+                        gta4_cutscene::load_model(game_dir, &actor.name, location.as_ref()?).ok()
+                    });
+                    if location.is_some() {
+                        progress.step(done.fetch_add(1, Ordering::Relaxed) + 1, total);
+                    }
+                    loaded.map(preview)
+                })
+                .collect();
+            let clips = (0..actors.len()).map(Some).collect();
+            Ok(Loaded {
+                dict: scene.animated.dict,
+                previews,
+                clips,
+                cut: scene.cutscene,
+                subtitles: scene.subtitles,
+                // The map around GTA IV cutscenes is not put together (yet).
+                surroundings: false,
+                problems: scene.animated.problems,
+            })
+        }),
+    );
+}
+
+/// A cutscene's actors and animation, loaded in the background.
+struct Loaded {
+    dict: ClipDictionary,
+    previews: Vec<Option<ModelPreview>>,
+    /// Per actor: its clip in `dict`.
+    clips: Vec<Option<usize>>,
+    cut: Cutscene,
+    /// (start, end, text) in seconds.
+    subtitles: Vec<(f32, f32, String)>,
+    /// Load the map around the scene.
+    surroundings: bool,
+    /// Animation pieces the game's files lack.
+    problems: Vec<String>,
+}
+
+type Loader = Box<dyn FnOnce(&std::path::Path, Option<Arc<GtaVKeys>>, &LoadProgress) -> anyhow::Result<Loaded> + Send>;
+
+fn preview(loaded: openrage_app::models::LoadedModel) -> ModelPreview {
+    let materials = render::Materials::new(&loaded);
+    let name = loaded.drawables.first().map(|(n, _)| n.clone()).unwrap_or_default();
+    let look = std::sync::RwLock::new(loaded.default_look());
+    ModelPreview { loaded, look, materials, name }
+}
+
+fn open_scene(ui: &AppWindow, cut_path: String, loader: Loader) {
     let Ok(win) = SceneWindow::new() else { return };
     win.set_theme_mode(ui.get_theme_mode());
     crate::accent::apply(&win);
     let name = cut_path.rsplit('/').next().unwrap_or(&cut_path).to_owned();
     win.set_heading(name.into());
     win.set_path(cut_path.clone().into());
-    win.set_duration(cut.duration.max(0.1));
     win.set_status("Loading the actors' models and the animation …".into());
     let state: Rc<RefCell<Option<State>>> = Rc::new(RefCell::new(None));
     wire(&win, &state);
@@ -128,13 +210,13 @@ pub fn open(ui: &AppWindow, cut_path: String, cut: Cutscene, models: Vec<Option<
     let progress = watch_progress(&win);
     let weak = win.as_weak();
     std::thread::spawn(move || {
-        let loaded = load(&game_dir, keys, &cut_path, &cut.actors, &models, &progress);
+        let loaded = loader(&game_dir, keys, &progress);
         let _ = weak.upgrade_in_event_loop(move |win| match loaded {
-            Ok((dict, previews)) => {
+            Ok(loaded) => {
                 if let Some(state) =
                     OPEN.with(|o| o.borrow().iter().find(|(i, ..)| *i == id).map(|(_, _, s)| Rc::clone(s)))
                 {
-                    start(&win, &state, id, dict, &cut, previews, progress);
+                    start(&win, &state, id, loaded, progress);
                 }
             }
             Err(e) => {
@@ -146,8 +228,6 @@ pub fn open(ui: &AppWindow, cut_path: String, cut: Cutscene, models: Vec<Option<
     });
 }
 
-type Loaded = (ClipDictionary, Vec<Option<ModelPreview>>);
-
 fn load(
     game_dir: &std::path::Path,
     keys: Option<Arc<GtaVKeys>>,
@@ -155,7 +235,7 @@ fn load(
     actors: &[Actor],
     models: &[Option<String>],
     progress: &LoadProgress,
-) -> anyhow::Result<Loaded> {
+) -> anyhow::Result<(ClipDictionary, Vec<Option<ModelPreview>>)> {
     progress.set("Loading the animation …", 0, 0);
     let (node, _) = rage_mods::resolve(game_dir, cut_path, keys.clone())?;
     let Node::ArchiveFile(rpf, id) = node else { anyhow::bail!("{cut_path} is not inside an archive") };
@@ -184,10 +264,7 @@ fn load(
                     {
                         loaded.add_textures(extra.0, extra.1);
                     }
-                    let materials = render::Materials::new(&loaded);
-                    let name = loaded.drawables.first().map(|(n, _)| n.clone()).unwrap_or_default();
-                    let look = std::sync::RwLock::new(loaded.default_look());
-                    Some(ModelPreview { loaded, look, materials, name })
+                    Some(preview(loaded))
                 })
             })
             .collect();
@@ -196,16 +273,9 @@ fn load(
     Ok((dict, previews))
 }
 
-fn start(
-    win: &SceneWindow,
-    state: &Rc<RefCell<Option<State>>>,
-    id: u64,
-    dict: ClipDictionary,
-    cut: &Cutscene,
-    previews: Vec<Option<ModelPreview>>,
-    progress: Arc<LoadProgress>,
-) {
-    let clips = cutscene::actor_clips(&cut.actors, &dict);
+fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded: Loaded, progress: Arc<LoadProgress>) {
+    let Loaded { dict, previews, clips, cut, subtitles, surroundings, problems } = loaded;
+    let cut = &cut;
     let mut actors = Vec::new();
     let (mut missing_model, mut missing_clip) = (0, 0);
     for ((actor, preview), clip) in cut.actors.iter().zip(previews).zip(clips) {
@@ -244,6 +314,9 @@ fn start(
     // Bounds for the free camera: where the actors stand at the start.
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
     for a in &actors {
+        if !on_stage(&dict, &dict.clips[a.clip], 0.0) {
+            continue;
+        }
         let m = cutscene::mover(&dict, &dict.clips[a.clip], 0.0);
         let p = [m[12], m[13], m[14]];
         for k in 0..3 {
@@ -260,6 +333,9 @@ fn start(
     }
     if missing_clip > 0 {
         status.push_str(&format!(" · {missing_clip} without animation"));
+    }
+    if !problems.is_empty() {
+        status.push_str(&format!(" · missing in the game's files: {}", problems.join(", ")));
     }
     status.push_str(" · drag to turn the free camera, scroll to zoom, Space plays");
     win.set_status(status.into());
@@ -286,9 +362,17 @@ fn start(
         object_shown: Vec::new(),
         lights: scene_lights(&cut.lights),
         show_lights: !cut.lights.is_empty(),
+        subtitles,
         timer: slint::Timer::default(),
     });
-    load_surroundings(win, id, cut, (lo, hi), progress);
+    if surroundings {
+        load_surroundings(win, id, cut, (lo, hi), progress);
+    } else {
+        progress.set("", 0, 0);
+        if let Some(st) = state.borrow_mut().as_mut() {
+            st.surroundings_pending = false;
+        }
+    }
     win.set_playing(true);
     let (w, s) = (win.as_weak(), Rc::clone(state));
     if let Some(st) = state.borrow().as_ref() {
@@ -485,7 +569,10 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
     let width = win.get_area_width().max(64.0) as u32;
     let height = win.get_area_height().max(64.0) as u32;
     let mut poses: Vec<(Mat4, Option<Vec<Mat4>>)> = Vec::with_capacity(st.actors.len());
-    for a in &st.actors {
+    // Actors the current section does not have stay out of the picture.
+    let shown: Vec<&SceneActor> =
+        st.actors.iter().filter(|a| on_stage(&st.dict, &st.dict.clips[a.clip], st.time)).collect();
+    for a in &shown {
         let clip = &st.dict.clips[a.clip];
         let model = cutscene::mover(&st.dict, clip, st.time);
         let skin = clip.part_at(st.time).and_then(|(i, part, at)| {
@@ -495,8 +582,7 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         });
         poses.push((model, skin));
     }
-    let mut items: Vec<crate::gpu::SceneItem> = st
-        .actors
+    let mut items: Vec<crate::gpu::SceneItem> = shown
         .iter()
         .zip(&poses)
         .map(|(a, (model, skin))| crate::gpu::SceneItem {
@@ -529,8 +615,7 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         None => {
             // No GPU: the software renderer, at a smaller size to stay responsive.
             let (sw, sh) = ((width / 2).max(64) as usize, (height / 2).max(64) as usize);
-            let mut soft: Vec<render::SceneItem> = st
-                .actors
+            let mut soft: Vec<render::SceneItem> = shown
                 .iter()
                 .zip(&poses)
                 .map(|(a, (model, skin))| render::SceneItem {
@@ -565,6 +650,14 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
     }
     win.set_time(st.time);
     win.set_time_text(format!("{:.1} / {:.1} s", st.time, st.duration).into());
+    let subtitle = st.subtitles.iter().find(|(start, end, _)| (*start..*end).contains(&st.time)).map(|(_, _, t)| t);
+    win.set_subtitle(subtitle.map(|t| t.as_str()).unwrap_or_default().into());
+}
+
+/// Whether an actor is in the scene at `time`: its part of the clip there
+/// has an animation (GTA IV actors are left out of some sections).
+fn on_stage(dict: &ClipDictionary, clip: &rage_formats::clip::Clip, time: f32) -> bool {
+    clip.part_at(time).and_then(|(_, p, _)| dict.animations.get(p.animation)).is_none_or(|a| !a.tracks.is_empty())
 }
 
 /// Opens a map file (`.ymap`; GTA IV `.wpl` or a map archive) as a scene: every object it places, with its
@@ -698,6 +791,7 @@ fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
         object_shown,
         lights: Vec::new(),
         show_lights: false,
+        subtitles: Vec::new(),
         timer: slint::Timer::default(),
     });
     render_frame(win, state);

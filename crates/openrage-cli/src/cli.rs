@@ -89,6 +89,10 @@ pub(crate) enum Command {
         /// Instead of archives, read the header of every Scaleform movie (.gfx) and Bink video (.bik).
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths", "scripts"])]
         media: bool,
+        /// Instead of archives, read every GTA IV cutscene (.cut): its sections, the clips of
+        /// its actors and camera in the animation dictionaries next to it, and its models.
+        #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths", "scripts", "media"])]
+        cutscenes: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
         /// With --models: write every GTA V Enhanced drawable (.ydr) anew with its own meshes and
         /// check that it reads back identically.
@@ -296,6 +300,15 @@ pub(crate) enum Command {
         /// Print the values of every track of this clip at a few frames.
         #[arg(long)]
         clip: Option<String>,
+    },
+    /// Show a GTA IV cutscene (.cut): its sections, cast with their models and clips,
+    /// and subtitles.
+    Cutscene {
+        /// Virtual path of the .cut file.
+        path: String,
+        /// Also load every actor's model with its textures, as the scene window does, and time it.
+        #[arg(long)]
+        models: bool,
     },
     /// List the sounds of an audio container (.awc) and optionally export them as WAV.
     Audio {
