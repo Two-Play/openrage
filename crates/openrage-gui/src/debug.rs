@@ -327,8 +327,16 @@ pub(crate) fn debug_launcher(win: &LauncherWindow) {
     slint::Timer::single_shot(Duration::from_secs(1), move || {
         let Some(win) = w.upgrade() else { return };
         if let Some(i) = &pick {
-            win.invoke_chosen(i.parse().unwrap_or(0), false);
+            // As a click does: the window shows that it is opening the game.
+            let i: i32 = i.parse().unwrap_or(0);
+            let name = slint::Model::row_data(&win.get_games(), i.max(0) as usize).map(|g| g.name).unwrap_or_default();
+            win.set_loading(format!("Opening {name}…").into());
+            win.invoke_chosen(i, false);
         } else if let Some(path) = &snapshot {
+            // `OPENRAGE_LAUNCHER_LOADING=<text>`: the window as it looks after a click.
+            if let Ok(text) = std::env::var("OPENRAGE_LAUNCHER_LOADING") {
+                win.set_loading(text.into());
+            }
             if let Ok(img) = win.window().take_snapshot() {
                 let _ =
                     rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(path, png));

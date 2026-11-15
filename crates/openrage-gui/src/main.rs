@@ -267,6 +267,8 @@ fn main() -> anyhow::Result<()> {
     }
     #[cfg(debug_assertions)]
     debug_snapshot(&ui);
+    // The start window (if any) closes once the explorer's event loop runs.
+    slint::Timer::single_shot(Duration::from_millis(300), close_launcher);
     let result = ui.run();
     gpu::shutdown();
     result?;

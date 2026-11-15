@@ -68,25 +68,41 @@ pub(crate) fn run_launcher(ui: &AppWindow) -> Result<Option<LaunchChoice>, slint
     crate::accent::apply(&win);
     win.set_games(ui.get_games());
     let choice: std::rc::Rc<std::cell::RefCell<Option<LaunchChoice>>> = Default::default();
-    let (c, w) = (std::rc::Rc::clone(&choice), win.as_weak());
-    win.on_chosen(move |i, remember| {
-        *c.borrow_mut() = Some(LaunchChoice::Game(i.max(0) as usize, remember));
-        if let Some(w) = w.upgrade() {
-            let _ = w.hide();
-        }
-    });
-    let (c, w) = (std::rc::Rc::clone(&choice), win.as_weak());
-    win.on_add_game(move || {
-        *c.borrow_mut() = Some(LaunchChoice::AddGame);
-        if let Some(w) = w.upgrade() {
-            let _ = w.hide();
-        }
-    });
+    // After a choice the window shows "Opening …" (set by the window itself)
+    // and stays open while the explorer gets ready; its event loop ends a
+    // moment later, once that has been drawn.
+    let finish = |c: &std::rc::Rc<std::cell::RefCell<Option<LaunchChoice>>>, made: LaunchChoice| {
+        *c.borrow_mut() = Some(made);
+        slint::Timer::single_shot(Duration::from_millis(80), || {
+            let _ = slint::quit_event_loop();
+        });
+    };
+    let c = std::rc::Rc::clone(&choice);
+    win.on_chosen(move |i, remember| finish(&c, LaunchChoice::Game(i.max(0) as usize, remember)));
+    let c = std::rc::Rc::clone(&choice);
+    win.on_add_game(move || finish(&c, LaunchChoice::AddGame));
     #[cfg(debug_assertions)]
     debug_launcher(&win);
-    // Returns once the window is hidden (a choice) or closed.
-    win.run()?;
-    Ok(choice.borrow_mut().take())
+    win.show()?;
+    // Ends after a choice, or when the window is closed (no choice).
+    slint::run_event_loop()?;
+    let made = choice.borrow_mut().take();
+    if made.is_some() {
+        LAUNCHER.with(|l| *l.borrow_mut() = Some(win));
+    }
+    Ok(made)
+}
+
+thread_local! {
+    /// The start window while the explorer gets ready.
+    static LAUNCHER: std::cell::RefCell<Option<LauncherWindow>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Closes the start window once the explorer is up.
+pub(crate) fn close_launcher() {
+    if let Some(win) = LAUNCHER.with(|l| l.borrow_mut().take()) {
+        let _ = win.hide();
+    }
 }
 
 /// Opens a game that was set up before (from the chooser); `remember` makes it the default.

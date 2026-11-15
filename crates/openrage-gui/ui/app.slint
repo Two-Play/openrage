@@ -5493,6 +5493,8 @@ export component LauncherWindow inherits Window {
     in-out property <int> theme-mode;
     in property <[GameRow]> games;
     in-out property <bool> remember;
+    // Set once a game is chosen: "Opening RDR2…" while the explorer gets ready.
+    in-out property <string> loading;
     callback chosen(int, bool);
     callback add-game();
 
@@ -5535,10 +5537,20 @@ export component LauncherWindow inherits Window {
             background: card-ta.has-hover ? Theme.hover : transparent;
             accessible-role: button;
             accessible-label: g.name;
-            accessible-action-default => { root.chosen(i, root.remember); }
+            opacity: root.loading == "" ? 1 : 0.5;
+            accessible-action-default => {
+                if root.loading == "" {
+                    root.loading = @tr("Opening {}…", g.name);
+                    root.chosen(i, root.remember);
+                }
+            }
             card-ta := TouchArea {
-                mouse-cursor: pointer;
-                clicked => { root.chosen(i, root.remember); }
+                enabled: root.loading == "";
+                mouse-cursor: root.loading == "" ? pointer : default;
+                clicked => {
+                    root.loading = @tr("Opening {}…", g.name);
+                    root.chosen(i, root.remember);
+                }
             }
             HorizontalLayout {
                 padding: Theme.space-s;
@@ -5569,15 +5581,33 @@ export component LauncherWindow inherits Window {
         Rectangle {
             vertical-stretch: 1;
         }
-        CheckBox {
+        if root.loading == "": CheckBox {
             text: @tr("Always open this game (change it in Settings)");
             checked <=> root.remember;
         }
-        HorizontalLayout {
+        if root.loading == "": HorizontalLayout {
             alignment: start;
             Button {
                 text: @tr("Add a game…");
-                clicked => { root.add-game(); }
+                clicked => {
+                    root.loading = @tr("Opening the setup…");
+                    root.add-game();
+                }
+            }
+        }
+        if root.loading != "": HorizontalLayout {
+            spacing: Theme.space-s;
+            alignment: start;
+            Spinner {
+                width: 24px;
+                height: 24px;
+                indeterminate: true;
+            }
+            Text {
+                text: root.loading;
+                vertical-alignment: center;
+                color: Theme.text;
+                accessible-role: text;
             }
         }
     }
