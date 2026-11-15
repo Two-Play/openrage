@@ -28,6 +28,8 @@ pub struct Config {
     /// Games whose changes are written into the game folder itself instead of
     /// the overlay folder (GTA IV only; see `crate::install::WriteTarget`).
     pub write_in_game: Vec<PathBuf>,
+    /// Games whose hint "ASI mods will not load under Proton" was dismissed.
+    pub asi_hint_off: Vec<PathBuf>,
 }
 
 fn dir() -> Option<PathBuf> {
@@ -59,6 +61,7 @@ impl Config {
                 "accent" => cfg.accent = Some(v.to_owned()),
                 "history_window" => cfg.history_window = Some(v == "true"),
                 "write_in_game" => cfg.write_in_game.push(PathBuf::from(v)),
+                "asi_hint_off" => cfg.asi_hint_off.push(PathBuf::from(v)),
                 "plugin" => {
                     let (id, grants) = v.split_once(':').unwrap_or((v, ""));
                     cfg.plugins.push((id.trim().to_owned(), grants.trim().to_owned()));
@@ -101,6 +104,9 @@ impl Config {
         }
         for g in &self.write_in_game {
             text.push_str(&format!("write_in_game={}\n", g.display()));
+        }
+        for g in &self.asi_hint_off {
+            text.push_str(&format!("asi_hint_off={}\n", g.display()));
         }
         for (id, grants) in &self.plugins {
             text.push_str(&format!("plugin={id}:{grants}\n"));

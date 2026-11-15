@@ -157,6 +157,7 @@ pub fn status(game_dir: &Path) -> Result<Status> {
         } else if lower.ends_with(".asi") {
             mods.push(AsiMod { name, enabled: true, size: meta.len() });
         } else if lower.ends_with(".dll")
+            && is_loader_name(&lower)
             && meta.len() < 16 << 20
             && let Ok(data) = fs::read(entry.path())
             && let Some(loader) = identify_loader(&name, &data)
@@ -184,6 +185,27 @@ pub fn status(game_dir: &Path) -> Result<Status> {
         proton: if cfg!(windows) { None } else { find_proton(game_dir) },
         battleye: game_dir.join("GTA5_Enhanced_BE.exe").is_file(),
     })
+}
+
+/// File names ASI loaders take: system DLLs the game loads from its own folder
+/// first. Only these are read when looking for a loader.
+fn is_loader_name(lower: &str) -> bool {
+    let stem = lower.strip_suffix(".dll").unwrap_or(lower);
+    stem.starts_with("xinput")
+        || stem.starts_with("d3d")
+        || matches!(
+            stem,
+            "dinput8"
+                | "dinput"
+                | "version"
+                | "winmm"
+                | "dsound"
+                | "dxgi"
+                | "wininet"
+                | "winhttp"
+                | "binkw64"
+                | "bink2w64"
+        )
 }
 
 /// A DLL that loads `.asi` plugins, recognised by what it says about itself
@@ -365,12 +387,36 @@ fn insert_before_blank(out: &mut Vec<String>, line: String) {
 /// Whether the game or its prefix is in use: Wine rewrites `user.reg` when it
 /// exits, so changing it then would be undone.
 fn prefix_in_use(proton: &Proton) -> bool {
-    let needle = format!("compatdata/{}/", proton.app_id);
     let Ok(procs) = fs::read_dir("/proc") else { return false };
     procs.flatten().any(|p| {
-        let Ok(cmd) = fs::read(p.path().join("cmdline")) else { return false };
-        let cmd = String::from_utf8_lossy(&cmd).to_ascii_lowercase();
-        cmd.contains(&needle) || ["gta5_enhanced.exe", "gta5.exe", "playgtav.exe"].iter().any(|e| cmd.contains(e))
+        let Ok(cmdline) = fs::read(p.path().join("cmdline")) else { return false };
+        let args: Vec<String> = cmdline
+            .split(|&b| b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        // The environment is read only for Wine's own processes.
+        let environ = || fs::read(p.path().join("environ")).map(|e| String::from_utf8_lossy(&e).into_owned());
+        uses_prefix(&args, environ, &proton.app_id)
+    })
+}
+
+/// Whether a process (its arguments; its environment, read on demand) is the
+/// game, or Wine running the game's prefix. Other programs that merely
+/// mention the prefix (an editor on `user.reg`) do not count.
+fn uses_prefix(args: &[String], environ: impl FnOnce() -> std::io::Result<String>, app_id: &str) -> bool {
+    let base = |a: &str| a.rsplit(['/', '\\']).next().unwrap_or(a).to_ascii_lowercase();
+    if args.iter().any(|a| matches!(base(a).as_str(), "gta5_enhanced.exe" | "gta5.exe" | "playgtav.exe")) {
+        return true;
+    }
+    let program = args.first().map(|a| base(a)).unwrap_or_default();
+    let wine = program.starts_with("wine") || program == "proton" || program.starts_with("pressure-vessel");
+    wine && environ().is_ok_and(|env| {
+        let prefix = format!("compatdata/{app_id}/");
+        env.split('\0').any(|var| {
+            let (key, value) = var.split_once('=').unwrap_or((var, ""));
+            matches!(key, "WINEPREFIX" | "STEAM_COMPAT_DATA_PATH") && format!("{value}/").contains(&prefix)
+        })
     })
 }
 
@@ -424,6 +470,23 @@ mod tests {
     }
 
     #[test]
+    fn knows_when_the_game_or_its_prefix_runs() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let no_env = || Ok(String::new());
+        let env = |e: &'static str| move || Ok(e.to_owned());
+        let game = args(&["/x/wine64-preloader", "Z:\\games\\GTA V Enhanced\\GTA5_Enhanced.exe", "-x"]);
+        assert!(uses_prefix(&game, no_env, "3240220"));
+        let server = args(&["/x/files/bin/wineserver"]);
+        assert!(uses_prefix(&server, env("A=1\0STEAM_COMPAT_DATA_PATH=/l/steamapps/compatdata/3240220\0"), "3240220"));
+        assert!(!uses_prefix(&server, env("STEAM_COMPAT_DATA_PATH=/l/steamapps/compatdata/1174180\0"), "3240220"));
+        // Programs that only mention the prefix, e.g. an editor on its user.reg.
+        let editor = args(&["/usr/bin/nano", "/l/steamapps/compatdata/3240220/pfx/user.reg"]);
+        assert!(!uses_prefix(&editor, || -> std::io::Result<String> { unreachable!() }, "3240220"));
+        let shell = args(&["/bin/zsh", "-c", "grep x /l/steamapps/compatdata/3240220/pfx/user.reg"]);
+        assert!(!uses_prefix(&shell, no_env, "3240220"));
+    }
+
+    #[test]
     fn recognises_loaders_by_their_own_words() {
         let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>();
         let mut enhanced = b"MZ....LOADER: Loading *.asi plugins".to_vec();
@@ -434,6 +497,8 @@ mod tests {
         assert_eq!(legacy.for_enhanced, Some(false));
         assert_eq!(identify_loader("version.dll", b"MZ..Ultimate ASI Loader").unwrap().for_enhanced, None);
         assert!(identify_loader("d3d11.dll", b"MZ..something else").is_none());
+        assert!(is_loader_name("xinput1_4.dll") && is_loader_name("dinput8.dll") && is_loader_name("version.dll"));
+        assert!(!is_loader_name("scripthookv.dll") && !is_loader_name("gfsdk_aftermath_lib.x64.dll"));
     }
 
     fn fake_install(name: &str, enhanced: bool) -> (PathBuf, PathBuf) {

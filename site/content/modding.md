@@ -149,7 +149,8 @@ would not load:
 **Linux (Proton):** Wine uses its own copy of the DLL the loader stands in for, so no ASI is ever loaded, unless the
 game's prefix tells Wine to take the game's DLL first. **Let Proton load the ASI loader** sets exactly that for the
 game's prefix (`compatdata/<app id>/pfx/user.reg`, backed up first as `user.reg.openrage-backup`), and can be taken
-back the same way. The game must be closed. Instead, the launch option `WINEDLLOVERRIDES="xinput1_4=n,b" %command%`
+back the same way. The game must be closed. When the loader is there but Proton would not load it, a hint above the file
+list says so, with the same button; dismiss it with ✕ (remembered for that game). Instead, the launch option `WINEDLLOVERRIDES="xinput1_4=n,b" %command%`
 (with the loader's name) does the same for one game.
 
 > [!WARNING]

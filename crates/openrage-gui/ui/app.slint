@@ -1127,6 +1127,11 @@ export component AppWindow inherits Window {
     // ASI mods (GTA V only): Mods → ASI mods… opens their window.
     in property <bool> asi-available;
     callback open-asi-window();
+    // A hint above the file list when an ASI loader is there but Proton does
+    // not load it (empty: hidden), with the fix and a way to dismiss it.
+    in property <string> asi-hint;
+    callback asi-hint-fix();
+    callback asi-hint-dismiss();
     in property <string> plugin-folder;
     in property <bool> settings-scroll-end;
     callback plugin-toggled(string, bool);
@@ -1683,6 +1688,46 @@ export component AppWindow inherits Window {
             folder: root.overlay-folder;
             in-game: root.write-in-game;
             lock => { root.edit-mode = false; }
+        }
+
+        if root.asi-hint != "": Rectangle {
+            background: Theme.accent-subtle;
+            accessible-role: groupbox;
+            accessible-label: @tr("ASI mods");
+            HorizontalLayout {
+                padding: Theme.space-s;
+                padding-left: Theme.space-l;
+                spacing: Theme.space-s;
+                Image {
+                    y: (parent.height - self.height) / 2;
+                    width: 16px;
+                    height: 16px;
+                    source: @image-url("icons/warning.svg");
+                    colorize: Theme.text;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    color: Theme.text;
+                    text: root.asi-hint;
+                }
+                Button {
+                    text: @tr("Let Proton load it");
+                    primary: true;
+                    clicked => { root.asi-hint-fix(); }
+                }
+                Button {
+                    text: @tr("ASI mods…");
+                    clicked => { root.open-asi-window(); }
+                }
+                IconButton {
+                    y: (parent.height - self.height) / 2;
+                    icon: @image-url("icons/close.svg");
+                    label: @tr("Dismiss (for this game)");
+                    clicked => { root.asi-hint-dismiss(); }
+                }
+            }
         }
 
         HorizontalLayout {

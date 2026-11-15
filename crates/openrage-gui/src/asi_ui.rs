@@ -27,17 +27,51 @@ fn gta5_dir() -> Option<PathBuf> {
     with_app(|a| a.game_dir.clone()).filter(|d| detect::is_gta5_dir(d))
 }
 
-/// Enables Mods → ASI mods… for GTA V and refreshes an open ASI window
-/// (after the game changed).
+/// Enables Mods → ASI mods… for GTA V, shows or hides the hint above the
+/// file list, and refreshes an open ASI window (after the game changed).
 pub(crate) fn refresh_asi(ui: &AppWindow) {
-    let available = gta5_dir().is_some();
+    let game = gta5_dir();
+    let available = game.is_some();
     ui.set_asi_available(available);
+    ui.set_asi_hint(game.as_deref().and_then(proton_hint).unwrap_or_default().into());
     if let Some(win) = window() {
         if available {
             fill(&win);
         } else {
             let _ = win.hide();
         }
+    }
+}
+
+/// The hint for a game whose ASI loader Proton does not load (unless the
+/// user dismissed it for this game).
+fn proton_hint(game: &Path) -> Option<String> {
+    if with_app(|a| a.cfg.asi_hint_off.iter().any(|g| g == game)) {
+        return None;
+    }
+    let s = asi::status(game).ok()?;
+    let loader = s.loader()?;
+    (s.proton.is_some() && !s.loader_runs()).then(|| {
+        format!(
+            "ASI mods will not load: Proton uses its own {} instead of the ASI loader in the game folder.",
+            loader.file
+        )
+    })
+}
+
+/// Lets Proton load the game's ASI loader (or its own DLL again): what was
+/// done, or why not.
+fn fix_proton(game: &Path, on: bool) -> Result<String, String> {
+    let result = asi::status(game).and_then(|s| {
+        let proton = s.proton.clone().context("the game does not run through Proton here")?;
+        let loader = s.loader().context("no ASI loader for this edition of the game")?.clone();
+        asi::set_proton_override(&proton, &loader.dll(), on)?;
+        Ok(loader.file)
+    });
+    match result {
+        Ok(file) if on => Ok(format!("Proton now loads the game's {file}")),
+        Ok(file) => Ok(format!("Proton uses its own {file} again")),
+        Err(e) => Err(format!("Cannot change the Proton setting: {e:#}")),
     }
 }
 
@@ -146,29 +180,44 @@ fn wire(win: &AsiWindow, ui: &AppWindow) {
             });
         });
     });
-    let w = win.as_weak();
+    let (w, main) = (win.as_weak(), ui.as_weak());
     win.on_proton(move |on| {
         let Some(win) = w.upgrade() else { return };
         let Some(game) = gta5_dir() else { return };
-        let result = asi::status(&game).and_then(|s| {
-            let proton = s.proton.clone().context("the game does not run through Proton here")?;
-            let loader = s.loader().context("no ASI loader for this edition of the game")?.clone();
-            asi::set_proton_override(&proton, &loader.dll(), on)?;
-            Ok(loader.file)
-        });
-        win.set_status(
-            match result {
-                Ok(file) if on => format!("Proton now loads the game's {file}"),
-                Ok(file) => format!("Proton uses its own {file} again"),
-                Err(e) => format!("Cannot change the Proton setting: {e:#}"),
-            }
-            .into(),
-        );
+        win.set_status(fix_proton(&game, on).unwrap_or_else(|e| e).into());
         fill(&win);
+        // The hint above the main window's file list follows.
+        if let Some(ui) = main.upgrade() {
+            refresh_asi(&ui);
+        }
     });
 }
 
 pub(crate) fn wire_asi(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_open_asi_window(move || with_ui(&w, open_asi_window));
+    let w = ui.as_weak();
+    ui.on_asi_hint_fix(move || {
+        with_ui(&w, |ui| {
+            let Some(game) = gta5_dir() else { return };
+            match fix_proton(&game, true) {
+                Ok(done) => ui.set_status(done.into()),
+                Err(e) => show_error(ui, e),
+            }
+            refresh_asi(ui);
+        })
+    });
+    let w = ui.as_weak();
+    ui.on_asi_hint_dismiss(move || {
+        with_ui(&w, |ui| {
+            let Some(game) = gta5_dir() else { return };
+            with_app(|a| {
+                if !a.cfg.asi_hint_off.contains(&game) {
+                    a.cfg.asi_hint_off.push(game);
+                }
+            });
+            save_settings(ui);
+            refresh_asi(ui);
+        })
+    });
 }
