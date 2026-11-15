@@ -51,72 +51,47 @@ pub(crate) fn refresh_games(ui: &AppWindow) {
     ui.set_ask_game(ask);
 }
 
-thread_local! {
-    /// The start window, while it is open.
-    static LAUNCHER: std::cell::RefCell<Option<LauncherWindow>> = const { std::cell::RefCell::new(None) };
+/// What the start window ended with.
+pub(crate) enum LaunchChoice {
+    /// A game of the list, and whether to always open it.
+    Game(usize, bool),
+    AddGame,
 }
 
-/// Shows the start window instead of the explorer (several games, none the
-/// default). Returns false if it could not be shown.
-pub(crate) fn show_launcher(ui: &AppWindow) -> bool {
-    let Ok(win) = LauncherWindow::new() else { return false };
+/// Runs the start window (several games, none the default) in an event loop
+/// of its own, before the explorer's: the explorer then starts the usual way
+/// with the game chosen. `Ok(None)`: closed without a choice. `Err`: the
+/// window could not be shown.
+pub(crate) fn run_launcher(ui: &AppWindow) -> Result<Option<LaunchChoice>, slint::PlatformError> {
+    let win = LauncherWindow::new()?;
     win.set_theme_mode(ui.get_theme_mode());
     crate::accent::apply(&win);
     win.set_games(ui.get_games());
-    // The switch to the explorer runs after the click has been handled: the
-    // start window is hidden then, not while it is still handling its own event.
-    let main = ui.as_weak();
+    let choice: std::rc::Rc<std::cell::RefCell<Option<LaunchChoice>>> = Default::default();
+    let (c, w) = (std::rc::Rc::clone(&choice), win.as_weak());
     win.on_chosen(move |i, remember| {
-        let main = main.clone();
-        slint::Timer::single_shot(Duration::ZERO, move || {
-            if let Some(ui) = main.upgrade() {
-                ui.invoke_game_chosen(i, remember);
-            }
-        });
+        *c.borrow_mut() = Some(LaunchChoice::Game(i.max(0) as usize, remember));
+        if let Some(w) = w.upgrade() {
+            let _ = w.hide();
+        }
     });
-    let main = ui.as_weak();
+    let (c, w) = (std::rc::Rc::clone(&choice), win.as_weak());
     win.on_add_game(move || {
-        let main = main.clone();
-        slint::Timer::single_shot(Duration::ZERO, move || {
-            if let Some(ui) = main.upgrade() {
-                show_main_window(&ui);
-                show_setup(&ui, false);
-            }
-        });
+        *c.borrow_mut() = Some(LaunchChoice::AddGame);
+        if let Some(w) = w.upgrade() {
+            let _ = w.hide();
+        }
     });
-    if win.show().is_err() {
-        return false;
-    }
-    LAUNCHER.with(|l| *l.borrow_mut() = Some(win));
-    true
-}
-
-/// The start window while it is open (for debug snapshots).
-#[cfg(debug_assertions)]
-pub(crate) fn launcher_window() -> Option<LauncherWindow> {
-    LAUNCHER.with(|l| l.borrow().as_ref().map(ComponentHandle::clone_strong))
-}
-
-/// Shows the explorer and closes the start window if it is open. The explorer
-/// is shown first: closing the last window would end the program.
-fn show_main_window(ui: &AppWindow) {
-    if let Err(e) = ui.show() {
-        eprintln!("cannot show the main window: {e}");
-        return;
-    }
-    if let Some(win) = LAUNCHER.with(|l| l.borrow().as_ref().map(ComponentHandle::clone_strong)) {
-        let _ = win.hide();
-        // Freed once nothing of it runs any more.
-        slint::Timer::single_shot(Duration::from_millis(100), || {
-            LAUNCHER.with(|l| l.borrow_mut().take());
-        });
-    }
+    #[cfg(debug_assertions)]
+    debug_launcher(&win);
+    // Returns once the window is hidden (a choice) or closed.
+    win.run()?;
+    Ok(choice.borrow_mut().take())
 }
 
 /// Opens a game that was set up before (from the chooser); `remember` makes it the default.
 pub(crate) fn open_game(ui: &AppWindow, index: usize, remember: bool) {
     let Some(dir) = with_app(|a| installed_games(&a.cfg).get(index).cloned()) else { return };
-    show_main_window(ui);
     let ready = if is_rdr2_dir(&dir) {
         register_rdr2(&dir)
     } else if is_gta4_dir(&dir) {

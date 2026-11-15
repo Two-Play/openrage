@@ -248,13 +248,17 @@ fn main() -> anyhow::Result<()> {
     });
     refresh_games(&ui);
     let ready = with_app(|app| app.game_dir.is_some() && (app.keys.is_some() || rdr2_ready));
-    // Several games and no default: a small start window asks first; the
-    // explorer opens with the game chosen there.
-    let launcher = ask && show_launcher(&ui);
+    // Several games and no default: a small start window asks first, then the
+    // explorer starts with the game chosen there.
     if ask {
-        // Without the start window (it could not be created): the dialog.
-        if !launcher {
-            ui.invoke_open_game_chooser(false);
+        match run_launcher(&ui) {
+            Ok(Some(LaunchChoice::Game(i, remember))) => open_game(&ui, i, remember),
+            Ok(Some(LaunchChoice::AddGame)) => show_setup(&ui, false),
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                eprintln!("start window: {e}");
+                ui.invoke_open_game_chooser(false);
+            }
         }
     } else if ready {
         start_browsing(&ui);
@@ -263,7 +267,7 @@ fn main() -> anyhow::Result<()> {
     }
     #[cfg(debug_assertions)]
     debug_snapshot(&ui);
-    let result = if launcher { slint::run_event_loop() } else { ui.run() };
+    let result = ui.run();
     gpu::shutdown();
     result?;
     Ok(())

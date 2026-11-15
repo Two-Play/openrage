@@ -24,12 +24,6 @@ pub(crate) fn debug_snapshot(ui: &AppWindow) {
         if std::env::var("OPENRAGE_EDIT").is_ok() {
             ui.set_edit_mode(true);
         }
-        // `OPENRAGE_LAUNCHER_PICK=<n>`: a click on the n-th game of the start window.
-        if let Ok(i) = std::env::var("OPENRAGE_LAUNCHER_PICK")
-            && let Some(w) = launcher_window()
-        {
-            w.invoke_chosen(i.parse().unwrap_or(0), false);
-        }
         if let Ok(i) = std::env::var("OPENRAGE_PICK_GAME") {
             ui.set_game_chooser_visible(false);
             ui.invoke_game_chosen(i.parse().unwrap_or(0), false);
@@ -125,22 +119,11 @@ pub(crate) fn debug_viewer(ui: &AppWindow) {
 /// The part of [`debug_snapshot`] after selecting a file.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
-    // The start window (several games, none the default), or `OPENRAGE_ASI`:
-    // the ASI mods window, instead of the explorer.
-    let asi = std::env::var("OPENRAGE_ASI").is_ok();
-    if launcher_window().is_some() || asi {
-        if asi {
-            open_asi_window(ui);
-        }
+    // `OPENRAGE_ASI`: the ASI mods window instead of the explorer.
+    if std::env::var("OPENRAGE_ASI").is_ok() {
+        open_asi_window(ui);
         slint::Timer::single_shot(Duration::from_millis(800), move || {
-            let snapshot = match launcher_window() {
-                Some(w) => w.window().take_snapshot(),
-                None => match asi_window() {
-                    Some(w) => w.window().take_snapshot(),
-                    None => return,
-                },
-            };
-            if let Ok(img) = snapshot {
+            if let Some(Ok(img)) = asi_window().map(|w| w.window().take_snapshot()) {
                 let _ =
                     rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(&path, png));
             }
@@ -328,4 +311,29 @@ pub(crate) fn debug_click(w: &slint::Window, var: &str) {
         w.dispatch_event(WindowEvent::PointerPressed { position, button });
         w.dispatch_event(WindowEvent::PointerReleased { position, button });
     }
+}
+
+/// The start window in debug builds: `OPENRAGE_LAUNCHER_PICK=<n>` chooses the
+/// n-th game after a second; otherwise, with `OPENRAGE_SNAPSHOT=<png>` set, a
+/// picture of it is saved there and the program quits.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_launcher(win: &LauncherWindow) {
+    let pick = std::env::var("OPENRAGE_LAUNCHER_PICK").ok();
+    let snapshot = std::env::var("OPENRAGE_SNAPSHOT").ok();
+    if pick.is_none() && snapshot.is_none() {
+        return;
+    }
+    let w = win.as_weak();
+    slint::Timer::single_shot(Duration::from_secs(1), move || {
+        let Some(win) = w.upgrade() else { return };
+        if let Some(i) = &pick {
+            win.invoke_chosen(i.parse().unwrap_or(0), false);
+        } else if let Some(path) = &snapshot {
+            if let Ok(img) = win.window().take_snapshot() {
+                let _ =
+                    rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(path, png));
+            }
+            std::process::exit(0);
+        }
+    });
 }
