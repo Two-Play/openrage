@@ -470,9 +470,13 @@ mod tests {
         fs::write(game.join("xinput1_4.dll"), [b"MZ..LOADER: Loading *.asi plugins".as_slice(), &utf16].concat())
             .unwrap();
         let s = status(&game).unwrap();
-        let proton = s.proton.clone().expect("prefix found through the app manifest");
         assert_eq!(s.loader().unwrap().file, "xinput1_4.dll");
-        if !cfg!(windows) {
+        if cfg!(windows) {
+            // No Proton on Windows: the game loads the loader by itself.
+            assert!(s.proton.is_none());
+            assert!(s.loader_runs() && s.problems().is_empty(), "{:?}", s.problems());
+        } else {
+            let proton = s.proton.clone().expect("prefix found through the app manifest");
             assert!(!s.loader_runs());
             assert!(s.problems()[0].contains("xinput1_4=n,b"), "{:?}", s.problems());
             set_proton_override(&proton, "xinput1_4", true).unwrap();
