@@ -3985,6 +3985,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "memchr",
  "openrage-plugins",
  "png",
  "rage-core",

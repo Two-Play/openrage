@@ -375,6 +375,13 @@ pub(crate) enum Command {
     /// OpenIV packages (.oiv): show, install into the mods folder, uninstall.
     #[command(subcommand)]
     Oiv(OivCommand),
+    /// GTA V: ASI mods (story mode only), their loader, and on Linux the Proton
+    /// setting that lets the loader run. Without a command: what is installed
+    /// and why mods would not load.
+    Asi {
+        #[command(subcommand)]
+        cmd: Option<AsiCommand>,
+    },
     /// Plugins: list, enable or disable them, preview files and run their actions.
     #[command(subcommand)]
     Plugin(PluginCommand),
@@ -500,6 +507,22 @@ pub(crate) enum PluginCommand {
         /// Apply changes to the mods folder without asking.
         #[arg(short, long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AsiCommand {
+    /// Put a disabled ASI mod back into the game folder.
+    Enable { name: String },
+    /// Put an ASI mod aside so the loader skips it (nothing is deleted).
+    Disable { name: String },
+    /// Copy an .asi file into the game folder (recorded in the history: `openrage undo` removes it).
+    Install { file: PathBuf },
+    /// Linux: let Proton load the game's ASI loader instead of Wine's own DLL
+    /// (`on`), or take that back (`off`). The game must not be running.
+    Proton {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
     },
 }
 

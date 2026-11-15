@@ -119,6 +119,13 @@ export struct Crumb {
 }
 
 // An installed plugin on the settings page.
+// An ASI mod of GTA V in the settings.
+export struct AsiRow {
+    name: string,
+    size: string,
+    enabled: bool,
+}
+
 export struct PluginRow {
     id: string,
     title: string,
@@ -1114,6 +1121,17 @@ export component AppWindow inherits Window {
     callback ask-game-changed(bool);
     // Plugins on the settings page.
     in property <[PluginRow]> plugins;
+    // ASI mods (GTA V only).
+    in property <bool> asi-available;
+    in property <string> asi-summary;
+    in property <string> asi-problem;
+    in property <bool> asi-can-fix-proton;
+    in property <bool> asi-proton-set;
+    in property <[AsiRow]> asi-mods;
+    callback asi-refresh();
+    callback asi-toggled(string, bool);
+    callback asi-install();
+    callback asi-proton(bool);
     in property <string> plugin-folder;
     in property <bool> settings-scroll-end;
     callback plugin-toggled(string, bool);
@@ -1179,6 +1197,7 @@ export component AppWindow inherits Window {
 
     public function open-settings() {
         root.accent-hex = root.color-hex(Theme.accent);
+        root.asi-refresh();
         root.settings-visible = true;
     }
 
@@ -3181,6 +3200,74 @@ export component AppWindow inherits Window {
                     Button {
                         text: @tr("Reload plugins");
                         clicked => { root.reload-plugins(); }
+                    }
+                }
+                if root.asi-available: Rectangle {
+                    height: 1px;
+                    background: Theme.border;
+                }
+                if root.asi-available: Text {
+                    text: @tr("ASI mods");
+                    font-size: Theme.font-title;
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                if root.asi-available: Text {
+                    text: @tr("ASI mods are DLLs that a loader in the game folder loads when GTA V starts. They are for story mode only: GTA Online bans modified games, and the anti-cheat BattlEye that GTA V Enhanced starts with may stop ASI loaders.");
+                    wrap: word-wrap;
+                    color: Theme.text-muted;
+                }
+                if root.asi-available: Text {
+                    text: root.asi-summary;
+                    wrap: word-wrap;
+                    color: Theme.text;
+                }
+                if root.asi-available && root.asi-problem != "": Text {
+                    text: root.asi-problem;
+                    wrap: word-wrap;
+                    color: Theme.danger;
+                    accessible-role: text;
+                    accessible-label: @tr("Problem: {}", root.asi-problem);
+                }
+                if root.asi-available && (root.asi-can-fix-proton || root.asi-proton-set): HorizontalLayout {
+                    alignment: start;
+                    if root.asi-can-fix-proton: Button {
+                        text: @tr("Let Proton load the ASI loader");
+                        primary: true;
+                        clicked => { root.asi-proton(true); }
+                    }
+                    if root.asi-proton-set: Button {
+                        text: @tr("Let Proton use its own DLL again");
+                        clicked => { root.asi-proton(false); }
+                    }
+                }
+                if root.asi-available && root.asi-mods.length == 0: Text {
+                    text: @tr("No ASI mods installed.");
+                    color: Theme.text-muted;
+                }
+                if root.asi-available: VerticalLayout {
+                    spacing: Theme.space-xs;
+                    for m in root.asi-mods: HorizontalLayout {
+                        spacing: Theme.space-s;
+                        Text {
+                            horizontal-stretch: 1;
+                            text: m.name + "  ·  " + m.size;
+                            vertical-alignment: center;
+                            color: m.enabled ? Theme.text : Theme.text-muted;
+                        }
+                        CheckBox {
+                            text: @tr("On");
+                            checked: m.enabled;
+                            accessible-label: @tr("Enable {}", m.name);
+                            toggled => { root.asi-toggled(m.name, self.checked); }
+                        }
+                    }
+                }
+                if root.asi-available: HorizontalLayout {
+                    alignment: start;
+                    Button {
+                        text: @tr("Install ASI mod…");
+                        clicked => { root.asi-install(); }
                     }
                 }
             }

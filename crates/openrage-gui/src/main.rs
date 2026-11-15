@@ -7,6 +7,7 @@
 mod about;
 mod accent;
 mod archive_ops;
+mod asi_ui;
 mod audio;
 mod badges;
 mod browser;
@@ -57,6 +58,7 @@ use rage_mods::{ChangeKind, CompareMode, Origin};
 
 use about::*;
 use archive_ops::*;
+use asi_ui::*;
 use callbacks::*;
 use debug::*;
 use docs::*;

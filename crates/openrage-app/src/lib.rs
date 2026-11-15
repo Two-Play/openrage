@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod anim;
+pub mod asi;
 pub mod audio;
 pub mod config;
 pub mod cutscene;
