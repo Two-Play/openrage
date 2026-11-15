@@ -74,6 +74,18 @@ pub fn is_rdr2_dir(dir: &Path) -> bool {
     dir.join(RDR2_EXE).is_file()
 }
 
+/// The icon of the game in `dir`, from its own program: (width, height, RGBA).
+pub fn game_icon(dir: &Path) -> Option<(u32, u32, Vec<u8>)> {
+    let programs: &[&str] = if is_rdr2_dir(dir) {
+        &[RDR2_EXE]
+    } else if crate::gta4::is_gta4_dir(dir) {
+        &["GTAIV.exe"]
+    } else {
+        &["GTA5_Enhanced.exe", "GTA5.exe", "PlayGTAV.exe"]
+    };
+    programs.iter().map(|p| dir.join(p)).filter(|p| p.is_file()).find_map(|p| crate::exe_icon::icon(&p))
+}
+
 /// Short name of the game installed in `dir`: "GTA V Enhanced", "GTA V",
 /// "GTA IV", "RDR2", or `None` when no known executable is there.
 pub fn game_name(dir: &Path) -> Option<&'static str> {

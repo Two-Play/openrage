@@ -7,16 +7,42 @@ pub(crate) fn installed_games(cfg: &Config) -> Vec<PathBuf> {
     cfg.known_games().into_iter().filter(|d| detect::is_gta5_dir(d) || is_rdr2_dir(d) || is_gta4_dir(d)).collect()
 }
 
+thread_local! {
+    /// Game icons by folder, read once from the games' programs.
+    static ICONS: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<slint::Image>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The icon of a game's own program (read once per folder).
+fn game_icon(dir: &Path) -> Option<slint::Image> {
+    ICONS.with(|icons| {
+        icons
+            .borrow_mut()
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| {
+                let (w, h, rgba) = detect::game_icon(dir)?;
+                let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h);
+                Some(slint::Image::from_rgba8(buffer))
+            })
+            .clone()
+    })
+}
+
 /// Fills the game switcher (File → Switch game…, settings).
 pub(crate) fn refresh_games(ui: &AppWindow) {
     let (rows, ask) = with_app(|a| {
         let rows: Vec<GameRow> = installed_games(&a.cfg)
             .iter()
-            .map(|d| GameRow {
-                name: detect::game_name(d).unwrap_or("Game").into(),
-                path: d.display().to_string().into(),
-                is_default: a.cfg.default_game.as_ref() == Some(d),
-                is_current: a.game_dir.as_ref() == Some(d),
+            .map(|d| {
+                let icon = game_icon(d);
+                GameRow {
+                    name: detect::game_name(d).unwrap_or("Game").into(),
+                    path: d.display().to_string().into(),
+                    is_default: a.cfg.default_game.as_ref() == Some(d),
+                    is_current: a.game_dir.as_ref() == Some(d),
+                    has_icon: icon.is_some(),
+                    icon: icon.unwrap_or_default(),
+                }
             })
             .collect();
         (rows, a.cfg.default_game.is_none())
@@ -37,18 +63,26 @@ pub(crate) fn show_launcher(ui: &AppWindow) -> bool {
     win.set_theme_mode(ui.get_theme_mode());
     crate::accent::apply(&win);
     win.set_games(ui.get_games());
+    // The switch to the explorer runs after the click has been handled: the
+    // start window is hidden then, not while it is still handling its own event.
     let main = ui.as_weak();
     win.on_chosen(move |i, remember| {
-        if let Some(ui) = main.upgrade() {
-            ui.invoke_game_chosen(i, remember);
-        }
+        let main = main.clone();
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            if let Some(ui) = main.upgrade() {
+                ui.invoke_game_chosen(i, remember);
+            }
+        });
     });
     let main = ui.as_weak();
     win.on_add_game(move || {
-        if let Some(ui) = main.upgrade() {
-            show_main_window(&ui);
-            show_setup(&ui, false);
-        }
+        let main = main.clone();
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            if let Some(ui) = main.upgrade() {
+                show_main_window(&ui);
+                show_setup(&ui, false);
+            }
+        });
     });
     if win.show().is_err() {
         return false;
@@ -66,9 +100,16 @@ pub(crate) fn launcher_window() -> Option<LauncherWindow> {
 /// Shows the explorer and closes the start window if it is open. The explorer
 /// is shown first: closing the last window would end the program.
 fn show_main_window(ui: &AppWindow) {
-    let _ = ui.show();
-    if let Some(win) = LAUNCHER.with(|l| l.borrow_mut().take()) {
+    if let Err(e) = ui.show() {
+        eprintln!("cannot show the main window: {e}");
+        return;
+    }
+    if let Some(win) = LAUNCHER.with(|l| l.borrow().as_ref().map(ComponentHandle::clone_strong)) {
         let _ = win.hide();
+        // Freed once nothing of it runs any more.
+        slint::Timer::single_shot(Duration::from_millis(100), || {
+            LAUNCHER.with(|l| l.borrow_mut().take());
+        });
     }
 }
 

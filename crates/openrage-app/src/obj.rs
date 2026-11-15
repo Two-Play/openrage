@@ -194,10 +194,15 @@ pub fn texture_name(name: &str) -> String {
 
 /// Reads a PNG as 8-bit RGBA: (width, height, pixels).
 pub fn read_png(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
-    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let data = std::fs::read(path).with_context(|| format!("opening {}", path.display()))?;
+    decode_png(&data).with_context(|| format!("reading {}", path.display()))
+}
+
+/// Decodes a PNG as 8-bit RGBA: (width, height, pixels).
+pub fn decode_png(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().with_context(|| format!("{} is not a PNG", path.display()))?;
+    let mut reader = decoder.read_info().context("not a PNG")?;
     let mut buf = vec![0u8; reader.output_buffer_size().context("PNG too large")?];
     let info = reader.next_frame(&mut buf)?;
     let pixels = &buf[..info.buffer_size()];
@@ -208,7 +213,7 @@ pub fn read_png(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
             pixels.as_chunks::<2>().0.iter().flat_map(|p| [p[0], p[0], p[0], p[1]]).collect()
         }
         png::ColorType::Grayscale => pixels.iter().flat_map(|&g| [g, g, g, 255]).collect(),
-        png::ColorType::Indexed => bail!("{}: indexed PNG could not be expanded", path.display()),
+        png::ColorType::Indexed => bail!("indexed PNG could not be expanded"),
     };
     Ok((info.width, info.height, rgba))
 }

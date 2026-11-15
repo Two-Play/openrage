@@ -50,6 +50,9 @@ export struct GameRow {
     path: string,
     is-default: bool,
     is-current: bool,
+    // The icon of the game's own program (else OpenRAGE's logo).
+    icon: image,
+    has-icon: bool,
 }
 
 export struct InfoRow {
@@ -2881,7 +2884,7 @@ export component AppWindow inherits Window {
                 padding: Theme.space-s;
                 spacing: Theme.space-m;
                 Image {
-                    source: @image-url("logo.svg");
+                    source: g.has-icon ? g.icon : @image-url("logo.svg");
                     width: 36px;
                     height: 36px;
                     y: (parent.height - self.height) / 2;
@@ -5541,7 +5544,7 @@ export component LauncherWindow inherits Window {
                 padding: Theme.space-s;
                 spacing: Theme.space-m;
                 Image {
-                    source: @image-url("logo.svg");
+                    source: g.has-icon ? g.icon : @image-url("logo.svg");
                     width: 36px;
                     height: 36px;
                     y: (parent.height - self.height) / 2;

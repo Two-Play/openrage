@@ -24,6 +24,12 @@ pub(crate) fn debug_snapshot(ui: &AppWindow) {
         if std::env::var("OPENRAGE_EDIT").is_ok() {
             ui.set_edit_mode(true);
         }
+        // `OPENRAGE_LAUNCHER_PICK=<n>`: a click on the n-th game of the start window.
+        if let Ok(i) = std::env::var("OPENRAGE_LAUNCHER_PICK")
+            && let Some(w) = launcher_window()
+        {
+            w.invoke_chosen(i.parse().unwrap_or(0), false);
+        }
         if let Ok(i) = std::env::var("OPENRAGE_PICK_GAME") {
             ui.set_game_chooser_visible(false);
             ui.invoke_game_chosen(i.parse().unwrap_or(0), false);
