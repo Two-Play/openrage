@@ -1,29 +1,77 @@
-//! Settings → ASI mods: GTA V's ASI mods, their loader and the Proton setting.
+//! Mods → ASI mods…: GTA V's ASI mods, their loader and the Proton setting, in
+//! their own window.
+
+use std::cell::RefCell;
 
 use anyhow::Context;
 use openrage_app::asi;
 
 use crate::*;
 
-/// Fills the ASI section of the settings from the open game (hidden for other games).
+thread_local! {
+    static WINDOW: RefCell<Option<AsiWindow>> = const { RefCell::new(None) };
+}
+
+/// The ASI window, if it was opened (for debug snapshots).
+#[cfg(debug_assertions)]
+pub(crate) fn asi_window() -> Option<AsiWindow> {
+    window()
+}
+
+fn window() -> Option<AsiWindow> {
+    WINDOW.with(|w| w.borrow().as_ref().map(ComponentHandle::clone_strong))
+}
+
+/// The open game if it is GTA V (the only game with ASI mods).
+fn gta5_dir() -> Option<PathBuf> {
+    with_app(|a| a.game_dir.clone()).filter(|d| detect::is_gta5_dir(d))
+}
+
+/// Enables Mods → ASI mods… for GTA V and refreshes an open ASI window
+/// (after the game changed).
 pub(crate) fn refresh_asi(ui: &AppWindow) {
-    let game = with_app(|a| a.game_dir.clone()).filter(|d| detect::is_gta5_dir(d));
-    let status = game.as_deref().map(asi::status);
-    let s = match status {
-        Some(Ok(s)) => s,
-        Some(Err(e)) => {
-            ui.set_asi_available(true);
-            ui.set_asi_summary(SharedString::new());
-            ui.set_asi_problem(format!("Cannot read the game folder: {e:#}").into());
-            ui.set_asi_mods(ModelRc::new(VecModel::from(Vec::<AsiRow>::new())));
-            return;
+    let available = gta5_dir().is_some();
+    ui.set_asi_available(available);
+    if let Some(win) = window() {
+        if available {
+            fill(&win);
+        } else {
+            let _ = win.hide();
         }
+    }
+}
+
+/// Shows the ASI window (creating it on first use).
+pub(crate) fn open_asi_window(ui: &AppWindow) {
+    let win = match window() {
+        Some(w) => w,
         None => {
-            ui.set_asi_available(false);
+            let Ok(win) = AsiWindow::new() else { return };
+            wire(&win, ui);
+            WINDOW.with(|w| *w.borrow_mut() = Some(win.clone_strong()));
+            win
+        }
+    };
+    win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(&win);
+    fill(&win);
+    let _ = win.show();
+}
+
+/// Fills the window from the game folder (and its Proton prefix).
+fn fill(win: &AsiWindow) {
+    let Some(game) = gta5_dir() else { return };
+    win.set_game(game.display().to_string().into());
+    let s = match asi::status(&game) {
+        Ok(s) => s,
+        Err(e) => {
+            win.set_summary(SharedString::new());
+            win.set_problem(format!("Cannot read the game folder: {e:#}").into());
+            win.set_mods(ModelRc::new(VecModel::from(Vec::<AsiRow>::new())));
             return;
         }
     };
-    let mut summary = Vec::new();
+    let mut summary = vec![format!("Game: GTA V {}", if s.enhanced { "Enhanced" } else { "Legacy" })];
     match s.loader() {
         Some(l) => summary.push(format!("Loader: {} ({})", l.file, l.description)),
         None => summary.push("Loader: none for this edition of the game".to_owned()),
@@ -36,72 +84,91 @@ pub(crate) fn refresh_asi(ui: &AppWindow) {
             format!("Proton (app {}): uses its own {}", p.app_id, l.file)
         });
     }
-    ui.set_asi_available(true);
-    ui.set_asi_summary(summary.join("\n").into());
-    ui.set_asi_problem(s.problems().join("\n").into());
+    win.set_summary(summary.join("\n").into());
+    win.set_problem(s.problems().join("\n").into());
     let proton_ready = s.proton.is_some() && s.loader().is_some();
-    ui.set_asi_can_fix_proton(proton_ready && !s.loader_runs());
-    ui.set_asi_proton_set(proton_ready && s.loader_runs());
+    win.set_can_fix_proton(proton_ready && !s.loader_runs());
+    win.set_proton_set(proton_ready && s.loader_runs());
     let rows: Vec<AsiRow> = s
         .mods
         .iter()
         .map(|m| AsiRow { name: m.name.clone().into(), size: human_size(m.size).into(), enabled: m.enabled })
         .collect();
-    ui.set_asi_mods(ModelRc::new(VecModel::from(rows)));
+    win.set_mods(ModelRc::new(VecModel::from(rows)));
 }
 
-pub(crate) fn wire_asi(ui: &AppWindow) {
-    let w = ui.as_weak();
-    ui.on_asi_refresh(move || with_ui(&w, refresh_asi));
-    let w = ui.as_weak();
-    ui.on_asi_toggled(move |name, on| {
-        with_ui(&w, |ui| {
-            let Some(game) = with_app(|a| a.game_dir.clone()) else { return };
-            match asi::set_enabled(&game, &name, on) {
-                Ok(()) => ui.set_status(format!("{name} {}", if on { "enabled" } else { "disabled" }).into()),
-                Err(e) => show_error(ui, format!("Cannot change {name}: {e:#}")),
-            }
-            refresh_asi(ui);
-        })
+fn wire(win: &AsiWindow, ui: &AppWindow) {
+    let w = win.as_weak();
+    win.on_refresh(move || {
+        if let Some(win) = w.upgrade() {
+            fill(&win);
+            win.set_status(SharedString::new());
+        }
     });
-    let w = ui.as_weak();
-    ui.on_asi_install(move || {
-        let w = w.clone();
+    let w = win.as_weak();
+    win.on_toggled(move |name, on| {
+        let Some(win) = w.upgrade() else { return };
+        let Some(game) = gta5_dir() else { return };
+        win.set_status(
+            match asi::set_enabled(&game, &name, on) {
+                Ok(()) => format!("{name} {}", if on { "enabled" } else { "disabled (put aside, not deleted)" }),
+                Err(e) => format!("Cannot change {name}: {e:#}"),
+            }
+            .into(),
+        );
+        fill(&win);
+    });
+    let (w, main) = (win.as_weak(), ui.as_weak());
+    win.on_install(move || {
+        let (w, main) = (w.clone(), main.clone());
         std::thread::spawn(move || {
             let Some(file) =
                 rfd::FileDialog::new().set_title("Install an ASI mod").add_filter("ASI mod", &["asi"]).pick_file()
             else {
                 return;
             };
-            let _ = w.upgrade_in_event_loop(move |ui| {
-                let Some(game) = with_app(|a| a.game_dir.clone()) else { return };
-                match asi::install(&game, &file) {
-                    Ok(path) => {
-                        ui.set_status(format!("Installed {} (undo removes it)", path.display()).into());
-                        refresh_undo(&ui);
+            let _ = w.upgrade_in_event_loop(move |win| {
+                let Some(game) = gta5_dir() else { return };
+                win.set_status(
+                    match asi::install(&game, &file) {
+                        Ok(path) => {
+                            // The main window's undo button and History know it now.
+                            if let Some(ui) = main.upgrade() {
+                                refresh_undo(&ui);
+                            }
+                            format!("Installed {} (undo removes it)", path.display())
+                        }
+                        Err(e) => format!("Cannot install the ASI mod: {e:#}"),
                     }
-                    Err(e) => show_error(&ui, format!("Cannot install the ASI mod: {e:#}")),
-                }
-                refresh_asi(&ui);
+                    .into(),
+                );
+                fill(&win);
             });
         });
     });
-    let w = ui.as_weak();
-    ui.on_asi_proton(move |on| {
-        with_ui(&w, |ui| {
-            let Some(game) = with_app(|a| a.game_dir.clone()) else { return };
-            let result = asi::status(&game).and_then(|s| {
-                let proton = s.proton.clone().context("the game does not run through Proton here")?;
-                let loader = s.loader().context("no ASI loader for this edition of the game")?.clone();
-                asi::set_proton_override(&proton, &loader.dll(), on)?;
-                Ok(loader.file)
-            });
+    let w = win.as_weak();
+    win.on_proton(move |on| {
+        let Some(win) = w.upgrade() else { return };
+        let Some(game) = gta5_dir() else { return };
+        let result = asi::status(&game).and_then(|s| {
+            let proton = s.proton.clone().context("the game does not run through Proton here")?;
+            let loader = s.loader().context("no ASI loader for this edition of the game")?.clone();
+            asi::set_proton_override(&proton, &loader.dll(), on)?;
+            Ok(loader.file)
+        });
+        win.set_status(
             match result {
-                Ok(file) if on => ui.set_status(format!("Proton now loads the game's {file}").into()),
-                Ok(file) => ui.set_status(format!("Proton uses its own {file} again").into()),
-                Err(e) => show_error(ui, format!("Cannot change the Proton setting: {e:#}")),
+                Ok(file) if on => format!("Proton now loads the game's {file}"),
+                Ok(file) => format!("Proton uses its own {file} again"),
+                Err(e) => format!("Cannot change the Proton setting: {e:#}"),
             }
-            refresh_asi(ui);
-        })
+            .into(),
+        );
+        fill(&win);
     });
+}
+
+pub(crate) fn wire_asi(ui: &AppWindow) {
+    let w = ui.as_weak();
+    ui.on_open_asi_window(move || with_ui(&w, open_asi_window));
 }

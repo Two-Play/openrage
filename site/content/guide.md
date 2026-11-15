@@ -13,7 +13,8 @@ New here? Start with [Getting started](@/getting-started.md). Prefer a terminal?
 ## Starting
 
 Start `openrage-gui`, or `openrage-gui <virtual path>` to open a folder or file directly.
-With several games set up, OpenRAGE asks which one to open, unless one is ticked as *Always open this game*.
+With several games set up, OpenRAGE first shows a small window that asks which one to open (unless one is ticked as
+*Always open this game*); the explorer opens with the game chosen there.
 **File → Switch game…** changes the game later.
 
 ## The window

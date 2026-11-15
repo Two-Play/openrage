@@ -25,9 +25,57 @@ pub(crate) fn refresh_games(ui: &AppWindow) {
     ui.set_ask_game(ask);
 }
 
+thread_local! {
+    /// The start window, while it is open.
+    static LAUNCHER: std::cell::RefCell<Option<LauncherWindow>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Shows the start window instead of the explorer (several games, none the
+/// default). Returns false if it could not be shown.
+pub(crate) fn show_launcher(ui: &AppWindow) -> bool {
+    let Ok(win) = LauncherWindow::new() else { return false };
+    win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(&win);
+    win.set_games(ui.get_games());
+    let main = ui.as_weak();
+    win.on_chosen(move |i, remember| {
+        if let Some(ui) = main.upgrade() {
+            ui.invoke_game_chosen(i, remember);
+        }
+    });
+    let main = ui.as_weak();
+    win.on_add_game(move || {
+        if let Some(ui) = main.upgrade() {
+            show_main_window(&ui);
+            show_setup(&ui, false);
+        }
+    });
+    if win.show().is_err() {
+        return false;
+    }
+    LAUNCHER.with(|l| *l.borrow_mut() = Some(win));
+    true
+}
+
+/// The start window while it is open (for debug snapshots).
+#[cfg(debug_assertions)]
+pub(crate) fn launcher_window() -> Option<LauncherWindow> {
+    LAUNCHER.with(|l| l.borrow().as_ref().map(ComponentHandle::clone_strong))
+}
+
+/// Shows the explorer and closes the start window if it is open. The explorer
+/// is shown first: closing the last window would end the program.
+fn show_main_window(ui: &AppWindow) {
+    let _ = ui.show();
+    if let Some(win) = LAUNCHER.with(|l| l.borrow_mut().take()) {
+        let _ = win.hide();
+    }
+}
+
 /// Opens a game that was set up before (from the chooser); `remember` makes it the default.
 pub(crate) fn open_game(ui: &AppWindow, index: usize, remember: bool) {
     let Some(dir) = with_app(|a| installed_games(&a.cfg).get(index).cloned()) else { return };
+    show_main_window(ui);
     let ready = if is_rdr2_dir(&dir) {
         register_rdr2(&dir)
     } else if is_gta4_dir(&dir) {

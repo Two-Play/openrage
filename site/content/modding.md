@@ -136,7 +136,8 @@ Every installed package can be **uninstalled** from **History** (or `openrage oi
 ## ASI mods (GTA V)
 
 ASI mods (trainers, scripts for Script Hook V) are DLLs that a **loader** in the game folder loads when GTA V starts.
-**Settings → ASI mods** (or `openrage asi`) shows what is installed and why mods would not load:
+**Mods → ASI mods…** opens a window (or `openrage asi` in a terminal) that shows what is installed and why mods
+would not load:
 
 - the loader and whether it fits the game: GTA V Enhanced needs its own loader (`xinput1_4.dll` from Script Hook V for
   Enhanced); the older `dinput8.dll` loader is for GTA V Legacy. OpenRAGE tells them apart by what the files say about

@@ -119,6 +119,29 @@ pub(crate) fn debug_viewer(ui: &AppWindow) {
 /// The part of [`debug_snapshot`] after selecting a file.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
+    // The start window (several games, none the default), or `OPENRAGE_ASI`:
+    // the ASI mods window, instead of the explorer.
+    let asi = std::env::var("OPENRAGE_ASI").is_ok();
+    if launcher_window().is_some() || asi {
+        if asi {
+            open_asi_window(ui);
+        }
+        slint::Timer::single_shot(Duration::from_millis(800), move || {
+            let snapshot = match launcher_window() {
+                Some(w) => w.window().take_snapshot(),
+                None => match asi_window() {
+                    Some(w) => w.window().take_snapshot(),
+                    None => return,
+                },
+            };
+            if let Ok(img) = snapshot {
+                let _ =
+                    rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(&path, png));
+            }
+            let _ = slint::quit_event_loop();
+        });
+        return;
+    }
     // A file selected by `OPENRAGE_SELECT` opens in the viewer only now.
     if viewer::newest().is_none() && std::env::var("OPENRAGE_SELECT").is_ok() {
         debug_viewer(ui);

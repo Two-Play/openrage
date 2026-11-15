@@ -1121,17 +1121,9 @@ export component AppWindow inherits Window {
     callback ask-game-changed(bool);
     // Plugins on the settings page.
     in property <[PluginRow]> plugins;
-    // ASI mods (GTA V only).
+    // ASI mods (GTA V only): Mods → ASI mods… opens their window.
     in property <bool> asi-available;
-    in property <string> asi-summary;
-    in property <string> asi-problem;
-    in property <bool> asi-can-fix-proton;
-    in property <bool> asi-proton-set;
-    in property <[AsiRow]> asi-mods;
-    callback asi-refresh();
-    callback asi-toggled(string, bool);
-    callback asi-install();
-    callback asi-proton(bool);
+    callback open-asi-window();
     in property <string> plugin-folder;
     in property <bool> settings-scroll-end;
     callback plugin-toggled(string, bool);
@@ -1197,7 +1189,6 @@ export component AppWindow inherits Window {
 
     public function open-settings() {
         root.accent-hex = root.color-hex(Theme.accent);
-        root.asi-refresh();
         root.settings-visible = true;
     }
 
@@ -1454,6 +1445,21 @@ export component AppWindow inherits Window {
                 icon: @image-url("icons/menu/search.svg");
                 shortcut: @keys(Control + Shift + F);
                 activated => { filter-edit.focus(); }
+            }
+        }
+        Menu {
+            title: @tr("Mods");
+            MenuItem {
+                title: @tr("Install package (.oiv)…");
+                icon: @image-url("icons/menu/package.svg");
+                enabled: !root.busy;
+                activated => { root.install-oiv(); }
+            }
+            MenuItem {
+                title: @tr("ASI mods…");
+                icon: @image-url("icons/menu/settings.svg");
+                enabled: root.asi-available;
+                activated => { root.open-asi-window(); }
             }
         }
         Menu {
@@ -3201,108 +3207,6 @@ export component AppWindow inherits Window {
                         text: @tr("Reload plugins");
                         clicked => { root.reload-plugins(); }
                     }
-                }
-                if root.asi-available: Rectangle {
-                    height: 1px;
-                    background: Theme.border;
-                }
-                if root.asi-available: Text {
-                    text: @tr("ASI mods");
-                    font-size: Theme.font-title;
-                    font-weight: 600;
-                    color: Theme.text;
-                }
-                if root.asi-available: Text {
-                    text: @tr("ASI mods are DLLs that a loader in the game folder loads when GTA V starts. They are for story mode only: GTA Online bans modified games, and the anti-cheat BattlEye that GTA V Enhanced starts with may stop ASI loaders.");
-                    wrap: word-wrap;
-                    color: Theme.text-muted;
-                }
-                if root.asi-available: Text {
-                    text: root.asi-summary;
-                    wrap: word-wrap;
-                    color: Theme.text;
-                }
-                if root.asi-available && root.asi-problem != "": Text {
-                    text: root.asi-problem;
-                    wrap: word-wrap;
-                    color: Theme.danger;
-                    accessible-role: text;
-                    accessible-label: @tr("Problem: {}", root.asi-problem);
-                }
-                if root.asi-available && (root.asi-can-fix-proton || root.asi-proton-set): HorizontalLayout {
-                    alignment: start;
-                    if root.asi-can-fix-proton: Button {
-                        text: @tr("Let Proton load the ASI loader");
-                        primary: true;
-                        clicked => { root.asi-proton(true); }
-                    }
-                    if root.asi-proton-set: Button {
-                        text: @tr("Let Proton use its own DLL again");
-                        clicked => { root.asi-proton(false); }
-                    }
-                }
-                if root.asi-available && root.asi-mods.length == 0: Text {
-                    text: @tr("No ASI mods installed.");
-                    color: Theme.text-muted;
-                }
-                if root.asi-available: VerticalLayout {
-                    spacing: Theme.space-xs;
-                    for m in root.asi-mods: HorizontalLayout {
-                        spacing: Theme.space-s;
-                        Text {
-                            horizontal-stretch: 1;
-                            text: m.name + "  ·  " + m.size;
-                            vertical-alignment: center;
-                            color: m.enabled ? Theme.text : Theme.text-muted;
-                        }
-                        CheckBox {
-                            text: @tr("On");
-                            checked: m.enabled;
-                            accessible-label: @tr("Enable {}", m.name);
-                            toggled => { root.asi-toggled(m.name, self.checked); }
-                        }
-                    }
-                }
-                if root.asi-available: HorizontalLayout {
-                    alignment: start;
-                    Button {
-                        text: @tr("Install ASI mod…");
-                        clicked => { root.asi-install(); }
-                    }
-                }
-            }
-        }
-        HorizontalLayout {
-            alignment: end;
-            Button {
-                text: @tr("Close");
-                primary: true;
-                clicked => { root.settings-visible = false; }
-            }
-        }
-    }
-
-    // Installing a plugin package: what it is and may do, before anything is written.
-    if root.plugin-pkg-visible: Dialog {
-        title: root.plugin-pkg-title;
-        subtitle: root.plugin-pkg-subtitle;
-        panel-width: 640px;
-        panel-height: 460px;
-        close => { root.plugin-pkg-visible = false; }
-        Rectangle {
-            vertical-stretch: 1;
-            background: Theme.surface-raised;
-            border-radius: Theme.radius;
-            ScrollView {
-                content-width: max(self.visible-width, details.preferred-width + 16px);
-                content-height: max(self.visible-height, details.preferred-height + 16px);
-                details := Text {
-                    x: 8px;
-                    y: 8px;
-                    width: parent.visible-width - 16px;
-                    text: root.plugin-pkg-details;
-                    wrap: word-wrap;
-                    color: Theme.text;
                 }
             }
         }
@@ -5422,5 +5326,256 @@ export component HistoryWindow inherits Window {
             root.set-edit-mode(true);
         }
         cancel => { root.unlock-visible = false; }
+    }
+}
+
+// GTA V's ASI mods: the loader, Script Hook V, the mods and the Proton setting.
+export component AsiWindow inherits Window {
+    title: @tr("ASI mods — OpenRAGE");
+    icon: @image-url("logo.svg");
+    preferred-width: 720px;
+    preferred-height: 560px;
+    min-width: 460px;
+    min-height: 360px;
+    background: Theme.background;
+    default-font-size: Theme.font-body;
+
+    in-out property <int> theme-mode;
+    in property <string> game;
+    in property <string> summary;
+    in property <string> problem;
+    in property <bool> can-fix-proton;
+    in property <bool> proton-set;
+    in property <[AsiRow]> mods;
+    in property <string> status;
+    callback toggled(string, bool);
+    callback install();
+    callback proton(bool);
+    callback refresh();
+
+    changed theme-mode => { root.apply-theme(); }
+    init => { root.apply-theme(); }
+
+    function apply-theme() {
+        Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+
+    VerticalLayout {
+        Rectangle {
+            background: Theme.surface;
+            HorizontalLayout {
+                padding: Theme.space-m;
+                padding-left: Theme.space-l;
+                spacing: Theme.space-s;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    Text {
+                        text: @tr("ASI mods");
+                        font-size: Theme.font-title;
+                        font-weight: 600;
+                        color: Theme.text;
+                    }
+                    Text {
+                        text: root.game;
+                        font-size: Theme.font-small;
+                        overflow: elide;
+                        color: Theme.text-muted;
+                    }
+                }
+                Button {
+                    text: @tr("Refresh");
+                    clicked => { root.refresh(); }
+                }
+                Button {
+                    text: @tr("Install ASI mod…");
+                    primary: true;
+                    clicked => { root.install(); }
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                padding: Theme.space-l;
+                spacing: Theme.space-m;
+                alignment: start;
+                Text {
+                    text: @tr("ASI mods are DLLs that a loader in the game folder loads when GTA V starts. They are for story mode only: GTA Online bans modified games, and the anti-cheat BattlEye that GTA V Enhanced starts with may stop ASI loaders.");
+                    wrap: word-wrap;
+                    color: Theme.text-muted;
+                }
+                Text {
+                    text: root.summary;
+                    wrap: word-wrap;
+                    color: Theme.text;
+                }
+                if root.problem != "": Text {
+                    text: root.problem;
+                    wrap: word-wrap;
+                    color: Theme.danger;
+                    accessible-role: text;
+                    accessible-label: @tr("Problem: {}", root.problem);
+                }
+                if root.can-fix-proton || root.proton-set: HorizontalLayout {
+                    alignment: start;
+                    if root.can-fix-proton: Button {
+                        text: @tr("Let Proton load the ASI loader");
+                        primary: true;
+                        clicked => { root.proton(true); }
+                    }
+                    if root.proton-set: Button {
+                        text: @tr("Let Proton use its own DLL again");
+                        clicked => { root.proton(false); }
+                    }
+                }
+                Rectangle {
+                    height: 1px;
+                    background: Theme.border;
+                }
+                if root.mods.length == 0: Text {
+                    text: @tr("No ASI mods installed.");
+                    color: Theme.text-muted;
+                }
+                for m in root.mods: HorizontalLayout {
+                    spacing: Theme.space-s;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: m.name + "  ·  " + m.size;
+                        vertical-alignment: center;
+                        color: m.enabled ? Theme.text : Theme.text-muted;
+                    }
+                    CheckBox {
+                        text: @tr("On");
+                        checked: m.enabled;
+                        accessible-label: @tr("Enable {}", m.name);
+                        toggled => { root.toggled(m.name, self.checked); }
+                    }
+                }
+            }
+        }
+        Rectangle {
+            height: 28px;
+            background: Theme.surface;
+            HorizontalLayout {
+                padding-left: Theme.space-l;
+                padding-right: Theme.space-l;
+                Text {
+                    text: root.status;
+                    vertical-alignment: center;
+                    font-size: Theme.font-small;
+                    overflow: elide;
+                    color: Theme.text-muted;
+                }
+            }
+        }
+    }
+}
+
+// Shown at start when several games are set up and none is the default:
+// choosing one opens the explorer with it.
+export component LauncherWindow inherits Window {
+    title: @tr("OpenRAGE — Open a game");
+    icon: @image-url("logo.svg");
+    preferred-width: 560px;
+    preferred-height: 170px + root.games.length * 64px + 60px;
+    min-width: 420px;
+    background: Theme.background;
+    default-font-size: Theme.font-body;
+
+    in-out property <int> theme-mode;
+    in property <[GameRow]> games;
+    in-out property <bool> remember;
+    callback chosen(int, bool);
+    callback add-game();
+
+    changed theme-mode => { root.apply-theme(); }
+    init => { root.apply-theme(); }
+
+    function apply-theme() {
+        Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+
+    VerticalLayout {
+        padding: Theme.space-l;
+        spacing: Theme.space-s;
+        HorizontalLayout {
+            spacing: Theme.space-m;
+            Image {
+                source: @image-url("logo.svg");
+                width: 40px;
+                height: 40px;
+            }
+            VerticalLayout {
+                alignment: center;
+                Text {
+                    text: @tr("Open a game");
+                    font-size: Theme.font-title;
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                Text {
+                    text: @tr("Which game should OpenRAGE open?");
+                    color: Theme.text-muted;
+                }
+            }
+        }
+        for g[i] in root.games: Rectangle {
+            height: 56px;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: card-ta.has-hover ? Theme.accent : Theme.border;
+            background: card-ta.has-hover ? Theme.hover : transparent;
+            accessible-role: button;
+            accessible-label: g.name;
+            accessible-action-default => { root.chosen(i, root.remember); }
+            card-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.chosen(i, root.remember); }
+            }
+            HorizontalLayout {
+                padding: Theme.space-s;
+                spacing: Theme.space-m;
+                Image {
+                    source: @image-url("logo.svg");
+                    width: 36px;
+                    height: 36px;
+                    y: (parent.height - self.height) / 2;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: g.name + (g.is-current ? "  · " + @tr("last opened") : "");
+                        font-weight: 600;
+                        color: Theme.text;
+                    }
+                    Text {
+                        text: g.path;
+                        font-size: Theme.font-small;
+                        overflow: elide;
+                        color: Theme.text-muted;
+                    }
+                }
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+        }
+        CheckBox {
+            text: @tr("Always open this game (change it in Settings)");
+            checked <=> root.remember;
+        }
+        HorizontalLayout {
+            alignment: start;
+            Button {
+                text: @tr("Add a game…");
+                clicked => { root.add-game(); }
+            }
+        }
     }
 }
