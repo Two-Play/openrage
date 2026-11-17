@@ -133,6 +133,30 @@ Every installed package can be **uninstalled** from **History** (or `openrage oi
 
 `<pso>` edits: such packages are refused with an explanation. `<defragmentation>` is skipped, as it only saves disk space.
 
+## ASI mods (GTA V)
+
+ASI mods (trainers, scripts for Script Hook V) are DLLs that a **loader** in the game folder loads when GTA V starts.
+**Mods → ASI mods…** opens a window (or `openrage asi` in a terminal) that shows what is installed and why mods
+would not load:
+
+- the loader and whether it fits the game: GTA V Enhanced needs its own loader (`xinput1_4.dll` from Script Hook V for
+  Enhanced); the older `dinput8.dll` loader is for GTA V Legacy. OpenRAGE tells them apart by what the files say about
+  themselves, not by their names;
+- whether Script Hook V is installed;
+- each `.asi` file, with a switch: **off** puts it aside in `.openrage/disabled-asi` in the game folder, **on** puts it
+  back. Nothing is deleted. **Install ASI mod…** copies one into the game folder, recorded in History (undo removes it).
+
+**Linux (Proton):** Wine uses its own copy of the DLL the loader stands in for, so no ASI is ever loaded, unless the
+game's prefix tells Wine to take the game's DLL first. **Let Proton load the ASI loader** sets exactly that for the
+game's prefix (`compatdata/<app id>/pfx/user.reg`, backed up first as `user.reg.openrage-backup`), and can be taken
+back the same way. The game must be closed. When the loader is there but Proton would not load it, a hint above the file
+list says so, with the same button; dismiss it with ✕ (remembered for that game). Instead, the launch option `WINEDLLOVERRIDES="xinput1_4=n,b" %command%`
+(with the loader's name) does the same for one game.
+
+> [!WARNING]
+> ASI mods are for story mode only. GTA Online bans modified games, and the anti-cheat BattlEye that GTA V Enhanced
+> starts with may stop ASI loaders.
+
 ## Mods folder
 
 OpenRAGE understands the `mods` folder of OpenIV.asi, where a file at `mods/<path>` replaces `<path>` in the game. It

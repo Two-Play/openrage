@@ -119,6 +119,18 @@ pub(crate) fn debug_viewer(ui: &AppWindow) {
 /// The part of [`debug_snapshot`] after selecting a file.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
+    // `OPENRAGE_ASI`: the ASI mods window instead of the explorer.
+    if std::env::var("OPENRAGE_ASI").is_ok() {
+        open_asi_window(ui);
+        slint::Timer::single_shot(Duration::from_millis(800), move || {
+            if let Some(Ok(img)) = asi_window().map(|w| w.window().take_snapshot()) {
+                let _ =
+                    rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(&path, png));
+            }
+            let _ = slint::quit_event_loop();
+        });
+        return;
+    }
     // A file selected by `OPENRAGE_SELECT` opens in the viewer only now.
     if viewer::newest().is_none() && std::env::var("OPENRAGE_SELECT").is_ok() {
         debug_viewer(ui);
@@ -299,4 +311,37 @@ pub(crate) fn debug_click(w: &slint::Window, var: &str) {
         w.dispatch_event(WindowEvent::PointerPressed { position, button });
         w.dispatch_event(WindowEvent::PointerReleased { position, button });
     }
+}
+
+/// The start window in debug builds: `OPENRAGE_LAUNCHER_PICK=<n>` chooses the
+/// n-th game after a second; otherwise, with `OPENRAGE_SNAPSHOT=<png>` set, a
+/// picture of it is saved there and the program quits.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_launcher(win: &LauncherWindow) {
+    let pick = std::env::var("OPENRAGE_LAUNCHER_PICK").ok();
+    let snapshot = std::env::var("OPENRAGE_SNAPSHOT").ok();
+    if pick.is_none() && snapshot.is_none() {
+        return;
+    }
+    let w = win.as_weak();
+    slint::Timer::single_shot(Duration::from_secs(1), move || {
+        let Some(win) = w.upgrade() else { return };
+        if let Some(i) = &pick {
+            // As a click does: the window shows that it is opening the game.
+            let i: i32 = i.parse().unwrap_or(0);
+            let name = slint::Model::row_data(&win.get_games(), i.max(0) as usize).map(|g| g.name).unwrap_or_default();
+            win.set_loading(format!("Opening {name}…").into());
+            win.invoke_chosen(i, false);
+        } else if let Some(path) = &snapshot {
+            // `OPENRAGE_LAUNCHER_LOADING=<text>`: the window as it looks after a click.
+            if let Ok(text) = std::env::var("OPENRAGE_LAUNCHER_LOADING") {
+                win.set_loading(text.into());
+            }
+            if let Ok(img) = win.window().take_snapshot() {
+                let _ =
+                    rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(path, png));
+            }
+            std::process::exit(0);
+        }
+    });
 }

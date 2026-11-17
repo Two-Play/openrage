@@ -7,22 +7,102 @@ pub(crate) fn installed_games(cfg: &Config) -> Vec<PathBuf> {
     cfg.known_games().into_iter().filter(|d| detect::is_gta5_dir(d) || is_rdr2_dir(d) || is_gta4_dir(d)).collect()
 }
 
+thread_local! {
+    /// Game icons by folder, read once from the games' programs.
+    static ICONS: std::cell::RefCell<std::collections::HashMap<PathBuf, Option<slint::Image>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The icon of a game's own program (read once per folder).
+fn game_icon(dir: &Path) -> Option<slint::Image> {
+    ICONS.with(|icons| {
+        icons
+            .borrow_mut()
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| {
+                let (w, h, rgba) = detect::game_icon(dir)?;
+                let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h);
+                Some(slint::Image::from_rgba8(buffer))
+            })
+            .clone()
+    })
+}
+
 /// Fills the game switcher (File → Switch game…, settings).
 pub(crate) fn refresh_games(ui: &AppWindow) {
     let (rows, ask) = with_app(|a| {
         let rows: Vec<GameRow> = installed_games(&a.cfg)
             .iter()
-            .map(|d| GameRow {
-                name: detect::game_name(d).unwrap_or("Game").into(),
-                path: d.display().to_string().into(),
-                is_default: a.cfg.default_game.as_ref() == Some(d),
-                is_current: a.game_dir.as_ref() == Some(d),
+            .map(|d| {
+                let icon = game_icon(d);
+                GameRow {
+                    name: detect::game_name(d).unwrap_or("Game").into(),
+                    path: d.display().to_string().into(),
+                    is_default: a.cfg.default_game.as_ref() == Some(d),
+                    is_current: a.game_dir.as_ref() == Some(d),
+                    has_icon: icon.is_some(),
+                    icon: icon.unwrap_or_default(),
+                }
             })
             .collect();
         (rows, a.cfg.default_game.is_none())
     });
     ui.set_games(ModelRc::new(VecModel::from(rows)));
     ui.set_ask_game(ask);
+}
+
+/// What the start window ended with.
+pub(crate) enum LaunchChoice {
+    /// A game of the list, and whether to always open it.
+    Game(usize, bool),
+    AddGame,
+}
+
+/// Runs the start window (several games, none the default) in an event loop
+/// of its own, before the explorer's: the explorer then starts the usual way
+/// with the game chosen. `Ok(None)`: closed without a choice. `Err`: the
+/// window could not be shown.
+pub(crate) fn run_launcher(ui: &AppWindow) -> Result<Option<LaunchChoice>, slint::PlatformError> {
+    let win = LauncherWindow::new()?;
+    win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(&win);
+    win.set_games(ui.get_games());
+    let choice: std::rc::Rc<std::cell::RefCell<Option<LaunchChoice>>> = Default::default();
+    // After a choice the window shows "Opening …" (set by the window itself)
+    // and stays open while the explorer gets ready; its event loop ends a
+    // moment later, once that has been drawn.
+    let finish = |c: &std::rc::Rc<std::cell::RefCell<Option<LaunchChoice>>>, made: LaunchChoice| {
+        *c.borrow_mut() = Some(made);
+        slint::Timer::single_shot(Duration::from_millis(80), || {
+            let _ = slint::quit_event_loop();
+        });
+    };
+    let c = std::rc::Rc::clone(&choice);
+    win.on_chosen(move |i, remember| finish(&c, LaunchChoice::Game(i.max(0) as usize, remember)));
+    let c = std::rc::Rc::clone(&choice);
+    win.on_add_game(move || finish(&c, LaunchChoice::AddGame));
+    #[cfg(debug_assertions)]
+    debug_launcher(&win);
+    win.show()?;
+    // Ends after a choice, or when the window is closed (no choice).
+    slint::run_event_loop()?;
+    let made = choice.borrow_mut().take();
+    if made.is_some() {
+        LAUNCHER.with(|l| *l.borrow_mut() = Some(win));
+    }
+    Ok(made)
+}
+
+thread_local! {
+    /// The start window while the explorer gets ready.
+    static LAUNCHER: std::cell::RefCell<Option<LauncherWindow>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Closes the start window once the explorer is up.
+pub(crate) fn close_launcher() {
+    if let Some(win) = LAUNCHER.with(|l| l.borrow_mut().take()) {
+        let _ = win.hide();
+    }
 }
 
 /// Opens a game that was set up before (from the chooser); `remember` makes it the default.

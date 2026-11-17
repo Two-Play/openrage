@@ -3,10 +3,12 @@
 #![forbid(unsafe_code)]
 
 pub mod anim;
+pub mod asi;
 pub mod audio;
 pub mod config;
 pub mod cutscene;
 pub mod detect;
+pub mod exe_icon;
 pub mod expr;
 pub mod extract;
 pub mod gta4;

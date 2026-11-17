@@ -14,6 +14,7 @@ rage-formats.workspace = true
 rage-index.workspace = true
 rage-resource.workspace = true
 anyhow.workspace = true
+memchr.workspace = true
 dirs.workspace = true
 rayon.workspace = true
 roxmltree.workspace = true

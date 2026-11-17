@@ -8,6 +8,7 @@ pub(crate) fn wire_callbacks(ui: &AppWindow) {
     wire_list(ui);
     wire_model(ui);
     wire_plugins(ui);
+    wire_asi(ui);
     wire_settings(ui);
     wire_sound(ui);
     wire_archive(ui);

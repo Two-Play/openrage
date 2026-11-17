@@ -7,6 +7,7 @@
 mod about;
 mod accent;
 mod archive_ops;
+mod asi_ui;
 mod audio;
 mod badges;
 mod browser;
@@ -57,6 +58,7 @@ use rage_mods::{ChangeKind, CompareMode, Origin};
 
 use about::*;
 use archive_ops::*;
+use asi_ui::*;
 use callbacks::*;
 use debug::*;
 use docs::*;
@@ -246,8 +248,18 @@ fn main() -> anyhow::Result<()> {
     });
     refresh_games(&ui);
     let ready = with_app(|app| app.game_dir.is_some() && (app.keys.is_some() || rdr2_ready));
+    // Several games and no default: a small start window asks first, then the
+    // explorer starts with the game chosen there.
     if ask {
-        ui.invoke_open_game_chooser(false);
+        match run_launcher(&ui) {
+            Ok(Some(LaunchChoice::Game(i, remember))) => open_game(&ui, i, remember),
+            Ok(Some(LaunchChoice::AddGame)) => show_setup(&ui, false),
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                eprintln!("start window: {e}");
+                ui.invoke_open_game_chooser(false);
+            }
+        }
     } else if ready {
         start_browsing(&ui);
     } else {
@@ -255,6 +267,8 @@ fn main() -> anyhow::Result<()> {
     }
     #[cfg(debug_assertions)]
     debug_snapshot(&ui);
+    // The start window (if any) closes once the explorer's event loop runs.
+    slint::Timer::single_shot(Duration::from_millis(300), close_launcher);
     let result = ui.run();
     gpu::shutdown();
     result?;

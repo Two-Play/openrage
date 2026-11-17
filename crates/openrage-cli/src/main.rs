@@ -256,6 +256,7 @@ fn run() -> Result<()> {
         Command::Mkdir { path } => cmd_edit(&game_dir, &path, Op::CreateDir, &format!("Created folder {path}"), keys),
         Command::History => cmd_history(&game_dir),
         Command::Oiv(cmd) => cmd_oiv(&game_dir, cmd, keys),
+        Command::Asi { cmd } => cmd_asi(&game_dir, cmd),
         Command::Plugin(cmd) => {
             let game: Arc<dyn openrage_plugins::GameFiles> =
                 Arc::new(openrage_app::plugins::GameDir::new(&game_dir, keys.clone()));

@@ -119,6 +119,10 @@ openrage replace-model x64i.rpf/…/prop_x.ydr hi.obj --lod med.obj --lod low.ob
 openrage oiv info mod.oiv                      # what a package would change
 openrage oiv install mod.oiv                   # install into the mods folder
 openrage oiv list / oiv uninstall "Name 1.0" [-y]   # installed packages, uninstall
+openrage asi                                   # GTA V: ASI loader, Script Hook V, .asi mods, why they would not load
+openrage asi disable NativeTrainer.asi         # put a mod aside (asi enable … puts it back)
+openrage asi install Speedo.asi                # copy into the game folder (openrage undo removes it)
+openrage asi proton on                         # Linux: let Proton load the game's ASI loader (off: take it back)
 openrage history                               # changes made to the mods folder
 openrage undo                                  # revert the newest change
 openrage mods                                  # files in the OpenIV mods folder

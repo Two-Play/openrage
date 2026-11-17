@@ -1,6 +1,7 @@
 //! One module per group of commands; `main.rs` dispatches to them.
 
 mod archive;
+mod asi;
 mod edit;
 mod oiv;
 mod plugin;
@@ -11,6 +12,7 @@ mod verify_gta4;
 mod view;
 
 pub(crate) use archive::*;
+pub(crate) use asi::*;
 pub(crate) use edit::*;
 pub(crate) use oiv::*;
 pub(crate) use plugin::*;
