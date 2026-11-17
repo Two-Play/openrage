@@ -34,32 +34,49 @@ pub fn load_clips(
 /// bone rests (the forearm, the upper arm). Without a track of their own they
 /// turn with that sibling, so skin weighted to them follows the limb. Only
 /// for GTA IV skeletons (`Char_…` bones); GTA V's helpers have expressions.
-fn follow_twist_bones(skeleton: &Skeleton, tracks: &mut [[Option<usize>; 3]]) {
+///
+/// A twist or roll helper turned against its sibling at rest (the forearm
+/// twist, about 20° about the arm) keeps that turn: the returned offset per
+/// bone (sibling's rest⁻¹ × own rest) follows the sibling's animated rotation.
+fn follow_twist_bones(skeleton: &Skeleton, tracks: &mut [[Option<usize>; 3]]) -> Vec<Option<[f32; 4]>> {
+    let mut offsets = vec![None; tracks.len()];
     if skeleton.find_name("Char_Pelvis").is_none() {
-        return;
+        return offsets;
     }
     let bones = &skeleton.bones;
     for (i, b) in bones.iter().enumerate() {
         if tracks[i][1].is_some() {
             continue;
         }
+        let lower = b.name.to_ascii_lowercase();
+        let helper = lower.contains("twist") || lower.contains("roll");
         let near = |o: &rage_formats::drawable::Bone| {
             let dt: f32 = (0..3).map(|k| (b.translation[k] - o.translation[k]).powi(2)).sum();
             let dot: f32 = (0..4).map(|k| b.rotation[k] * o.rotation[k]).sum();
-            dt < 0.03 * 0.03 && dot.abs() > 0.999
+            dt < 0.03 * 0.03 && (helper || dot.abs() > 0.999)
         };
         let sibling = (0..bones.len())
             .find(|&j| j != i && bones[j].parent == b.parent && tracks[j][1].is_some() && near(&bones[j]));
         if let Some(j) = sibling {
             tracks[i][1] = tracks[j][1];
+            let r = bones[j].rotation;
+            let offset = crate::expr::quat_mul([-r[0], -r[1], -r[2], r[3]], b.rotation);
+            // Only worth applying when the rests differ.
+            if offset[3].abs() < 0.9999 {
+                offsets[i] = Some(offset);
+            }
         }
     }
+    offsets
 }
 
 /// Which animation tracks drive which skeleton bones.
 pub struct Binding {
     /// Per bone: translation, rotation and scale track indices.
     tracks: Vec<[Option<usize>; 3]>,
+    /// Per bone: a turn after the animated rotation (helpers following a
+    /// sibling, see [`follow_twist_bones`]).
+    rotation_offsets: Vec<Option<[f32; 4]>>,
     /// Inverse bind pose per bone.
     inverse_bind: Vec<Mat4>,
     /// The ped's expressions bound to this skeleton and animation.
@@ -80,11 +97,11 @@ impl Binding {
             };
             tracks[b][slot] = Some(i);
         }
-        follow_twist_bones(skeleton, &mut tracks);
+        let rotation_offsets = follow_twist_bones(skeleton, &mut tracks);
         let inverse_bind = skeleton.world_transforms().iter().map(math::inverse_affine).collect();
         let parents =
             skeleton.bones.iter().enumerate().map(|(i, b)| usize::try_from(b.parent).ok().filter(|&p| p < i)).collect();
-        Self { tracks, inverse_bind, programs: Vec::new(), parents }
+        Self { tracks, rotation_offsets, inverse_bind, programs: Vec::new(), parents }
     }
 
     /// Also runs the ped's expressions each frame (face and helper bones).
@@ -130,7 +147,11 @@ impl Binding {
                 let value = |track: Option<usize>| track.and_then(|k| animation.value(k, frame));
                 Local {
                     translation: value(t).map_or(r.translation, |v| [v[0], v[1], v[2]]),
-                    rotation: value(rot).unwrap_or(r.rotation),
+                    rotation: match (value(rot), self.rotation_offsets.get(i).copied().flatten()) {
+                        (Some(q), Some(offset)) => crate::expr::quat_mul(q, offset),
+                        (Some(q), None) => q,
+                        (None, _) => r.rotation,
+                    },
                     scale: value(s).map_or(r.scale, |v| [v[0], v[1], v[2]]),
                 }
             })
@@ -171,4 +192,48 @@ pub fn skin_point(skin: &[Mat4], indices: [u16; 4], weights: [f32; 4], p: [f32; 
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rage_formats::clip::BoneTrack;
+    use rage_formats::drawable::Bone;
+
+    #[test]
+    fn twist_helpers_keep_their_turn() {
+        let bone = |name: &str, tag, parent, translation, rotation| Bone {
+            name: name.into(),
+            tag,
+            parent,
+            translation,
+            rotation,
+            scale: [1.0; 3],
+        };
+        // The twist rests on the forearm, turned 40° about the arm (X).
+        let (s, c) = (20f32.to_radians().sin(), 20f32.to_radians().cos());
+        let skeleton = Skeleton {
+            bones: vec![
+                bone("Char_Pelvis", 0, -1, [0.0; 3], [0.0, 0.0, 0.0, 1.0]),
+                bone("Char_R_Forearm", 1, 0, [0.3, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]),
+                bone("Char_R_ForeTwist", 2, 0, [0.3, 0.0, 0.0], [s, 0.0, 0.0, c]),
+            ],
+        };
+        // The forearm turns 90° about Z.
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let animation = Animation::from_frames(
+            1,
+            0.0,
+            vec![BoneTrack { bone: 1, format: 1, track: TRACK_BONE_ROTATION }],
+            vec![vec![[0.0, 0.0, h, h]]],
+        );
+        let binding = Binding::new(&skeleton, &animation);
+        let skin = binding.skin(&skeleton, &animation, 0.0);
+        // The twist's skin matrix moves its vertices as the forearm's do.
+        let p = [0.6, 0.1, 0.0];
+        let (a, b) = (math::transform_point(&skin[1], p), math::transform_point(&skin[2], p));
+        for k in 0..3 {
+            assert!((a[k] - b[k]).abs() < 1e-5, "{a:?} {b:?}");
+        }
+    }
 }

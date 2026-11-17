@@ -16,6 +16,7 @@ pub mod geometry;
 pub mod gltf;
 pub mod gxt;
 pub mod gxt2;
+pub mod ivaud;
 pub mod ldb;
 pub mod math;
 pub mod media;

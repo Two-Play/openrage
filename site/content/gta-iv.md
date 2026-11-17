@@ -143,8 +143,11 @@ Double-click a placement file (`.wpl`) to see its objects in 3D, with the object
   puts them together, for example a whole part of Algonquin with 2,483 objects.
 - Models come from the archive next to the placement file first, then from anywhere in the game.
 - Low-detail stand-ins (`lod…`, `slod…`) are left out unless a file holds nothing else.
+- **Interiors** (offices, shops, bars, the portacabins of the docks) are placed as one object whose contents the
+  `.ide` files list (`mlo` sections): they show with everything inside.
 
-**Checked:** of 435,116 placed objects, all but 1,434 have a model (their names are in no `.ide` file).
+**Checked:** 1,375 placed interiors expanded; of the 492,802 objects then placed, all but 59 have a model (their names
+are in no `.ide` file).
 
 ## Collisions
 
@@ -170,7 +173,8 @@ characters (`cs_*` in `cutsprops.img`), whose faces have a fuller rig.
   selecting one offers the fitting models.
 - The cutscene characters' skin shaders (`gta_ped_skin…`) keep other data in the texture's alpha channel; OpenRAGE
   draws them opaque (also in the glTF export), so their heads show.
-- Twist and roll helper bones follow the bone they rest on, so arms stay in one piece.
+- Twist and roll helper bones follow the bone they rest on, keeping their own turn, so arms and wrists stay in one
+  piece.
 
 ```
 openrage clips <path to .wad>
@@ -189,19 +193,35 @@ scene window, the way GTA V cutscenes play. Its sections (`b_1_0.wad`, `b_1_1.wa
   vehicles and map objects by name. The player is put together from `playerped.rpf` — Niko, Johnny or Luis, after
   the episode the cutscene belongs to. People play their body and facial clips; actors a section leaves out are
   hidden while it plays.
+- **Outfits:** people wear what the cutscene's `[VARIATION]` lines give them — which variant of each part (head,
+  upper body, legs, hands, …) and its texture variant — and change them where the cutscene says (a time into the
+  section, or into the cutscene when it is longer than the section).
+- **Accessories** (`[PROPS]`): hats, glasses, earrings and watches from the person's prop dictionary
+  (`pedprops.img`), on the head or wrist they belong to.
+- **Vehicle colours** (`[VEHICLE_DETAILS]`) from `carcols.dat`: the paint materials take the cutscene's colours.
+- **The map around it**, interiors included, from the episode's placement files. Objects the cutscene replaces with
+  its own copies (`[REMOVE]`, a door that opens, a phone that is picked up) are left out. Sections that move to
+  another place are put where they play.
 - **The camera** of each section, with its field of view, or a free camera (drag or scroll).
+- **Lights:** the key, fill and rim lights each section animates (`[LIGHTS]`): where they are, their colour, reach,
+  intensity and cone, switched on and off as the cutscene does (**Lights off** in the window).
+- **Sound** from `pc/audio/sfx/cutscenes.rpf` (the episodes' `EP1_SFX.rpf`, `EP2_SFX.rpf`): the streams are decoded
+  (IMA ADPCM, three channels — middle, left, right — mixed to stereo) and play with the scene, following pause and
+  the time slider (**Sound off** in the window). A section that names no sound lets the one before run on.
 - **Subtitles** from the episode's `american.gxt`.
 
-The map around the scene is not shown yet. The text stays reachable through the context menu (**Open in text editor**).
+The text stays reachable through the context menu (**Open in text editor**).
 
 ```
-openrage cutscene pc/anim/cuts.img/b_1.cut     # sections, cast with their models, subtitles
+openrage cutscene pc/anim/cuts.img/b_1.cut [--models] [--map 40]   # sections, cast, subtitles; outfits, map
 openrage verify --cutscenes                    # every .cut: sections, clips, camera and models
 ```
 
-**Checked:** 344 cutscenes (8.4 hours, 803 sections, 2,942 actors), every model found. Two cutscenes lack a piece in
-the game's own files: `TBoGT/…/gt11_xa.cut` has no `gt11_xa_0.wad`, and `int_ae.cut` names a clip its dictionary
-does not have.
+**Checked:** 344 cutscenes (8.4 hours, 803 sections, 2,942 actors), every model found, 493 minutes of sound decoded,
+234 of 238 accessories found. Particle effects (`[EFFECTS]`: blood, shell casings) are not shown.
+Two cutscenes lack a piece in the game's own files: `TBoGT/…/gt11_xa.cut` has no `gt11_xa_0.wad`, and `int_ae.cut`
+names a clip its dictionary does not have. 72 sounds cutscenes name are not in the game (mostly those of the
+`…p1`/`…p2` part cutscenes of TBoGT, and the intro's `rom1_a`).
 
 ## Editing
 

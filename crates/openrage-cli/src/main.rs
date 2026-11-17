@@ -182,7 +182,7 @@ fn run() -> Result<()> {
         Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
         Command::Verify { path, cutscenes: true, .. } if gta4 => cmd_verify_gta4_cutscenes(&game_dir, &path),
         Command::Verify { cutscenes: true, .. } => bail!("--cutscenes checks GTA IV cutscenes; this is not GTA IV"),
-        Command::Cutscene { path, models } => cmd_gta4_cutscene(&game_dir, &path, models),
+        Command::Cutscene { path, models, map } => cmd_gta4_cutscene(&game_dir, &path, models, map),
         Command::Rdr2Ped { name, outfit, check, load } => cmd_rdr2_ped(&game_dir, name.as_deref(), outfit, check, load),
         Command::Verify { path, animations: true, .. } if gta4 => cmd_verify_gta4_animations(&game_dir, &path),
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),

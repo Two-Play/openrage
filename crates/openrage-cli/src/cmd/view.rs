@@ -285,19 +285,31 @@ pub(crate) fn check_maps_gta4(game_dir: &Path, started: Instant) -> Result<()> {
             }
         });
     }
-    let (mut objects, mut unnamed, mut no_file) = (0usize, 0usize, 0usize);
+    let (mut objects, mut unnamed, mut no_file, mut interiors) = (0usize, 0usize, 0usize, 0usize);
     let mut missing: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut check = |name: &str| {
+        objects += 1;
+        // Without a name (counted by the caller) or without a file.
+        if !name.is_empty() && index.model_source(name, game_dir, game_dir).is_none() {
+            no_file += 1;
+            *missing.entry(name.to_owned()).or_default() += 1;
+        }
+    };
     for (_, data) in &files {
         let Ok(wpl) = rage_formats::wpl::parse(data) else { continue };
         for i in &wpl.instances {
-            objects += 1;
+            // An interior: the objects inside it.
+            if let Some(inside) = index.mlo_entities(i.model_hash) {
+                interiors += 1;
+                inside.iter().for_each(|e| check(&e.model));
+                continue;
+            }
             match index.model_name(i.model_hash) {
-                None => unnamed += 1,
-                Some(n) if index.model_source(&n, game_dir, game_dir).is_none() => {
-                    no_file += 1;
-                    *missing.entry(n).or_default() += 1;
+                None => {
+                    check("");
+                    unnamed += 1;
                 }
-                Some(_) => {}
+                Some(n) => check(&n),
             }
         }
     }
@@ -307,7 +319,7 @@ pub(crate) fn check_maps_gta4(game_dir: &Path, started: Instant) -> Result<()> {
         outln!("  no model file: {n:>4} × {name}");
     }
     outln!(
-        "{} placement files, {objects} objects: {} with a model, {unnamed} with an unknown model name, {no_file} whose model was not found ({:.1}s)",
+        "{} placement files, {objects} objects ({interiors} interiors expanded): {} with a model, {unnamed} with an unknown model name, {no_file} whose model was not found ({:.1}s)",
         files.len(),
         objects - unnamed - no_file,
         started.elapsed().as_secs_f32()

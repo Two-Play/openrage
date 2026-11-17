@@ -680,6 +680,10 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
         no_model: Vec<String>,
         problems: Vec<String>,
         seconds: f32,
+        /// Seconds of sound decoded.
+        sound: f32,
+        /// Accessories named, and found.
+        props: (usize, usize),
     }
     let results: Vec<(String, Result<Checked>)> = cuts
         .par_iter()
@@ -695,18 +699,31 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
                     .filter(|(_, m)| gta4_cutscene::find_model(game_dir, vpath, m).is_none())
                     .map(|(_, m)| m.clone())
                     .collect();
+                let (sound, missing_sound) = gta4_cutscene::audio(game_dir, vpath, &cut);
+                let mut props = (0, 0);
+                for (key, model) in &actors {
+                    let chosen = cut.props(key);
+                    props.0 += chosen.len();
+                    props.1 += gta4_cutscene::load_props(game_dir, vpath, model, &chosen).len();
+                }
+                let mut problems = animated.problems;
+                problems.extend(missing_sound.into_iter().map(|n| format!("no sound {n}")));
                 Ok(Checked {
                     sections: cut.sections.len(),
                     actors: actors.len(),
                     no_model,
-                    problems: animated.problems,
+                    problems,
                     seconds: cut.duration(),
+                    sound: sound.map_or(0.0, |p| p.duration_secs()),
+                    props,
                 })
             })();
             (vpath.clone(), checked)
         })
         .collect();
     let (mut sections, mut actors, mut seconds, mut no_model, mut problems, mut ok) = (0, 0, 0.0, 0, 0, 0);
+    let mut sound = 0.0;
+    let mut props = (0, 0);
     for (vpath, r) in results {
         match r {
             Ok(c) => {
@@ -714,6 +731,8 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
                 sections += c.sections;
                 actors += c.actors;
                 seconds += c.seconds;
+                sound += c.sound;
+                props = (props.0 + c.props.0, props.1 + c.props.1);
                 no_model += c.no_model.len();
                 problems += c.problems.len();
                 if !c.no_model.is_empty() {
@@ -730,10 +749,14 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
         outln!("FAIL {e}");
     }
     outln!(
-        "{} cutscenes ({ok} read, {:.0} minutes), {sections} sections, {actors} actors, \
-         {no_model} without a model, {problems} clips or dictionaries missing, {} errors ({:.1}s)",
+        "{} cutscenes ({ok} read, {:.0} minutes, {:.0} minutes of sound), {sections} sections, {actors} actors, \
+         {no_model} without a model, {} of {} accessories found, {problems} clips, dictionaries or sounds missing, \
+         {} errors ({:.1}s)",
         cuts.len(),
         seconds / 60.0,
+        sound / 60.0,
+        props.1,
+        props.0,
         errors.len(),
         started.elapsed().as_secs_f32()
     );
@@ -744,7 +767,7 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
 }
 
 /// Shows a GTA IV cutscene: sections, cast with models and clips, subtitles.
-pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool) -> Result<()> {
+pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool, map: Option<f32>) -> Result<()> {
     use openrage_app::gta4_cutscene;
     let started = Instant::now();
     let scene = gta4_cutscene::load(game_dir, vpath)?;
@@ -786,6 +809,26 @@ pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool)
     for p in &scene.animated.problems {
         outln!("missing: {p}");
     }
+    for (actor, props) in scene.cutscene.actors.iter().zip(&scene.props) {
+        if !props.is_empty() {
+            let loaded = gta4_cutscene::load_props(game_dir, vpath, &actor.name, props);
+            let names: Vec<String> = props.iter().filter_map(|p| p.name()).collect();
+            outln!("  {} wears {} ({} of {} found)", actor.name, names.join(", "), loaded.len(), props.len());
+        }
+    }
+    for (actor, changes) in scene.cutscene.actors.iter().zip(&scene.outfit_changes) {
+        if !changes.is_empty() {
+            let at: Vec<String> = changes.iter().map(|(t, _)| format!("{t:.1}s")).collect();
+            outln!("  {} changes outfit at {}", actor.name, at.join(", "));
+        }
+    }
+    match &scene.audio {
+        Some(pcm) => outln!("sound: {:.1}s, {} Hz", pcm.duration_secs(), pcm.sample_rate),
+        None => outln!("sound: none"),
+    }
+    for name in &scene.missing_audio {
+        outln!("missing: sound {name}");
+    }
     for (start, end, text) in scene.subtitles.iter().take(5) {
         outln!("  {start:7.2}–{end:7.2}s  {}", text.replace('\n', " / "));
     }
@@ -799,8 +842,30 @@ pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool)
             .models
             .par_iter()
             .zip(&scene.cutscene.actors)
-            .filter_map(|(l, a)| Some(gta4_cutscene::load_model(game_dir, &a.name, l.as_ref()?)))
+            .zip(&scene.outfits)
+            .filter_map(|((l, a), outfit)| Some(gta4_cutscene::load_model(game_dir, &a.name, l.as_ref()?, outfit)))
             .collect();
+        // What the people with an outfit wear.
+        let dressed =
+            scene.models.iter().zip(&scene.cutscene.actors).zip(&scene.outfits).filter(|((l, _), _)| l.is_some());
+        for (((_, actor), outfit), model) in dressed.zip(&loaded) {
+            let Ok(model) = model else { continue };
+            if outfit.is_empty() {
+                continue;
+            }
+            let shown: Vec<String> = model
+                .parts
+                .iter()
+                .filter(|p| p.visible)
+                .map(|p| {
+                    let d = &model.drawables[p.drawable].1;
+                    let diffuse =
+                        d.shaders.iter().flat_map(|s| &s.textures).find(|t| t.to_ascii_lowercase().contains("_diff_"));
+                    format!("{} ({})", p.name, diffuse.map_or("-", |t| t.as_str()))
+                })
+                .collect();
+            outln!("  {} wears {}", actor.name, shown.join(", "));
+        }
         let textures: usize =
             loaded.iter().flatten().map(|m| m.external.iter().map(|(_, d)| d.textures.len()).sum::<usize>()).sum();
         for e in loaded.iter().filter_map(|r| r.as_ref().err()) {
@@ -810,6 +875,21 @@ pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool)
             "{} of {} models loaded, {textures} textures ({:.2}s)",
             loaded.iter().filter(|r| r.is_ok()).count(),
             loaded.len(),
+            started.elapsed().as_secs_f32()
+        );
+    }
+    if let Some(radius) = map {
+        let started = Instant::now();
+        let centres: Vec<[f32; 3]> = cut.sections.iter().map(|s| s.offset).collect();
+        let remove: Vec<([f32; 3], String)> = cut.sections.iter().flat_map(|s| s.remove.iter().cloned()).collect();
+        let episode = gta4_cutscene::episode(vpath);
+        let around = openrage_app::gta4::load_objects_near(game_dir, episode, &centres, radius, &remove, &|_, _| {})?;
+        outln!(
+            "map: {} objects, {} models, {} without a model, {} removed by the cutscene ({:.2}s)",
+            around.objects,
+            around.models.len(),
+            around.missing.iter().map(|(_, n)| n).sum::<usize>(),
+            remove.len(),
             started.elapsed().as_secs_f32()
         );
     }
