@@ -25,6 +25,11 @@ fn plugin_dir() -> &'static Path {
                 "--release",
                 "--target",
                 "wasm32-wasip2",
+                // Where the .wasm files are picked up below, also when the
+                // caller set CARGO_TARGET_DIR (e.g. a target folder shared
+                // between checkouts).
+                "--target-dir",
+                "target",
                 "-p",
                 "strings",
                 "-p",
