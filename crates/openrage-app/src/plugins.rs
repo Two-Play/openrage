@@ -126,19 +126,21 @@ impl GameFiles for GameDir {
         let Node::ArchiveFile(rpf, id) = self.resolve(template)? else {
             bail!("{template} is not a model inside an archive")
         };
-        if !template.to_ascii_lowercase().ends_with(".ydr") {
-            bail!("{template}: only drawables (.ydr) can be built so far");
+        let lower = template.to_ascii_lowercase();
+        if !lower.ends_with(".ydr") && !lower.ends_with(".yft") {
+            bail!("{template}: only drawables (.ydr) and fragments (.yft) can be built so far");
         }
         let res = rpf.read_resource(id)?;
-        let (levels, materials) = plugin_meshes(model, &ydr_write::usable_shaders(&res)?)?;
+        let own = ydr_write::bones_with_own_models(&res);
+        let mut bones = ydr_write::skinned_bones(&res)?.map(|b| crate::obj::Bones::new(b).with_own_models(own));
+        let (levels, materials) = plugin_meshes(model, &ydr_write::shader_infos(&res)?, bones.as_mut())?;
         let donor = (materials.iter().any(|m| m.texture.is_some()) && !ydr_write::can_donate_textures(&res))
             .then(|| crate::obj::find_texture_donor(&self.dir, template, self.keys.clone()))
             .flatten();
         let refs: Vec<&[ydr_write::NewMesh]> = levels.iter().map(Vec::as_slice).collect();
         let file = ydr_write::replace_lods(&res, &refs, Some(&materials), donor.as_ref())?;
         // What the game gets must read back.
-        drawable::parse_ydr(&rage_resource::Resource::from_rsc7(&file)?)
-            .context("the built model does not read back")?;
+        ydr_write::read_back(&file).context("the built model does not read back")?;
         Ok(file)
     }
 
@@ -241,19 +243,23 @@ impl GameFiles for GameDir {
 /// as its texture, named after `texture` or the material) and the meshes per
 /// detail level: meshes whose part ends in `_lod1`, `_lod2` or `_lod3` (or is
 /// `lod1` …) go to the further levels. Meshes too large for one geometry are
-/// split.
+/// split. With `bones` (skinned templates: vehicles), each part goes on the
+/// bone of its name (without the level suffix), others on the body.
 pub fn plugin_meshes(
     model: &Model,
-    shaders: &[u16],
+    infos: &[rage_formats::ydr_write::ShaderInfo],
+    mut bones: Option<&mut crate::obj::Bones>,
 ) -> Result<(Vec<Vec<rage_formats::ydr_write::NewMesh>>, Vec<rage_formats::ydr_write::NewMaterial>)> {
     use rage_formats::ydr_write::{NewMaterial, NewMesh, texture_from_rgba};
+    let shaders: Vec<u16> = infos.iter().map(|i| i.index).collect();
     let Some(&last) = shaders.last() else { bail!("the template has no shader meshes can use") };
     let mut materials = Vec::new();
     for (i, m) in model.materials.iter().enumerate() {
         let shader = match m.name.strip_prefix('#').map(str::parse::<u16>) {
             Some(Ok(n)) if shaders.contains(&n) => n,
             Some(_) => bail!("material {:?}: the template has the shaders {shaders:?}", m.name),
-            None => shaders.get(i).copied().unwrap_or(last),
+            None => crate::obj::shader_named(infos, &m.name, (!m.texture.is_empty()).then_some(m.texture.as_str()))
+                .unwrap_or_else(|| shaders.get(i).copied().unwrap_or(last)),
         };
         let texture = match &m.image {
             Some(img) => {
@@ -262,6 +268,7 @@ pub fn plugin_meshes(
             }
             None => None,
         };
+        let (texture, _) = crate::obj::fit_texture(infos, shader, texture);
         materials.push(NewMaterial { shader, texture });
     }
     let level_of = |part: &str| -> usize {
@@ -273,6 +280,11 @@ pub fn plugin_meshes(
         if m.material as usize >= materials.len() {
             bail!("mesh with an unknown material");
         }
+        if bones.as_deref_mut().is_some_and(|b| b.leaves_out(&m.part)) {
+            continue;
+        }
+        let n = m.positions.len() / 3;
+        let bone = bones.as_deref_mut().map(|b| b.bone_of(&m.part));
         levels[level_of(&m.part)].extend(crate::obj::split(NewMesh {
             shader: m.material as u16,
             positions: m.positions.as_chunks::<3>().0.to_vec(),
@@ -280,6 +292,7 @@ pub fn plugin_meshes(
             uvs: m.uvs.as_chunks::<2>().0.to_vec(),
             colors: Vec::new(),
             indices: m.indices.clone(),
+            bones: bone.map(|b| vec![b; n]).unwrap_or_default(),
         }));
     }
     if levels[0].is_empty() {
@@ -315,7 +328,10 @@ pub fn to_plugin_model(model: &crate::models::LoadedModel) -> Model {
     let main_shaders = model.drawables.first().map(|(_, d)| d.shaders.as_slice()).unwrap_or_default();
     for (part, d) in model.shown(&visible) {
         let shaders = if d.shaders.is_empty() { main_shaders } else { d.shaders.as_slice() };
-        for m in &d.meshes {
+        let bone_names: Vec<&str> =
+            d.skeleton.as_ref().map(|s| s.bones.iter().map(|b| b.name.as_str()).collect()).unwrap_or_default();
+        for (bone, m) in d.meshes.iter().flat_map(|m| by_bone(m, &bone_names)) {
+            let m = &m;
             let Some(shader) = shaders.get(m.shader as usize) else { continue };
             let texture = shader.base_texture().unwrap_or_default().to_owned();
             // Same shader kind and texture: one material.
@@ -336,7 +352,7 @@ pub fn to_plugin_model(model: &crate::models::LoadedModel) -> Model {
             let flat =
                 |v: &[[f32; 3]], f: &dyn Fn([f32; 3]) -> [f32; 3]| v.iter().flat_map(|p| f(*p)).collect::<Vec<_>>();
             meshes.push(Mesh {
-                part: part.name.clone(),
+                part: bone.map_or_else(|| part.name.clone(), str::to_owned),
                 positions: flat(&m.positions, &|p| math::transform_point(&part.transform, p)),
                 normals: flat(&m.normals, &|n| math::transform_dir(&part.transform, n)),
                 uvs: m.uvs.iter().flatten().copied().collect(),
@@ -346,6 +362,52 @@ pub fn to_plugin_model(model: &crate::models::LoadedModel) -> Model {
         }
     }
     Model { meshes, materials: materials.into_iter().map(|(_, m)| m).collect() }
+}
+
+/// A mesh whose every vertex moves with one bone (vehicle bodies) split by
+/// bone, each piece with its bone's name, so that exported parts can be put
+/// back on their bones on import; other meshes (peds, blended between
+/// bones) stay whole. A triangle goes with the bone of its first corner.
+fn by_bone<'a>(m: &drawable::Mesh, bones: &[&'a str]) -> Vec<(Option<&'a str>, drawable::Mesh)> {
+    let rigid = !bones.is_empty()
+        && m.bone_indices.len() == m.positions.len()
+        && m.bone_weights.iter().all(|w| w.iter().filter(|&&x| x > 0.0).count() == 1);
+    if !rigid {
+        return vec![(None, m.clone())];
+    }
+    let main = |i: u32| {
+        let (b, w) = (m.bone_indices[i as usize], m.bone_weights[i as usize]);
+        b[(0..4).find(|&k| w[k] > 0.0).unwrap_or(0)]
+    };
+    let mut pieces: Vec<(u16, drawable::Mesh, std::collections::HashMap<u32, u32>)> = Vec::new();
+    for t in m.indices.as_chunks::<3>().0 {
+        let bone = main(t[0]);
+        let at = match pieces.iter().position(|(b, _, _)| *b == bone) {
+            Some(k) => k,
+            None => {
+                let piece = drawable::Mesh { shader: m.shader, ..Default::default() };
+                pieces.push((bone, piece, std::collections::HashMap::new()));
+                pieces.len() - 1
+            }
+        };
+        let (_, piece, map) = &mut pieces[at];
+        for &i in t {
+            let k = *map.entry(i).or_insert_with(|| {
+                let k = piece.positions.len() as u32;
+                let i = i as usize;
+                piece.positions.push(m.positions[i]);
+                if let Some(n) = m.normals.get(i) {
+                    piece.normals.push(*n);
+                }
+                if let Some(uv) = m.uvs.get(i) {
+                    piece.uvs.push(*uv);
+                }
+                k
+            });
+            piece.indices.push(k);
+        }
+    }
+    pieces.into_iter().map(|(b, piece, _)| (bones.get(b as usize).copied().filter(|n| !n.is_empty()), piece)).collect()
 }
 
 /// A plugin's model for the 3D view: one drawable per part, one shader per
@@ -696,6 +758,13 @@ pub fn apply_writes(
 mod tests {
     use super::*;
 
+    /// Shaders without texture names, all taking textures.
+    fn plain(ids: &[u16]) -> Vec<rage_formats::ydr_write::ShaderInfo> {
+        ids.iter()
+            .map(|&index| rage_formats::ydr_write::ShaderInfo { index, texture: None, takes_texture: true })
+            .collect()
+    }
+
     #[test]
     fn applies_writes_to_mods_with_undo() {
         let tmp = std::env::temp_dir().join(format!("openrage-app-plugin-writes-{}", std::process::id()));
@@ -800,15 +869,15 @@ mod tests {
             meshes: vec![mesh(0, "body"), mesh(1, ""), mesh(2, "body_LOD1"), mesh(3, "lod2")],
             materials: vec![material("a"), material("#0"), textured, material("d")],
         };
-        let (levels, materials) = plugin_meshes(&model, &[0, 3]).unwrap();
+        let (levels, materials) = plugin_meshes(&model, &plain(&[0, 3]), None).unwrap();
         assert_eq!(materials.iter().map(|m| m.shader).collect::<Vec<_>>(), [0, 0, 3, 3]);
         assert_eq!(materials[2].texture.as_ref().unwrap().name, "c");
         assert_eq!(levels.iter().map(Vec::len).collect::<Vec<_>>(), [2, 1, 1]);
         assert_eq!(levels[1][0].shader, 2, "meshes keep their material index");
         let pinned = Model { meshes: vec![mesh(0, "")], materials: vec![material("#7")] };
-        assert!(plugin_meshes(&pinned, &[0, 3]).is_err());
+        assert!(plugin_meshes(&pinned, &plain(&[0, 3]), None).is_err());
         let only_lod = Model { meshes: vec![mesh(0, "x_lod1")], materials: vec![material("a")] };
-        assert!(plugin_meshes(&only_lod, &[0]).is_err());
+        assert!(plugin_meshes(&only_lod, &plain(&[0]), None).is_err());
     }
 
     #[test]

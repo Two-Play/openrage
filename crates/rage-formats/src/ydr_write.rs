@@ -48,7 +48,7 @@
 use rage_resource::builder::{BlockId, Builder, Segment};
 use rage_resource::{Resource, ResourceError};
 
-use crate::drawable::{Gen, VERSION_YDR_ENHANCED, param};
+use crate::drawable::{VERSION_YDR_ENHANCED, VERSION_YFT_ENHANCED, param};
 use crate::texture::{Dimension, Format, Texture};
 use crate::ytd::Layout as DictLayout;
 use crate::ytd_write::{guess_usage, name_hash, write_fields};
@@ -188,6 +188,10 @@ pub struct NewMesh {
     pub colors: Vec<[f32; 4]>,
     /// Three per triangle.
     pub indices: Vec<u32>,
+    /// The skeleton bone each vertex moves with (index into the skeleton),
+    /// for templates whose meshes are skinned (vehicles); empty: the first
+    /// bone. Ignored for templates with fixed meshes.
+    pub bones: Vec<u16>,
 }
 
 fn bad(msg: impl Into<String>) -> ResourceError {
@@ -202,6 +206,22 @@ struct TemplateGeometry {
     model: u64,
     stride: usize,
     layout: Layout,
+    /// Skinned: the geometry's bone table (skeleton indices); the vertices'
+    /// blend indices point into it.
+    bones: Option<Vec<u16>>,
+}
+
+/// The drawable of a template: the root of a `.ydr`, the main drawable of
+/// a `.yft` (at `0x30` of the fragment).
+fn drawable_root(res: &Resource) -> Result<u64, ResourceError> {
+    if res.version != VERSION_YFT_ENHANCED {
+        return Ok(SYS);
+    }
+    let d = res.u64(SYS + 0x30)?;
+    if !(SYS..GFX).contains(&d) {
+        return Err(bad("the fragment has no drawable"));
+    }
+    Ok(d)
 }
 
 /// The slots of a vertex declaration that hold something.
@@ -246,10 +266,15 @@ fn read_layout(res: &Resource, decl: u64, stride: usize) -> Result<Layout, Resou
 }
 
 /// The template's geometries, one per shader index (the first found).
+/// Fixed (unskinned) geometries when the template has any; otherwise the
+/// skinned ones (vehicles: the whole body is one skinned model, every vertex
+/// moving with one bone).
 fn template_geometries(res: &Resource) -> Result<Vec<(u16, TemplateGeometry)>, ResourceError> {
-    let mut out: Vec<(u16, TemplateGeometry)> = Vec::new();
+    let root = drawable_root(res)?;
+    let mut fixed: Vec<(u16, TemplateGeometry)> = Vec::new();
+    let mut skinned: Vec<(u16, TemplateGeometry)> = Vec::new();
     for lod in 0..4 {
-        let list = res.u64(SYS + 0x50 + lod * 8)?;
+        let list = res.u64(root + 0x50 + lod * 8)?;
         if list == 0 {
             continue;
         }
@@ -259,27 +284,45 @@ fn template_geometries(res: &Resource) -> Result<Vec<(u16, TemplateGeometry)>, R
             if model == 0 {
                 continue;
             }
-            let binding = res.u32(model + 0x28)?;
-            if (binding >> 8) & 0xFF != 0 {
-                continue; // skinned: needs bone data this writer does not produce
-            }
+            let is_skinned = (res.u32(model + 0x28)? >> 8) & 0xFF != 0;
             let geoms = res.u64(model + 0x08)?;
             let mapping = res.u64(model + 0x20)?;
             for g in 0..res.u16(model + 0x10)? as u64 {
                 let geometry = res.u64(geoms + g * 8)?;
                 let shader = if mapping != 0 { res.u16(mapping + g * 2)? } else { 0 };
-                if out.iter().any(|(s, _)| *s == shader) || res.u64(geometry + 0x68)? != 0 {
+                let out = if is_skinned { &mut skinned } else { &mut fixed };
+                if out.iter().any(|(s, _)| *s == shader) {
                     continue;
                 }
+                let table = res.u64(geometry + 0x68)?;
                 let vertex_buffer = res.u64(geometry + 0x18)?;
                 let index_buffer = res.u64(geometry + 0x38)?;
                 let stride = res.u32(vertex_buffer + 0x0C)? as usize;
-                let layout = read_layout(res, res.u64(vertex_buffer + 0x38)?, stride)?;
-                out.push((shader, TemplateGeometry { geometry, vertex_buffer, index_buffer, model, stride, layout }));
+                let decl = res.u64(vertex_buffer + 0x38)?;
+                let (layout, bones) = if is_skinned {
+                    // Skinned geometries this writer cannot fill are skipped.
+                    let Ok(layout) = read_layout(res, decl, stride) else { continue };
+                    let blend = |slot, format| layout.slots.iter().any(|&(s, _, f)| s == slot && f == format);
+                    let count = res.u16(geometry + 0x72)? as u64;
+                    if table == 0 || count == 0 || count > 256 || !blend(16, 28) || !blend(20, 30) {
+                        continue;
+                    }
+                    let bones = (0..count).map(|i| res.u16(table + i * 2)).collect::<Result<Vec<_>, _>>()?;
+                    (layout, Some(bones))
+                } else {
+                    if table != 0 {
+                        continue;
+                    }
+                    (read_layout(res, decl, stride)?, None)
+                };
+                out.push((
+                    shader,
+                    TemplateGeometry { geometry, vertex_buffer, index_buffer, model, stride, layout, bones },
+                ));
             }
         }
     }
-    Ok(out)
+    Ok(if fixed.is_empty() { skinned } else { fixed })
 }
 
 /// The shader indices of the template that meshes can use.
@@ -290,14 +333,133 @@ pub fn usable_shaders(template: &Resource) -> Result<Vec<u16>, ResourceError> {
     Ok(s)
 }
 
+/// A shader of the template that meshes can use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShaderInfo {
+    /// Its index among the template's shaders.
+    pub index: u16,
+    /// The name of its colour texture, if it has one.
+    pub texture: Option<String>,
+    /// Whether a copy can take a texture of its own (it has a colour slot).
+    pub takes_texture: bool,
+}
+
+/// The shaders meshes can use ([`usable_shaders`]), with their colour
+/// texture and whether a material's texture can be bound to a copy.
+pub fn shader_infos(template: &Resource) -> Result<Vec<ShaderInfo>, ResourceError> {
+    let usable = usable_shaders(template)?;
+    let drawable = if template.version == VERSION_YFT_ENHANCED {
+        crate::drawable::parse_yft(template)?
+    } else {
+        crate::drawable::parse_ydr(template)?
+    };
+    let group = template.u64(drawable_root(template)? + 0x10)?;
+    let list = if group != 0 { template.u64(group + 0x10)? } else { 0 };
+    let mut out = Vec::new();
+    for index in usable {
+        let ptr = if list != 0 { template.u64(list + u64::from(index) * 8)? } else { 0 };
+        let takes_texture = ptr != 0
+            && colour_slot(template, ptr).is_ok_and(|slot| {
+                template
+                    .u64(ptr + 0x10)
+                    .is_ok_and(|refs| refs != 0 && template.u64(refs + slot as u64 * 8).is_ok_and(|r| r != 0))
+            });
+        let texture = drawable.shaders.get(index as usize).and_then(|s| s.base_texture()).map(str::to_owned);
+        out.push(ShaderInfo { index, texture, takes_texture });
+    }
+    Ok(out)
+}
+
+/// The bone names of the template's skeleton when its meshes are skinned
+/// (vehicles), so parts can be put on bones ([`NewMesh::bones`]); `None`
+/// for templates with fixed meshes.
+pub fn skinned_bones(template: &Resource) -> Result<Option<Vec<String>>, ResourceError> {
+    check_template(template)?;
+    if !template_geometries(template)?.iter().any(|(_, t)| t.bones.is_some()) {
+        return Ok(None);
+    }
+    let d = crate::drawable::read_drawable(template, drawable_root(template)?, true)?;
+    Ok(d.skeleton.map(|s| s.bones.into_iter().map(|b| b.name).collect()))
+}
+
+/// The bones of a fragment that have a model of their own (vehicle wheels,
+/// drawn by the fragment's children); empty for drawables. Meshes put on
+/// them would be drawn twice.
+pub fn bones_with_own_models(template: &Resource) -> Vec<String> {
+    if template.version != VERSION_YFT_ENHANCED {
+        return Vec::new();
+    }
+    let Ok(d) = drawable_root(template) else { return Vec::new() };
+    let Some(skeleton) = crate::drawable::read_drawable(template, d, true).ok().and_then(|d| d.skeleton) else {
+        return Vec::new();
+    };
+    // Every child, also those sharing a model (the four wheels share one).
+    let tags = || -> Result<Vec<u16>, ResourceError> {
+        let group = template.u64(SYS + 0xF0)?;
+        if group == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(lod) = (0..3).map(|i| template.u64(group + 0x10 + i * 8)).find_map(|p| p.ok().filter(|&p| p != 0))
+        else {
+            return Ok(Vec::new());
+        };
+        let list = template.u64(lod + 0xD0)?;
+        let mut tags = Vec::new();
+        for i in 0..template.u8(lod + 0x11E)? as u64 {
+            let child = template.u64(list + i * 8)?;
+            if child == 0 {
+                continue;
+            }
+            let drawable = template.u64(child + 0xA0)?;
+            if drawable != 0 && template.u64(drawable + 0x50)? != 0 {
+                tags.push(template.u16(child + 0x12)?);
+            }
+        }
+        Ok(tags)
+    };
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags().unwrap_or_default() {
+        if let Some(k) = skeleton.find_tag(tag) {
+            let name = &skeleton.bones[k].name;
+            if !name.is_empty() && !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    // The game puts a vehicle's wheel model on every wheel bone, also those
+    // without a child of their own (usually only `wheel_lf` has one).
+    let is_wheel = |n: &str| {
+        let n = n.to_ascii_lowercase();
+        n.starts_with("wheel_") && !n.contains("mesh")
+    };
+    if out.iter().any(|n| is_wheel(n)) {
+        for b in &skeleton.bones {
+            if is_wheel(&b.name) && !out.contains(&b.name) {
+                out.push(b.name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Reads a written file back as the game would: a `.ydr`'s drawable or a
+/// `.yft`'s main drawable.
+pub fn read_back(file: &[u8]) -> Result<crate::drawable::Drawable, ResourceError> {
+    let res = Resource::from_rsc7(file)?;
+    if res.version == VERSION_YFT_ENHANCED {
+        crate::drawable::parse_yft(&res)
+    } else {
+        crate::drawable::parse_ydr(&res)
+    }
+}
+
 fn check_template(template: &Resource) -> Result<(), ResourceError> {
-    if template.version != VERSION_YDR_ENHANCED {
+    if template.version != VERSION_YDR_ENHANCED && template.version != VERSION_YFT_ENHANCED {
         return Err(bad(format!(
-            "the template is version {}; only GTA V Enhanced drawables (version {VERSION_YDR_ENHANCED}) can be written so far",
+            "the template is version {}; only GTA V Enhanced drawables and fragments (versions {VERSION_YDR_ENHANCED} and {VERSION_YFT_ENHANCED}) can be written so far",
             template.version
         )));
     }
-    let _ = Gen::Enhanced;
     Ok(())
 }
 
@@ -429,7 +591,9 @@ fn encode(format: u8, v: [f32; 4], out: &mut [u8]) {
 }
 
 /// The vertices of a mesh in a template layout.
-fn vertex_data(m: &NewMesh, layout: &Layout, stride: usize) -> Result<Vec<u8>, ResourceError> {
+/// `blend`: per vertex, the index into the template geometry's bone table
+/// (skinned templates).
+fn vertex_data(m: &NewMesh, layout: &Layout, stride: usize, blend: &[u8]) -> Result<Vec<u8>, ResourceError> {
     let n = m.positions.len();
     let normals = if m.normals.len() == n { m.normals.clone() } else { smooth_normals(m) };
     let needs_tangents = layout.slots.iter().any(|&(s, _, _)| (8..12).contains(&s));
@@ -445,8 +609,13 @@ fn vertex_data(m: &NewMesh, layout: &Layout, stride: usize) -> Result<Vec<u8>, R
                 0..=3 => [p[0], p[1], p[2], 1.0],
                 4..=7 => [nv[0], nv[1], nv[2], 0.0],
                 8..=11 => tangents[i],
-                // Blend data belongs to skinned meshes, which are not written.
-                16..=23 => return Err(bad("the template's vertices carry bone weights (skinned)")),
+                // One bone per vertex, with all the weight. The game keeps the
+                // first blend weight and index in the third byte.
+                16..=19 => [0.0, 0.0, 1.0, 0.0],
+                20..=23 => match blend.get(i) {
+                    Some(&b) => [0.0, 0.0, f32::from(b), 0.0],
+                    None => return Err(bad("the template's vertices carry bone weights (skinned)")),
+                },
                 24 => m.colors.get(i).copied().unwrap_or([1.0; 4]),
                 25..=27 => [1.0; 4],
                 28..=35 => [uv[0], uv[1], 0.0, 0.0],
@@ -526,7 +695,7 @@ pub fn replace_lods(
     build(template, lods, materials, donor)
 }
 
-/// Whether `res` (an Enhanced drawable or texture dictionary) has a texture
+/// Whether `res` (an Enhanced drawable, fragment or texture dictionary) has a texture
 /// structure that [`replace_with_materials`] can copy (as the `donor`).
 pub fn can_donate_textures(res: &Resource) -> bool {
     texture_templates(res).is_some()
@@ -535,11 +704,13 @@ pub fn can_donate_textures(res: &Resource) -> bool {
 /// The first texture structure and dictionary root of an Enhanced resource:
 /// its embedded dictionary (drawable) or its root (texture dictionary).
 fn texture_templates(res: &Resource) -> Option<(Vec<u8>, Vec<u8>)> {
-    let root = if res.version == VERSION_YDR_ENHANCED {
-        let group = res.u64(SYS + 0x10).ok().filter(|&g| g != 0)?;
+    let root = if res.version == VERSION_YDR_ENHANCED || res.version == VERSION_YFT_ENHANCED {
+        let group = res.u64(drawable_root(res).ok()? + 0x10).ok().filter(|&g| g != 0)?;
         res.u64(group + 0x08).ok().filter(|&t| t != 0)?
-    } else {
+    } else if res.version == crate::ytd::VERSION_ENHANCED {
         SYS
+    } else {
+        return None;
     };
     let count = res.u16(root + 0x38).ok()?;
     if count == 0 {
@@ -600,6 +771,7 @@ fn build(
             if (!m.normals.is_empty() && m.normals.len() != n)
                 || (!m.uvs.is_empty() && m.uvs.len() != n)
                 || (!m.colors.is_empty() && m.colors.len() != n)
+                || (!m.bones.is_empty() && m.bones.len() != n)
             {
                 return Err(bad(format!("{what} has per-vertex data of the wrong length")));
             }
@@ -625,7 +797,10 @@ fn build(
     b.add_pages_info(sys, 0x08);
 
     // Materials: one shader copy each (indices after the template's shaders).
-    let group = template.u64(SYS + 0x10)?;
+    // The drawable: the file's root, or a fragment's main drawable.
+    let root_addr = drawable_root(template)?;
+    let fragment = root_addr != SYS;
+    let group = template.u64(root_addr + 0x10)?;
     let first_new = if group != 0 { template.u16(group + 0x18)? } else { 0 };
     if let Some(mats) = materials {
         if group == 0 {
@@ -638,10 +813,10 @@ fn build(
     // The template's detail levels: model list, distance, render mask.
     let mut levels = Vec::new();
     for k in 0..4u64 {
-        let list = template.u64(SYS + 0x50 + k * 8)?;
+        let list = template.u64(root_addr + 0x50 + k * 8)?;
         let model = if list != 0 && template.u16(list + 8)? > 0 { template.u64(template.u64(list)?)? } else { 0 };
-        let distance = f32::from_le_bytes(template.bytes(SYS + 0x70 + k * 4, 4)?.try_into().unwrap());
-        levels.push((model, distance, template.u32(SYS + 0x80 + k * 4)?));
+        let distance = f32::from_le_bytes(template.bytes(root_addr + 0x70 + k * 4, 4)?.try_into().unwrap());
+        levels.push((model, distance, template.u32(root_addr + 0x80 + k * 4)?));
     }
     let template_levels = levels.iter().take_while(|l| l.0 != 0).count();
     let far = levels.iter().map(|l| l.1).fold(0.0f32, f32::max);
@@ -653,7 +828,11 @@ fn build(
         let mut boxes = Vec::new();
         for m in meshes.iter() {
             let t = template_of(source(m).expect("checked"));
-            let data = vertex_data(m, &t.layout, t.stride)?;
+            let blend = match &t.bones {
+                Some(table) => blend_indices(m, table)?,
+                None => Vec::new(),
+            };
+            let data = vertex_data(m, &t.layout, t.stride, &blend)?;
             let vdata = b.add(Segment::System, data);
             let mut idx = Vec::with_capacity(m.indices.len() * 2);
             for &k in &m.indices {
@@ -699,7 +878,10 @@ fn build(
             _ => template_of(source(&meshes[0]).expect("checked")).model,
         };
         let mut model = copy(source_model, MODEL_SIZE)?;
-        if template.u32(source_model + 0x28)? >> 8 & 0xFF != 0 {
+        // A model whose skinning differs from the geometries' (a skinned
+        // level model with fixed geometries): the geometries' own model.
+        let skinned = template_of(source(&meshes[0]).expect("checked")).bones.is_some();
+        if (template.u32(source_model + 0x28)? >> 8 & 0xFF != 0) != skinned {
             model = copy(template_of(source(&meshes[0]).expect("checked")).model, MODEL_SIZE)?;
         }
         put_u16(&mut model, 0x10, n as u16);
@@ -757,7 +939,29 @@ fn build(
         .flat_map(|m| &m.positions)
         .map(|p| dot(sub(*p, centre), sub(*p, centre)).sqrt())
         .fold(0.0f32, f32::max);
-    let root = 0usize;
+    let root = (root_addr - SYS) as usize;
+    // A fragment keeps its levels: vehicles choose them by distance
+    // themselves (vehicles.meta), so every level the template has gets the
+    // furthest one given, and the distances and masks stay.
+    if fragment {
+        let d = b.data_mut(sys);
+        for (k, c) in centre.iter().enumerate() {
+            put_f32(d, root + 0x20 + k * 4, *c);
+            put_f32(d, root + 0x30 + k * 4, all.0[k]);
+            put_f32(d, root + 0x40 + k * 4, all.1[k]);
+        }
+        put_f32(d, root + 0x2C, radius);
+        d[root + 0x50..root + 0x70].fill(0);
+        let count = lists.len().max(template_levels);
+        for k in 0..count {
+            let list = lists[k.min(lists.len() - 1)];
+            b.pointer(sys, root + 0x50 + k * 8, list, 0);
+            if k >= template_levels {
+                put_u32(b.data_mut(sys), root + 0x80 + k * 4, mask_of(0));
+            }
+        }
+        return b.build(template.version);
+    }
     {
         let d = b.data_mut(sys);
         for (k, c) in centre.iter().enumerate() {
@@ -775,7 +979,27 @@ fn build(
     for (k, list) in lists.into_iter().enumerate() {
         b.pointer(sys, root + 0x50 + k * 8, list, 0);
     }
-    b.build(VERSION_YDR_ENHANCED)
+    b.build(template.version)
+}
+
+/// Per vertex, the index into a skinned template geometry's bone table of
+/// the bone it moves with.
+fn blend_indices(m: &NewMesh, table: &[u16]) -> Result<Vec<u8>, ResourceError> {
+    let first = table.first().copied().unwrap_or(0);
+    let mut cache: Vec<(u16, u8)> = Vec::new();
+    (0..m.positions.len())
+        .map(|i| {
+            let bone = m.bones.get(i).copied().unwrap_or(first);
+            if let Some(&(_, k)) = cache.iter().find(|(b, _)| *b == bone) {
+                return Ok(k);
+            }
+            let k = table.iter().position(|&b| b == bone).and_then(|k| u8::try_from(k).ok()).ok_or_else(|| {
+                bad(format!("bone {bone} cannot be used: the template's geometry does not move with it"))
+            })?;
+            cache.push((bone, k));
+            Ok(k)
+        })
+        .collect()
 }
 
 /// The colour texture slot of a template shader: its index into the texture
@@ -1081,6 +1305,7 @@ pub(crate) mod tests {
             uvs: vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
             colors: Vec::new(),
             indices: vec![0, 1, 2, 0, 2, 3],
+            bones: Vec::new(),
         }
     }
 

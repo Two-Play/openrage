@@ -204,12 +204,13 @@ pub(crate) fn cmd_replace_model(
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
     use openrage_app::obj;
-    use rage_formats::{drawable, ydr_write};
+    use rage_formats::ydr_write;
     let Node::ArchiveFile(rpf, id) = rage_mods::resolve(game_dir, vpath, keys.clone())?.0 else {
         bail!("{vpath} is not a file inside an archive")
     };
-    if !vpath.to_ascii_lowercase().ends_with(".ydr") {
-        bail!("{vpath} is not a drawable (.ydr)");
+    let lower = vpath.to_ascii_lowercase();
+    if !lower.ends_with(".ydr") && !lower.ends_with(".yft") {
+        bail!("{vpath} is not a drawable (.ydr) or fragment (.yft)");
     }
     if o.lods.len() > 3 {
         bail!("at most three further detail levels (--lod)");
@@ -249,7 +250,14 @@ pub(crate) fn cmd_replace_model(
         }
         levels_text.push(text);
     }
-    let mut fitter = obj::Fitter::new(&shaders, o.shader, &textures)?;
+    let mut fitter =
+        obj::Fitter::new(&shaders, o.shader, &textures)?.with_shader_info(ydr_write::shader_infos(&template)?);
+    // Vehicles: parts named like bones (`door_dside_f`, `bonnet`) move with them.
+    // Wheels have models of their own: parts named after them are left out.
+    if let Some(bones) = ydr_write::skinned_bones(&template)? {
+        let own = ydr_write::bones_with_own_models(&template);
+        fitter = fitter.with_bones(obj::Bones::new(bones).with_own_models(own));
+    }
     let mut levels = Vec::new();
     for text in &levels_text {
         levels.push(fitter.level(obj::read(text)?));
@@ -259,6 +267,20 @@ pub(crate) fn cmd_replace_model(
             m.texture.as_ref().map(|t| format!(", texture {} ({}×{})", t.name, t.width, t.height)).unwrap_or_default();
         outln!("material {material:<24} → shader {}{texture}", m.shader);
     }
+    if !fitter.textures_kept.is_empty() {
+        outln!("kept the shader's own texture (it takes no other): {}", fitter.textures_kept.join(", "));
+    }
+    if let Some(bones) = fitter.bones() {
+        for (part, bone) in &bones.matched {
+            outln!("part {part:<28} → bone {bone}");
+        }
+        if !bones.unmatched.is_empty() {
+            outln!("parts on the body ({}): {}", bones.body_name(), bones.unmatched.join(", "));
+        }
+        if !bones.left_out.is_empty() {
+            outln!("left out (the vehicle's own models stay): {}", bones.left_out.join(", "));
+        }
+    }
     let materials: Vec<ydr_write::NewMaterial> = fitter.materials.into_iter().map(|(_, m)| m).collect();
     let donor = (materials.iter().any(|m| m.texture.is_some()) && !ydr_write::can_donate_textures(&template))
         .then(|| obj::find_texture_donor(game_dir, vpath, keys.clone()))
@@ -266,7 +288,7 @@ pub(crate) fn cmd_replace_model(
     let level_refs: Vec<&[ydr_write::NewMesh]> = levels.iter().map(Vec::as_slice).collect();
     let file = ydr_write::replace_lods(&template, &level_refs, Some(&materials), donor.as_ref())?;
     // What the game will read: check it reads back.
-    let check = drawable::parse_ydr(&rage_resource::Resource::from_rsc7(&file)?)?;
+    let check = ydr_write::read_back(&file)?;
     let vertices: usize = check.meshes.iter().map(|m| m.positions.len()).sum();
     let triangles: usize = check.meshes.iter().map(|m| m.indices.len() / 3).sum();
     outln!(

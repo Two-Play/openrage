@@ -250,10 +250,13 @@ pub(crate) enum Command {
         #[arg(long, value_name = "TEXT", conflicts_with = "out")]
         import: Option<PathBuf>,
     },
-    /// Replace the meshes of a GTA V Enhanced drawable (.ydr) with a Wavefront OBJ model. The
-    /// drawable's shaders and textures stay; OBJ materials go to its shaders in order.
+    /// Replace the meshes of a GTA V Enhanced drawable (.ydr) or vehicle body (.yft) with a
+    /// Wavefront OBJ model. The model's shaders and textures stay; OBJ materials go to its
+    /// shaders in order. Vehicles: OBJ parts named like a bone (`door_dside_f`, `bonnet`) move
+    /// with it, other parts with the body.
     ReplaceModel {
-        /// The drawable in the game, e.g. `x64i.rpf/levels/gta5/props/…/prop_x.ydr`.
+        /// The model in the game, e.g. `x64i.rpf/levels/gta5/props/…/prop_x.ydr` or
+        /// `x64e.rpf/levels/gta5/vehicles.rpf/adder.yft`.
         path: String,
         /// The OBJ file.
         obj: PathBuf,
