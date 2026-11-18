@@ -207,8 +207,12 @@ scene window, the way GTA V cutscenes play. Its sections (`b_1_0.wad`, `b_1_1.wa
   intensity and cone, switched on and off as the cutscene does (**Lights off** in the window).
 - **Sound** from `pc/audio/sfx/cutscenes.rpf` (the episodes' `EP1_SFX.rpf`, `EP2_SFX.rpf`): the streams are decoded
   (IMA ADPCM, three channels — middle, left, right — mixed to stereo) and play with the scene, following pause and
-  the time slider (**Sound off** in the window). A section that names no sound lets the one before run on.
-- **Subtitles** from the episode's `american.gxt`.
+  the time slider (**Sound off** in the window). A section that names no sound lets the one before run on, and so
+  does a sound the game lacks.
+- **Subtitles** from the episode's `american.gxt`, each part of a cutscene put together from several with its own
+  timing and text table.
+- **Part cutscenes** (`y1_aap2`, `rb03p2`, `gt10_p1`): when the game lacks their own sound or texts, they take those
+  of the whole cutscene they are cut from, from where they start in it.
 
 The text stays reachable through the context menu (**Open in text editor**).
 
@@ -217,11 +221,12 @@ openrage cutscene pc/anim/cuts.img/b_1.cut [--models] [--map 40]   # sections, c
 openrage verify --cutscenes                    # every .cut: sections, clips, camera and models
 ```
 
-**Checked:** 344 cutscenes (8.4 hours, 803 sections, 2,942 actors), every model found, 493 minutes of sound decoded,
-234 of 238 accessories found. Particle effects (`[EFFECTS]`: blood, shell casings) are not shown.
-Two cutscenes lack a piece in the game's own files: `TBoGT/…/gt11_xa.cut` has no `gt11_xa_0.wad`, and `int_ae.cut`
-names a clip its dictionary does not have. 72 sounds cutscenes name are not in the game (mostly those of the
-`…p1`/`…p2` part cutscenes of TBoGT, and the intro's `rom1_a`).
+**Checked:** 344 cutscenes (8.6 hours, 810 sections, 2,973 actors), every model found; every cutscene has sound but
+`TBoGT/…/gt11_xa.cut`, which also lacks its animation (`gt11_xa_0.wad`); every subtitle has its text; 237 of 238
+accessories found (the glasses `em_7.cut` gives Elizabeta are in no prop dictionary); `int_ae.cut` names a clip its
+dictionary does not have. Particle effects (`[EFFECTS]`) come from the episode's effect lists
+(`pc/data/effects/*.wpfl`); all 852 the cutscenes name are found, but particles drawn as models (muzzle prongs,
+debris) are not shown.
 
 ## Editing
 
