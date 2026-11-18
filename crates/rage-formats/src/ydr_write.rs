@@ -77,35 +77,54 @@ pub struct NewMaterial {
     pub texture: Option<Texture>,
 }
 
-/// A colour texture from 8-bit RGBA pixels: BGRA with all mip levels (each
-/// half the size, box filtered).
+/// A colour texture from 8-bit RGBA pixels, block compressed like the
+/// game's own: BC1 when every pixel is opaque, BC3 otherwise, with mip levels
+/// down to 4 pixels on the short side. Sizes that are not multiples of 4
+/// cannot be block compressed and stay uncompressed
+/// ([`uncompressed_texture_from_rgba`]).
 pub fn texture_from_rgba(name: &str, width: u32, height: u32, rgba: &[u8]) -> Result<Texture, ResourceError> {
-    if width == 0 || height == 0 || width > 8192 || height > 8192 || rgba.len() != (width * height * 4) as usize {
-        return Err(bad(format!("texture {name}: {width}×{height} with {} bytes of pixels", rgba.len())));
+    check_pixels(name, width, height, rgba)?;
+    if !width.is_multiple_of(4) || !height.is_multiple_of(4) {
+        return uncompressed_texture_from_rgba(name, width, height, rgba);
     }
+    let opaque = rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255);
+    let (format, codec) =
+        if opaque { (Format::BC1_UNORM, texpresso::Format::Bc1) } else { (Format::BC3_UNORM, texpresso::Format::Bc3) };
+    // Levels while the short side is at least 4 (a whole block).
+    let levels = 32 - (width.min(height) / 4).leading_zeros();
+    let params = texpresso::Params { algorithm: texpresso::Algorithm::ClusterFit, ..Default::default() };
+    let mut data = Vec::new();
+    for (w, h, level) in mip_chain(width, height, rgba, levels) {
+        let start = data.len();
+        data.resize(start + codec.compressed_size(w, h), 0);
+        codec.compress(&level, w, h, params, &mut data[start..]);
+    }
+    Ok(Texture {
+        name: name.to_owned(),
+        width,
+        height,
+        depth: 1,
+        levels,
+        format,
+        dimension: Dimension::Texture2D,
+        usage: guess_usage(name),
+        data,
+    })
+}
+
+/// A colour texture from 8-bit RGBA pixels, uncompressed: BGRA with all mip
+/// levels down to 1 pixel. Exact, but four to eight times the size of
+/// [`texture_from_rgba`].
+pub fn uncompressed_texture_from_rgba(
+    name: &str,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> Result<Texture, ResourceError> {
+    check_pixels(name, width, height, rgba)?;
     let levels = 32 - width.min(height).leading_zeros();
     let mut data = Vec::new();
-    let (mut w, mut h) = (width as usize, height as usize);
-    let mut level: Vec<u8> = rgba.to_vec();
-    for l in 0..levels {
-        if l > 0 {
-            let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
-            let mut next = vec![0u8; nw * nh * 4];
-            for y in 0..nh {
-                for x in 0..nw {
-                    for c in 0..4 {
-                        let mut sum = 0u32;
-                        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                            let (sx, sy) = ((x * 2 + dx).min(w - 1), (y * 2 + dy).min(h - 1));
-                            sum += u32::from(level[(sy * w + sx) * 4 + c]);
-                        }
-                        next[(y * nw + x) * 4 + c] = ((sum + 2) / 4) as u8;
-                    }
-                }
-            }
-            level = next;
-            (w, h) = (nw, nh);
-        }
+    for (_, _, level) in mip_chain(width, height, rgba, levels) {
         // RGBA → BGRA
         data.extend(level.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0], p[3]]));
     }
@@ -120,6 +139,39 @@ pub fn texture_from_rgba(name: &str, width: u32, height: u32, rgba: &[u8]) -> Re
         usage: guess_usage(name),
         data,
     })
+}
+
+fn check_pixels(name: &str, width: u32, height: u32, rgba: &[u8]) -> Result<(), ResourceError> {
+    if width == 0 || height == 0 || width > 8192 || height > 8192 || rgba.len() != (width * height * 4) as usize {
+        return Err(bad(format!("texture {name}: {width}×{height} with {} bytes of pixels", rgba.len())));
+    }
+    Ok(())
+}
+
+/// `levels` mip levels of RGBA pixels (width, height, pixels), each half the
+/// size of the one before, box filtered.
+fn mip_chain(width: u32, height: u32, rgba: &[u8], levels: u32) -> Vec<(usize, usize, Vec<u8>)> {
+    let mut out = vec![(width as usize, height as usize, rgba.to_vec())];
+    for _ in 1..levels {
+        let (w, h, level) = out.last().expect("first level");
+        let (w, h) = (*w, *h);
+        let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+        let mut next = vec![0u8; nw * nh * 4];
+        for y in 0..nh {
+            for x in 0..nw {
+                for c in 0..4 {
+                    let mut sum = 0u32;
+                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                        let (sx, sy) = ((x * 2 + dx).min(w - 1), (y * 2 + dy).min(h - 1));
+                        sum += u32::from(level[(sy * w + sx) * 4 + c]);
+                    }
+                    next[(y * nw + x) * 4 + c] = ((sum + 2) / 4) as u8;
+                }
+            }
+        }
+        out.push((nw, nh, next));
+    }
+    out
 }
 
 /// A mesh to write: triangles of one shader of the template.
@@ -1068,10 +1120,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn textures_are_block_compressed() {
+        let (w, h) = (64u32, 32u32);
+        let gradient = |alpha: fn(usize) -> u8| -> Vec<u8> {
+            (0..(w * h) as usize).flat_map(|i| [(i % 64 * 4) as u8, (i / 64 * 8) as u8, 128, alpha(i)]).collect()
+        };
+        let opaque = gradient(|_| 255);
+        let t = texture_from_rgba("grad", w, h, &opaque).unwrap();
+        assert_eq!(t.format, Format::BC1_UNORM);
+        assert_eq!(t.levels, 4, "64×32 down to 8×4");
+        assert_eq!(t.data.len(), (16 * 8 + 8 * 4 + 4 * 2 + 2) * 8);
+        assert_eq!(Some(t.data.len()), t.expected_size());
+        let back = t.to_rgba().unwrap();
+        let worst = back.iter().zip(&opaque).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(worst <= 12, "BC1 stays close to the pixels (off by {worst})");
+
+        let see_through = gradient(|i| (i % 2 * 255) as u8);
+        let t = texture_from_rgba("glass", w, h, &see_through).unwrap();
+        assert_eq!(t.format, Format::BC3_UNORM);
+        assert_eq!(t.data.len(), (16 * 8 + 8 * 4 + 4 * 2 + 2) * 16);
+        let back = t.to_rgba().unwrap();
+        assert!(back.as_chunks::<4>().0.iter().zip(see_through.as_chunks::<4>().0).all(|(a, b)| a[3] == b[3]));
+
+        // Not a multiple of 4: uncompressed.
+        let odd = texture_from_rgba("odd", 6, 6, &[7u8; 6 * 6 * 4]).unwrap();
+        assert_eq!((odd.format, odd.levels), (Format::B8G8R8A8_UNORM, 3));
+    }
+
+    #[test]
+    fn compressed_textures_are_embedded_too() {
+        let t = template_with(2, true);
+        let rgba: Vec<u8> = (0..16 * 16).flat_map(|i| [i as u8, 0, 255 - i as u8, 255]).collect();
+        let tex = texture_from_rgba("bc", 16, 16, &rgba).unwrap();
+        let file =
+            replace_with_materials(&t, &[quad(0, 0.0)], &[NewMaterial { shader: 1, texture: Some(tex.clone()) }], None)
+                .unwrap();
+        let d = drawable::parse_ydr(&Resource::from_rsc7(&file).unwrap()).unwrap();
+        let dict = d.textures.expect("embedded dictionary");
+        let got = dict.textures.iter().find(|t| t.name == "bc").unwrap();
+        assert_eq!((got.format, got.width, got.levels), (Format::BC1_UNORM, 16, 3));
+        assert_eq!(got.data, tex.data);
+    }
+
+    #[test]
     fn materials_get_their_own_shaders_and_textures() {
         let t = template_with(2, true);
         let rgba: Vec<u8> = (0..4 * 4 * 4).map(|i| i as u8).collect();
-        let brick = texture_from_rgba("brick", 4, 4, &rgba).unwrap();
+        let brick = uncompressed_texture_from_rgba("brick", 4, 4, &rgba).unwrap();
         assert_eq!(brick.levels, 3);
         assert_eq!(brick.data.len(), (16 + 4 + 1) * 4);
         let materials = [NewMaterial { shader: 1, texture: Some(brick) }, NewMaterial { shader: 1, texture: None }];
