@@ -63,10 +63,11 @@ other texture, mesh, shader and bone unchanged. GTA V Legacy uses the same struc
 
 ## Models (preview)
 
-A drawable of GTA V Enhanced (`.ydr`) can get new geometry and textures from a Wavefront OBJ file:
+A drawable (`.ydr`) or a vehicle body (`.yft`) of GTA V Enhanced can get new geometry and textures from a Wavefront
+OBJ file:
 
 - **In the explorer:** turn on the *OBJ tools* plugin (it comes with OpenRAGE, **Settings → Plugins**), unlock
-  editing, right-click the `.ydr` → **Replace with OBJ…** and choose the OBJ together with its `.mtl` and PNG
+  editing, right-click the `.ydr` or `.yft` → **Replace with OBJ…** and choose the OBJ together with its `.mtl` and PNG
   textures. The change goes into the `mods` folder and is one entry in **History**. *OBJ tools* also exports models as
   OBJ with their textures, so you can export, edit (e.g. in Blender) and bring them back.
 - **From the command line:** `openrage replace-model x64i.rpf/levels/gta5/props/…/prop_x.ydr model.obj --mods`
@@ -75,23 +76,42 @@ A drawable of GTA V Enhanced (`.ydr`) can get new geometry and textures from a W
 
 How it works:
 
-- **Shaders:** every OBJ material gets its own copy of one of the drawable's shaders (in order; `--shader N` uses
-  shader N for all). The copies keep the original shader's settings and the vertex layout it expects.
+- **Shaders:** every OBJ material gets its own copy of one of the drawable's shaders. A material named after a
+  shader's texture (as *OBJ tools* exports them, e.g. `vehicle_badges_adder_badges`) goes on that shader, others go
+  on the shaders in order; `--shader N` uses shader N for all. The copies keep the original shader's settings and the
+  vertex layout it expects.
 - **Textures:** a material's `map_Kd` (PNG) is embedded in the drawable and bound to its copy's colour slot, with all
   mip levels; a material with only a colour (`Kd`) gets a small texture of that colour; without either it keeps the
-  original texture. Models without embedded textures borrow the texture structure of another model of the game.
+  original texture, as does a shader without a colour slot (vehicle paint, licence plates). Models without embedded
+  textures borrow the texture structure of another model or texture dictionary of the game.
   Textures are block compressed like the game's own (BC1, or BC3 when they have transparency), with mip levels;
   a 512×512 texture takes about 170 KB instead of 1.4 MB. Sizes that are not multiples of 4 stay uncompressed.
-  `--no-textures` keeps the original textures.
+  `--no-textures` keeps the original textures; in the explorer, pick only the PNGs you changed.
 - **Detail levels:** `--lod near.obj --lod far.obj` (up to three) add further levels; plugins mark them with parts
   named `…_lod1`, `…_lod2`, `…_lod3`. Distances come from the original's levels where it has them, otherwise 50 m
   doubling per level; the last level is seen as far as the original's furthest.
 - OBJ is converted from Y-up to the game's Z-up; missing normals are computed, tangents always. Meshes over 65,535
   vertices are split. `--mods` puts the result into the `mods` folder in place of the original (undo with **Undo** /
   `openrage undo`), `--out` writes the file elsewhere.
-- Not yet: GTA V Legacy, `.yft`/`.ydd`, skinned models and collisions (the original collision stays). The written
-  drawables read back identically in OpenRAGE (`openrage verify --models --rebuild` rewrites every drawable of the
-  game, also with shader copies and embedded textures); please report how they behave in the game.
+- Not yet: GTA V Legacy, `.ydd`, peds and other models blended between bones, and collisions (the original collision
+  stays). The written drawables and vehicles read back identically in OpenRAGE (`openrage verify --models --rebuild`
+  rewrites every `.ydr` and `.yft` of the game, also with shader copies and embedded textures); please report how
+  they behave in the game.
+
+### Vehicles
+
+A vehicle body is one model on the vehicle's skeleton: every part moves with a bone (doors, bonnet, boot, bumpers).
+The import keeps that:
+
+- **Parts by name:** an OBJ object or group (`o`, `g`) named like a bone goes on that bone, e.g. `door_dside_f`,
+  `door_pside_f`, `bonnet`, `boot`, `bumper_f`. Blender's `.001` and the numbers *OBJ tools* adds (`bonnet_6`) are
+  ignored. Everything else goes on the body (`bodyshell`). `replace-model` lists which part went where.
+- **Wheels** are models of their own: parts named after a wheel bone (`wheel_lf` …) are left out, and the original
+  wheels stay.
+- **Export, edit, import:** *OBJ tools* exports a vehicle with one object per bone, so an export can be edited in
+  Blender and brought back with every door still opening.
+- The skeleton, physics, damage, the wheels and the vehicle's detail levels stay; every level shows the new body.
+- `openrage replace-model x64e.rpf/levels/gta5/vehicles.rpf/adder.yft car.obj --mods`.
 
 ## Text files and game text
 

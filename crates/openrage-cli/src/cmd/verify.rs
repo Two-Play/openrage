@@ -571,22 +571,36 @@ pub(crate) fn cmd_verify_text(game_dir: &Path, within: &str, keys: Option<Arc<Gt
     Ok(())
 }
 
-/// Writes every Enhanced `.ydr` anew with its own meshes (through the model
-/// writer) and compares what the reader gets back.
+/// Writes every Enhanced `.ydr` and `.yft` anew with its own meshes (through
+/// the model writer) and compares what the reader gets back. Vehicles keep
+/// the bone every vertex moves with.
 pub(crate) fn cmd_verify_model_writer(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     use rage_formats::{drawable, ydr_write};
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     let check = |res: &rage_resource::Resource| -> Result<bool> {
-        if res.version != drawable::VERSION_YDR_ENHANCED {
+        if res.version != drawable::VERSION_YDR_ENHANCED && res.version != drawable::VERSION_YFT_ENHANCED {
             return Ok(false);
         }
-        let before = drawable::parse_ydr(res)?;
+        let before = if res.version == drawable::VERSION_YFT_ENHANCED {
+            drawable::parse_yft(res)?
+        } else {
+            drawable::parse_ydr(res)?
+        };
         let usable = ydr_write::usable_shaders(res)?;
+        let skinned = ydr_write::skinned_bones(res)?.is_some();
+        // The bone with the most weight, per vertex.
+        let main_bones = |m: &drawable::Mesh| -> Vec<u16> {
+            m.bone_indices
+                .iter()
+                .zip(&m.bone_weights)
+                .map(|(b, w)| b[(0..4).fold(0, |k, i| if w[i] > w[k] { i } else { k })])
+                .collect()
+        };
         let meshes: Vec<ydr_write::NewMesh> = before
             .meshes
             .iter()
-            .filter(|m| usable.contains(&m.shader) && !m.indices.is_empty() && m.bone_indices.is_empty())
+            .filter(|m| usable.contains(&m.shader) && !m.indices.is_empty() && m.bone_indices.is_empty() != skinned)
             .map(|m| ydr_write::NewMesh {
                 shader: m.shader,
                 positions: m.positions.clone(),
@@ -594,13 +608,14 @@ pub(crate) fn cmd_verify_model_writer(game_dir: &Path, within: &str, keys: Optio
                 uvs: m.uvs.clone(),
                 colors: m.colors.clone(),
                 indices: m.indices.clone(),
+                bones: main_bones(m),
             })
             .collect();
         if meshes.is_empty() {
             return Ok(false);
         }
         let file = ydr_write::replace_meshes(res, &meshes)?;
-        let after = drawable::parse_ydr(&rage_resource::Resource::from_rsc7(&file)?)?;
+        let after = ydr_write::read_back(&file)?;
         if after.meshes.len() != meshes.len() {
             bail!("{} meshes written, {} read back", meshes.len(), after.meshes.len());
         }
@@ -625,6 +640,9 @@ pub(crate) fn cmd_verify_model_writer(game_dir: &Path, within: &str, keys: Optio
             }
             if !m.colors.is_empty() && a.colors.first() != m.colors.first() {
                 bail!("mesh {i}: colours differ after writing");
+            }
+            if main_bones(a) != m.bones {
+                bail!("mesh {i}: vertices move with other bones after writing");
             }
         }
         // Materials: a shader copy per mesh shader, with a texture where the
@@ -661,7 +679,7 @@ pub(crate) fn cmd_verify_model_writer(game_dir: &Path, within: &str, keys: Optio
             Err(e) if e.to_string().contains("colour") => return Ok(true),
             Err(e) => return Err(e.into()),
         };
-        let after = drawable::parse_ydr(&rage_resource::Resource::from_rsc7(&file)?)?;
+        let after = ydr_write::read_back(&file)?;
         if after.shaders.len() != shaders_before + materials.len() {
             bail!("materials: {} shaders, expected {}", after.shaders.len(), shaders_before + materials.len());
         }
@@ -696,7 +714,8 @@ pub(crate) fn cmd_verify_model_writer(game_dir: &Path, within: &str, keys: Optio
                 prefix,
                 true,
                 &mut |a, id, p| {
-                    if !a.entry(id).name.to_ascii_lowercase().ends_with(".ydr") {
+                    let name = a.entry(id).name.to_ascii_lowercase();
+                    if !name.ends_with(".ydr") && !name.ends_with(".yft") {
                         return;
                     }
                     seen += 1;

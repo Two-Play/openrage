@@ -260,10 +260,13 @@ OpenRAGE offers:
   not supported yet. Same permission rule as `read-file`. Added to API 0.3 after its first release: OpenRAGE versions
   without it refuse plugins that use it.
 - `build-model(template, model)`: a game model file built from `model` on top of the model at `template` (so far a
-  GTA V Enhanced `.ydr`): the template keeps its settings, OpenRAGE writes the meshes (normals if missing, tangents,
-  bounds). Every material gets its own copy of a template shader: in order, or shader `n` for a material named `#n`.
-  A material with `image` gets it embedded as its colour texture (named after `texture`, else the material). Meshes
-  whose part ends in `_lod1`, `_lod2` or `_lod3` form further detail levels. Returns the file's bytes; pass them to
+  GTA V Enhanced `.ydr`, or a vehicle `.yft`): the template keeps its settings, OpenRAGE writes the meshes (normals if
+  missing, tangents, bounds). Every material gets its own copy of a template shader: the one whose colour texture it
+  is named after (`texture`, or a name ending in `_<texture>`), shader `n` for a material named `#n`, else in order.
+  A material with `image` gets it embedded as its colour texture (named after `texture`, else the material), unless
+  its shader takes none. Meshes whose part ends in `_lod1`, `_lod2` or `_lod3` form further detail levels. On a
+  vehicle, a part named like a bone (`door_dside_f`, `bonnet`) moves with that bone, wheel parts are left out (the
+  wheels stay), and everything else goes on the body. Returns the file's bytes; pass them to
   `write-mod-file` in a `modify` action. Same permission rule as `read-file`. Added to API 0.3 after its first
   release: OpenRAGE versions without it refuse plugins that use it.
 - `log(level, message)`: shown by `openrage plugin`, and in the explorer's info panel next to a preview (the last
@@ -320,7 +323,7 @@ Y up (OBJ, glTF) need `(x, y, z) → (x, z, −y)` and `v → 1 − v` on the wa
   `name.mtl` and one PNG per texture. It only calls `load-model` and `load-texture`, so it works for every game
   OpenRAGE reads.
 - **Preview** of `.obj` files in the 3D view: the plugin returns a `model` view.
-- **Replace with OBJ…** on a GTA V Enhanced `.ydr` (a `modify` action with `pick = ["obj"]`): reads the chosen OBJ,
+- **Replace with OBJ…** on a GTA V Enhanced `.ydr` or vehicle `.yft` (a `modify` action with `pick = ["obj"]`): reads the chosen OBJ,
   calls `build-model` with the drawable as the template and writes the result with `write-mod-file`. This is why it
   asks for `write-mods`.
 

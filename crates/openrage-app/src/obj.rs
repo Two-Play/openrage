@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use rage_crypto::GtaVKeys;
 use rage_formats::texture::Texture;
-use rage_formats::ydr_write::{MAX_VERTICES, NewMaterial, NewMesh};
+use rage_formats::ydr_write::{MAX_VERTICES, NewMaterial, NewMesh, ShaderInfo};
 use rage_rpf::vfs::Node;
 
 /// Triangles of one material.
@@ -22,15 +22,22 @@ pub struct ObjMesh {
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
+    /// The objects or groups (`o`, `g`) the triangles came from, and per
+    /// vertex the index of its one in this list.
+    pub part_names: Vec<String>,
+    pub parts: Vec<u16>,
 }
 
 /// Reads an OBJ file: `v`, `vt`, `vn`, `f` (polygons fanned into triangles,
-/// negative indices from the end) and `usemtl`. One mesh per material, in the
-/// order they first appear.
+/// negative indices from the end), `usemtl`, and `o`/`g` (the part each
+/// vertex belongs to). One mesh per material, in the order they first appear.
 pub fn read(text: &str) -> Result<Vec<ObjMesh>> {
     let (mut v, mut vt, mut vn) = (Vec::<[f32; 3]>::new(), Vec::<[f32; 2]>::new(), Vec::<[f32; 3]>::new());
     let mut meshes: Vec<ObjMesh> = Vec::new();
-    let mut seen: Vec<HashMap<(usize, usize, usize), u32>> = Vec::new();
+    let mut seen: Vec<HashMap<(usize, usize, usize, usize), u32>> = Vec::new();
+    // Part names, and the current one (index into `names`).
+    let mut names: Vec<String> = vec![String::new()];
+    let mut part = 0usize;
     let mut current = 0usize;
     let mut has_uv = false;
     let mut has_normals = false;
@@ -77,6 +84,13 @@ pub fn read(text: &str) -> Result<Vec<ObjMesh>> {
                 let (x, y, z) = (num(it.next(), line)?, num(it.next(), line)?, num(it.next(), line)?);
                 vn.push([x, -z, y]);
             }
+            Some("o" | "g") => {
+                let name = it.collect::<Vec<_>>().join(" ");
+                part = names.iter().position(|n| *n == name).unwrap_or_else(|| {
+                    names.push(name);
+                    names.len() - 1
+                });
+            }
             Some("usemtl") => {
                 material = it.collect::<Vec<_>>().join(" ");
                 started = false;
@@ -105,11 +119,19 @@ pub fn read(text: &str) -> Result<Vec<ObjMesh>> {
                         _ => 0,
                     };
                     let mesh = &mut meshes[current];
-                    let key = (p, t, nn);
+                    let key = (p, t, nn, part);
                     let i = match seen[current].get(&key) {
                         Some(&i) => i,
                         None => {
                             let i = mesh.positions.len() as u32;
+                            let k = match mesh.part_names.iter().position(|n| *n == names[part]) {
+                                Some(k) => k,
+                                None => {
+                                    mesh.part_names.push(names[part].clone());
+                                    mesh.part_names.len() - 1
+                                }
+                            };
+                            mesh.parts.push(k as u16);
                             mesh.positions.push(v[p]);
                             mesh.uvs.push(if t > 0 { vt[t - 1] } else { [0.0, 0.0] });
                             mesh.normals.push(if nn > 0 { vn[nn - 1] } else { [0.0, 0.0, 0.0] });
@@ -228,6 +250,120 @@ pub struct Fitter<'a> {
     textures: &'a HashMap<String, Texture>,
     /// (OBJ material name, material)
     pub materials: Vec<(String, NewMaterial)>,
+    bones: Option<Bones>,
+    infos: Vec<ShaderInfo>,
+    /// Materials whose texture was not used: their shader takes none, so
+    /// it keeps its own.
+    pub textures_kept: Vec<String>,
+}
+
+/// The template shader a material is named after: OpenRAGE's OBJ export
+/// names materials `<shader kind>_<texture>` and their images after the
+/// texture, so exported models go back on the shaders they came from.
+pub fn shader_named(infos: &[ShaderInfo], material: &str, texture: Option<&str>) -> Option<u16> {
+    let material = material.to_ascii_lowercase();
+    let texture = texture.map(str::to_ascii_lowercase);
+    infos
+        .iter()
+        .find(|i| {
+            i.texture.as_deref().map(str::to_ascii_lowercase).is_some_and(|t| {
+                material == t || material.ends_with(&format!("_{t}")) || texture.as_deref() == Some(t.as_str())
+            })
+        })
+        .map(|i| i.index)
+}
+
+/// A material's texture, unless its shader cannot take one (then the shader
+/// keeps its own): (texture, whether one was given and not used).
+pub fn fit_texture(infos: &[ShaderInfo], shader: u16, texture: Option<Texture>) -> (Option<Texture>, bool) {
+    let takes = infos.iter().find(|i| i.index == shader).is_none_or(|i| i.takes_texture);
+    match texture {
+        Some(_) if !takes => (None, true),
+        t => (t, false),
+    }
+}
+
+/// Puts parts of a model on the bones of a skeleton by name (vehicles:
+/// `door_dside_f`, `bonnet`, `wheel_lf` …); other parts go on the body.
+#[derive(Debug, Clone)]
+pub struct Bones {
+    names: Vec<String>,
+    body: u16,
+    /// Bones with a model of their own (vehicle wheels): parts named like
+    /// them are left out.
+    own_models: Vec<String>,
+    /// Parts put on a bone (part, bone name), parts that matched none, and
+    /// parts left out.
+    pub matched: Vec<(String, String)>,
+    pub unmatched: Vec<String>,
+    pub left_out: Vec<String>,
+}
+
+impl Bones {
+    /// `names`: the skeleton's bone names in order. The body is the bone
+    /// `bodyshell` (vehicles), else `chassis`, else the first.
+    pub fn new(names: Vec<String>) -> Self {
+        let find = |n: &str| names.iter().position(|b| b.eq_ignore_ascii_case(n));
+        let body = find("bodyshell").or_else(|| find("chassis")).unwrap_or(0) as u16;
+        Self { names, body, own_models: Vec::new(), matched: Vec::new(), unmatched: Vec::new(), left_out: Vec::new() }
+    }
+
+    /// Bones that have a model of their own (a fragment's wheels): parts
+    /// named like them are left out, as the game draws those models there.
+    pub fn with_own_models(mut self, bones: Vec<String>) -> Self {
+        self.own_models = bones;
+        self
+    }
+
+    /// The skeleton index of the bone a part is named after.
+    fn find(&self, part: &str) -> Option<usize> {
+        let lower = part.trim().to_ascii_lowercase();
+        let base = lower.split('.').next().unwrap_or("");
+        let base = (1..=3).find_map(|k| base.strip_suffix(&format!("_lod{k}"))).unwrap_or(base);
+        let find = |n: &str| self.names.iter().position(|b| b.eq_ignore_ascii_case(n));
+        // OBJ exports number their objects (`door_dside_f_3`); bones such as
+        // `extra_1` keep their number when they exist.
+        let numbered = base
+            .rsplit_once('_')
+            .filter(|(_, n)| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+            .map(|(b, _)| b);
+        find(base).or_else(|| numbered.and_then(find))
+    }
+
+    /// Whether a part is left out: named after a bone with a model of its own.
+    pub fn leaves_out(&mut self, part: &str) -> bool {
+        let out =
+            self.find(part).is_some_and(|k| self.own_models.iter().any(|b| b.eq_ignore_ascii_case(&self.names[k])));
+        if out && !self.left_out.iter().any(|p| p == part) {
+            self.left_out.push(part.to_owned());
+        }
+        out
+    }
+
+    /// The bone a part goes on: by its name, ignoring case and what tools
+    /// add: after a dot (`door_dside_f.001`), a level suffix (`_lod1`) or a
+    /// number (`door_dside_f_3`, from OpenRAGE's OBJ export).
+    pub fn bone_of(&mut self, part: &str) -> u16 {
+        match self.find(part) {
+            Some(k) => {
+                if !part.is_empty() && !self.matched.iter().any(|(p, _)| p == part) {
+                    self.matched.push((part.to_owned(), self.names[k].clone()));
+                }
+                k as u16
+            }
+            None => {
+                if !part.is_empty() && !self.unmatched.iter().any(|p| p == part) {
+                    self.unmatched.push(part.to_owned());
+                }
+                self.body
+            }
+        }
+    }
+
+    /// The name of the bone parts without a bone of their own go on.
+    pub fn body_name(&self) -> &str {
+        self.names.get(self.body as usize).map_or("", String::as_str)
+    }
 }
 
 impl<'a> Fitter<'a> {
@@ -240,24 +376,73 @@ impl<'a> Fitter<'a> {
         {
             bail!("shader {s} cannot be used; the template has {shaders:?}");
         }
-        Ok(Self { shaders, shader, textures, materials: Vec::new() })
+        Ok(Self {
+            shaders,
+            shader,
+            textures,
+            materials: Vec::new(),
+            bones: None,
+            infos: Vec::new(),
+            textures_kept: Vec::new(),
+        })
+    }
+
+    /// What the template's shaders look like ([`rage_formats::ydr_write::shader_infos`]):
+    /// materials named after a shader's texture go on it, and textures go
+    /// only to shaders that can take one.
+    pub fn with_shader_info(mut self, infos: Vec<ShaderInfo>) -> Self {
+        self.infos = infos;
+        self
+    }
+
+    /// Puts the parts on these bones (templates with skinned meshes).
+    pub fn with_bones(mut self, bones: Bones) -> Self {
+        self.bones = Some(bones);
+        self
+    }
+
+    /// The bones parts went on, after [`Self::level`].
+    pub fn bones(&self) -> Option<&Bones> {
+        self.bones.as_ref()
     }
 
     /// The meshes of one level, their `shader` the index of their material.
     pub fn level(&mut self, meshes: Vec<ObjMesh>) -> Vec<NewMesh> {
         let mut out = Vec::new();
         for m in meshes {
+            let m = match &mut self.bones {
+                Some(b) => {
+                    let out: Vec<bool> = m.part_names.iter().map(|p| b.leaves_out(p)).collect();
+                    if out.contains(&true) { without_triangles(m, |part| out[part as usize]) } else { m }
+                }
+                None => m,
+            };
+            if m.indices.is_empty() {
+                continue;
+            }
             let k = match self.materials.iter().position(|(name, _)| *name == m.material) {
                 Some(k) => k,
                 None => {
                     let i = self.materials.len();
-                    let shader = self
-                        .shader
-                        .unwrap_or_else(|| *self.shaders.get(i).unwrap_or(self.shaders.last().expect("checked")));
                     let texture = self.textures.get(&m.material).cloned();
+                    let shader = self.shader.unwrap_or_else(|| {
+                        shader_named(&self.infos, &m.material, texture.as_ref().map(|t| t.name.as_str()))
+                            .unwrap_or_else(|| *self.shaders.get(i).unwrap_or(self.shaders.last().expect("checked")))
+                    });
+                    let (texture, kept) = fit_texture(&self.infos, shader, texture);
+                    if kept {
+                        self.textures_kept.push(m.material.clone());
+                    }
                     self.materials.push((m.material.clone(), NewMaterial { shader, texture }));
                     i
                 }
+            };
+            let bones = match &mut self.bones {
+                Some(b) => {
+                    let of: Vec<u16> = m.part_names.iter().map(|p| b.bone_of(p)).collect();
+                    m.parts.iter().map(|&p| of[p as usize]).collect()
+                }
+                None => Vec::new(),
             };
             out.extend(split(NewMesh {
                 shader: k as u16,
@@ -266,15 +451,16 @@ impl<'a> Fitter<'a> {
                 uvs: m.uvs,
                 colors: Vec::new(),
                 indices: m.indices,
+                bones,
             }));
         }
         out
     }
 }
 
-/// An Enhanced drawable with embedded textures, to lend its texture
-/// structure to a model that has none: one next to `vpath` in its archive,
-/// else any in that archive.
+/// An Enhanced drawable with embedded textures (or a texture dictionary),
+/// to lend its texture structure to a model that has none: one next to
+/// `vpath` in its archive, else any in that archive.
 pub fn find_texture_donor(
     game_dir: &Path,
     vpath: &str,
@@ -283,8 +469,16 @@ pub fn find_texture_donor(
     let parent = vpath.rsplit_once('/').map_or("", |(p, _)| p);
     let Ok((Node::ArchiveDir(rpf, dir), _)) = rage_mods::resolve(game_dir, parent, keys) else { return None };
     let donates = |r: &rage_resource::Resource| rage_formats::ydr_write::can_donate_textures(r);
-    for c in rpf.children(dir) {
-        if rpf.entry(c).name.to_ascii_lowercase().ends_with(".ydr")
+    // Drawables first, then texture dictionaries (vehicle archives have only
+    // fragments and dictionaries).
+    let kinds = |name: &str| {
+        let n = name.to_ascii_lowercase();
+        n.ends_with(".ydr") || n.ends_with(".ytd")
+    };
+    let mut children: Vec<_> = rpf.children(dir).collect();
+    children.sort_by_key(|&c| !rpf.entry(c).name.to_ascii_lowercase().ends_with(".ydr"));
+    for c in children {
+        if kinds(&rpf.entry(c).name)
             && let Ok(r) = rpf.read_resource(c)
             && donates(&r)
         {
@@ -299,7 +493,7 @@ pub fn find_texture_donor(
         "",
         true,
         &mut |a, id, p| {
-            if found.is_some() || seen > 5000 || !p.to_ascii_lowercase().ends_with(".ydr") {
+            if found.is_some() || seen > 5000 || !kinds(p) {
                 return;
             }
             seen += 1;
@@ -312,6 +506,34 @@ pub fn find_texture_donor(
         &mut |_| {},
     );
     found
+}
+
+/// The mesh without the triangles whose first corner belongs to a part
+/// `drop` names (by index into its part names); unused vertices go too.
+fn without_triangles(m: ObjMesh, drop: impl Fn(u16) -> bool) -> ObjMesh {
+    let mut out = ObjMesh { material: m.material, part_names: m.part_names, ..Default::default() };
+    let mut map: HashMap<u32, u32> = HashMap::new();
+    for t in m.indices.as_chunks::<3>().0 {
+        if drop(m.parts[t[0] as usize]) {
+            continue;
+        }
+        for &i in t {
+            let k = *map.entry(i).or_insert_with(|| {
+                let i = i as usize;
+                out.positions.push(m.positions[i]);
+                out.parts.push(m.parts[i]);
+                if !m.normals.is_empty() {
+                    out.normals.push(m.normals[i]);
+                }
+                if !m.uvs.is_empty() {
+                    out.uvs.push(m.uvs[i]);
+                }
+                out.positions.len() as u32 - 1
+            });
+            out.indices.push(k);
+        }
+    }
+    out
 }
 
 /// Splits a mesh into pieces of at most [`MAX_VERTICES`] vertices.
@@ -340,6 +562,9 @@ pub fn split(m: NewMesh) -> Vec<NewMesh> {
                 }
                 if !m.colors.is_empty() {
                     piece.colors.push(m.colors[i as usize]);
+                }
+                if !m.bones.is_empty() {
+                    piece.bones.push(m.bones[i as usize]);
                 }
                 k
             });
@@ -386,6 +611,59 @@ mod tests {
     }
 
     #[test]
+    fn parts_go_on_the_bones_of_their_names() {
+        let text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\n\
+            o bodyshell_mesh\nusemtl paint\nf 1 2 3\n\
+            o door_dside_f.001\nusemtl paint\nf 2 4 3\n\
+            g BONNET\nusemtl glass\nf 1 2 4\n";
+        let meshes = read(text).unwrap();
+        assert_eq!(meshes.len(), 2);
+        let paint = &meshes[0];
+        assert_eq!(paint.part_names, ["bodyshell_mesh", "door_dside_f.001"]);
+        assert_eq!(paint.positions.len(), 6, "a corner shared by two parts is two vertices");
+        assert_eq!(paint.parts, [0, 0, 0, 1, 1, 1]);
+
+        let skeleton = ["chassis", "bonnet", "door_dside_f", "bodyshell"].map(String::from).to_vec();
+        let textures = HashMap::new();
+        let mut fit = Fitter::new(&[0], None, &textures).unwrap().with_bones(Bones::new(skeleton));
+        let out = fit.level(meshes);
+        assert_eq!(out[0].bones, [3, 3, 3, 2, 2, 2], "unknown parts go on the body (bodyshell)");
+        assert_eq!(out[1].bones, [1, 1, 1]);
+        let bones = fit.bones().unwrap();
+        assert_eq!(bones.unmatched, ["bodyshell_mesh"]);
+        assert_eq!(bones.body_name(), "bodyshell");
+        assert!(bones.matched.contains(&("door_dside_f.001".into(), "door_dside_f".into())));
+        let mut b = Bones::new(["chassis", "extra_1", "bonnet"].map(String::from).to_vec());
+        assert_eq!((b.bone_of("bonnet_12"), b.bone_of("extra_1"), b.bone_of("extra_1_4")), (2, 1, 1));
+
+        // Parts named after a bone with a model of its own (wheels) are left out.
+        let skeleton = ["chassis", "bodyshell", "wheel_lf"].map(String::from).to_vec();
+        let wheels = Bones::new(skeleton).with_own_models(vec!["wheel_lf".into()]);
+        let mut fit = Fitter::new(&[0], None, &textures).unwrap().with_bones(wheels);
+        let text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\no body_0\nf 1 2 3\no wheel_lf_7\nf 2 4 3\n";
+        let out = fit.level(read(text).unwrap());
+        assert_eq!((out.len(), out[0].positions.len(), out[0].indices.len()), (1, 3, 3));
+        assert_eq!(fit.bones().unwrap().left_out, ["wheel_lf_7"]);
+
+        // Materials named after a shader's texture go on it; a shader without
+        // a colour slot keeps its own texture.
+        let infos = vec![
+            ShaderInfo { index: 0, texture: Some("paint".into()), takes_texture: false },
+            ShaderInfo { index: 4, texture: Some("Plate01".into()), takes_texture: true },
+        ];
+        assert_eq!(shader_named(&infos, "plate_shader_plate01", None), Some(4));
+        assert_eq!(shader_named(&infos, "x", Some("plate01")), Some(4));
+        assert_eq!(shader_named(&infos, "glass", None), None);
+        let tex = rage_formats::ydr_write::texture_from_rgba("t", 4, 4, &[9; 64]).unwrap();
+        assert!(fit_texture(&infos, 0, Some(tex.clone())).1);
+        assert!(fit_texture(&infos, 4, Some(tex)).0.is_some());
+
+        // Without bones: none.
+        let mut plain = Fitter::new(&[0], None, &textures).unwrap();
+        assert!(plain.level(read(text).unwrap()).iter().all(|m| m.bones.is_empty()));
+    }
+
+    #[test]
     fn fits_materials_to_shaders_and_splits_big_meshes() {
         let mesh = |name: &str| ObjMesh {
             material: name.into(),
@@ -393,6 +671,7 @@ mod tests {
             normals: Vec::new(),
             uvs: Vec::new(),
             indices: vec![0, 1, 2],
+            ..Default::default()
         };
         let textures = HashMap::new();
         let mut fit = Fitter::new(&[0, 2], None, &textures).unwrap();
