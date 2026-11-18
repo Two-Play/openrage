@@ -4,7 +4,7 @@ name: Dev environment
 # whenever the environment or the dependencies change.
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths: ["dev/**", "rust-toolchain.toml", "Cargo.lock", ".github/workflows/dev-env.yml"]
   pull_request:
     paths: ["dev/**", "rust-toolchain.toml", "Cargo.lock", ".github/workflows/dev-env.yml"]

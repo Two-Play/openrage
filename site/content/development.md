@@ -83,9 +83,20 @@ podman run --rm -v "$PWD":/src:Z -w /src localhost/openrage-dev cargo build --re
 
 CI builds the image and OpenRAGE inside it whenever the environment or the dependencies change.
 
+## Branches
+
+- **`develop`** is where work goes: every change is a pull request into `develop` (the default branch).
+- **`main`** holds what is released. It only takes pull requests from `develop` (a release) or from a `hotfix/…`
+  branch (an urgent fix, merged back into `develop` afterwards); the *Branch flow* check refuses others.
+- Both branches are protected: no direct pushes, no force pushes, no deleting; changes need a pull request with the
+  *test* and *licenses* checks passing. Pull requests that only touch the website or documentation skip those checks
+  (CI ignores such changes), so a maintainer merges them as an admin.
+
+A release: open a pull request from `develop` into `main`, merge it, then tag `main` (below).
+
 ## Releases
 
-Releases are made by pushing a version tag (`git tag v0.2.0 && git push origin v0.2.0`, matching the version in `Cargo.toml`); the *Release* workflow builds both systems and publishes the release. It can also be run by hand from the Actions tab to build the archives without publishing.
+Releases are made by pushing a version tag on `main` (`git tag v0.2.0 && git push origin v0.2.0`, matching the version in `Cargo.toml`); the *Release* workflow builds both systems and publishes the release. It can also be run by hand from the Actions tab to build the archives without publishing.
 
 Once a release is published, the *Release bundle* workflow adds `openrage-<tag>-linux-windows.zip`: both versions in one
 download (`linux/`, `windows/`, a short `README.txt` and the license files), for mod sites that host one file per release.

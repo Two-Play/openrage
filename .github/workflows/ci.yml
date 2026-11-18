@@ -4,7 +4,7 @@ name: CI
 # the website has its own checks (pages.yml).
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths-ignore:
       - "site/**"
       - "docs/**"

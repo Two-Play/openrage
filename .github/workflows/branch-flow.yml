@@ -1,0 +1,24 @@
+name: Branch flow
+
+# Work goes into `develop`; `main` only takes releases from `develop` (and
+# urgent fixes from `hotfix/…` branches). The rulesets of both branches
+# require pull requests; this check, required on `main`, keeps everything
+# else out of it.
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only develop or hotfix/… go into main
+        env:
+          HEAD: ${{ github.head_ref }}
+        run: |
+          case "$HEAD" in
+            develop|hotfix/*) echo "$HEAD → main: ok" ;;
+            *) echo "::error::Pull requests into main come from develop (or hotfix/…), not from $HEAD. Target develop instead."; exit 1 ;;
+          esac
