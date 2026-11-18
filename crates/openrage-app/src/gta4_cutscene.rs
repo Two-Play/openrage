@@ -33,6 +33,8 @@ pub struct Subtitle {
     pub start: f32,
     pub duration: f32,
     pub key: String,
+    /// The text table it is in (`[MISSION_TEXT_NAME]` of its header).
+    pub table: Option<String>,
 }
 
 /// One line of a section's `[MODELS]`.
@@ -418,13 +420,20 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
             block = None;
             continue;
         }
-        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+        // A block starts, its `]` sometimes missing (`[MISSION_TEXT_NAME`).
+        if let Some(name) = line.strip_prefix('[').map(|l| l.strip_suffix(']').unwrap_or(l))
+            && !name.is_empty()
+            && name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        {
             block = Some(name.to_owned());
             continue;
         }
         let Some(name) = block.as_deref() else {
-            // Padding after the last section (not always NUL bytes).
-            if section.is_none() && !cut.sections.is_empty() {
+            // Padding after the last section: left-over memory, not text.
+            if section.is_none()
+                && !cut.sections.is_empty()
+                && line.chars().any(|c| !(c == '\t' || (' '..='~').contains(&c)))
+            {
                 break;
             }
             // Notes left by the game's tools (`VARIATION FOUND!`).
@@ -437,10 +446,14 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
                 let f: Vec<&str> = line.split_whitespace().collect();
                 let [start, length, key] = f.as_slice() else { bail!(bad()) };
                 let (start, length): (f32, f32) = (start.parse().with_context(bad)?, length.parse().with_context(bad)?);
+                // A cutscene put together from several has a header before
+                // each part: its times count from the part's first section.
+                let part = cut.sections.iter().map(|s| s.duration).sum::<f32>();
                 cut.subtitles.push(Subtitle {
-                    start: start / 1000.0,
+                    start: part + start / 1000.0,
                     duration: length / 1000.0,
                     key: (*key).to_owned(),
+                    table: cut.text_table.clone(),
                 });
             }
             (None, "FLAGS") => cut.flags.push(line.to_owned()),
@@ -820,28 +833,46 @@ pub fn load_props(
     while let Some((s, _)) = shorter.last().and_then(|s| s.rsplit_once('_')) {
         shorter.push(s.to_owned());
     }
-    let stems: Vec<String> =
+    let mut stems: Vec<String> =
         shorter.iter().flat_map(|s| [s.clone(), s[..s.len().saturating_sub(1)].to_owned()]).collect();
-    let Some(vpath) = stems.iter().find_map(|stem| {
-        index
-            .model_files(&format!("{stem}_p"))
-            .iter()
-            .filter(|(_, e)| e.to_ascii_lowercase().ends_with(".wdd"))
-            .min_by_key(|(p, _)| !in_episode(p))
-            .and_then(|(p, e)| Some(format!("{}/{e}", p.strip_prefix(game).ok()?.to_string_lossy().replace('\\', "/"))))
-    }) else {
-        return Vec::new();
-    };
-    let wanted: Vec<(String, u32, &'static str)> = props
+    // A cutscene character's dictionary may lack what the in-game one has
+    // (`cs_mori_k_p` has no glasses, `ig_mori_k_p` does).
+    let in_game: Vec<String> = stems.iter().filter_map(|s| Some(format!("ig_{}", s.strip_prefix("cs_")?))).collect();
+    stems.extend(in_game);
+    let dictionaries: Vec<String> = stems
+        .iter()
+        .filter_map(|stem| {
+            index
+                .model_files(&format!("{stem}_p"))
+                .iter()
+                .filter(|(_, e)| e.to_ascii_lowercase().ends_with(".wdd"))
+                .min_by_key(|(p, _)| !in_episode(p))
+                .and_then(|(p, e)| {
+                    Some(format!("{}/{e}", p.strip_prefix(game).ok()?.to_string_lossy().replace('\\', "/")))
+                })
+        })
+        .collect();
+    let mut wanted: Vec<(String, u32, &'static str)> = props
         .iter()
         .filter_map(|p| {
             let name = p.name()?;
             Some((name.clone(), rage_core::hash::joaat(&name), p.bone()))
         })
         .collect();
-    let names: Vec<(String, u32)> = wanted.iter().map(|(n, h, _)| (n.clone(), *h)).collect();
-    let loaded = crate::models::load_gta4_members(game, &vpath, &names).unwrap_or_default();
-    loaded.into_iter().filter_map(|(name, m)| Some((m, wanted.iter().find(|(n, ..)| *n == name)?.2))).collect()
+    let mut out = Vec::new();
+    // Each accessory from the first dictionary that has it.
+    for vpath in dictionaries {
+        if wanted.is_empty() {
+            break;
+        }
+        let names: Vec<(String, u32)> = wanted.iter().map(|(n, h, _)| (n.clone(), *h)).collect();
+        for (name, m) in crate::models::load_gta4_members(game, &vpath, &names).unwrap_or_default() {
+            if let Some(k) = wanted.iter().position(|(n, ..)| *n == name) {
+                out.push((m, wanted.remove(k).2));
+            }
+        }
+    }
+    out
 }
 
 /// Paints a GTA IV vehicle: its `gta_vehicle_paint1` to `…paint3`
@@ -884,28 +915,57 @@ pub fn light_at(dict: &ClipDictionary, clip: &Clip, time: f32) -> Option<cutscen
 }
 
 /// The cutscene's subtitles with their text, from the episode's
-/// `american.gxt`: (start, end, text), in seconds.
+/// `american.gxt`: (start, end, text), in seconds. A part cutscene whose
+/// texts the game mostly lacks shows those of the whole cutscene it is part of.
 pub fn subtitles(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Vec<(f32, f32, String)> {
+    let own = own_subtitles(game, vpath, cut);
+    // Most of its own texts there: a few missing are the game's.
+    if own.len() * 2 >= cut.subtitles.len() {
+        return own;
+    }
+    let Some((whole, offset)) = whole_cutscene(game, vpath, cut) else { return own };
+    let end = offset + cut.duration();
+    let from_whole: Vec<(f32, f32, String)> = own_subtitles(game, vpath, &whole)
+        .into_iter()
+        .filter(|(start, ..)| (offset..end).contains(start))
+        .map(|(start, stop, text)| (start - offset, stop - offset, text))
+        .collect();
+    if from_whole.len() > own.len() { from_whole } else { own }
+}
+
+fn own_subtitles(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Vec<(f32, f32, String)> {
     if cut.subtitles.is_empty() {
         return Vec::new();
     }
-    let rel = format!("{}common/text/american.gxt", episode(vpath));
-    let Some(tables) = rage_rpf::vfs::find_case_insensitive(game, &rel)
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|d| rage_formats::gxt::parse(&d).ok())
-    else {
+    // The episode's texts, then the base game's and the other episode's (a
+    // few cutscenes name texts of another table).
+    let mut tables: Vec<rage_formats::gxt::Table> = Vec::new();
+    for ep in [episode(vpath), "", "TLAD/", "TBoGT/"] {
+        if ep.eq_ignore_ascii_case(episode(vpath)) && !tables.is_empty() {
+            continue;
+        }
+        let read = rage_rpf::vfs::find_case_insensitive(game, &format!("{ep}common/text/american.gxt"))
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|d| rage_formats::gxt::parse(&d).ok());
+        tables.extend(read.unwrap_or_default());
+    }
+    if tables.is_empty() {
         return Vec::new();
-    };
-    // The mission's own table first, then the others.
-    let wanted = cut.text_table.as_deref().unwrap_or_default();
-    let mut order: Vec<&rage_formats::gxt::Table> = tables.iter().collect();
-    order.sort_by_key(|t| !t.name.eq_ignore_ascii_case(wanted));
+    }
     cut.subtitles
         .iter()
         .filter_map(|s| {
+            // The subtitle's own table first, then the others.
+            let wanted = s.table.as_deref().or(cut.text_table.as_deref()).unwrap_or_default();
             let hash = rage_core::hash::joaat(&s.key);
-            let text = order.iter().find_map(|t| t.entries.iter().find(|(h, _)| *h == hash).map(|(_, v)| v))?;
-            Some((s.start, s.start + s.duration, plain_text(text)))
+            let find =
+                |t: &rage_formats::gxt::Table| t.entries.iter().find(|(h, _)| *h == hash).map(|(_, v)| v.clone());
+            let text = tables
+                .iter()
+                .filter(|t| t.name.eq_ignore_ascii_case(wanted))
+                .find_map(find)
+                .or_else(|| tables.iter().find_map(find))?;
+            Some((s.start, s.start + s.duration, plain_text(&text)))
         })
         .collect()
 }
@@ -968,35 +1028,94 @@ fn audio_paths(vpath: &str, name: &str) -> Vec<String> {
 
 /// The cutscene's sound as one stereo track from its start: a section's
 /// `[AUDIO]` starts that sound where the section starts; a section without
-/// one (or with the same) lets the sound run on. Also returns the sounds not found.
+/// one (or with the same) lets the sound run on, and so does a sound the
+/// game lacks. A part cutscene (`y1_aap2`, `rb03p2`) whose own sound the
+/// game lacks plays the whole cutscene's sound (`y1_aa`) from where its
+/// first section starts there. Also returns the sounds not found.
 pub fn audio(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> (Option<rage_formats::awc::Pcm>, Vec<String>) {
+    let (own, missing) = own_audio(game, vpath, cut);
+    if own.is_some() {
+        return (own, missing);
+    }
+    match whole_cutscene(game, vpath, cut) {
+        Some((whole, offset)) => match own_audio(game, vpath, &whole).0 {
+            Some(pcm) => (Some(slice(&pcm, offset, cut.duration())), Vec::new()),
+            None => (None, missing),
+        },
+        None => (None, missing),
+    }
+}
+
+/// The cutscene `cut` is a part of: another one next to it whose sections
+/// include `cut`'s first one (by its animation dictionary), and where that
+/// section starts in it.
+fn whole_cutscene(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Option<(Gta4Cutscene, f32)> {
+    let first = cut.sections.first()?.anim.to_ascii_lowercase();
+    if first.is_empty() {
+        return None;
+    }
+    let (Node::Gta4File(archive, id), _) = rage_mods::resolve(game, vpath, None).ok()? else { return None };
+    let dir = (0..archive.len())
+        .find(|&d| archive.entry(d).is_dir() && archive.children(d).contains(&id))
+        .unwrap_or(rage_rpf::Gta4Archive::ROOT);
+    archive
+        .children(dir)
+        .filter(|&other| other != id && archive.entry(other).name.to_ascii_lowercase().ends_with(".cut"))
+        .filter_map(|other| parse(&archive.read(other).ok()?).ok())
+        .filter(|whole| whole.sections.len() > cut.sections.len())
+        .find_map(|whole| {
+            let k = whole.sections.iter().position(|s| s.anim.eq_ignore_ascii_case(&first))?;
+            let offset = whole.sections[..k].iter().map(|s| s.duration).sum();
+            Some((whole, offset))
+        })
+}
+
+/// `length` seconds of a stereo track from `start` (silence past its end).
+fn slice(pcm: &rage_formats::awc::Pcm, start: f32, length: f32) -> rage_formats::awc::Pcm {
+    let rate = pcm.sample_rate as f32;
+    let from = ((start * rate) as usize * 2).min(pcm.samples.len());
+    let to = (from + (length * rate) as usize * 2).min(pcm.samples.len());
+    rage_formats::awc::Pcm { sample_rate: pcm.sample_rate, channels: 2, samples: pcm.samples[from..to].to_vec() }
+}
+
+/// A cutscene's own sound (see [`audio`]), without looking for the whole
+/// cutscene it may be part of.
+fn own_audio(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> (Option<rage_formats::awc::Pcm>, Vec<String>) {
     // (start in the cutscene, sound name)
     let mut segments: Vec<(f32, String)> = Vec::new();
     let mut at = 0.0;
     for s in &cut.sections {
-        if let Some(name) = s.audio.as_deref().filter(|n| !n.is_empty())
-            && segments.last().is_none_or(|(_, last)| !last.eq_ignore_ascii_case(name))
-        {
-            segments.push((at, name.to_owned()));
+        if let Some(name) = s.audio.as_deref().filter(|n| !n.is_empty()) {
+            segments.push((at, name.to_ascii_lowercase()));
         }
         at += s.duration;
     }
     let total = cut.duration();
-    let mut missing = Vec::new();
-    // A sound the game lacks lets the one before run on.
-    let found: Vec<(f32, rage_formats::awc::Pcm)> = segments
-        .into_iter()
-        .filter_map(|(start, name)| {
-            let pcm = audio_paths(vpath, &name).into_iter().find_map(|p| {
+    let mut missing: Vec<String> = Vec::new();
+    let mut sounds: std::collections::HashMap<String, Option<rage_formats::awc::Pcm>> = Default::default();
+    for (_, name) in &segments {
+        sounds.entry(name.clone()).or_insert_with(|| {
+            let pcm = audio_paths(vpath, name).into_iter().find_map(|p| {
                 let (Node::Gta4File(a, id), _) = rage_mods::resolve(game, &p, None).ok()? else { return None };
                 rage_formats::ivaud::decode(&a.read(id).ok()?).ok()
             });
             if pcm.is_none() {
-                missing.push(name);
+                missing.push(name.clone());
             }
-            Some((start, to_stereo(&pcm?)))
-        })
-        .collect();
+            pcm.map(|p| to_stereo(&p))
+        });
+    }
+    // A sound the game lacks lets the one before run on; so does the same
+    // sound named again.
+    let mut found: Vec<(f32, &rage_formats::awc::Pcm)> = Vec::new();
+    let mut last: Option<&str> = None;
+    for (start, name) in &segments {
+        let Some(Some(pcm)) = sounds.get(name) else { continue };
+        if last != Some(name.as_str()) {
+            found.push((*start, pcm));
+            last = Some(name);
+        }
+    }
     let mut out: Option<rage_formats::awc::Pcm> = None;
     for (i, (start, pcm)) in found.iter().enumerate() {
         let end = found.get(i + 1).map_or(f32::MAX, |(s, _)| *s);
@@ -1021,6 +1140,10 @@ pub fn audio(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> (Option<rage_forma
             }
             track.samples.extend_from_slice(&pcm.samples[2 * k..2 * k + 2]);
         }
+    }
+    // Nothing plays past the cutscene's end.
+    if let Some(track) = out.as_mut() {
+        track.samples.truncate((total * track.sample_rate as f32) as usize * 2);
     }
     (out, missing)
 }
@@ -1142,7 +1265,10 @@ mod tests {
         data.extend_from_slice(b"\xcd\xcd\x14\\@\n\0\0\xcd garbage after the text");
         let cut = parse(&data).unwrap();
         assert_eq!(cut.text_table.as_deref(), Some("B1AUD"));
-        assert_eq!(cut.subtitles[1], Subtitle { start: 1.737, duration: 0.763, key: "B1_CUT1_2".into() });
+        assert_eq!(
+            cut.subtitles[1],
+            Subtitle { start: 1.737, duration: 0.763, key: "B1_CUT1_2".into(), table: Some("B1AUD".into()) }
+        );
         assert_eq!(cut.flags, ["LONG_FADE_OUT"]);
         assert_eq!(cut.player_start, Some([-1153.121, 415.058, 4.57]));
         assert_eq!(cut.sections.len(), 2);
@@ -1247,6 +1373,24 @@ FX_CS_spit:effect1_0 0 1205 500 500 0 0 0 0 0 0 0\n[/EFFECTS]\n[DURATION]\n2000\
     }
 
     #[test]
+    fn reads_cutscenes_put_together() {
+        // Two cutscenes in one: each part's header counts its subtitles from
+        // its own first section; one header lacks a `]`.
+        let cut = parse(
+            b"[MISSION_TEXT_NAME]\nA1AUD\n[/MISSION_TEXT_NAME]\n[TEXT]\n500 1000 A1_1\n[/TEXT]\n\
+[SECTION_START]\n[DURATION]\n20000\n[/DURATION]\n[ANIM]\na_0\n[/ANIM]\n[SECTION_END]\n\
+[CUTSCENE_HEADER]\n541\t3233\n[/CUTSCENE_HEADER]\n[MISSION_TEXT_NAME\nB2AUD\n[/MISSION_TEXT_NAME]\n\
+[TEXT]\n1500 1000 B2_1\n[/TEXT]\nVARIATION FOUND!\n\
+[SECTION_START]\n[DURATION]\n10000\n[/DURATION]\n[ANIM]\nb_0\n[/ANIM]\n[SECTION_END]\n\xcd\xcd\xcd\x14\n",
+        )
+        .unwrap();
+        assert_eq!(cut.sections.len(), 2, "the second part is read too");
+        let second = &cut.subtitles[1];
+        assert_eq!((second.start, second.table.as_deref()), (21.5, Some("B2AUD")));
+        assert_eq!(cut.subtitles[0].table.as_deref(), Some("A1AUD"));
+    }
+
+    #[test]
     fn rejects_broken_files() {
         assert!(parse(b"[TEXT]\n1 2 A\n[/TEXT]\n").is_err(), "no sections");
         assert!(parse(b"[SECTION_START]\n[MODELS]\nCS_PhilB\n[/MODELS]\n[SECTION_END]\n").is_err());
@@ -1264,6 +1408,16 @@ FX_CS_spit:effect1_0 0 1205 500 500 0 0 0 0 0 0 0\n[/EFFECTS]\n[DURATION]\n2000\
         assert_eq!(cut.player_start, Some([-1501.92, 283.1, 13.78]));
         assert_eq!(cut.subtitles.len(), 1);
         assert_eq!(cut.sections[0].models[0].face, None);
+    }
+
+    #[test]
+    fn cuts_a_part_out_of_a_sound() {
+        use rage_formats::awc::Pcm;
+        // Two frames per second: frames 0..=4.
+        let whole = Pcm { sample_rate: 2, channels: 2, samples: vec![0, 0, 1, 1, 2, 2, 3, 3, 4, 4] };
+        assert_eq!(slice(&whole, 1.0, 1.0).samples, [2, 2, 3, 3]);
+        assert_eq!(slice(&whole, 2.0, 5.0).samples, [4, 4], "stops at the end");
+        assert!(slice(&whole, 9.0, 1.0).samples.is_empty());
     }
 
     #[test]

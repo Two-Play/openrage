@@ -684,6 +684,8 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
         sound: f32,
         /// Accessories named, and found.
         props: (usize, usize),
+        /// Subtitles, and those whose text was found.
+        subtitles: (usize, usize),
         /// Effects named, and found in the effect lists.
         effects: (usize, usize),
         unknown_effects: Vec<String>,
@@ -740,6 +742,7 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
                     seconds: cut.duration(),
                     sound: sound.map_or(0.0, |p| p.duration_secs()),
                     props,
+                    subtitles: (cut.subtitles.len(), gta4_cutscene::subtitles(game_dir, vpath, &cut).len()),
                 })
             })();
             (vpath.clone(), checked)
@@ -747,6 +750,8 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
         .collect();
     let (mut sections, mut actors, mut seconds, mut no_model, mut problems, mut ok) = (0, 0, 0.0, 0, 0, 0);
     let mut sound = 0.0;
+    let mut subtitles = (0, 0);
+    let mut silent: Vec<String> = Vec::new();
     let mut props = (0, 0);
     let mut effects = (0, 0);
     for (vpath, r) in results {
@@ -757,6 +762,9 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
                 actors += c.actors;
                 seconds += c.seconds;
                 sound += c.sound;
+                if c.sound == 0.0 {
+                    silent.push(vpath.rsplit('/').next().unwrap_or(&vpath).to_owned());
+                }
                 props = (props.0 + c.props.0, props.1 + c.props.1);
                 effects = (effects.0 + c.effects.0, effects.1 + c.effects.1);
                 let mut unknown = c.unknown_effects.clone();
@@ -764,6 +772,7 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
                 if !unknown.is_empty() {
                     outln!("{vpath}: effects not in the effect lists: {}", unknown.join(", "));
                 }
+                subtitles = (subtitles.0 + c.subtitles.0, subtitles.1 + c.subtitles.1);
                 no_model += c.no_model.len();
                 problems += c.problems.len();
                 if !c.no_model.is_empty() {
@@ -779,10 +788,14 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
     for e in errors.iter().take(50) {
         outln!("FAIL {e}");
     }
+    if !silent.is_empty() {
+        outln!("{} cutscenes without sound: {}", silent.len(), silent.join(", "));
+    }
     outln!(
         "{} cutscenes ({ok} read, {:.0} minutes, {:.0} minutes of sound), {sections} sections, {actors} actors, \
-         {no_model} without a model, {} of {} accessories found, {} of {} effects found, {problems} clips, \
-         dictionaries or sounds missing, {} errors ({:.1}s)",
+         {no_model} without a model, {} of {} accessories found, {} of {} effects found, \
+         {} subtitles shown ({} named), {problems} clips, dictionaries or sounds missing, \
+         {} errors ({:.1}s)",
         cuts.len(),
         seconds / 60.0,
         sound / 60.0,
@@ -790,6 +803,8 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
         props.0,
         effects.1,
         effects.0,
+        subtitles.1,
+        subtitles.0,
         errors.len(),
         started.elapsed().as_secs_f32()
     );
