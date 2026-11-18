@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
+use openrage_app::gta4_effects::{Image, Sprite};
 use openrage_app::models::{LoadedModel, Look};
 use openrage_app::render::{Camera, Materials};
 use rage_formats::math;
@@ -128,6 +129,34 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
     let colour = mix(base.rgb * draw.tint.rgb, layer.rgb, layer.a);
     return vec4<f32>(colour * light, 1.0);
 }
+
+// Particles: camera-facing squares, built on the CPU in world space.
+struct SpriteIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) colour: vec4<f32>,
+};
+struct SpriteOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) colour: vec4<f32>,
+};
+
+@vertex
+fn vs_sprite(v: SpriteIn) -> SpriteOut {
+    var o: SpriteOut;
+    o.clip = globals.view_proj * vec4<f32>(v.pos, 1.0);
+    o.uv = v.uv;
+    o.colour = v.colour;
+    return o;
+}
+
+// Premultiplied: blended over (alpha) or added (glows) by the pipeline.
+@fragment
+fn fs_sprite(i: SpriteOut) -> @location(0) vec4<f32> {
+    let c = textureSample(tex, samp, i.uv) * i.colour;
+    return vec4<f32>(c.rgb * c.a, c.a);
+}
 "#;
 
 #[repr(C)]
@@ -139,6 +168,14 @@ struct Vertex {
     weights: [f32; 4],
     joints: [u32; 4],
     uv1: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SpriteVertex {
+    pos: [f32; 3],
+    uv: [f32; 2],
+    colour: [f32; 4],
 }
 
 #[repr(C)]
@@ -174,6 +211,9 @@ struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    /// Particles blended over the scene, and particles that add light.
+    sprite_blend: wgpu::RenderPipeline,
+    sprite_add: wgpu::RenderPipeline,
     globals_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
     tint_layout: wgpu::BindGroupLayout,
@@ -226,6 +266,8 @@ struct State {
     targets: Option<Targets>,
     /// Bone palette of items without a skin (all identity), shared by them.
     rest_pose: Option<wgpu::BindGroup>,
+    /// Particle textures, uploaded once each.
+    sprite_textures: Vec<(Weak<Image>, wgpu::BindGroup)>,
 }
 
 thread_local! {
@@ -364,6 +406,62 @@ fn init() -> Option<Gpu> {
         multiview_mask: None,
         cache: None,
     });
+    let sprite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sprite"),
+        bind_group_layouts: &[Some(&globals_layout), Some(&texture_layout)],
+        immediate_size: 0,
+    });
+    let sprite_pipeline = |blend: wgpu::BlendState| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sprite"),
+            layout: Some(&sprite_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_sprite"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SpriteVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4],
+                })],
+            },
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            // Hidden behind models, but not hiding each other.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: SAMPLES, ..Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_sprite"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: COLOR_FORMAT,
+                    blend: Some(blend),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let sprite_blend = sprite_pipeline(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+    let sprite_add = sprite_pipeline(wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Zero,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    });
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         address_mode_u: wgpu::AddressMode::Repeat,
         address_mode_v: wgpu::AddressMode::Repeat,
@@ -374,6 +472,8 @@ fn init() -> Option<Gpu> {
     let white = upload_texture(&device, &queue, 1, 1, &[255, 255, 255, 255]);
     let clear = upload_texture(&device, &queue, 1, 1, &[0, 0, 0, 0]);
     Some(Gpu {
+        sprite_blend,
+        sprite_add,
         device,
         queue,
         pipeline,
@@ -616,7 +716,7 @@ pub fn render(
     w: u32,
     h: u32,
 ) -> Option<slint::Image> {
-    render_scene(&[SceneItem { preview, look, model: math::IDENTITY, skin }], &[], camera, w, h)
+    render_scene(&[SceneItem { preview, look, model: math::IDENTITY, skin }], &[], &[], camera, w, h)
 }
 
 /// One model of a scene: what is shown, where it stands and its pose.
@@ -628,11 +728,57 @@ pub struct SceneItem<'a> {
     pub skin: Option<&'a [math::Mat4]>,
 }
 
-/// Renders several models (each with its own placement and pose) from
-/// `camera`, e.g. all actors of a cutscene.
+/// A run of sprites drawn alike: first sprite, count, additive, texture.
+type SpriteRun = (usize, usize, bool, *const Image);
+
+/// Particles as camera-facing squares, farthest first: vertices (six per
+/// sprite) and the runs to draw them in.
+fn sprite_vertices(sprites: &[Sprite], camera: &Camera) -> (Vec<SpriteVertex>, Vec<SpriteRun>) {
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let mut order: Vec<&Sprite> = sprites.iter().collect();
+    let depth = |s: &Sprite| {
+        dot(
+            camera.forward,
+            [s.position[0] - camera.eye[0], s.position[1] - camera.eye[1], s.position[2] - camera.eye[2]],
+        )
+    };
+    order.sort_by(|a, b| depth(b).total_cmp(&depth(a)));
+    let mut vertices = Vec::with_capacity(order.len() * 6);
+    let mut runs: Vec<SpriteRun> = Vec::new();
+    for (i, s) in order.iter().enumerate() {
+        let (sin, cos) = s.rotation.sin_cos();
+        let (hw, hh) = (s.size[0] / 2.0, s.size[1] / 2.0);
+        // The square's axes, turned in the view plane.
+        let ax: [f32; 3] = std::array::from_fn(|k| (camera.right[k] * cos + camera.up[k] * sin) * hw);
+        let ay: [f32; 3] = std::array::from_fn(|k| (camera.up[k] * cos - camera.right[k] * sin) * hh);
+        let corner = |x: f32, y: f32, u: f32, v: f32| SpriteVertex {
+            pos: std::array::from_fn(|k| s.position[k] + ax[k] * x + ay[k] * y),
+            uv: [u, v],
+            colour: s.colour,
+        };
+        let [u0, v0, u1, v1] = s.uv;
+        let (a, b, c, d) = (
+            corner(-1.0, 1.0, u0, v0),
+            corner(1.0, 1.0, u1, v0),
+            corner(1.0, -1.0, u1, v1),
+            corner(-1.0, -1.0, u0, v1),
+        );
+        vertices.extend_from_slice(&[a, b, c, a, c, d]);
+        let key = (s.additive, Arc::as_ptr(&s.texture));
+        match runs.last_mut() {
+            Some(run) if (run.2, run.3) == key => run.1 += 1,
+            _ => runs.push((i, 1, key.0, key.1)),
+        }
+    }
+    (vertices, runs)
+}
+
+/// Renders several models (each with its own placement and pose) and
+/// particles from `camera`, e.g. all actors of a cutscene.
 pub fn render_scene(
     items: &[SceneItem],
     lights: &[SceneLight],
+    sprites: &[Sprite],
     camera: &Camera,
     w: u32,
     h: u32,
@@ -659,6 +805,15 @@ pub fn render_scene(
             }
         }
 
+        st.sprite_textures.retain(|(owner, _)| owner.strong_count() > 0);
+        for sprite in sprites {
+            let ptr = Arc::as_ptr(&sprite.texture);
+            if !st.sprite_textures.iter().any(|(o, _)| o.as_ptr() == ptr) {
+                let t = &sprite.texture;
+                let view = upload_texture(&gpu.device, &gpu.queue, t.width, t.height, &t.rgba);
+                st.sprite_textures.push((Arc::downgrade(t), texture_bind_group(gpu, &view, &gpu.clear)));
+            }
+        }
         if st.targets.as_ref().is_none_or(|t| t.size != (w, h)) {
             st.targets = Some(targets(gpu, w, h));
         }
@@ -759,6 +914,14 @@ pub fn render_scene(
         let skin_groups: Vec<Option<wgpu::BindGroup>> =
             items.iter().map(|item| item.skin.map(|s| palette_group(Some(s)))).collect();
 
+        let (sprite_vertices, sprite_runs) = sprite_vertices(sprites, camera);
+        let sprite_buffer = (!sprite_vertices.is_empty()).then(|| {
+            gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sprites"),
+                contents: bytemuck::cast_slice(&sprite_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -790,6 +953,20 @@ pub fn render_scene(
                 pass.set_vertex_buffer(0, d.vertices.slice(..));
                 pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..d.count, 0, 0..1);
+            }
+            // Particles last, over what they are in front of.
+            if let Some(buffer) = &sprite_buffer {
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                for &(first, count, additive, texture) in &sprite_runs {
+                    let Some((_, group)) = st.sprite_textures.iter().find(|(o, _)| o.as_ptr() == texture) else {
+                        continue;
+                    };
+                    pass.set_pipeline(if additive { &gpu.sprite_add } else { &gpu.sprite_blend });
+                    pass.set_bind_group(0, &globals_group, &[]);
+                    pass.set_bind_group(1, group, &[]);
+                    let range = (first * 6) as u32..((first + count) * 6) as u32;
+                    pass.draw(range, 0..1);
+                }
             }
         }
         encoder.copy_texture_to_buffer(
@@ -857,6 +1034,46 @@ mod tests {
         assert!(!super::sphere_visible(&planes, &at([40.0, 10.0, 0.0]), unit));
         // A large sphere beside the view still reaches into it.
         assert!(super::sphere_visible(&planes, &at([40.0, 10.0, 0.0]), ([0.0; 3], 40.0)));
+    }
+
+    #[test]
+    fn sprites_draw_far_first_in_runs() {
+        use openrage_app::gta4_effects::{Image, Sprite};
+        use std::sync::Arc;
+        let camera = openrage_app::render::Camera {
+            eye: [0.0; 3],
+            forward: [0.0, 1.0, 0.0],
+            right: [1.0, 0.0, 0.0],
+            up: [0.0, 0.0, 1.0],
+            distance: 5.0,
+            radius: 50.0,
+            fov: 60f32.to_radians(),
+        };
+        let image = Arc::new(Image { width: 1, height: 1, rgba: vec![255; 4] });
+        let sprite = |y: f32, additive: bool| Sprite {
+            position: [0.0, y, 0.0],
+            size: [2.0, 2.0],
+            rotation: 0.0,
+            colour: [1.0; 4],
+            uv: [0.0, 0.0, 1.0, 1.0],
+            texture: Arc::clone(&image),
+            additive,
+        };
+        let (vertices, runs) =
+            super::sprite_vertices(&[sprite(1.0, false), sprite(5.0, false), sprite(3.0, true)], &camera);
+        assert_eq!(vertices.len(), 18);
+        // Farthest first: y 5 and 3, then 1; alike neighbours share a run.
+        assert_eq!(vertices[0].pos[1], 5.0);
+        assert_eq!(
+            runs.iter().map(|r| (r.0, r.1, r.2)).collect::<Vec<_>>(),
+            [(0, 1, false), (1, 1, true), (2, 1, false)]
+        );
+        // A 2 m square around its centre, facing the camera.
+        let xs: Vec<f32> = vertices[..6].iter().map(|v| v.pos[0]).collect();
+        assert_eq!(
+            (xs.iter().cloned().fold(f32::MAX, f32::min), xs.iter().cloned().fold(f32::MIN, f32::max)),
+            (-1.0, 1.0)
+        );
     }
 
     #[test]
