@@ -611,6 +611,9 @@ pub(crate) fn cmd_script(
 }
 
 pub(crate) fn cmd_particles(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    if path.to_ascii_lowercase().ends_with(".wpfl") {
+        return gta4_particles(game_dir, path);
+    }
     let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
     let Node::ArchiveFile(rpf, id) = node else { bail!("{path} is not a file inside an archive") };
     let p = rage_formats::ypt::parse(&rpf.read_resource(id)?)?;
@@ -632,6 +635,58 @@ pub(crate) fn cmd_particles(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKe
     }
     for e in &p.effects {
         outln!("  effect  {e}");
+    }
+    Ok(())
+}
+
+/// Shows a GTA IV effect list (`.wpfl`): effects with their emitters and
+/// particle rules, textures.
+fn gta4_particles(game_dir: &Path, path: &str) -> Result<()> {
+    use rage_formats::wpfl::{self, ParticleKind};
+    let data = match rage_mods::resolve(game_dir, path, None)?.0 {
+        Node::Gta4File(a, id) => a.read(id)?,
+        Node::PlainFile(p) => fs::read(p)?,
+        _ => bail!("{path} is not a file"),
+    };
+    let list = wpfl::parse(&rage_resource::Resource::from_rsc5(&data)?)?;
+    let sprites = list.particles.iter().filter(|p| p.kind == ParticleKind::Sprite).count();
+    outln!(
+        "{} effects, {} emitters, {} particle rules ({sprites} sprites, {} models), {} textures, {} models",
+        list.effects.len(),
+        list.emitters.len(),
+        list.particles.len(),
+        list.particles.len() - sprites,
+        list.textures.as_ref().map_or(0, |t| t.textures.len()),
+        list.models
+    );
+    if list.other_events > 0 {
+        outln!("{} events start other effects (not shown)", list.other_events);
+    }
+    for e in &list.errors {
+        outln!("problem: {e}");
+    }
+    for fx in &list.effects {
+        outln!("  effect  {} ({:.2}s)", fx.name, fx.duration(&list));
+        for ev in &fx.events {
+            let (em, pr) = (&list.emitters[ev.emitter], &list.particles[ev.particle]);
+            let what = match pr.kind {
+                ParticleKind::Sprite => format!(
+                    "sprite {}{}",
+                    pr.texture.as_deref().unwrap_or("-"),
+                    if pr.additive { ", glows" } else { "" }
+                ),
+                ParticleKind::Model => "model".to_owned(),
+            };
+            let life = em.life.at(0.0);
+            outln!(
+                "            {}: {:.2}s{}, life {:.2}–{:.2}s, {what}",
+                em.name,
+                em.duration,
+                if em.one_shot { " once" } else { "" },
+                life[0],
+                life[1]
+            );
+        }
     }
     Ok(())
 }

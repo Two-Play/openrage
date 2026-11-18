@@ -13,6 +13,7 @@ use openrage_app::anim::Binding;
 use openrage_app::cutscene::{self, Actor, Cutscene};
 use openrage_app::models::Look;
 use openrage_app::render::{self, Camera, View};
+use openrage_app::{gta4_cutscene, gta4_effects};
 use rage_crypto::GtaVKeys;
 use rage_formats::clip::ClipDictionary;
 use rage_formats::math::{self, Mat4};
@@ -78,6 +79,9 @@ struct State {
     audio: Option<Arc<rage_formats::awc::Pcm>>,
     output: Option<crate::audio::Output>,
     sound_on: bool,
+    /// Particle effects (GTA IV) placed in the scene, and their lists.
+    effects: Vec<gta4_effects::Instance>,
+    effect_library: Arc<gta4_effects::Library>,
     timer: slint::Timer,
 }
 
@@ -172,6 +176,7 @@ pub fn open(ui: &AppWindow, cut_path: String, cut: Cutscene, models: Vec<Option<
                 costumes: Vec::new(),
                 props: Vec::new(),
                 paints: Vec::new(),
+                effects: Effects::default(),
             })
         }),
     );
@@ -185,7 +190,6 @@ pub fn open_gta4(ui: &AppWindow, cut_path: String) {
         ui,
         cut_path,
         Box::new(move |game_dir, _keys, progress| {
-            use openrage_app::gta4_cutscene;
             progress.set("Reading the cutscene and its animation …", 0, 0);
             let scene = gta4_cutscene::load(game_dir, &path)?;
             let actors = &scene.cutscene.actors;
@@ -259,6 +263,16 @@ pub fn open_gta4(ui: &AppWindow, cut_path: String) {
                     .collect(),
                 audio: scene.audio,
                 light_clips: scene.animated.lights,
+                effects: Effects {
+                    shifts: scene
+                        .cut
+                        .sections
+                        .iter()
+                        .map(|s| std::array::from_fn(|k| s.offset[k] - scene.cut.sections[0].offset[k]))
+                        .collect(),
+                    placed: scene.effects,
+                    library: Arc::new(scene.effect_library),
+                },
             })
         }),
     );
@@ -287,6 +301,16 @@ struct Loaded {
     props: Vec<Vec<(ModelPreview, &'static str)>>,
     /// Per actor: its paint (GTA IV vehicles).
     paints: Vec<Option<[[f32; 3]; 3]>>,
+    effects: Effects,
+}
+
+/// A GTA IV cutscene's particle effects as the cutscene names them.
+#[derive(Default)]
+struct Effects {
+    placed: Vec<gta4_cutscene::PlacedEffect>,
+    /// Per section: from the first section's origin to its own.
+    shifts: Vec<[f32; 3]>,
+    library: Arc<gta4_effects::Library>,
 }
 
 /// The map around a cutscene.
@@ -415,6 +439,7 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
         costumes,
         props,
         paints,
+        effects,
     } = loaded;
     let cut = &cut;
     let mut actors = Vec::new();
@@ -422,7 +447,10 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
     let mut costumes = costumes.into_iter();
     let mut props = props.into_iter();
     let mut paints = paints.into_iter();
+    // Per cut actor: its place in `actors` (effects attach to them).
+    let mut actor_of: Vec<Option<usize>> = Vec::new();
     for ((actor, preview), clip) in cut.actors.iter().zip(previews).zip(clips) {
+        actor_of.push(None);
         let later = costumes.next().unwrap_or_default();
         let worn = props.next().unwrap_or_default();
         let paint = paints.next().flatten();
@@ -481,10 +509,14 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
             None => Vec::new(),
         };
         actors.push(SceneActor { preview: Arc::new(preview), look, costumes, attachments, clip, bindings });
+        if let Some(last) = actor_of.last_mut() {
+            *last = Some(actors.len() - 1);
+        }
     }
     let duration = dict.clips.iter().map(|c| c.duration()).fold(cut.duration, f32::max);
     let camera_clip = cutscene::camera_clip(&dict);
     let dict = Arc::new(dict);
+    let (instances, unknown_effects) = place_effects(&dict, &actors, &actor_of, &effects);
     // Bounds for the free camera: where the actors stand at the start.
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
     for a in &actors {
@@ -507,6 +539,12 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
     }
     if missing_clip > 0 {
         status.push_str(&format!(" · {missing_clip} without animation"));
+    }
+    if !instances.is_empty() || unknown_effects > 0 {
+        status.push_str(&format!(" · {} effects", instances.len()));
+        if unknown_effects > 0 {
+            status.push_str(&format!(" ({unknown_effects} not in the effect lists)"));
+        }
     }
     if !problems.is_empty() {
         status.push_str(&format!(" · missing in the game's files: {}", problems.join(", ")));
@@ -558,6 +596,8 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
         audio: audio.map(Arc::new),
         output: None,
         sound_on,
+        effects: instances,
+        effect_library: effects.library,
         timer: slint::Timer::default(),
     });
     if let Some(st) = state.borrow_mut().as_mut() {
@@ -570,6 +610,73 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
         st.timer.start(slint::TimerMode::Repeated, Duration::from_millis(33), move || tick(&w, &s));
     }
     render_frame(win, state);
+}
+
+/// Where an actor (or one of its bones, by tag; 0 is the model itself) is at `time`.
+fn actor_bone_at(dict: &ClipDictionary, a: &SceneActor, bone: u16, time: f32) -> Mat4 {
+    let clip = &dict.clips[a.clip];
+    let model = cutscene::mover(dict, clip, time);
+    if bone == 0 {
+        return model;
+    }
+    let posed = (|| {
+        let sk = a.dressed(time).0.loaded.skeleton.as_ref()?;
+        let b = sk.find_tag(bone)?;
+        let (i, part, at) = clip.part_at(time)?;
+        let anim = dict.animations.get(part.animation)?;
+        let skin = a.bindings.get(i)?.as_ref()?.skin(sk, anim, anim.frame_at(at));
+        Some(math::mul(&model, &math::mul(skin.get(b)?, &sk.world_transforms()[b])))
+    })();
+    posed.unwrap_or(model)
+}
+
+/// The cutscene's effects placed in the scene: each with where it is while
+/// its emitters run (following the actor and bone it is attached to). Also
+/// returns how many effects the effect lists lack.
+fn place_effects(
+    dict: &ClipDictionary,
+    actors: &[SceneActor],
+    actor_of: &[Option<usize>],
+    effects: &Effects,
+) -> (Vec<gta4_effects::Instance>, usize) {
+    let lib = &effects.library;
+    let instances = effects
+        .placed
+        .par_iter()
+        .enumerate()
+        .filter_map(|(n, e)| {
+            let (list, effect) = lib.find(&e.effect.name)?;
+            let fx = &lib.lists[list].effects[effect];
+            let emitting = fx.events.iter().map(|ev| lib.lists[list].emitters[ev.emitter].duration).fold(0.0, f32::max);
+            let local = math::mul(
+                &math::from_trs(e.effect.position, [0.0, 0.0, 0.0, 1.0], [1.0; 3]),
+                &gta4_effects::euler(e.effect.rotation),
+            );
+            let actor = e.actor.and_then(|a| actor_of.get(a).copied().flatten()).and_then(|a| actors.get(a));
+            let shift = effects.shifts.get(e.section).copied().unwrap_or([0.0; 3]);
+            let samples = (((e.end - e.start) + emitting) / gta4_effects::TRACK_STEP).ceil() as usize + 1;
+            let track = (0..samples.min(4000))
+                .map(|k| {
+                    let t = e.start + k as f32 * gta4_effects::TRACK_STEP;
+                    let base = match actor {
+                        Some(a) => actor_bone_at(dict, a, e.effect.bone, t),
+                        None => math::from_trs(shift, [0.0, 0.0, 0.0, 1.0], [1.0; 3]),
+                    };
+                    math::mul(&base, &local)
+                })
+                .collect();
+            Some(gta4_effects::Instance {
+                list,
+                effect,
+                start: e.start,
+                end: e.end,
+                track,
+                seed: (n as u32).wrapping_mul(0x9E37_79B9) ^ 0x5bd1_e995,
+            })
+        })
+        .collect::<Vec<_>>();
+    let unknown = effects.placed.len() - instances.len();
+    (instances, unknown)
 }
 
 /// Some ped models carry large flat helper surfaces (25 m across); a person
@@ -854,7 +961,8 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
             animated = scene_lights_scaled(&now, st.brightest_light);
             &animated
         };
-        crate::gpu::render_scene(&items, lights, &camera, width, height)
+        let sprites = gta4_effects::sprites_at(&st.effect_library, &st.effects, st.time);
+        crate::gpu::render_scene(&items, lights, &sprites, &camera, width, height)
     } else {
         None
     };
@@ -1055,6 +1163,8 @@ fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
         audio: None,
         output: None,
         sound_on: false,
+        effects: Vec::new(),
+        effect_library: Arc::default(),
         timer: slint::Timer::default(),
     });
     render_frame(win, state);

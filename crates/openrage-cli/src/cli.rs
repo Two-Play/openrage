@@ -233,9 +233,9 @@ pub(crate) enum Command {
         #[arg(long)]
         strings: bool,
     },
-    /// Show what a particle dictionary (.ypt) contains: effects, emitters, textures, models.
+    /// Show what a particle dictionary (.ypt; GTA IV .wpfl effect list) contains: effects, emitters, textures, models.
     Particles {
-        /// Virtual path of the .ypt.
+        /// Virtual path of the .ypt or .wpfl.
         path: String,
     },
     /// Show a text table (.gxt2 as OpenIV .oxt text, .nametable one name per line; GTA IV .gxt) or a GTA IV placement file (.wpl).

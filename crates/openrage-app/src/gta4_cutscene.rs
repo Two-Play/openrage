@@ -95,6 +95,44 @@ pub struct Section {
     /// Vehicle colours (`[VEHICLE_DETAILS]`: model, then four numbers of
     /// `carcols.dat`'s colours; all 0 when the cutscene sets none).
     pub vehicles: Vec<(u32, [u32; 4])>,
+    /// Particle effects (`[EFFECTS]`).
+    pub effects: Vec<CutEffect>,
+}
+
+/// One `[EFFECTS]` line: `FX_muz_machine:effect1_0 2 0 40499 40499 x y z
+/// rx ry rz 0` — the effect (the part after `:` only tells the effects
+/// apart), the model it is attached to (its number in the section's
+/// `[MODELS]`, -1 for none), that model's bone (tag, 0 for its root, 1205
+/// a person's head), start and end in milliseconds into the section's scene
+/// (see [`Gta4Cutscene::scenes`]; the same for a single burst, otherwise the
+/// effect runs on until the end),
+/// the position in the bone's space and its rotation (radians about X, Y,
+/// Z). The number after them is always 0; two cutscenes add a word and a
+/// number (`smoke 1.000000`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CutEffect {
+    /// The effect's name (`FX_muz_machine`).
+    pub name: String,
+    pub model: Option<u32>,
+    pub bone: u16,
+    /// Seconds into the section's scene.
+    pub start: f32,
+    pub end: f32,
+    pub position: [f32; 3],
+    pub rotation: [f32; 3],
+}
+
+/// A cutscene's effect with its times in the whole cutscene and the actor
+/// (see [`Gta4Cutscene::actors`]) it is attached to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedEffect {
+    pub effect: CutEffect,
+    /// The section it belongs to.
+    pub section: usize,
+    pub actor: Option<usize>,
+    /// Seconds into the cutscene.
+    pub start: f32,
+    pub end: f32,
 }
 
 /// One `[PROPS]` line: `model variant anchor` (`1 0 1`: model 1's first
@@ -167,10 +205,34 @@ pub struct Gta4Cutscene {
     pub subtitles: Vec<Subtitle>,
     pub flags: Vec<String>,
     pub player_start: Option<[f32; 3]>,
+    /// `[CUTSCENE_HEADER]`: one line per scene of the original animation,
+    /// the frames (30 a second) where its sections start and the last one
+    /// ends (`165 890 1476 2221 2727`: four sections). Effect times count
+    /// from a scene's first frame.
+    pub scenes: Vec<Vec<f32>>,
     pub sections: Vec<Section>,
 }
 
 impl Gta4Cutscene {
+    /// Per section: seconds into the cutscene where its scene (see
+    /// [`Gta4Cutscene::scenes`]) starts. Without a header that matches the
+    /// sections, every section counts as a scene of its own.
+    pub fn scene_starts(&self) -> Vec<f32> {
+        let mut starts = Vec::with_capacity(self.sections.len());
+        let mut at = 0.0;
+        let firsts: Vec<bool> = self.scenes.iter().flat_map(|l| (1..l.len()).map(|i| i == 1)).collect();
+        let matched = firsts.len() == self.sections.len();
+        let mut start = 0.0;
+        for (n, s) in self.sections.iter().enumerate() {
+            if !matched || firsts[n] {
+                start = at;
+            }
+            starts.push(start);
+            at += s.duration;
+        }
+        starts
+    }
+
     /// Length in seconds: all sections in a row.
     pub fn duration(&self) -> f32 {
         self.sections.iter().map(|s| s.duration).sum()
@@ -250,6 +312,30 @@ impl Gta4Cutscene {
             return Vec::new();
         };
         section.props.iter().filter(|p| p.model == model.index).copied().collect()
+    }
+
+    /// Every section's effects, with cutscene times and actors.
+    pub fn effects(&self) -> Vec<PlacedEffect> {
+        let actors = self.actors();
+        let starts = self.scene_starts();
+        let mut out = Vec::new();
+        for (n, s) in self.sections.iter().enumerate() {
+            let at = starts[n];
+            for e in &s.effects {
+                let actor = e
+                    .model
+                    .and_then(|m| s.models.iter().find(|x| x.index == m))
+                    .and_then(|m| actors.iter().position(|(key, _)| *key == m.actor()));
+                out.push(PlacedEffect {
+                    effect: e.clone(),
+                    section: n,
+                    actor,
+                    start: at + e.start,
+                    end: at + e.end.max(e.start),
+                });
+            }
+        }
+        out
     }
 
     /// Every light (its clip's name without the section number, lower case)
@@ -358,6 +444,9 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
                 });
             }
             (None, "FLAGS") => cut.flags.push(line.to_owned()),
+            (None, "CUTSCENE_HEADER") => {
+                cut.scenes.push(line.split_whitespace().filter_map(|v| v.parse().ok()).collect())
+            }
             (None, "PLAYER_START") => cut.player_start = Some(floats(line).with_context(bad)?),
             (Some(s), "MODELS") => {
                 let f: Vec<&str> = line.split_whitespace().collect();
@@ -397,6 +486,7 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
                 }
             }
             (Some(s), "LIGHTS") => s.lights.push(line.to_owned()),
+            (Some(s), "EFFECTS") => s.effects.push(parse_effect(line).with_context(bad)?),
             (Some(s), "VEHICLE_DETAILS") => {
                 let f: Vec<u32> =
                     line.split_whitespace().map(|v| v.parse()).collect::<Result<_, _>>().with_context(bad)?;
@@ -428,6 +518,23 @@ pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
         bail!("no sections ([SECTION_START] … [SECTION_END])");
     }
     Ok(cut)
+}
+
+fn parse_effect(line: &str) -> Option<CutEffect> {
+    let mut f = line.split_whitespace();
+    let name = f.next()?.split(':').next()?.to_owned();
+    // Ten numbers; a few lines add more (`… 0 smoke 1.0`), unused.
+    let n: Vec<f32> = f.take(10).map(|v| v.parse().ok()).collect::<Option<_>>()?;
+    let &[model, bone, start, end, x, y, z, rx, ry, rz] = n.as_slice() else { return None };
+    Some(CutEffect {
+        name,
+        model: (model >= 0.0).then_some(model as u32),
+        bone: if bone > 0.0 { bone as u16 } else { 0 },
+        start: start / 1000.0,
+        end: end / 1000.0,
+        position: [x, y, z],
+        rotation: [rx, ry, rz],
+    })
 }
 
 /// The folder of the episode a virtual path is in (`TLAD/`, `TBoGT/`), or
@@ -940,6 +1047,11 @@ pub struct Scene {
     pub audio: Option<rage_formats::awc::Pcm>,
     /// Sounds the cutscene names that the game does not have.
     pub missing_audio: Vec<String>,
+    /// The particle effects (`[EFFECTS]`) and the effect lists they come from.
+    pub effects: Vec<PlacedEffect>,
+    pub effect_library: crate::gta4_effects::Library,
+    /// Effect lists that could not be read.
+    pub effect_problems: Vec<String>,
 }
 
 /// Reads the cutscene at `vpath` and finds its animation, models and subtitles.
@@ -983,7 +1095,13 @@ pub fn load(game: &Path, vpath: &str) -> Result<Scene> {
         })
         .collect();
     let (audio, missing_audio) = audio(game, vpath, &cut);
+    let effects = cut.effects();
+    let (effect_library, effect_problems) =
+        if effects.is_empty() { Default::default() } else { crate::gta4_effects::Library::load(game, episode(vpath)) };
     Ok(Scene {
+        effects,
+        effect_library,
+        effect_problems,
         cut,
         cutscene,
         animated,
@@ -1097,6 +1215,35 @@ mod tests {
         .unwrap();
         assert_eq!(cut.vehicle_colours("biff"), Some([130, 114, 37, 45]));
         assert_eq!(cut.vehicle_colours("biff-1"), None, "no colours set");
+    }
+
+    #[test]
+    fn reads_effects() {
+        // Sections 0 and 1 are one scene, section 2 another.
+        let cut = parse(
+            b"[CUTSCENE_HEADER]\n100 160 1060\n10 70\n[/CUTSCENE_HEADER]\n\
+[SECTION_START]\n[MODELS]\n0 player player_0\n[/MODELS]\n[DURATION]\n2000\n[/DURATION]\n[SECTION_END]\n\
+[SECTION_START]\n[MODELS]\n0 csAk47 csAk47_1\n1 player player_1\n[/MODELS]\n[EFFECTS]\n\
+FX_muz_machine:effect1_0 0 0 499 499 0.55 -0.005 0.06 0.0 0.07 0.07 0.000000\n\
+FX_CS_GT05_water_tap:effect4_0 -1 -1 22500 26500 0 0 0 0 0 0 0\n\
+FX_CS_spit:effect1_0 1 1205 100 100 0 0.1 0 0 0 0 0 smoke 1.000000\n[/EFFECTS]\n\
+[DURATION]\n30000\n[/DURATION]\n[SECTION_END]\n\
+[SECTION_START]\n[MODELS]\n0 player player_2\n[/MODELS]\n[EFFECTS]\n\
+FX_CS_spit:effect1_0 0 1205 500 500 0 0 0 0 0 0 0\n[/EFFECTS]\n[DURATION]\n2000\n[/DURATION]\n[SECTION_END]\n",
+        )
+        .unwrap();
+        assert_eq!(cut.scene_starts(), [0.0, 0.0, 32.0]);
+        let e = &cut.sections[1].effects;
+        assert_eq!(e.len(), 3);
+        assert_eq!((e[0].name.as_str(), e[0].model, e[0].bone), ("FX_muz_machine", Some(0), 0));
+        assert_eq!(e[0].position, [0.55, -0.005, 0.06]);
+        assert_eq!((e[1].model, e[1].bone, e[1].start, e[1].end), (None, 0, 22.5, 26.5));
+        let placed = cut.effects();
+        // Times in the whole cutscene (from the scene's start); actors by their clips.
+        assert_eq!((placed[0].start, placed[0].actor), (0.499, Some(1)));
+        assert_eq!((placed[3].start, placed[3].section), (32.5, 2));
+        assert_eq!(placed[1].actor, None);
+        assert_eq!((placed[2].actor, placed[2].effect.bone), (Some(0), 1205));
     }
 
     #[test]

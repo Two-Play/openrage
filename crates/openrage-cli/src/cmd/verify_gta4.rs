@@ -684,6 +684,21 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
         sound: f32,
         /// Accessories named, and found.
         props: (usize, usize),
+        /// Effects named, and found in the effect lists.
+        effects: (usize, usize),
+        unknown_effects: Vec<String>,
+    }
+    // The effect lists, once per episode.
+    let mut libraries: std::collections::HashMap<String, openrage_app::gta4_effects::Library> = Default::default();
+    for vpath in &cuts {
+        let episode = gta4_cutscene::episode(vpath).to_owned();
+        if let std::collections::hash_map::Entry::Vacant(slot) = libraries.entry(episode) {
+            let (lib, problems) = openrage_app::gta4_effects::Library::load(game_dir, slot.key());
+            for p in problems {
+                outln!("effect list: {p}");
+            }
+            slot.insert(lib);
+        }
     }
     let results: Vec<(String, Result<Checked>)> = cuts
         .par_iter()
@@ -708,7 +723,16 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
                 }
                 let mut problems = animated.problems;
                 problems.extend(missing_sound.into_iter().map(|n| format!("no sound {n}")));
+                let library = &libraries[gta4_cutscene::episode(vpath)];
+                let placed = cut.effects();
+                let unknown_effects: Vec<String> = placed
+                    .iter()
+                    .filter(|e| library.find(&e.effect.name).is_none())
+                    .map(|e| e.effect.name.clone())
+                    .collect();
                 Ok(Checked {
+                    effects: (placed.len(), placed.len() - unknown_effects.len()),
+                    unknown_effects,
                     sections: cut.sections.len(),
                     actors: actors.len(),
                     no_model,
@@ -724,6 +748,7 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
     let (mut sections, mut actors, mut seconds, mut no_model, mut problems, mut ok) = (0, 0, 0.0, 0, 0, 0);
     let mut sound = 0.0;
     let mut props = (0, 0);
+    let mut effects = (0, 0);
     for (vpath, r) in results {
         match r {
             Ok(c) => {
@@ -733,6 +758,12 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
                 seconds += c.seconds;
                 sound += c.sound;
                 props = (props.0 + c.props.0, props.1 + c.props.1);
+                effects = (effects.0 + c.effects.0, effects.1 + c.effects.1);
+                let mut unknown = c.unknown_effects.clone();
+                unknown.dedup();
+                if !unknown.is_empty() {
+                    outln!("{vpath}: effects not in the effect lists: {}", unknown.join(", "));
+                }
                 no_model += c.no_model.len();
                 problems += c.problems.len();
                 if !c.no_model.is_empty() {
@@ -750,13 +781,15 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
     }
     outln!(
         "{} cutscenes ({ok} read, {:.0} minutes, {:.0} minutes of sound), {sections} sections, {actors} actors, \
-         {no_model} without a model, {} of {} accessories found, {problems} clips, dictionaries or sounds missing, \
-         {} errors ({:.1}s)",
+         {no_model} without a model, {} of {} accessories found, {} of {} effects found, {problems} clips, \
+         dictionaries or sounds missing, {} errors ({:.1}s)",
         cuts.len(),
         seconds / 60.0,
         sound / 60.0,
         props.1,
         props.0,
+        effects.1,
+        effects.0,
         errors.len(),
         started.elapsed().as_secs_f32()
     );
@@ -834,6 +867,21 @@ pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool,
     }
     if scene.subtitles.len() > 5 {
         outln!("  … {} more subtitles", scene.subtitles.len() - 5);
+    }
+    if !scene.effects.is_empty() {
+        let found = scene.effects.iter().filter(|e| scene.effect_library.find(&e.effect.name).is_some()).count();
+        outln!("{} effects, {found} found in the effect lists", scene.effects.len());
+        let mut seen = std::collections::BTreeMap::<String, usize>::new();
+        for e in &scene.effects {
+            *seen.entry(e.effect.name.clone()).or_default() += 1;
+        }
+        for (name, n) in &seen {
+            let state = if scene.effect_library.find(name).is_some() { "" } else { "  (not found)" };
+            outln!("  {n:4}× {name}{state}");
+        }
+        for p in &scene.effect_problems {
+            outln!("problem: effect list {p}");
+        }
     }
     outln!("({:.2}s)", started.elapsed().as_secs_f32());
     if load_models {
