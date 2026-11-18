@@ -9,6 +9,7 @@ How to write one: **[Writing plugins](https://two-play.github.io/openrage/plugin
 | `examples/strings/` | example: the readable text in any file, as a preview and an export (also of whole folders) |
 | `examples/gxt2-patch/` | example: applies an OpenIV `.oxt` text file to a `.gxt2`, writing into the `mods` folder |
 | `examples/obj-tools/` | example: exports game models as OBJ with PNG textures (`load-model`), shows `.obj` in 3D, replaces an Enhanced `.ydr` with an OBJ (`build-model`) |
+| `examples/hex-tools/` | example: a tool with a window of its own (Tools menu): a number converter with RAGE hashes; plus a hex dump export |
 | `tests/probe/` | test plugin for the host's sandbox and limits (not shipped) |
 
 The interface itself is [`crates/openrage-plugins/wit/plugin.wit`](../crates/openrage-plugins/wit/plugin.wit).

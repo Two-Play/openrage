@@ -28,6 +28,7 @@ mod scene;
 mod search;
 mod setup_ui;
 mod sound_ui;
+mod tools_ui;
 mod util;
 mod viewer;
 mod xmlview;
@@ -71,6 +72,7 @@ use preview::*;
 use search::*;
 use setup_ui::*;
 use sound_ui::*;
+use tools_ui::*;
 use util::*;
 
 slint::include_modules!();

@@ -203,6 +203,27 @@ impl Host {
         })
     }
 
+    /// Runs one of the plugin's tools with the fields' values: its `preview`
+    /// for `tool:<id>` (see [`manifest::Tool`]).
+    pub fn run_tool(
+        &self,
+        plugin: &Plugin,
+        component: &Component,
+        files: Arc<dyn GameFiles>,
+        tool: &str,
+        values: &[(String, String)],
+    ) -> Outcome<Preview> {
+        if plugin.manifest.tool(tool).is_none() {
+            return Outcome {
+                value: Err(anyhow!("{} has no tool {tool:?}", plugin.manifest.name)),
+                log: Vec::new(),
+                writes: Vec::new(),
+            };
+        }
+        let data = manifest::encode_tool_values(values);
+        self.preview(plugin, component, files, &manifest::tool_vpath(tool), &data)
+    }
+
     /// Runs one of the plugin's actions on the files the user picked.
     pub fn run_action(
         &self,

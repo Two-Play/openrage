@@ -26,6 +26,7 @@ pub(crate) fn start_browsing(ui: &AppWindow) {
     ui.set_window_title(title.into());
     start_index_update(ui);
     refresh_asi(ui);
+    refresh_tool_menu(ui);
     refresh_undo(ui);
     navigate(ui, "", true);
     // Optional start path, e.g. `openrage-gui x64e.rpf/levels/gta5/vehicles.rpf/adder.yft`.

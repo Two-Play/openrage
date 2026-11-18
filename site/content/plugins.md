@@ -32,6 +32,7 @@ memory and a time limit. The same `.wasm` runs on Linux and Windows.
 | **Read** any file of the game (archives included, with the changes in `mods/`) | ✅ with the `read-game` permission |
 | **Metadata as XML** (`.ymt`, `.ymap`, `.ytyp`, `.meta`, PSO, RBF): no binary parsing in the plugin | ✅ (`load-xml`, read only) |
 | **Change** game files: into the `mods` folder, as one step the user can undo | ✅ with `write-mods`, in `modify` actions |
+| **Tools** with a window of their own: fields the user fills in, a result the plugin computes (Tools menu) | ✅ (`[[tools]]`) |
 | openFormats export, importers into game formats | planned |
 
 ## Quick start (Rust)
@@ -168,6 +169,54 @@ pick-title = "Choose a patch"  # title of that file dialog
 ```
 
 Unknown keys, permissions or categories are errors, so typos show up in `openrage plugin list` right away.
+
+## Tools: a window of their own
+
+A tool is a small window in the **Tools** menu (and `openrage plugin tool` on the command line): OpenRAGE draws the
+fields the plugin declares, and shows what the plugin computes from them, again whenever a value changes. The example
+[`plugins/examples/hex-tools`](https://github.com/Two-Play/openrage/tree/main/plugins/examples/hex-tools) is a number
+converter: type `0x1F`, `-1`, `1.5` or a name, and see it as decimal, hex, bytes, float bits and its RAGE hash.
+
+```toml
+[[tools]]
+id = "numbers"                 # the plugin is asked for tool:numbers
+title = "Number converter"
+description = "Type a number or a name."
+
+[[tools.fields]]
+id = "value"                   # the key the plugin gets the value under
+label = "Value"
+default = "0x1234ABCD"         # kind = "text" is the default
+
+[[tools.fields]]
+id = "as"
+label = "Read as"
+kind = "choice"                # text, choice or check (true/false)
+choices = ["auto", "integer", "float", "text"]
+```
+
+The plugin answers in its `preview`, which OpenRAGE calls with `tool:<id>` and the values; `ToolRequest` in the SDK
+reads them. A table shows one row per line with each value selectable (and the whole result can be copied), text and
+trees show as text:
+
+```rust
+fn preview(vpath: String, data: Vec<u8>) -> Result<Preview, String> {
+    if let Some(tool) = ToolRequest::parse(&vpath, &data) {
+        let rows = vec![vec!["Length".into(), tool.get("value").len().to_string()]];
+        return Ok(Preview::table(vec!["Form".into(), "Value".into()], rows));
+    }
+    Err("no file previews".into())
+}
+```
+
+```
+openrage plugin tool hex-tools numbers --set value=0x1F
+openrage plugin tool hex-tools numbers --set value=adder --set as=text
+```
+
+Tools need no change to the plugin interface: they use `preview`, so they work with API 0.3. OpenRAGE versions
+before tools refuse plugins that declare `[[tools]]` (unknown keys are errors). A tool has the same rights as the
+plugin's previews: the game's files only with `read-game`.
 
 ## Permissions
 

@@ -119,6 +119,25 @@ pub(crate) fn debug_viewer(ui: &AppWindow) {
 /// The part of [`debug_snapshot`] after selecting a file.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
+    // `OPENRAGE_TOOL=<n>`: the n-th plugin tool's window (`OPENRAGE_TOOL_SET=<i>=<value>`
+    // types into its i-th field first).
+    if let Ok(n) = std::env::var("OPENRAGE_TOOL") {
+        open_tool(ui, n.parse().unwrap_or(0));
+        if let Some(win) = newest_tool_window()
+            && let Ok(set) = std::env::var("OPENRAGE_TOOL_SET")
+            && let Some((i, value)) = set.split_once('=')
+        {
+            win.invoke_changed(i.parse().unwrap_or(0), value.into());
+        }
+        slint::Timer::single_shot(Duration::from_millis(2500), move || {
+            if let Some(Ok(img)) = newest_tool_window().map(|w| w.window().take_snapshot()) {
+                let _ =
+                    rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(&path, png));
+            }
+            let _ = slint::quit_event_loop();
+        });
+        return;
+    }
     // `OPENRAGE_ASI`: the ASI mods window instead of the explorer.
     if std::env::var("OPENRAGE_ASI").is_ok() {
         open_asi_window(ui);

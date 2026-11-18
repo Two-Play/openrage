@@ -122,6 +122,27 @@ export struct Crumb {
 }
 
 // An installed plugin on the settings page.
+// A plugin tool in the Tools menu.
+export struct ToolMenuRow {
+    title: string,
+    plugin: string,
+}
+
+// An input of a plugin tool's window. kind: 0 text, 1 choice, 2 check box.
+export struct ToolFieldRow {
+    label: string,
+    kind: int,
+    value: string,
+    choices: [string],
+    choice-index: int,
+}
+
+// A line of a plugin tool's result table: the first column, the rest.
+export struct ToolResultRow {
+    key: string,
+    value: string,
+}
+
 // An ASI mod of GTA V in the settings.
 export struct AsiRow {
     name: string,
@@ -1124,6 +1145,9 @@ export component AppWindow inherits Window {
     callback ask-game-changed(bool);
     // Plugins on the settings page.
     in property <[PluginRow]> plugins;
+    // Tools of the enabled plugins (Tools menu).
+    in property <[ToolMenuRow]> plugin-tools;
+    callback open-tool(int);
     // ASI mods (GTA V only): Mods → ASI mods… opens their window.
     in property <bool> asi-available;
     callback open-asi-window();
@@ -1468,6 +1492,17 @@ export component AppWindow inherits Window {
                 icon: @image-url("icons/menu/settings.svg");
                 enabled: root.asi-available;
                 activated => { root.open-asi-window(); }
+            }
+        }
+        Menu {
+            title: @tr("Tools");
+            if root.plugin-tools.length == 0: MenuItem {
+                title: @tr("No plugin tools (Settings → Plugins)");
+                enabled: false;
+            }
+            for t[i] in root.plugin-tools: MenuItem {
+                title: t.title;
+                activated => { root.open-tool(i); }
             }
         }
         Menu {
@@ -5661,6 +5696,161 @@ export component LauncherWindow inherits Window {
                 vertical-alignment: center;
                 color: Theme.text;
                 accessible-role: text;
+            }
+        }
+    }
+}
+
+// A plugin's tool: OpenRAGE draws the fields the plugin declared and shows
+// what the plugin computes from them.
+export component ToolWindow inherits Window {
+    title: root.tool-title + " — OpenRAGE";
+    icon: @image-url("logo.svg");
+    preferred-width: 640px;
+    preferred-height: 520px;
+    min-width: 420px;
+    min-height: 300px;
+    background: Theme.background;
+    default-font-size: Theme.font-body;
+
+    in-out property <int> theme-mode;
+    in property <string> mono-font: "monospace";
+    in property <string> tool-title;
+    in property <string> plugin;
+    in property <string> description;
+    in property <[ToolFieldRow]> fields;
+    // A table result: one row per line, each value selectable on its own.
+    in property <[ToolResultRow]> rows;
+    // A text (or tree) result.
+    in property <string> result;
+    in property <string> info;
+    in property <string> error;
+    in property <bool> running;
+    callback changed(int, string);
+    callback copy-result();
+
+    changed theme-mode => { root.apply-theme(); }
+    init => { root.apply-theme(); }
+
+    function apply-theme() {
+        Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+
+    VerticalLayout {
+        Rectangle {
+            background: Theme.surface;
+            VerticalLayout {
+                padding: Theme.space-m;
+                padding-left: Theme.space-l;
+                spacing: 2px;
+                Text {
+                    text: root.tool-title;
+                    font-size: Theme.font-title;
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                Text {
+                    text: @tr("Plugin: {}", root.plugin);
+                    font-size: Theme.font-small;
+                    color: Theme.text-muted;
+                }
+                if root.description != "": Text {
+                    text: root.description;
+                    wrap: word-wrap;
+                    color: Theme.text-muted;
+                }
+            }
+        }
+        Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+        VerticalLayout {
+            padding: Theme.space-l;
+            spacing: Theme.space-s;
+            for f[i] in root.fields: HorizontalLayout {
+                spacing: Theme.space-s;
+                Text {
+                    width: 170px;
+                    text: f.label;
+                    vertical-alignment: center;
+                    color: Theme.text-muted;
+                }
+                if f.kind == 0: LineEdit {
+                    horizontal-stretch: 1;
+                    text: f.value;
+                    accessible-label: f.label;
+                    edited(text) => { root.changed(i, text); }
+                }
+                if f.kind == 1: ComboBox {
+                    horizontal-stretch: 1;
+                    model: f.choices;
+                    current-index: f.choice-index;
+                    selected(value) => { root.changed(i, value); }
+                }
+                if f.kind == 2: CheckBox {
+                    horizontal-stretch: 1;
+                    checked: f.value == "true";
+                    text: f.label;
+                    toggled => { root.changed(i, self.checked ? "true" : "false"); }
+                }
+            }
+            if root.error != "": Text {
+                text: root.error;
+                wrap: word-wrap;
+                color: Theme.danger;
+                accessible-role: text;
+                accessible-label: @tr("Problem: {}", root.error);
+            }
+            if root.info != "": Text {
+                text: root.info;
+                wrap: word-wrap;
+                font-size: Theme.font-small;
+                color: Theme.text-muted;
+            }
+            if root.rows.length > 0: ScrollView {
+                vertical-stretch: 1;
+                VerticalLayout {
+                    spacing: Theme.space-xs;
+                    alignment: start;
+                    for r in root.rows: HorizontalLayout {
+                        spacing: Theme.space-s;
+                        Text {
+                            width: 170px;
+                            text: r.key;
+                            vertical-alignment: center;
+                            color: Theme.text-muted;
+                        }
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text: r.value;
+                            read-only: true;
+                            accessible-label: r.key;
+                        }
+                    }
+                }
+            }
+            if root.rows.length == 0: TextEdit {
+                vertical-stretch: 1;
+                read-only: true;
+                text: root.result;
+                font-size: 13px;
+                wrap: no-wrap;
+                accessible-label: @tr("Result");
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: Theme.space-s;
+                if root.running: Spinner {
+                    width: 20px;
+                    height: 20px;
+                    indeterminate: true;
+                }
+                Button {
+                    text: @tr("Copy result");
+                    enabled: root.result != "" || root.rows.length > 0;
+                    clicked => { root.copy-result(); }
+                }
             }
         }
     }

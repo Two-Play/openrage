@@ -46,6 +46,7 @@ pub(crate) fn refresh_plugin_rows(ui: &AppWindow) {
 /// and previews change.
 pub(crate) fn after_plugins_change(ui: &AppWindow) {
     refresh_plugin_rows(ui);
+    refresh_tool_menu(ui);
     if with_app(|a| a.listing.is_some()) {
         refresh_files(ui, None);
     }

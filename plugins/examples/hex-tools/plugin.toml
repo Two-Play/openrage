@@ -1,0 +1,35 @@
+# OpenRAGE example plugin: a tool with a window of its own, plus an action.
+# Copy this folder to start your own.
+id = "hex-tools"
+name = "Hex tools"
+version = "0.1.0"
+api = "0.3"
+description = "A number converter (hex, decimal, binary, float bits, RAGE hashes) in its own window, and hex dumps of any file."
+authors = ["OpenRAGE contributors"]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/Two-Play/openrage"
+wasm = "hex_tools.wasm"
+
+# A tool: OpenRAGE draws a window with these fields (Tools menu) and shows
+# what the plugin's preview returns for `tool:numbers` and the values.
+[[tools]]
+id = "numbers"
+title = "Number converter"
+description = "Type a number (0x1F, 31, 0b11111, -1, 1.5) or a name: see it in every form, with its RAGE hash."
+
+[[tools.fields]]
+id = "value"
+label = "Value"
+default = "0x1234ABCD"
+
+[[tools.fields]]
+id = "as"
+label = "Read as"
+kind = "choice"
+choices = ["auto", "integer", "float", "text"]
+
+[[actions]]
+id = "hex-dump"
+title = "Export hex dump…"
+extensions = ["*"]
+batch = true

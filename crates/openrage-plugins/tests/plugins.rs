@@ -38,6 +38,8 @@ fn plugin_dir() -> &'static Path {
                 "gxt2-patch",
                 "-p",
                 "obj-tools",
+                "-p",
+                "hex-tools",
             ])
             .status()
             .expect("running cargo for the plugins");
@@ -49,6 +51,7 @@ fn plugin_dir() -> &'static Path {
             ("probe", "tests/probe"),
             ("gxt2_patch", "examples/gxt2-patch"),
             ("obj_tools", "examples/obj-tools"),
+            ("hex_tools", "examples/hex-tools"),
         ] {
             let dir = out.join(id);
             std::fs::create_dir_all(&dir).unwrap();
@@ -378,4 +381,27 @@ fn plugins_read_metadata_as_xml() {
     probe.granted.clear();
     let e = run(&host, &probe, game, "xml", "a.rpf/x.ymt").unwrap_err();
     assert!(format!("{e:#}").contains("permission read-game"), "{e:#}");
+}
+
+#[test]
+fn tools_compute_their_window_from_the_fields() {
+    let host = host();
+    let reg = registry(&[("hex-tools", &[])]);
+    let plugin = reg.get("hex-tools").unwrap();
+    let tool = plugin.manifest.tool("numbers").expect("the number converter");
+    assert_eq!(tool.fields.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(), ["value", "as"]);
+    let component = host.compile(plugin).unwrap();
+    let values = |v: &str| vec![("value".to_owned(), v.to_owned()), ("as".to_owned(), "auto".to_owned())];
+    let result = host.run_tool(plugin, &component, Arc::new(NoGame), "numbers", &values("0x1F")).value.unwrap();
+    let Some(View::Table(table)) = result.view else { panic!("a table: {result:?}") };
+    assert!(table.rows.iter().any(|r| r[0] == "Decimal" && r[1] == "31"), "{:?}", table.rows);
+    // A name: its RAGE hash, as the game stores it (`openrage search adder` agrees).
+    let name = host.run_tool(plugin, &component, Arc::new(NoGame), "numbers", &values("adder")).value.unwrap();
+    let Some(View::Table(table)) = name.view else { panic!("a table: {name:?}") };
+    assert!(table.rows.iter().any(|r| r[0] == "joaat (RAGE hash)" && r[1] == "0xB779A091"), "{:?}", table.rows);
+    // The plugin's own errors reach the window; unknown tools are refused.
+    let wrong = vec![("value".to_owned(), "hello".to_owned()), ("as".to_owned(), "integer".to_owned())];
+    assert!(host.run_tool(plugin, &component, Arc::new(NoGame), "numbers", &wrong).value.is_err());
+    let e = host.run_tool(plugin, &component, Arc::new(NoGame), "nope", &values("1")).value.unwrap_err();
+    assert!(format!("{e:#}").contains("no tool"), "{e:#}");
 }

@@ -90,6 +90,17 @@ pub(crate) fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &Plug
                 }
                 outln!("Action:      {} — {} [{}] ({})", a.id, a.title, a.extensions.join(", "), notes.join(", "));
             }
+            for t in &m.tools {
+                outln!("Tool:        {} — {}", t.id, t.title);
+                for f in &t.fields {
+                    let kind = match f.kind {
+                        openrage_plugins::manifest::FieldKind::Text => "text".to_owned(),
+                        openrage_plugins::manifest::FieldKind::Check => "true/false".to_owned(),
+                        openrage_plugins::manifest::FieldKind::Choice => f.choices.join("/"),
+                    };
+                    outln!("               --set {}=…  {} ({kind}, starts as {:?})", f.id, f.label, f.initial());
+                }
+            }
             Ok(())
         }
         PluginCommand::Enable { id, yes } => {
@@ -211,50 +222,27 @@ pub(crate) fn cmd_plugin(cfg: &mut Config, game: Option<GameContext>, cmd: &Plug
             for i in &preview.info {
                 outln!("{}: {}", i.key, i.value);
             }
-            match preview.view {
-                None => {}
-                Some(openrage_plugins::View::Text(text)) => outln!("\n{text}"),
-                Some(openrage_plugins::View::Tree(nodes)) => {
-                    let mut depth = vec![0usize; nodes.len()];
-                    outln!();
-                    for (i, n) in nodes.iter().enumerate() {
-                        depth[i] = n.parent.map_or(0, |p| depth[p as usize] + 1);
-                        let value = if n.value.is_empty() { String::new() } else { format!(": {}", n.value) };
-                        outln!("{}{}{value}", "  ".repeat(depth[i]), n.label);
-                    }
-                }
-                Some(openrage_plugins::View::Table(t)) => {
-                    outln!("\n{}", t.columns.join("\t"));
-                    for row in &t.rows {
-                        outln!("{}", row.join("\t"));
-                    }
-                }
-                Some(openrage_plugins::View::Model(model)) => {
-                    let vertices: usize = model.meshes.iter().map(|m| m.positions.len() / 3).sum();
-                    let triangles: usize = model.meshes.iter().map(|m| m.indices.len() / 3).sum();
-                    outln!(
-                        "Model: {} meshes, {vertices} vertices, {triangles} triangles, {} materials",
-                        model.meshes.len(),
-                        model.materials.len()
-                    );
-                    if let Some(out) = glb {
-                        let stem = vpath.rsplit('/').next().unwrap_or(&vpath).split('.').next().unwrap_or("model");
-                        let loaded = openrage_app::plugins::from_plugin_model(&model, stem);
-                        let data = openrage_app::models::to_glb(&loaded, stem, &loaded.default_look())
-                            .context("the model has nothing to export")?;
-                        fs::write(out, data)?;
-                        outln!("Saved {}", out.display());
-                    }
-                }
-                Some(openrage_plugins::View::Image(img)) => {
-                    outln!("Image: {}×{}", img.width, img.height);
-                    if let Some(out) = png {
-                        fs::write(out, rage_formats::png(img.width, img.height, &img.rgba)?)?;
-                        outln!("Saved {}", out.display());
-                    }
-                }
+            print_view(preview.view, &vpath, png.as_deref(), glb.as_deref())
+        }
+        PluginCommand::Tool { id, tool, set } => {
+            let p = find(id)?;
+            if !p.enabled() {
+                bail!("{} is not enabled (`openrage plugin enable {id}`)", p.manifest.name);
             }
-            Ok(())
+            let Some(spec) = p.manifest.tool(tool) else {
+                let ids: Vec<_> = p.manifest.tools.iter().map(|t| t.id.as_str()).collect();
+                bail!("{} has no tool {tool:?} (it has: {})", p.manifest.name, ids.join(", "));
+            };
+            let values = tool_values(spec, set)?;
+            let host = Host::new(Limits::default())?;
+            let component = host.compile(p)?;
+            let outcome = host.run_tool(p, &component, files, tool, &values);
+            print_log(&outcome.log);
+            let result = outcome.value.with_context(|| format!("{}: {}", p.manifest.name, spec.title))?;
+            for i in &result.info {
+                outln!("{}: {}", i.key, i.value);
+            }
+            print_view(result.view, &openrage_plugins::manifest::tool_vpath(tool), None, None)
         }
         PluginCommand::Run { id, action, paths, file, pick, out, yes } => {
             let p = find(id)?;
@@ -381,4 +369,78 @@ pub(crate) fn status_text(status: &openrage_plugins::Status) -> String {
             format!("needs approval ({})", names.join(", "))
         }
     }
+}
+
+/// Prints a plugin's view (text, tree, table, model or image); `png`/`glb`
+/// save images and models.
+fn print_view(view: Option<openrage_plugins::View>, vpath: &str, png: Option<&Path>, glb: Option<&Path>) -> Result<()> {
+    match view {
+        None => {}
+        Some(openrage_plugins::View::Text(text)) => outln!("\n{text}"),
+        Some(openrage_plugins::View::Tree(nodes)) => {
+            let mut depth = vec![0usize; nodes.len()];
+            outln!();
+            for (i, n) in nodes.iter().enumerate() {
+                depth[i] = n.parent.map_or(0, |p| depth[p as usize] + 1);
+                let value = if n.value.is_empty() { String::new() } else { format!(": {}", n.value) };
+                outln!("{}{}{value}", "  ".repeat(depth[i]), n.label);
+            }
+        }
+        Some(openrage_plugins::View::Table(t)) => {
+            outln!("\n{}", t.columns.join("\t"));
+            for row in &t.rows {
+                outln!("{}", row.join("\t"));
+            }
+        }
+        Some(openrage_plugins::View::Model(model)) => {
+            let vertices: usize = model.meshes.iter().map(|m| m.positions.len() / 3).sum();
+            let triangles: usize = model.meshes.iter().map(|m| m.indices.len() / 3).sum();
+            outln!(
+                "Model: {} meshes, {vertices} vertices, {triangles} triangles, {} materials",
+                model.meshes.len(),
+                model.materials.len()
+            );
+            if let Some(out) = glb {
+                let stem = vpath.rsplit('/').next().unwrap_or(vpath).split('.').next().unwrap_or("model");
+                let loaded = openrage_app::plugins::from_plugin_model(&model, stem);
+                let data = openrage_app::models::to_glb(&loaded, stem, &loaded.default_look())
+                    .context("the model has nothing to export")?;
+                fs::write(out, data)?;
+                outln!("Saved {}", out.display());
+            }
+        }
+        Some(openrage_plugins::View::Image(img)) => {
+            outln!("Image: {}×{}", img.width, img.height);
+            if let Some(out) = png {
+                fs::write(out, rage_formats::png(img.width, img.height, &img.rgba)?)?;
+                outln!("Saved {}", out.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The values of a tool's fields: their starting values, changed by
+/// `field=value` arguments (checked against the field's kind).
+fn tool_values(tool: &openrage_plugins::manifest::Tool, set: &[String]) -> Result<Vec<(String, String)>> {
+    use openrage_plugins::manifest::FieldKind;
+    let mut values: Vec<(String, String)> = tool.fields.iter().map(|f| (f.id.clone(), f.initial())).collect();
+    for arg in set {
+        let (id, value) = arg.split_once('=').with_context(|| format!("--set {arg}: write it as FIELD=VALUE"))?;
+        let Some(field) = tool.fields.iter().find(|f| f.id == id) else {
+            let ids: Vec<_> = tool.fields.iter().map(|f| f.id.as_str()).collect();
+            bail!("{} has no field {id:?} (it has: {})", tool.title, ids.join(", "));
+        };
+        match field.kind {
+            FieldKind::Choice if !field.choices.iter().any(|c| c == value) => {
+                bail!("{id}: {value:?} is not one of {}", field.choices.join(", "))
+            }
+            FieldKind::Check if !matches!(value, "true" | "false") => bail!("{id}: use true or false"),
+            _ => {}
+        }
+        if let Some(slot) = values.iter_mut().find(|(k, _)| k == id) {
+            slot.1 = value.to_owned();
+        }
+    }
+    Ok(values)
 }
