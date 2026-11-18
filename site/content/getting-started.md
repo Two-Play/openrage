@@ -93,7 +93,8 @@ Nothing to migrate: OpenRAGE works with what you already have.
 - **Same output:** DDS textures, WAV audio and `.oxt` game text match OpenIV's exports.
 - **Same safety:** OpenRAGE starts read-only; **Read-only → Editing** unlocks changes, like OpenIV's edit mode.
 - **New:** undo for every change, search across the whole game, Linux, GTA V Enhanced and RDR2.
-- **Not yet:** importing models. Keep OpenIV for that; both tools share the same `mods` folder.
+- **Model import is a preview:** OBJ models replace GTA V Enhanced props and vehicle bodies
+  ([how](@/modding.md#models-preview)). For other kinds of models keep OpenIV; both tools share the same `mods` folder.
 
 ## Next steps
 
