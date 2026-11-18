@@ -80,6 +80,8 @@ How it works:
 - **Textures:** a material's `map_Kd` (PNG) is embedded in the drawable and bound to its copy's colour slot, with all
   mip levels; a material with only a colour (`Kd`) gets a small texture of that colour; without either it keeps the
   original texture. Models without embedded textures borrow the texture structure of another model of the game.
+  Textures are block compressed like the game's own (BC1, or BC3 when they have transparency), with mip levels;
+  a 512×512 texture takes about 170 KB instead of 1.4 MB. Sizes that are not multiples of 4 stay uncompressed.
   `--no-textures` keeps the original textures.
 - **Detail levels:** `--lod near.obj --lod far.obj` (up to three) add further levels; plugins mark them with parts
   named `…_lod1`, `…_lod2`, `…_lod3`. Distances come from the original's levels where it has them, otherwise 50 m
@@ -87,10 +89,9 @@ How it works:
 - OBJ is converted from Y-up to the game's Z-up; missing normals are computed, tangents always. Meshes over 65,535
   vertices are split. `--mods` puts the result into the `mods` folder in place of the original (undo with **Undo** /
   `openrage undo`), `--out` writes the file elsewhere.
-- Not yet: GTA V Legacy, `.yft`/`.ydd`, skinned models and collisions (the original collision stays). Textures are
-  embedded uncompressed. The written drawables read back identically in OpenRAGE (`openrage verify --models
-  --rebuild` rewrites every drawable of the game, also with shader copies and embedded textures); please report how
-  they behave in the game.
+- Not yet: GTA V Legacy, `.yft`/`.ydd`, skinned models and collisions (the original collision stays). The written
+  drawables read back identically in OpenRAGE (`openrage verify --models --rebuild` rewrites every drawable of the
+  game, also with shader copies and embedded textures); please report how they behave in the game.
 
 ## Text files and game text
 
