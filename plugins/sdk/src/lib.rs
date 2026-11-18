@@ -49,7 +49,7 @@ pub use bindings::Guest as Plugin;
 pub mod prelude {
     pub use crate::host::{current_game, list_dir, load_xml, read_file, write_mod_file};
     pub use crate::{
-        DirEntry, Game, Image, Info, Input, Level, OutputFile, Plugin, Preview, Table, TreeNode, View, log,
+        DirEntry, Game, Image, Info, Input, Level, OutputFile, Plugin, Preview, Table, ToolRequest, TreeNode, View, log,
     };
 }
 
@@ -109,4 +109,85 @@ impl OutputFile {
 /// The file name of a virtual path (`a/b/c.ydr` → `c.ydr`).
 pub fn file_name(vpath: &str) -> &str {
     vpath.rsplit(['/', '\\']).next().unwrap_or(vpath)
+}
+
+/// A tool's window asking for its result (`[[tools]]` in `plugin.toml`):
+/// OpenRAGE calls `preview` with `vpath` = `tool:<id>` and the fields'
+/// values as `data`. Whatever `preview` returns is shown in the window.
+///
+/// ```ignore
+/// fn preview(vpath: String, data: Vec<u8>) -> Result<Preview, String> {
+///     if let Some(tool) = ToolRequest::parse(&vpath, &data) {
+///         let value = tool.get("value");
+///         return Ok(Preview::text(format!("{value} has {} characters", value.len())));
+///     }
+///     // … previews of files
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolRequest {
+    /// The tool's `id` from `plugin.toml`.
+    pub tool: String,
+    /// `(field id, value)`, in the order of the fields; check boxes are
+    /// `true` or `false`.
+    pub values: Vec<(String, String)>,
+}
+
+impl ToolRequest {
+    /// The request, if this `preview` call is one (else it is a file).
+    pub fn parse(vpath: &str, data: &[u8]) -> Option<Self> {
+        let tool = vpath.strip_prefix("tool:")?.to_owned();
+        let text = String::from_utf8_lossy(data);
+        let values = text
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(id, value)| (id.to_owned(), unescape(value)))
+            .collect();
+        Some(ToolRequest { tool, values })
+    }
+
+    /// The value of a field ("" if there is none).
+    pub fn get(&self, id: &str) -> &str {
+        self.values.iter().find(|(k, _)| k == id).map_or("", |(_, v)| v.as_str())
+    }
+
+    /// Whether a check box is ticked.
+    pub fn checked(&self, id: &str) -> bool {
+        self.get(id) == "true"
+    }
+}
+
+/// Undoes the escaping of values (`\\` and `\n`).
+fn unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_tool_requests() {
+        let r = ToolRequest::parse("tool:numbers", b"value=0x1F\\nnext\nsigned=true\nempty=\n").unwrap();
+        assert_eq!(r.tool, "numbers");
+        assert_eq!(r.get("value"), "0x1F\nnext");
+        assert!(r.checked("signed"));
+        assert_eq!(r.get("empty"), "");
+        assert_eq!(r.get("missing"), "");
+        assert!(ToolRequest::parse("x64a.rpf/a.dat", b"").is_none(), "a file, not a tool");
+        assert_eq!(unescape("a\\\\b"), "a\\b");
+    }
 }

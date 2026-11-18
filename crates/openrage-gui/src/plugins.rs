@@ -172,6 +172,102 @@ pub struct PreviewResult {
 pub fn preview(id: &str, game: &GameContext, vpath: &str, data: &[u8]) -> PreviewResult {
     let result = with_plugin(id, |host, plugin, component| {
         let outcome = host.preview(plugin, component, game.files(), vpath, data);
+        to_result(plugin, outcome, vpath)
+    });
+    result.unwrap_or_else(|e| PreviewResult {
+        info: vec![("Plugin error".to_owned(), e)],
+        text: String::new(),
+        image: None,
+        model: None,
+    })
+}
+
+/// A tool of an enabled plugin (Tools menu).
+#[derive(Clone)]
+pub struct ToolRef {
+    pub plugin_id: String,
+    pub plugin_name: String,
+    pub tool: openrage_plugins::manifest::Tool,
+}
+
+/// The tools of the enabled plugins that work with the open game.
+pub fn tools() -> Vec<ToolRef> {
+    let Some(state) = state() else { return Vec::new() };
+    let game = open_game();
+    state
+        .registry
+        .plugins
+        .iter()
+        .filter(|p| p.enabled() && p.manifest.supports(game))
+        .flat_map(|p| {
+            p.manifest.tools.iter().map(move |t| ToolRef {
+                plugin_id: p.manifest.id.clone(),
+                plugin_name: p.manifest.name.clone(),
+                tool: t.clone(),
+            })
+        })
+        .collect()
+}
+
+/// What a tool computed, for its window.
+#[derive(Default)]
+pub struct ToolResult {
+    /// The plugin's info lines and its last log lines, one per line.
+    pub info: String,
+    /// A table result: first column, the other columns.
+    pub rows: Vec<(String, String)>,
+    /// A text or tree result (also the table as text, for copying).
+    pub text: String,
+    pub error: String,
+}
+
+/// Runs a tool with the fields' values (call it from a worker thread).
+pub fn run_tool(tool: &ToolRef, game: &GameContext, values: &[(String, String)]) -> ToolResult {
+    let result = with_plugin(&tool.plugin_id, |host, plugin, component| {
+        Ok(host.run_tool(plugin, component, game.files(), &tool.tool.id, values))
+    });
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => return ToolResult { error: e, ..Default::default() },
+    };
+    let log: Vec<String> = log_lines(&outcome.log).into_iter().map(|(_, l)| l).collect();
+    let mut out = ToolResult::default();
+    match outcome.value {
+        Ok(p) => {
+            let info: Vec<String> = p.info.iter().map(|i| format!("{}: {}", i.key, i.value)).chain(log).collect();
+            out.info = info.join("\n");
+            match p.view {
+                Some(View::Table(t)) => {
+                    out.text = table_text(&t.columns, &t.rows);
+                    out.rows = t
+                        .rows
+                        .iter()
+                        .map(|r| (r.first().cloned().unwrap_or_default(), r.get(1..).unwrap_or_default().join("  ·  ")))
+                        .collect();
+                }
+                Some(View::Text(t)) => out.text = t,
+                Some(View::Tree(nodes)) => out.text = tree_text(&nodes),
+                Some(View::Image(_) | View::Model(_)) => {
+                    out.error = "tools show text and tables; this result is an image or a model".into()
+                }
+                None => {}
+            }
+        }
+        Err(e) => {
+            out.error = format!("{e:#}");
+            out.info = log.join("\n");
+        }
+    }
+    out
+}
+
+/// What a plugin's preview (or tool) returned, ready to show.
+fn to_result(
+    plugin: &Plugin,
+    outcome: openrage_plugins::Outcome<openrage_plugins::Preview>,
+    vpath: &str,
+) -> Result<PreviewResult, String> {
+    {
         let mut info = vec![("Plugin".to_owned(), plugin.manifest.name.clone())];
         match outcome.value {
             Ok(p) => {
@@ -199,13 +295,7 @@ pub fn preview(id: &str, game: &GameContext, vpath: &str, data: &[u8]) -> Previe
                 Ok(PreviewResult { info, text: String::new(), image: None, model: None })
             }
         }
-    });
-    result.unwrap_or_else(|e| PreviewResult {
-        info: vec![("Plugin error".to_owned(), e)],
-        text: String::new(),
-        image: None,
-        model: None,
-    })
+    }
 }
 
 /// The last lines a plugin logged, as notes for the info panel.

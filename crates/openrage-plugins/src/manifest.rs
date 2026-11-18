@@ -49,6 +49,81 @@ pub struct Manifest {
     /// Commands it adds (context menu, `openrage plugin run`).
     #[serde(default)]
     pub actions: Vec<Action>,
+    /// Tools with a window of their own (fields the user fills in, a result
+    /// the plugin computes), in the explorer's Tools menu.
+    #[serde(default)]
+    pub tools: Vec<Tool>,
+}
+
+/// A tool: OpenRAGE draws its window from the fields and shows what the
+/// plugin's `preview` returns for `tool:<id>` with the fields' values.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Tool {
+    /// Unique within the plugin; the plugin is asked for `tool:<id>`.
+    pub id: String,
+    /// Window title and menu text, e.g. "Number converter".
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub fields: Vec<Field>,
+}
+
+/// An input of a tool.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Field {
+    /// The key the plugin receives the value under.
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub kind: FieldKind,
+    /// Starting value: text, one of `choices`, or `true`/`false` for a check box.
+    #[serde(default)]
+    pub default: String,
+    /// The values of a `choice` field.
+    #[serde(default)]
+    pub choices: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FieldKind {
+    /// A line of text.
+    #[default]
+    Text,
+    /// One of `choices`.
+    Choice,
+    /// A check box: `true` or `false`.
+    Check,
+}
+
+impl Field {
+    /// The value the field starts with.
+    pub fn initial(&self) -> String {
+        match self.kind {
+            FieldKind::Choice if self.default.is_empty() => self.choices.first().cloned().unwrap_or_default(),
+            FieldKind::Check if self.default.is_empty() => "false".to_owned(),
+            _ => self.default.clone(),
+        }
+    }
+}
+
+/// The `vpath` a tool is asked for in `preview`.
+pub fn tool_vpath(tool: &str) -> String {
+    format!("tool:{tool}")
+}
+
+/// The fields' values as the `data` of a tool's `preview` call: one
+/// `id=value` line each, with `\` and line breaks escaped (`\\`, `\n`).
+pub fn encode_tool_values(values: &[(String, String)]) -> Vec<u8> {
+    let mut out = String::new();
+    for (id, value) in values {
+        let value = value.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "");
+        out.push_str(&format!("{id}={value}\n"));
+    }
+    out.into_bytes()
 }
 
 fn default_wasm() -> String {
@@ -229,7 +304,48 @@ impl Manifest {
                 bail!("action {:?} is of kind modify, which needs the write-mods permission", a.id);
             }
         }
+        for (i, t) in self.tools.iter().enumerate() {
+            if !valid_id(&t.id) {
+                bail!("tool id {:?}: use lowercase letters, digits and '-'", t.id);
+            }
+            if self.tools[..i].iter().any(|u| u.id == t.id) {
+                bail!("tool id {:?} is used twice", t.id);
+            }
+            if t.title.trim().is_empty() {
+                bail!("tool {:?} has no title", t.id);
+            }
+            if t.fields.len() > 32 {
+                bail!("tool {:?} has more than 32 fields", t.id);
+            }
+            for (j, f) in t.fields.iter().enumerate() {
+                if !valid_id(&f.id) {
+                    bail!("tool {:?}: field id {:?}: use lowercase letters, digits and '-'", t.id, f.id);
+                }
+                if t.fields[..j].iter().any(|g| g.id == f.id) {
+                    bail!("tool {:?}: field id {:?} is used twice", t.id, f.id);
+                }
+                match f.kind {
+                    FieldKind::Choice if f.choices.is_empty() => {
+                        bail!("tool {:?}: choice field {:?} has no choices", t.id, f.id)
+                    }
+                    FieldKind::Choice if !f.default.is_empty() && !f.choices.contains(&f.default) => {
+                        bail!("tool {:?}: field {:?}: default {:?} is not one of its choices", t.id, f.id, f.default)
+                    }
+                    FieldKind::Check if !matches!(f.default.as_str(), "" | "true" | "false") => {
+                        bail!("tool {:?}: check box {:?}: default must be true or false", t.id, f.id)
+                    }
+                    FieldKind::Text | FieldKind::Check if !f.choices.is_empty() => {
+                        bail!("tool {:?}: field {:?}: only choice fields have choices", t.id, f.id)
+                    }
+                    _ => {}
+                }
+            }
+        }
         Ok(())
+    }
+
+    pub fn tool(&self, id: &str) -> Option<&Tool> {
+        self.tools.iter().find(|t| t.id == id)
     }
 
     /// Whether it works with `game` (`None`: no game open).
@@ -366,5 +482,37 @@ mod tests {
         assert!(!matches(&exts, "a.ytd", false));
         assert!(matches(&exts, "a.ytd", true));
         assert_eq!(extension("dir.d/file"), "");
+    }
+
+    #[test]
+    fn tools_and_their_fields() {
+        let tool = |fields: &str| {
+            Manifest::parse(&format!("{MINIMAL}\n[[tools]]\nid = \"conv\"\ntitle = \"Converter\"\n{fields}"))
+        };
+        let m = tool(
+            "[[tools.fields]]\nid = \"value\"\nlabel = \"Value\"\n\
+             [[tools.fields]]\nid = \"as\"\nlabel = \"As\"\nkind = \"choice\"\nchoices = [\"a\", \"b\"]\n\
+             [[tools.fields]]\nid = \"signed\"\nlabel = \"Signed\"\nkind = \"check\"",
+        )
+        .unwrap();
+        let t = m.tool("conv").unwrap();
+        let initial: Vec<String> = t.fields.iter().map(Field::initial).collect();
+        assert_eq!(initial, ["", "a", "false"], "a choice starts at its first value, a check box off");
+        for (bad, why) in [
+            ("[[tools.fields]]\nid = \"as\"\nlabel = \"As\"\nkind = \"choice\"", "no choices"),
+            (
+                "[[tools.fields]]\nid = \"as\"\nlabel = \"As\"\nkind = \"choice\"\nchoices = [\"a\"]\ndefault = \"z\"",
+                "not one of",
+            ),
+            ("[[tools.fields]]\nid = \"x\"\nlabel = \"X\"\nkind = \"check\"\ndefault = \"yes\"", "true or false"),
+            ("[[tools.fields]]\nid = \"x\"\nlabel = \"X\"\n[[tools.fields]]\nid = \"x\"\nlabel = \"Y\"", "used twice"),
+            ("[[tools.fields]]\nid = \"Bad Id\"\nlabel = \"X\"", "field id"),
+        ] {
+            let e = tool(bad).unwrap_err();
+            assert!(format!("{e:#}").contains(why), "{why}: {e:#}");
+        }
+        // The values reach the plugin as id=value lines, line breaks escaped.
+        let data = encode_tool_values(&[("value".into(), "a\nb\\c".into()), ("as".into(), "a".into())]);
+        assert_eq!(String::from_utf8(data).unwrap(), "value=a\\nb\\\\c\nas=a\n");
     }
 }

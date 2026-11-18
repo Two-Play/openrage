@@ -489,6 +489,17 @@ pub(crate) enum PluginCommand {
         #[arg(long)]
         glb: Option<PathBuf>,
     },
+    /// Run one of a plugin's tools (the windows of the Tools menu) and print
+    /// its result; without --set, its fields keep their starting values.
+    Tool {
+        /// The plugin.
+        id: String,
+        /// The tool (as listed by `openrage plugin info`).
+        tool: String,
+        /// A field's value, e.g. --set value=0x1F; repeatable.
+        #[arg(long = "set", value_name = "FIELD=VALUE")]
+        set: Vec<String>,
+    },
     /// Run a plugin's action on files (or, for batch actions, folders and
     /// archives), save what it produces and apply its changes to the mods folder.
     Run {
