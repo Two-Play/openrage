@@ -177,6 +177,18 @@ fn rejects_corrupt_tables() {
 }
 
 #[test]
+fn empty_archives_say_so() {
+    // RDR2 ships `common.rpf` as an empty placeholder.
+    let dir = std::env::temp_dir().join(format!("rage-rpf-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("common.rpf"), b"").unwrap();
+    let err = vfs::resolve(&dir, "common.rpf", None).err().expect("an error");
+    assert!(matches!(err, RpfError::Empty(_, 0)), "{err:?}");
+    assert!(err.to_string().contains("empty file (0 bytes)"), "{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn entry_kinds_are_detected() {
     let path = write_temp("kinds", &sample_archive());
     let rpf = Rpf7::open(&path, None).unwrap();
