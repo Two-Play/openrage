@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.Two_Play.OpenRAGE</id>
+  <name>OpenRAGE</name>
+  <summary>Explore and mod GTA V, GTA IV and Red Dead Redemption 2</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only AND AGPL-3.0-only</project_license>
+  <developer id="io.github.two_play">
+    <name>Two-Play</name>
+  </developer>
+  <description>
+    <p>
+      OpenRAGE is an open-source successor to OpenIV. It browses and searches every archive of the game, previews
+      textures, models, sounds and animations, reads metadata as XML, edits game text and installs .oiv packages,
+      compatible with OpenIV's mods folder and with undo.
+    </p>
+    <p>
+      OpenRAGE contains no game files and no encryption keys: keys are taken from your own copy of the game.
+      It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.Two_Play.OpenRAGE.desktop</launchable>
+  <url type="homepage">https://two-play.github.io/openrage/</url>
+  <url type="bugtracker">https://github.com/Two-Play/openrage/issues</url>
+  <url type="vcs-browser">https://github.com/Two-Play/openrage</url>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/Two-Play/openrage/main/docs/images/overview-dark.png</image>
+      <caption>The explorer with a 3D preview of a car</caption>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>openrage</binary>
+    <binary>openrage-gui</binary>
+    <mediatype>application/x-openrage-plugin</mediatype>
+    <mediatype>application/x-openiv-package</mediatype>
+  </provides>
+  <releases>
+    <release version="{VERSION}" date="{DATE}"/>
+  </releases>
+</component>
