@@ -383,6 +383,7 @@ component FileItem inherits Rectangle {
     height: Theme.row-height;
     opacity: item.dim ? 0.55 : 1.0;
     border-radius: root.tile-icon > 0px ? Theme.radius : 0px;
+    clip: root.tile-icon > 0px;
     property <color> fg: selected && focused ? Theme.selection-text : Theme.text;
     background: selected ? (focused ? Theme.selection : Theme.accent-subtle) : area.has-hover ? Theme.hover : odd ? Theme.stripe : transparent;
     accessible-role: list-item;
@@ -416,16 +417,23 @@ component FileItem inherits Rectangle {
                 }
             }
         }
-        Text {
-            vertical-stretch: 1;
-            text: item.name;
-            horizontal-alignment: center;
-            vertical-alignment: top;
-            wrap: char-wrap;
-            overflow: elide;
-            color: root.fg;
+        // At most two lines, so long names never push the size into the next tile.
+        Rectangle {
+            height: min(name.preferred-height, Theme.font-body * 2.8);
+            clip: true;
+            name := Text {
+                y: 0;
+                width: 100%;
+                text: item.name;
+                horizontal-alignment: center;
+                vertical-alignment: top;
+                wrap: char-wrap;
+                overflow: elide;
+                color: root.fg;
+            }
         }
         Text {
+            height: Theme.font-small * 1.5;
             text: item.size != "" ? item.size : item.kind;
             horizontal-alignment: center;
             font-size: Theme.font-small;
@@ -1210,7 +1218,7 @@ export component AppWindow inherits Window {
     // Icon view: tile and icon size, and how many tiles fit in a line.
     property <length> tile-icon: round((root.view-mode == 2 ? 72px : 40px) * Theme.text-scale / 1px) * 1px;
     property <length> tile-width: round((root.view-mode == 2 ? 136px : 100px) * Theme.text-scale / 1px) * 1px;
-    property <length> tile-height: root.tile-icon + Theme.font-body * 2.8 + Theme.font-small * 1.5 + 4 * Theme.space-xs;
+    property <length> tile-height: root.tile-icon + Theme.font-body * 2.8 + Theme.font-small * 1.5 + 6 * Theme.space-xs;
     property <int> per-line: root.view-mode == 0 ? 1 : max(1, floor((list-box.width - 16px) / root.tile-width));
     property <length> line-height: root.view-mode == 0 ? Theme.row-height : root.tile-height;
     callback plugin-toggled(string, bool);
