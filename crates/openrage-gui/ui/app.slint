@@ -375,11 +375,14 @@ component FileItem inherits Rectangle {
     in property <bool> texture-mode;
     in property <bool> history-mode;
     in property <bool> can-edit;
+    // Icon view: the size of the icon (0: a row of the list).
+    in property <length> tile-icon: 0px;
     callback select();
     callback open();
     callback action(string);
     height: Theme.row-height;
     opacity: item.dim ? 0.55 : 1.0;
+    border-radius: root.tile-icon > 0px ? Theme.radius : 0px;
     property <color> fg: selected && focused ? Theme.selection-text : Theme.text;
     background: selected ? (focused ? Theme.selection : Theme.accent-subtle) : area.has-hover ? Theme.hover : odd ? Theme.stripe : transparent;
     accessible-role: list-item;
@@ -396,7 +399,41 @@ component FileItem inherits Rectangle {
         width: 3px;
         background: Theme.mark-color(item.mark);
     }
-    HorizontalLayout {
+    if root.tile-icon > 0px: VerticalLayout {
+        padding: Theme.space-xs;
+        spacing: Theme.space-xs;
+        alignment: start;
+        HorizontalLayout {
+            alignment: center;
+            FormatIcon {
+                width: root.tile-icon;
+                height: root.tile-icon;
+                name: item.icon;
+                tint: selected && focused ? Theme.selection-text : item.tint;
+                container: item.can-open && item.icon != "folder" && item.icon != "archive";
+                Tooltip {
+                    text: @markdown("\{item.name + " · " + item.kind}");
+                }
+            }
+        }
+        Text {
+            vertical-stretch: 1;
+            text: item.name;
+            horizontal-alignment: center;
+            vertical-alignment: top;
+            wrap: char-wrap;
+            overflow: elide;
+            color: root.fg;
+        }
+        Text {
+            text: item.size != "" ? item.size : item.kind;
+            horizontal-alignment: center;
+            font-size: Theme.font-small;
+            overflow: elide;
+            color: selected && focused ? Theme.selection-text : Theme.text-muted;
+        }
+    }
+    if root.tile-icon == 0px: HorizontalLayout {
         padding-left: Theme.space-s;
         padding-right: Theme.space-s;
         spacing: Theme.space-s;
@@ -1157,7 +1194,25 @@ export component AppWindow inherits Window {
     callback asi-hint-fix();
     callback asi-hint-dismiss();
     in property <string> plugin-folder;
-    in property <bool> settings-scroll-end;
+    // Settings tab: 0 appearance, 1 game, 2 behaviour, 3 plugins.
+    in-out property <int> settings-tab;
+    // File list view (View menu, saved as `file_view`): 0 list, 1 icons, 2 large icons.
+    in-out property <int> view-mode;
+    callback view-mode-changed(int);
+    // Text size (View → Text size, saved as `text_size`).
+    callback text-scale-chosen(float);
+    // Search and filter fields, folded into a button until used.
+    in-out property <bool> search-open;
+    in-out property <string> search-text;
+    property <int> search-focus-tick;
+    in-out property <bool> filter-open;
+    property <int> filter-focus-tick;
+    // Icon view: tile and icon size, and how many tiles fit in a line.
+    property <length> tile-icon: round((root.view-mode == 2 ? 72px : 40px) * Theme.text-scale / 1px) * 1px;
+    property <length> tile-width: round((root.view-mode == 2 ? 136px : 100px) * Theme.text-scale / 1px) * 1px;
+    property <length> tile-height: root.tile-icon + Theme.font-body * 2.8 + Theme.font-small * 1.5 + 4 * Theme.space-xs;
+    property <int> per-line: root.view-mode == 0 ? 1 : max(1, floor((list-box.width - 16px) / root.tile-width));
+    property <length> line-height: root.view-mode == 0 ? Theme.row-height : root.tile-height;
     callback plugin-toggled(string, bool);
     callback open-plugin-folder();
     callback reload-plugins();
@@ -1224,6 +1279,11 @@ export component AppWindow inherits Window {
         root.settings-visible = true;
     }
 
+    public function open-settings-at(tab: int) {
+        root.settings-tab = tab;
+        root.open-settings();
+    }
+
     function set-theme(mode: int) {
         root.theme-mode = mode;
         root.theme-changed(mode);
@@ -1239,12 +1299,43 @@ export component AppWindow inherits Window {
         if (i < 0) {
             return;
         }
+        if (root.view-mode != 0) {
+            root.reveal-tile(i);
+            return;
+        }
         // One row of context stays visible above and below the selection.
         if (max(0, i - 1) * Theme.row-height < -list.content-y) {
             list.content-y = -max(0, i - 1) * Theme.row-height;
         } else if ((i + 2) * Theme.row-height > list.visible-height - list.content-y) {
             list.content-y = min(0, list.visible-height - min(i + 2, root.files.length) * Theme.row-height);
         }
+    }
+
+    // The same for the icon view: scrolls to the line of tile `i`.
+    function reveal-tile(i: int) {
+        let line = floor(i / root.per-line);
+        let lines = ceil(root.files.length / root.per-line);
+        if (line * root.tile-height < -grid.content-y) {
+            grid.content-y = -line * root.tile-height;
+        } else if ((line + 1) * root.tile-height > grid.visible-height - grid.content-y) {
+            grid.content-y = min(0, grid.visible-height - min(line + 1, lines) * root.tile-height);
+        }
+    }
+
+    function set-view(mode: int) {
+        root.view-mode = mode;
+        root.view-mode-changed(mode);
+        root.reveal-row(root.file-selected);
+    }
+
+    public function open-search() {
+        root.search-open = true;
+        root.search-focus-tick += 1;
+    }
+
+    public function open-filter() {
+        root.filter-open = true;
+        root.filter-focus-tick += 1;
     }
 
     // Selections made by the app (opening a path, Back, sorting, …) are kept in view too.
@@ -1420,6 +1511,44 @@ export component AppWindow inherits Window {
                 activated => { root.show-history(); }
             }
             MenuSeparator { }
+            MenuItem {
+                title: (root.view-mode == 0 ? "✓ " : "") + @tr("List");
+                icon: @image-url("icons/menu/view-list.svg");
+                shortcut: @keys(Control + "1");
+                activated => { root.set-view(0); }
+            }
+            MenuItem {
+                title: (root.view-mode == 1 ? "✓ " : "") + @tr("Icons");
+                icon: @image-url("icons/menu/view-grid.svg");
+                shortcut: @keys(Control + "2");
+                activated => { root.set-view(1); }
+            }
+            MenuItem {
+                title: (root.view-mode == 2 ? "✓ " : "") + @tr("Large icons");
+                icon: @image-url("icons/menu/view-large.svg");
+                shortcut: @keys(Control + "3");
+                activated => { root.set-view(2); }
+            }
+            Menu {
+                title: @tr("Text size");
+                MenuItem {
+                    title: (Theme.text-scale < 0.95 ? "✓ " : "") + @tr("Small");
+                    activated => { root.text-scale-chosen(0.9); }
+                }
+                MenuItem {
+                    title: (Theme.text-scale >= 0.95 && Theme.text-scale < 1.05 ? "✓ " : "") + @tr("Normal");
+                    activated => { root.text-scale-chosen(1.0); }
+                }
+                MenuItem {
+                    title: (Theme.text-scale >= 1.05 && Theme.text-scale < 1.2 ? "✓ " : "") + @tr("Large");
+                    activated => { root.text-scale-chosen(1.15); }
+                }
+                MenuItem {
+                    title: (Theme.text-scale >= 1.2 ? "✓ " : "") + @tr("Larger");
+                    activated => { root.text-scale-chosen(1.3); }
+                }
+            }
+            MenuSeparator { }
             Menu {
                 title: @tr("Theme");
                 MenuItem {
@@ -1470,13 +1599,13 @@ export component AppWindow inherits Window {
                 title: @tr("Search");
                 icon: @image-url("icons/menu/search.svg");
                 shortcut: @keys(Control + F);
-                activated => { search-edit.focus(); }
+                activated => { root.open-search(); }
             }
             MenuItem {
                 title: @tr("Filter list");
                 icon: @image-url("icons/menu/search.svg");
                 shortcut: @keys(Control + Shift + F);
-                activated => { filter-edit.focus(); }
+                activated => { root.open-filter(); }
             }
         }
         Menu {
@@ -1497,12 +1626,18 @@ export component AppWindow inherits Window {
         Menu {
             title: @tr("Tools");
             if root.plugin-tools.length == 0: MenuItem {
-                title: @tr("No plugin tools (Settings → Plugins)");
+                title: @tr("No plugin tools");
                 enabled: false;
             }
             for t[i] in root.plugin-tools: MenuItem {
                 title: t.title;
                 activated => { root.open-tool(i); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: @tr("Plugins…");
+                icon: @image-url("icons/menu/package.svg");
+                activated => { root.open-settings-at(3); }
             }
         }
         Menu {
@@ -1631,21 +1766,38 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                Rectangle {
-                    width: 16px;
-                    Image {
-                        width: 16px;
-                        height: 16px;
-                        source: @image-url("icons/search.svg");
-                        colorize: Theme.text-muted;
-                        accessible-role: none;
-                    }
+                if !root.search-open: IconButton {
+                    y: (parent.height - self.height) / 2;
+                    icon: @image-url("icons/search.svg");
+                    label: @tr("Search names, hashes, text… (Ctrl+F)");
+                    clicked => { root.open-search(); }
                 }
-                search-edit := LineEdit {
+                if root.search-open: Rectangle {
                     width: 280px;
-                    placeholder-text: @tr("Search names, hashes, text… (Ctrl+F)");
-                    accessible-label: @tr("Search");
-                    accepted(text) => { root.search(text); }
+                    min-height: 32px;
+                    FocusScope {
+                        KeyBinding {
+                            keys: @keys(Escape);
+                            activated => { root.search-open = false; }
+                        }
+                        search-edit := LineEdit {
+                            width: parent.width;
+                            height: parent.height;
+                            text <=> root.search-text;
+                            placeholder-text: @tr("Search names, hashes, text…");
+                            accessible-label: @tr("Search");
+                            accepted(text) => { root.search(text); }
+                            property <int> tick: root.search-focus-tick;
+                            changed tick => { self.focus(); }
+                            init => { self.focus(); }
+                            // Folds back into the button when left empty.
+                            changed has-focus => {
+                                if (!self.has-focus && self.text == "") {
+                                    root.search-open = false;
+                                }
+                            }
+                        }
+                    }
                 }
                 VSeparator { }
                 if root.mods-available: Button {
@@ -1818,12 +1970,68 @@ export component AppWindow inherits Window {
                             color: Theme.text-muted;
                         }
                     }
-                    filter-edit := LineEdit {
-                        width: 200px;
-                        text <=> root.filter;
-                        placeholder-text: @tr("Filter this list");
-                        accessible-label: @tr("Filter this list");
-                        edited(text) => { root.filter-edited(text); }
+                    if !root.filter-open && root.filter == "": IconButton {
+                        y: (parent.height - self.height) / 2;
+                        icon: @image-url("icons/filter.svg");
+                        label: @tr("Filter this list (Ctrl+Shift+F)");
+                        clicked => { root.open-filter(); }
+                    }
+                    if root.filter-open || root.filter != "": Rectangle {
+                        width: 220px;
+                        min-height: 32px;
+                        FocusScope {
+                            KeyBinding {
+                                keys: @keys(Escape);
+                                activated => {
+                                    root.filter = "";
+                                    root.filter-edited("");
+                                    root.filter-open = false;
+                                }
+                            }
+                            filter-edit := LineEdit {
+                                width: parent.width;
+                                height: parent.height;
+                                text <=> root.filter;
+                                placeholder-text: @tr("Filter this list");
+                                accessible-label: @tr("Filter this list");
+                                edited(text) => { root.filter-edited(text); }
+                                property <int> tick: root.filter-focus-tick;
+                                changed tick => { self.focus(); }
+                                init => {
+                                    if (root.filter-open) {
+                                        self.focus();
+                                    }
+                                }
+                                changed has-focus => {
+                                    if (!self.has-focus && self.text == "") {
+                                        root.filter-open = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        IconButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/view-list.svg");
+                            label: @tr("List (Ctrl+1)");
+                            active: root.view-mode == 0;
+                            clicked => { root.set-view(0); }
+                        }
+                        IconButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/view-grid.svg");
+                            label: @tr("Icons (Ctrl+2)");
+                            active: root.view-mode == 1;
+                            clicked => { root.set-view(1); }
+                        }
+                        IconButton {
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/view-large.svg");
+                            label: @tr("Large icons (Ctrl+3)");
+                            active: root.view-mode == 2;
+                            clicked => { root.set-view(2); }
+                        }
                     }
                 }
 
@@ -1990,7 +2198,7 @@ export component AppWindow inherits Window {
                     border-color: drop.has-drag || list-scope.has-focus ? Theme.accent : Theme.border;
                     clip: true;
                     VerticalLayout {
-                        Rectangle {
+                        if root.view-mode == 0: Rectangle {
                             height: 28px;
                             background: Theme.surface;
                             HorizontalLayout {
@@ -2042,7 +2250,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        Rectangle {
+                        if root.view-mode == 0: Rectangle {
                             height: 1px;
                             background: Theme.border;
                         }
@@ -2052,19 +2260,29 @@ export component AppWindow inherits Window {
                             accessible-label: @tr("Files");
                             KeyBinding {
                                 keys: @keys(DownArrow);
-                                activated => { root.move-selection(1); }
+                                activated => { root.move-selection(root.per-line); }
                             }
                             KeyBinding {
                                 keys: @keys(UpArrow);
+                                activated => { root.move-selection(-root.per-line); }
+                            }
+                            KeyBinding {
+                                keys: @keys(RightArrow);
+                                enabled: root.view-mode != 0;
+                                activated => { root.move-selection(1); }
+                            }
+                            KeyBinding {
+                                keys: @keys(LeftArrow);
+                                enabled: root.view-mode != 0;
                                 activated => { root.move-selection(-1); }
                             }
                             KeyBinding {
                                 keys: @keys(PageDown);
-                                activated => { root.move-selection(max(1, floor(list.visible-height / Theme.row-height) - 1)); }
+                                activated => { root.move-selection(root.per-line * max(1, floor(list-box.height / root.line-height) - 1)); }
                             }
                             KeyBinding {
                                 keys: @keys(PageUp);
-                                activated => { root.move-selection(-max(1, floor(list.visible-height / Theme.row-height) - 1)); }
+                                activated => { root.move-selection(-root.per-line * max(1, floor(list-box.height / root.line-height) - 1)); }
                             }
                             KeyBinding {
                                 keys: @keys(Home);
@@ -2096,7 +2314,7 @@ export component AppWindow inherits Window {
                                 keys: @keys(Delete);
                                 activated => { root.delete-selected(); }
                             }
-                            Rectangle {
+                            list-box := Rectangle {
                                 drop := DropArea {
                                     enabled: root.archive-mode && root.can-edit;
                                     can-drop(event) => { return DragAction.copy; }
@@ -2106,6 +2324,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 list := ListView {
+                                    visible: root.view-mode == 0;
                                     for row[i] in root.files: FileItem {
                                         item: row;
                                         wide-kind: root.search-mode;
@@ -2127,6 +2346,42 @@ export component AppWindow inherits Window {
                                         action(a) => {
                                             list-scope.focus();
                                             root.row-action(i, a);
+                                        }
+                                    }
+                                }
+                                // Icon view: lines of tiles (a ListView, so only the visible lines exist).
+                                grid := ListView {
+                                    visible: root.view-mode != 0;
+                                    for line in root.view-mode == 0 ? 0 : ceil(root.files.length / root.per-line): HorizontalLayout {
+                                        padding-left: Theme.space-xs;
+                                        alignment: start;
+                                        for c in root.per-line: Rectangle {
+                                            width: root.tile-width;
+                                            height: root.tile-height;
+                                            property <int> i: line * root.per-line + c;
+                                            if i < root.files.length: FileItem {
+                                                x: 2px;
+                                                y: 2px;
+                                                width: parent.width - 4px;
+                                                height: parent.height - 4px;
+                                                tile-icon: root.tile-icon;
+                                                item: root.files[i];
+                                                selected: i == root.file-selected;
+                                                focused: list-scope.has-focus;
+                                                archive-mode: root.archive-mode;
+                                                texture-mode: root.texture-mode;
+                                                history-mode: root.history-mode;
+                                                can-edit: root.can-edit;
+                                                select => {
+                                                    list-scope.focus();
+                                                    root.file-select(i);
+                                                }
+                                                open => { root.file-open(i); }
+                                                action(a) => {
+                                                    list-scope.focus();
+                                                    root.row-action(i, a);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -2449,7 +2704,7 @@ export component AppWindow inherits Window {
                             y: 8px;
                             text: root.preview-text;
                             font-family: root.mono-font;
-                            font-size: 12px;
+                            font-size: 12px * Theme.text-scale;
                             wrap: no-wrap;
                             color: Theme.text;
                         }
@@ -2632,7 +2887,7 @@ export component AppWindow inherits Window {
                     y: 8px;
                     text: root.oiv-changes;
                     font-family: root.mono-font;
-                    font-size: 12px;
+                    font-size: 12px * Theme.text-scale;
                     color: Theme.text;
                 }
             }
@@ -2917,7 +3172,7 @@ export component AppWindow inherits Window {
                         horizontal-stretch: 1;
                         read-only: true;
                         wrap: word-wrap;
-                        font-size: 12px;
+                        font-size: 12px * Theme.text-scale;
                         text: root.about-text;
                     }
                 }
@@ -3009,7 +3264,7 @@ export component AppWindow inherits Window {
         }
     }
 
-    // Settings page: appearance, game, behaviour.
+    // Settings: appearance, game, behaviour and plugins, one tab each.
     if root.settings-visible: Dialog {
         title: @tr("Settings");
         panel-width: 560px;
@@ -3017,279 +3272,342 @@ export component AppWindow inherits Window {
         closable: true;
         close => { root.settings-visible = false; }
         property <color> chosen: root.parse-hex(root.accent-hex);
-        ScrollView {
+        TabWidget {
             vertical-stretch: 1;
-            // Debug snapshots of the plugin list (`OPENRAGE_SETTINGS=plugins`).
-            changed content-height => {
-                if root.settings-scroll-end {
-                    self.content-y = self.visible-height - self.content-height;
+            current-index <=> root.settings-tab;
+            Tab {
+                title: @tr("Appearance");
+                ScrollView {
+                    VerticalLayout {
+                        alignment: start;
+                        spacing: Theme.space-m;
+                        padding: Theme.space-m;
+                        padding-left: 0;
+                        HorizontalLayout {
+                            spacing: Theme.space-s;
+                            Text {
+                                width: 120px;
+                                text: @tr("Theme");
+                                vertical-alignment: center;
+                                color: Theme.text-muted;
+                            }
+                            Button {
+                                text: @tr("System");
+                                primary: root.theme-mode == 0;
+                                clicked => { root.set-theme(0); }
+                            }
+                            Button {
+                                text: @tr("Light");
+                                primary: root.theme-mode == 1;
+                                clicked => { root.set-theme(1); }
+                            }
+                            Button {
+                                text: @tr("Dark");
+                                primary: root.theme-mode == 2;
+                                clicked => { root.set-theme(2); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: Theme.space-s;
+                            Text {
+                                width: 120px;
+                                text: @tr("Accent color");
+                                vertical-alignment: center;
+                                color: Theme.text-muted;
+                            }
+                            Button {
+                                text: @tr("OpenRAGE orange");
+                                primary: Theme.accent-mode == 1;
+                                clicked => { root.accent-chosen(1, Theme.accent-custom); }
+                            }
+                            Button {
+                                text: @tr("System default");
+                                primary: Theme.accent-mode == 0;
+                                clicked => { root.accent-chosen(0, Theme.accent-custom); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: Theme.space-s;
+                            padding-left: 120px + Theme.space-s;
+                            for c in [#c2410c, #2563eb, #0891b2, #16a34a, #9333ea, #db2777, #ca8a04]: Rectangle {
+                                width: 28px;
+                                height: 28px;
+                                border-radius: 14px;
+                                background: c;
+                                border-width: Theme.accent-mode == 2 && Theme.accent-custom == c ? 3px : 0px;
+                                border-color: Theme.text;
+                                accessible-role: button;
+                                accessible-label: root.color-hex(c);
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => {
+                                        root.accent-hex = root.color-hex(c);
+                                        root.accent-chosen(2, c);
+                                    }
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: Theme.space-s;
+                            padding-left: 120px + Theme.space-s;
+                            Rectangle {
+                                width: 28px;
+                                height: 28px;
+                                border-radius: Theme.radius;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                background: chosen;
+                            }
+                            LineEdit {
+                                horizontal-stretch: 1;
+                                text <=> root.accent-hex;
+                                accessible-label: @tr("Own color as #rrggbb");
+                                placeholder-text: @tr("Own color, e.g. #c2410c");
+                                accepted => {
+                                    if (chosen.alpha > 0) {
+                                        root.accent-chosen(2, chosen);
+                                    }
+                                }
+                            }
+                            Button {
+                                text: @tr("Use");
+                                enabled: chosen.alpha > 0;
+                                clicked => { root.accent-chosen(2, chosen); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: Theme.space-s;
+                            Text {
+                                width: 120px;
+                                text: @tr("Text size");
+                                vertical-alignment: center;
+                                color: Theme.text-muted;
+                            }
+                            for s[i] in [{ label: @tr("Small"), scale: 0.9 }, { label: @tr("Normal"), scale: 1.0 }, { label: @tr("Large"), scale: 1.15 }, { label: @tr("Larger"), scale: 1.3 }]: Button {
+                                text: s.label;
+                                primary: Math.abs(Theme.text-scale - s.scale) < 0.01;
+                                clicked => { root.text-scale-chosen(s.scale); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: Theme.space-s;
+                            Text {
+                                width: 120px;
+                                text: @tr("Files");
+                                vertical-alignment: center;
+                                color: Theme.text-muted;
+                            }
+                            Button {
+                                text: @tr("List");
+                                primary: root.view-mode == 0;
+                                clicked => { root.set-view(0); }
+                            }
+                            Button {
+                                text: @tr("Icons");
+                                primary: root.view-mode == 1;
+                                clicked => { root.set-view(1); }
+                            }
+                            Button {
+                                text: @tr("Large icons");
+                                primary: root.view-mode == 2;
+                                clicked => { root.set-view(2); }
+                            }
+                        }
+                    }
                 }
             }
-            VerticalLayout {
-                spacing: Theme.space-m;
-                padding-right: Theme.space-m;
-                Text {
-                    text: @tr("Appearance");
-                    font-size: Theme.font-title;
-                    font-weight: 600;
-                    color: Theme.text;
-                }
-                HorizontalLayout {
-                    spacing: Theme.space-s;
-                    Text {
-                        width: 120px;
-                        text: @tr("Theme");
-                        vertical-alignment: center;
-                        color: Theme.text-muted;
-                    }
-                    Button {
-                        text: @tr("System");
-                        primary: root.theme-mode == 0;
-                        clicked => { root.set-theme(0); }
-                    }
-                    Button {
-                        text: @tr("Light");
-                        primary: root.theme-mode == 1;
-                        clicked => { root.set-theme(1); }
-                    }
-                    Button {
-                        text: @tr("Dark");
-                        primary: root.theme-mode == 2;
-                        clicked => { root.set-theme(2); }
-                    }
-                }
-                HorizontalLayout {
-                    spacing: Theme.space-s;
-                    Text {
-                        width: 120px;
-                        text: @tr("Accent color");
-                        vertical-alignment: center;
-                        color: Theme.text-muted;
-                    }
-                    Button {
-                        text: @tr("OpenRAGE orange");
-                        primary: Theme.accent-mode == 1;
-                        clicked => { root.accent-chosen(1, Theme.accent-custom); }
-                    }
-                    Button {
-                        text: @tr("System default");
-                        primary: Theme.accent-mode == 0;
-                        clicked => { root.accent-chosen(0, Theme.accent-custom); }
-                    }
-                }
-                HorizontalLayout {
-                    spacing: Theme.space-s;
-                    padding-left: 120px + Theme.space-s;
-                    for c in [#c2410c, #2563eb, #0891b2, #16a34a, #9333ea, #db2777, #ca8a04]: Rectangle {
-                        width: 28px;
-                        height: 28px;
-                        border-radius: 14px;
-                        background: c;
-                        border-width: Theme.accent-mode == 2 && Theme.accent-custom == c ? 3px : 0px;
-                        border-color: Theme.text;
-                        accessible-role: button;
-                        accessible-label: root.color-hex(c);
-                        TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                root.accent-hex = root.color-hex(c);
-                                root.accent-chosen(2, c);
-                            }
-                        }
-                    }
-                }
-                HorizontalLayout {
-                    spacing: Theme.space-s;
-                    padding-left: 120px + Theme.space-s;
-                    Rectangle {
-                        width: 28px;
-                        height: 28px;
-                        border-radius: Theme.radius;
-                        border-width: 1px;
-                        border-color: Theme.border;
-                        background: chosen;
-                    }
-                    LineEdit {
-                        horizontal-stretch: 1;
-                        text <=> root.accent-hex;
-                        accessible-label: @tr("Own color as #rrggbb");
-                        placeholder-text: @tr("Own color, e.g. #c2410c");
-                        accepted => {
-                            if (chosen.alpha > 0) {
-                                root.accent-chosen(2, chosen);
-                            }
-                        }
-                    }
-                    Button {
-                        text: @tr("Use");
-                        enabled: chosen.alpha > 0;
-                        clicked => { root.accent-chosen(2, chosen); }
-                    }
-                }
-                Rectangle {
-                    height: 1px;
-                    background: Theme.border;
-                }
-                Text {
-                    text: @tr("Game");
-                    font-size: Theme.font-title;
-                    font-weight: 600;
-                    color: Theme.text;
-                }
-                HorizontalLayout {
-                    spacing: Theme.space-s;
-                    Image {
-                        source: @image-url("logo.svg");
-                        width: 32px;
-                        height: 32px;
-                    }
+            Tab {
+                title: @tr("Game");
+                ScrollView {
                     VerticalLayout {
-                        horizontal-stretch: 1;
+                        alignment: start;
+                        spacing: Theme.space-m;
+                        padding: Theme.space-m;
+                        padding-left: 0;
+                        HorizontalLayout {
+                            spacing: Theme.space-s;
+                            Image {
+                                source: @image-url("logo.svg");
+                                width: 32px;
+                                height: 32px;
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: root.settings-game;
+                                    font-weight: 600;
+                                    color: Theme.text;
+                                }
+                                Text {
+                                    text: root.settings-game-dir;
+                                    font-size: Theme.font-small;
+                                    wrap: char-wrap;
+                                    color: Theme.text-muted;
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: Theme.space-s;
+                            Button {
+                                text: @tr("Switch game…");
+                                enabled: root.games.length > 1;
+                                clicked => {
+                                    root.settings-visible = false;
+                                    root.open-game-chooser(true);
+                                }
+                            }
+                            Button {
+                                text: @tr("Add or change a game…");
+                                clicked => {
+                                    root.settings-visible = false;
+                                    root.open-setup();
+                                }
+                            }
+                        }
+                        CheckBox {
+                            text: @tr("Ask which game to open at start");
+                            enabled: root.games.length > 1;
+                            checked: root.ask-game;
+                            toggled => { root.ask-game-changed(self.checked); }
+                        }
+                    }
+                }
+            }
+            Tab {
+                title: @tr("Behaviour");
+                ScrollView {
+                    VerticalLayout {
+                        alignment: start;
+                        spacing: Theme.space-m;
+                        padding: Theme.space-m;
+                        padding-left: 0;
+                        CheckBox {
+                            text: @tr("Show the change history in its own window");
+                            checked: root.history-in-window;
+                            toggled => {
+                                root.history-in-window = self.checked;
+                                root.history-window-changed(self.checked);
+                            }
+                        }
+                        CheckBox {
+                            text: @tr("Show the game as it sees itself with mods (mods overlay)");
+                            enabled: root.mods-available;
+                            checked: root.mods-overlay;
+                            toggled => {
+                                root.mods-overlay = self.checked;
+                                root.overlay-toggled(self.checked);
+                            }
+                        }
+                    }
+                }
+            }
+            Tab {
+                title: @tr("Plugins");
+                ScrollView {
+                    VerticalLayout {
+                        alignment: start;
+                        spacing: Theme.space-m;
+                        padding: Theme.space-m;
+                        padding-left: 0;
                         Text {
-                            text: root.settings-game;
-                            font-weight: 600;
-                            color: Theme.text;
+                            text: @tr("Plugins add previews and actions for more file types. They run in a sandbox: they see only the files you open with them, plus the game's files if you allow it, and cannot change anything or go online. New plugins stay off until you turn them on.");
+                            wrap: word-wrap;
+                            color: Theme.text-muted;
+                        }
+                        HorizontalLayout {
+                            alignment: start;
+                            spacing: Theme.space-s;
+                            Button {
+                                text: @tr("Install plugin…");
+                                primary: true;
+                                clicked => { root.pick-plugin-package(); }
+                            }
+                            Button {
+                                text: @tr("Open plugin folder");
+                                clicked => { root.open-plugin-folder(); }
+                            }
+                            Button {
+                                text: @tr("Reload plugins");
+                                clicked => { root.reload-plugins(); }
+                            }
+                        }
+                        if root.plugins.length == 0: Text {
+                            text: @tr("No plugins installed. Put a plugin's folder into the plugin folder, then reload.");
+                            wrap: word-wrap;
+                            color: Theme.text-muted;
+                        }
+                        for p in root.plugins: HorizontalLayout {
+                            spacing: Theme.space-s;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 2px;
+                                Text {
+                                    text: p.title + "  ·  " + p.status;
+                                    font-weight: 600;
+                                    color: p.broken ? Theme.danger : Theme.text;
+                                }
+                                if p.description != "": Text {
+                                    text: p.description;
+                                    font-size: Theme.font-small;
+                                    wrap: word-wrap;
+                                    color: Theme.text-muted;
+                                }
+                                Text {
+                                    text: p.permissions;
+                                    font-size: Theme.font-small;
+                                    wrap: word-wrap;
+                                    color: p.broken ? Theme.danger : Theme.text-muted;
+                                }
+                            }
+                            if !p.broken: CheckBox {
+                                text: @tr("On");
+                                checked: p.enabled;
+                                accessible-label: @tr("Enable {}", p.title);
+                                toggled => { root.plugin-toggled(p.id, self.checked); }
+                            }
+                            if p.removable: VerticalLayout {
+                                alignment: center;
+                                Button {
+                                    text: @tr("Uninstall");
+                                    accessible-label: @tr("Uninstall {}", p.title);
+                                    clicked => { root.uninstall-plugin(p.id); }
+                                }
+                            }
                         }
                         Text {
-                            text: root.settings-game-dir;
+                            text: root.plugin-folder;
                             font-size: Theme.font-small;
                             wrap: char-wrap;
                             color: Theme.text-muted;
                         }
                     }
                 }
-                HorizontalLayout {
-                    alignment: start;
-                    spacing: Theme.space-s;
-                    Button {
-                        text: @tr("Switch game…");
-                        enabled: root.games.length > 1;
-                        clicked => {
-                            root.settings-visible = false;
-                            root.open-game-chooser(true);
-                        }
-                    }
-                    Button {
-                        text: @tr("Add or change a game…");
-                        clicked => {
-                            root.settings-visible = false;
-                            root.open-setup();
-                        }
-                    }
-                }
-                CheckBox {
-                    text: @tr("Ask which game to open at start");
-                    enabled: root.games.length > 1;
-                    checked: root.ask-game;
-                    toggled => { root.ask-game-changed(self.checked); }
-                }
-                Rectangle {
-                    height: 1px;
-                    background: Theme.border;
-                }
-                Text {
-                    text: @tr("Behaviour");
-                    font-size: Theme.font-title;
-                    font-weight: 600;
-                    color: Theme.text;
-                }
-                CheckBox {
-                    text: @tr("Show the change history in its own window");
-                    checked: root.history-in-window;
-                    toggled => {
-                        root.history-in-window = self.checked;
-                        root.history-window-changed(self.checked);
-                    }
-                }
-                CheckBox {
-                    text: @tr("Show the game as it sees itself with mods (mods overlay)");
-                    enabled: root.mods-available;
-                    checked: root.mods-overlay;
-                    toggled => {
-                        root.mods-overlay = self.checked;
-                        root.overlay-toggled(self.checked);
-                    }
-                }
-                Rectangle {
-                    height: 1px;
-                    background: Theme.border;
-                }
-                Text {
-                    text: @tr("Plugins");
-                    font-size: Theme.font-title;
-                    font-weight: 600;
-                    color: Theme.text;
-                }
-                Text {
-                    text: @tr("Plugins add previews and actions for more file types. They run in a sandbox: they see only the files you open with them, plus the game's files if you allow it, and cannot change anything or go online. New plugins stay off until you turn them on.");
+            }
+        }
+    }
+
+    // Installing a plugin package: what it is and may do, before anything is written.
+    if root.plugin-pkg-visible: Dialog {
+        title: root.plugin-pkg-title;
+        subtitle: root.plugin-pkg-subtitle;
+        panel-width: 640px;
+        panel-height: 460px;
+        close => { root.plugin-pkg-visible = false; }
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.surface-raised;
+            border-radius: Theme.radius;
+            ScrollView {
+                content-width: max(self.visible-width, details.preferred-width + 16px);
+                content-height: max(self.visible-height, details.preferred-height + 16px);
+                details := Text {
+                    x: 8px;
+                    y: 8px;
+                    width: parent.visible-width - 16px;
+                    text: root.plugin-pkg-details;
                     wrap: word-wrap;
-                    color: Theme.text-muted;
-                }
-                if root.plugins.length == 0: Text {
-                    text: @tr("No plugins installed. Put a plugin's folder into the plugin folder, then reload.");
-                    wrap: word-wrap;
-                    color: Theme.text-muted;
-                }
-                for p in root.plugins: HorizontalLayout {
-                    spacing: Theme.space-s;
-                    VerticalLayout {
-                        horizontal-stretch: 1;
-                        spacing: 2px;
-                        Text {
-                            text: p.title + "  ·  " + p.status;
-                            font-weight: 600;
-                            color: p.broken ? Theme.danger : Theme.text;
-                        }
-                        if p.description != "": Text {
-                            text: p.description;
-                            font-size: Theme.font-small;
-                            wrap: word-wrap;
-                            color: Theme.text-muted;
-                        }
-                        Text {
-                            text: p.permissions;
-                            font-size: Theme.font-small;
-                            wrap: word-wrap;
-                            color: p.broken ? Theme.danger : Theme.text-muted;
-                        }
-                    }
-                    if !p.broken: CheckBox {
-                        text: @tr("On");
-                        checked: p.enabled;
-                        accessible-label: @tr("Enable {}", p.title);
-                        toggled => { root.plugin-toggled(p.id, self.checked); }
-                    }
-                    if p.removable: VerticalLayout {
-                        alignment: center;
-                        Button {
-                            text: @tr("Uninstall");
-                            accessible-label: @tr("Uninstall {}", p.title);
-                            clicked => { root.uninstall-plugin(p.id); }
-                        }
-                    }
-                }
-                Text {
-                    text: root.plugin-folder;
-                    font-size: Theme.font-small;
-                    wrap: char-wrap;
-                    color: Theme.text-muted;
-                }
-                HorizontalLayout {
-                    alignment: start;
-                    spacing: Theme.space-s;
-                    Button {
-                        text: @tr("Install plugin…");
-                        primary: true;
-                        clicked => { root.pick-plugin-package(); }
-                    }
-                    Button {
-                        text: @tr("Open plugin folder");
-                        clicked => { root.open-plugin-folder(); }
-                    }
-                    Button {
-                        text: @tr("Reload plugins");
-                        clicked => { root.reload-plugins(); }
-                    }
+                    color: Theme.text;
                 }
             }
         }
@@ -3398,7 +3716,7 @@ export component AppWindow inherits Window {
                 text: root.setup-log;
                 wrap: word-wrap;
                 font-family: root.mono-font;
-                font-size: 12px;
+                font-size: 12px * Theme.text-scale;
                 color: Theme.text;
             }
         }
@@ -4243,7 +4561,7 @@ export component EditorWindow inherits Window {
                     height: 100%;
                     text <=> root.text;
                     read-only: !root.editable || root.locked-reason != "" || root.saving;
-                    font-size: 13px;
+                    font-size: 13px * Theme.text-scale;
                     wrap: root.wrap ? TextWrap.word-wrap : TextWrap.no-wrap;
                     edited => { root.modified = true; }
                 }
@@ -4706,7 +5024,7 @@ export component XmlWindow inherits Window {
                                 horizontal-alignment: right;
                                 vertical-alignment: center;
                                 font-family: root.mono-font;
-                                font-size: 12px;
+                                font-size: 12px * Theme.text-scale;
                                 color: Theme.text-faint;
                             }
                             HorizontalLayout {
@@ -4716,7 +5034,7 @@ export component XmlWindow inherits Window {
                                     text: s.text;
                                     vertical-alignment: center;
                                     font-family: root.mono-font;
-                                    font-size: 12px;
+                                    font-size: 12px * Theme.text-scale;
                                     color: root.span-color(s.kind);
                                 }
                             }
@@ -5834,7 +6152,7 @@ export component ToolWindow inherits Window {
                 vertical-stretch: 1;
                 read-only: true;
                 text: root.result;
-                font-size: 13px;
+                font-size: 13px * Theme.text-scale;
                 wrap: no-wrap;
                 accessible-label: @tr("Result");
             }

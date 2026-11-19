@@ -16,14 +16,18 @@ export global Theme {
 
     out property <length> radius: 6px;
     out property <length> radius-s: 4px;
-    out property <length> row-height: 26px;
-    out property <length> icon-size: 16px;
+
+    // Text size (View → Text size, saved as `text_size`): text, list rows and
+    // file icons grow with it.
+    in-out property <float> text-scale: 1.0;
+    out property <length> row-height: round(26px * text-scale / 1px) * 1px;
+    out property <length> icon-size: round(16px * text-scale / 1px) * 1px;
 
     // Type scale
-    out property <length> font-small: 11px;
-    out property <length> font-body: 13px;
-    out property <length> font-title: 16px;
-    out property <length> font-heading: 20px;
+    out property <length> font-small: 11px * text-scale;
+    out property <length> font-body: 13px * text-scale;
+    out property <length> font-title: 16px * text-scale;
+    out property <length> font-heading: 20px * text-scale;
 
     // Surfaces
     out property <color> background: Palette.background;
@@ -89,6 +93,7 @@ export global Icons {
         if (name == "particles") { return @image-url("icons/particles.svg"); }
         if (name == "package") { return @image-url("icons/package.svg"); }
         if (name == "search") { return @image-url("icons/search.svg"); }
+        if (name == "filter") { return @image-url("icons/filter.svg"); }
         return @image-url("icons/file.svg");
     }
 }

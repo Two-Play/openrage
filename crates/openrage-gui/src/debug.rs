@@ -32,9 +32,15 @@ pub(crate) fn debug_snapshot(ui: &AppWindow) {
         if std::env::var("OPENRAGE_CONFIRM_PLUGIN").is_ok() && ui.get_plugin_pkg_visible() {
             ui.invoke_plugin_pkg_confirm();
         }
+        // `OPENRAGE_FIELD=search|filter`: unfold that field.
+        match std::env::var("OPENRAGE_FIELD").as_deref() {
+            Ok("search") => ui.invoke_open_search(),
+            Ok("filter") => ui.invoke_open_filter(),
+            _ => {}
+        }
         if let Ok(page) = std::env::var("OPENRAGE_SETTINGS") {
-            ui.set_settings_scroll_end(page == "plugins");
-            ui.invoke_open_settings();
+            let tab = ["appearance", "game", "behaviour", "plugins"].iter().position(|t| *t == page).unwrap_or(0);
+            ui.invoke_open_settings_at(tab as i32);
         }
         // `OPENRAGE_ABOUT=<tab>` opens the About dialog on that tab (0–2).
         if let Ok(tab) = std::env::var("OPENRAGE_ABOUT") {
