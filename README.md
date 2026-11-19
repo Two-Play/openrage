@@ -38,6 +38,8 @@ OpenIV's last release was in January 2022. OpenRAGE picks up where it left off a
 - **Every major format:** textures, models, audio, animations, metadata as XML, collisions, paths, nav meshes, cutscenes, scripts, game text.
 - **Coming from OpenIV?** Your `mods` folder and `.oiv` packages work as they are ([how to switch](https://two-play.github.io/openrage/getting-started/#coming-from-openiv)).
 - **Mods, safely:** changes go to OpenIV's `mods` folder, never into your game files; every change and every `.oiv` package can be undone.
+- **Models in:** replace props and vehicle bodies of GTA V Enhanced with your own OBJ models; doors and bonnets keep moving (preview).
+- **ASI mods:** see and switch GTA V's ASI mods, and on Linux let Proton load the ASI loader with one click.
 - **Ready for GTA VI:** support follows as fast as possible once GTA VI comes to PC.
 - **Tested on the whole game:** every format is checked against every file of GTA V ([details](https://two-play.github.io/openrage/#status)).
 
@@ -58,12 +60,12 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 
 | Game | Archives | Formats |
 |---|---|---|
-| **GTA V** (Legacy & Enhanced) | ✅ read and edit (mods folder, with undo) | ✅ textures (also inside models) · models · audio · animations · metadata · text · collisions · paths · cutscenes · scripts · ◐ model import from OBJ with textures and detail levels (Enhanced .ydr, preview; explorer via the OBJ tools plugin) |
+| **GTA V** (Legacy & Enhanced) | ✅ read and edit (mods folder, with undo) | ✅ textures (also inside models) · models · audio · animations · metadata · text · collisions · paths · cutscenes · scripts · ASI mods (manager, Proton fix on Linux) · ◐ model import from OBJ with compressed textures and detail levels (Enhanced `.ydr` and vehicle bodies `.yft`, preview; explorer via the OBJ tools plugin) |
 | **Red Dead Redemption 2** | ✅ read, with keys from your own game | ◐ textures · models · texts · metadata · audio · animations · ped outfits (read-only) |
 | **GTA VI** | 🔜 next: as fast as possible once it comes to PC | – |
 | **GTA IV** (Complete Edition) | ✅ read (IMG3, RPF2, RPF3), key from your own `GTAIV.exe` | ◐ textures · models · collisions · animations · text · scripts · maps in 3D · cutscenes (played with their cast, camera, subtitles and particle effects) · particle effect lists (`.wpfl`) · editing `.img`, `.rpf`, placement files, loose files and textures (`.wtd`, inside `.wdr`) (update folder, or the game files with originals kept) |
 
-**Plugins** (API 0.3, preview): sandboxed WebAssembly plugins add file types, previews (text, tree, table, image, 3D model), export and batch actions with access to the game's models and textures, and changes to game files through the `mods` folder (with undo), for every game. ✅ explorer (file list, preview, context menu, Settings → Plugins) and command line (`openrage plugin`), three example plugins included (OBJ export among them) · plugin packages (`.orp`) with install/uninstall in the explorer and the CLI · 🔜 openFormats, importers into game formats. [Writing plugins](https://two-play.github.io/openrage/plugins/)
+**Plugins** (API 0.3, preview): sandboxed WebAssembly plugins add file types, previews (text, tree, table, image, 3D model), tool windows of their own (Tools menu), export and batch actions with access to the game's models and textures, and changes to game files through the `mods` folder (with undo), for every game. ✅ explorer (file list, preview, context menu, Settings → Plugins) and command line (`openrage plugin`), four example plugins included (OBJ export and import, a number and hash converter among them) · plugin packages (`.orp`) with install/uninstall in the explorer and the CLI · models into game formats (`build-model`) · 🔜 openFormats. [Writing plugins](https://two-play.github.io/openrage/plugins/)
 
 ## Installation
 

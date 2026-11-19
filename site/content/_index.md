@@ -24,14 +24,14 @@ features_intro = "What OpenRAGE can open, show and change today."
 screenshots_title = "Screenshots"
 screenshots_intro = "Click a picture to enlarge it, arrow keys browse. The screenshots show files from the author's own copy of the game."
 games_title = "Supported games"
-games_intro = "GTA V comes first and Red Dead Redemption 2 can be explored. **GTA VI is next:** support follows as fast as possible once it comes to PC. GTA IV can be explored too: archives, textures, models, collisions, animations, texts and maps in 3D."
+games_intro = "GTA V comes first and Red Dead Redemption 2 can be explored. **GTA VI is next:** support follows as fast as possible once it comes to PC. GTA IV can be explored and modded too: archives, textures, models, collisions, animations, texts, maps in 3D and whole cutscenes."
 details_summary = "Checked against the whole game"
 download_intro = "Unpack the archive and run `openrage-gui` (or `openrage` for the command line). On first start the GUI detects your game and sets up the keys."
 why_title = "Why switch from OpenIV"
 why_intro = "OpenRAGE keeps what OpenIV got right — the `mods` folder, `.oiv` packages, the export formats — so your mods keep working. Switching costs nothing, and you gain this:"
 compare_title = "OpenRAGE and OpenIV side by side"
 compare_note = """
-OpenIV supports more games and can import models; both tools share the same `mods` folder, so you can use them side by side.
+OpenIV supports more games and imports more kinds of models; both tools share the same `mods` folder, so you can use them side by side.
 Out of date? [Open an issue](https://github.com/Two-Play/openrage/issues).
 """
 
@@ -177,7 +177,7 @@ variant = "Complete Edition"
 archives_status = "ok"
 archives = "IMG3, RPF2 and RPF3 read: decryption with the key from your own GTAIV.exe, browsing and extracting in the GUI"
 formats_status = "partial"
-formats = "textures, models, collisions, animations and maps in 3D (DDS/PNG and glTF export), texts (.gxt), placement files (.wpl) and scripts (disassembly), read-only"
+formats = "textures, models, collisions, animations and maps in 3D (DDS/PNG and glTF export), cutscenes with particle effects, texts (.gxt), placement files (.wpl) and scripts (disassembly); editing of archives, placements and textures"
 
 # ------------------------------------------------------------- Why OpenRAGE
 
@@ -245,7 +245,7 @@ edge = "openrage"
 [[extra.compare]]
 feature = "Other games"
 openiv = "GTA IV, EFLC, Max Payne 3"
-openrage = "RDR2 archives, textures, models, texts, metadata, audio and animations; GTA IV archives, textures, models, texts and placements; GTA VI as soon as it is on PC"
+openrage = "RDR2 archives, textures, models, texts, metadata, audio and animations; GTA IV archives, textures, models, texts, placements and cutscenes; GTA VI as soon as it is on PC"
 edge = "openiv"
 
 [[extra.compare]]
@@ -279,7 +279,7 @@ openrage = "glTF (Blender)"
 [[extra.compare]]
 feature = "Model import"
 openiv = "Yes"
-openrage = "Not yet"
+openrage = "OBJ into GTA V Enhanced props and vehicle bodies (preview)"
 edge = "openiv"
 
 [[extra.compare]]
