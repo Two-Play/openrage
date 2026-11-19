@@ -214,7 +214,9 @@ fn main() -> anyhow::Result<()> {
     ui.set_theme_mode(with_app(|a| theme_mode(a.cfg.theme.as_deref())));
     let (mode, color) = with_app(|a| accent::from_setting(a.cfg.accent.as_deref()));
     accent::set(mode, color);
+    accent::set_text_scale(with_app(|a| a.cfg.text_size.unwrap_or(100)) as f32 / 100.0);
     accent::apply(&ui);
+    ui.set_view_mode(with_app(|a| view_mode(a.cfg.file_view.as_deref())));
     ui.set_history_in_window(with_app(|a| a.cfg.history_window.unwrap_or(true)));
     let languages: Vec<SharedString> =
         std::iter::once("All languages".into()).chain(LANGUAGES.iter().map(|l| capitalize(l).into())).collect();
