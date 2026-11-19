@@ -3981,7 +3981,7 @@ dependencies = [
 
 [[package]]
 name = "openrage-app"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -4003,7 +4003,7 @@ dependencies = [
 
 [[package]]
 name = "openrage-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4022,7 +4022,7 @@ dependencies = [
 
 [[package]]
 name = "openrage-gui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4049,7 +4049,7 @@ dependencies = [
 
 [[package]]
 name = "openrage-plugins"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -4528,11 +4528,11 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rage-core"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "rage-crypto"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes",
  "flate2",
@@ -4543,7 +4543,7 @@ dependencies = [
 
 [[package]]
 name = "rage-formats"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "flate2",
  "lewton",
@@ -4558,7 +4558,7 @@ dependencies = [
 
 [[package]]
 name = "rage-index"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "flate2",
  "rage-core",
@@ -4571,7 +4571,7 @@ dependencies = [
 
 [[package]]
 name = "rage-mods"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "rage-crypto",
  "rage-rpf",
@@ -4579,7 +4579,7 @@ dependencies = [
 
 [[package]]
 name = "rage-resource"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "flate2",
  "thiserror 2.0.21",
@@ -4587,7 +4587,7 @@ dependencies = [
 
 [[package]]
 name = "rage-rpf"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "flate2",
  "memchr",
@@ -4603,7 +4603,7 @@ dependencies = [
 
 [[package]]
 name = "rage-tfit2"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "rand"

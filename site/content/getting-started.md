@@ -23,6 +23,15 @@ Ready-made builds for **Linux** (x86-64, glibc 2.35 or newer) and **Windows** (x
 Unpack the archive and start the GUI, or `openrage` for the command line. The archive also holds `openrage.desktop`
 and `openrage.png` for a menu entry. Newer releases also come as an **AppImage**: make it executable and start it.
 
+From 0.5 there is also a **Flatpak** (`openrage-*-x86_64.flatpak`). It installs a menu entry, and OpenRAGE plugins
+(`.orp`) and OpenIV packages (`.oiv`) then open in OpenRAGE with a double-click. It keeps its settings apart from the
+other downloads, in `~/.var/app/io.github.Two_Play.OpenRAGE`. The command line runs with
+`flatpak run --command=openrage io.github.Two_Play.OpenRAGE`.
+
+```
+flatpak install --user openrage-*-x86_64.flatpak
+```
+
 ```
 tar -xzf openrage-*-linux-x86_64.tar.gz
 cd openrage-*-linux-x86_64

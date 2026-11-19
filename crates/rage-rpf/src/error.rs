@@ -5,6 +5,8 @@ use std::path::PathBuf;
 pub enum RpfError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}: empty file ({1} bytes), not an archive")]
+    Empty(String, u64),
     #[error("{0}: not an RPF7 archive (magic {1:#010x})")]
     BadMagic(String, u32),
     #[error("{0}: archive is encrypted but no keys are loaded (run `openrage keys` first)")]

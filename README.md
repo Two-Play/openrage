@@ -34,7 +34,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 
 OpenIV's last release was in January 2022. OpenRAGE picks up where it left off and stays compatible with it.
 
-- **Explorer and search:** archives, even nested ones, open like folders; names, hashes and full text of the whole game in milliseconds.
+- **Explorer and search:** archives, even nested ones, open like folders, as a list or as icons; names, hashes and full text of the whole game in milliseconds.
 - **Every major format:** textures, models, audio, animations, metadata as XML, collisions, paths, nav meshes, cutscenes, scripts, game text.
 - **Coming from OpenIV?** Your `mods` folder and `.oiv` packages work as they are ([how to switch](https://two-play.github.io/openrage/getting-started/#coming-from-openiv)).
 - **Mods, safely:** changes go to OpenIV's `mods` folder, never into your game files; every change and every `.oiv` package can be undone.
@@ -69,7 +69,7 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 
 ## Installation
 
-Download the [latest release](https://github.com/Two-Play/openrage/releases/latest) for Linux (AppImage or `.tar.gz`) or Windows (`.zip`) and start `openrage-gui`. On first start it finds your game and sets up the keys. Step by step: **[Getting started](https://two-play.github.io/openrage/getting-started/)**.
+Download the [latest release](https://github.com/Two-Play/openrage/releases/latest) for Linux (AppImage, Flatpak or `.tar.gz`) or Windows (`.zip`) and start `openrage-gui`. On first start it finds your game and sets up the keys. Step by step: **[Getting started](https://two-play.github.io/openrage/getting-started/)**.
 
 To build from source (Rust, pinned in `rust-toolchain.toml`; on Linux also the fontconfig, xkbcommon, Wayland and ALSA development packages):
 

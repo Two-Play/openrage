@@ -1,6 +1,7 @@
 //! The accent color (View → Accent color): the widget style's, OpenRAGE
 //! orange (the logo's) or one of the user's choice. Every window gets it when
 //! it opens and when it changes; it is saved in the settings as `accent`.
+//! The text size (View → Text size) travels the same way.
 
 use std::cell::Cell;
 
@@ -10,9 +11,21 @@ use crate::Theme;
 
 thread_local! {
     static CURRENT: Cell<(i32, Color)> = const { Cell::new((0, Color::from_rgb_u8(0xc2, 0x41, 0x0c))) };
+    /// The text size (View → Text size), 1.0 = normal; saved as `text_size`.
+    static TEXT_SCALE: Cell<f32> = const { Cell::new(1.0) };
 }
 
-/// Applies the current accent to a window.
+/// Sets the text size (applying it is up to the caller, like the accent).
+pub fn set_text_scale(scale: f32) {
+    TEXT_SCALE.with(|c| c.set(scale.clamp(0.75, 1.6)));
+}
+
+/// The text size setting in percent.
+pub fn text_size_setting() -> u32 {
+    (TEXT_SCALE.with(Cell::get) * 100.0).round() as u32
+}
+
+/// Applies the current accent and text size to a window.
 pub fn apply<T>(win: &T)
 where
     T: ComponentHandle,
@@ -22,6 +35,7 @@ where
     let theme = win.global::<Theme>();
     theme.set_accent_custom(color);
     theme.set_accent_mode(mode);
+    theme.set_text_scale(TEXT_SCALE.with(Cell::get));
 }
 
 /// Sets the current accent (applying it is up to the caller).

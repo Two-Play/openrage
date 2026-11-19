@@ -25,6 +25,12 @@ With several games set up, OpenRAGE first shows a small window that asks which o
 - The file list is sortable and shows a format icon for each file (textures, models, maps, data, audio, scripts …).
 - Files that contain other files (texture dictionaries, audio containers) carry a badge on their icon.
 - The **address bar** has clickable breadcrumbs. Click the free space (or press Ctrl+L) to type a path.
+- **Views:** the buttons above the list (or View → List, Icons, Large icons; Ctrl+1, Ctrl+2, Ctrl+3) show the files
+  as a list with columns or as icons. In the icon views the arrow keys move left, right, up and down.
+- **Filter:** the funnel button above the list (Ctrl+Shift+F) opens a field that narrows the list to names containing
+  the text; Esc clears and closes it.
+- **Text size:** View → Text size (or Settings → Appearance) makes text, list rows and icons smaller or larger, in
+  every window.
 
 ### Preview and info panel
 
@@ -71,11 +77,15 @@ The other windows have right-click menus too:
 | Backspace or Alt+Up | Up one folder |
 | Ctrl+L | Type a path |
 | Ctrl+F | Search |
+| Ctrl+Shift+F | Filter the list |
+| Ctrl+1 / Ctrl+2 / Ctrl+3 | List / icons / large icons |
 | F2 / Delete | Rename / delete (in edit mode) |
 | Ctrl+Z | Undo |
 | F1 | All keyboard shortcuts |
 
 ## Search
+
+The magnifier in the toolbar (or Ctrl+F) opens the search field; Enter searches, Esc folds it away again.
 
 OpenRAGE keeps a search index of the whole game. It is built once in about 30 seconds; after a game update only the
 archives that changed are read again.
@@ -96,12 +106,14 @@ Typing `?query` into the address bar searches as well; Back returns to the resul
 
 ## Settings
 
-**Settings** (gear button, File → Settings… or Ctrl+,) holds:
+**Settings** (gear button, File → Settings… or Ctrl+,) has four tabs:
 
-- the theme (light, dark or system) and the accent colour (a preset or any colour of your own);
-- the games: *Switch game…*, *Add or change a game…* and whether to ask at start;
-- whether the history opens in its own window and whether the mods overlay is shown;
-- the [plugins](#plugins): which are on, their permissions, the plugin folder.
+- **Appearance:** the theme (light, dark or system), the accent colour (a preset or any colour of your own), the text
+  size and the file view;
+- **Game:** *Switch game…*, *Add or change a game…* and whether to ask at start;
+- **Behaviour:** whether the history opens in its own window and whether the mods overlay is shown;
+- **Plugins** (also Tools → Plugins…): installing, which are on, their permissions, the plugin folder; see
+  [plugins](#plugins).
 
 The sun/moon button in the toolbar switches the theme quickly.
 
@@ -112,7 +124,7 @@ in a sandbox: a plugin sees only the files you open with it and, if you allow it
 change anything, open other files or go online.
 
 - **Install:** **Settings → Plugins → Install plugin…** installs a plugin package (`.orp`); opening an `.orp` with
-  OpenRAGE does the same. You first see what the plugin is, what it may do and its SHA-256 checksum (compare it with
+  OpenRAGE (a double-click, once OpenRAGE is the file manager's app for it; the Flatpak sets that up) does the same. You first see what the plugin is, what it may do and its SHA-256 checksum (compare it with
   the one the author publishes). **Uninstall** removes it again. A plugin folder also works: put it into your plugin
   folder (`~/.config/openrage/plugins` on Linux, `%APPDATA%\openrage\plugins` on Windows, or `plugins` next to the
   program); **Open plugin folder** opens it, **Reload plugins** picks up new ones. The download comes with four example plugins: *Strings* (shows and

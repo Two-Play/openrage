@@ -166,6 +166,10 @@ impl Rpf7 {
     ) -> Result<Self, RpfError> {
         let corrupt = |reason: &str| RpfError::CorruptToc { archive: display_path.clone(), reason: reason.into() };
 
+        // Some games ship empty placeholders (RDR2's `common.rpf` is 0 bytes).
+        if size < 16 {
+            return Err(RpfError::Empty(display_path, size));
+        }
         let mut header = [0u8; 16];
         read_exact_at(&file, &mut header, base)?;
         let magic = u32_le(&header, 0);

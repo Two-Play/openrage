@@ -1,7 +1,7 @@
 name: Release
 
-# Pushing a tag such as v0.2.0 builds OpenRAGE for Linux (.tar.gz and
-# AppImage) and Windows (.zip) and publishes a GitHub release with them and
+# Pushing a tag such as v0.2.0 builds OpenRAGE for Linux (.tar.gz, AppImage
+# and Flatpak) and Windows (.zip) and publishes a GitHub release with them and
 # their SHA-256 checksums.
 # "Run workflow" (manual) builds the same archives without publishing, to
 # try a release first. Tests are not repeated here: CI runs them on every
@@ -77,7 +77,7 @@ jobs:
             7z a -tzip "out/$dir.zip" "$dir" > /dev/null
           else
             cp target/release/openrage target/release/openrage-gui "$dir/"
-            cp packaging/openrage.desktop packaging/openrage.png "$dir/"
+            cp packaging/openrage.desktop packaging/openrage.png packaging/openrage-mime.xml "$dir/"
             tar czf "out/$dir.tar.gz" "$dir"
           fi
       - name: AppImage
@@ -114,8 +114,37 @@ jobs:
           path: out/*
           if-no-files-found: error
 
-  publish:
+  # The Flatpak, from the Linux archive built above (nothing is compiled again).
+  flatpak:
     needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: linux
+      - name: Install Flatpak and the runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.freedesktop.Platform//26.08
+      - name: Build the Flatpak
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          mkdir -p unpacked out
+          tar xzf "linux/openrage-${ref}-linux-x86_64.tar.gz" -C unpacked
+          packaging/flatpak/build.sh "unpacked/openrage-${ref}-linux-x86_64" "$version" "out/openrage-${ref}-x86_64.flatpak"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: out/*.flatpak
+          if-no-files-found: error
+
+  publish:
+    needs: [build, flatpak]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:

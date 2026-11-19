@@ -147,8 +147,10 @@ fn main() -> anyhow::Result<()> {
     let ui = AppWindow::new()?;
     // Wayland shows a window's icon only through its app id and the desktop
     // entry of the same name (`openrage.desktop`, icon `openrage`); X11 uses
-    // it as WM_CLASS. Must be set before the first window is shown.
-    if let Err(e) = slint::set_xdg_app_id("openrage") {
+    // it as WM_CLASS. Must be set before the first window is shown. In the
+    // Flatpak the desktop entry is named after the Flatpak's id.
+    let app_id = std::env::var("FLATPAK_ID").unwrap_or_else(|_| "openrage".to_owned());
+    if let Err(e) = slint::set_xdg_app_id(&app_id) {
         eprintln!("app id: {e}");
     }
     let cfg = Config::load();
@@ -212,7 +214,9 @@ fn main() -> anyhow::Result<()> {
     ui.set_theme_mode(with_app(|a| theme_mode(a.cfg.theme.as_deref())));
     let (mode, color) = with_app(|a| accent::from_setting(a.cfg.accent.as_deref()));
     accent::set(mode, color);
+    accent::set_text_scale(with_app(|a| a.cfg.text_size.unwrap_or(100)) as f32 / 100.0);
     accent::apply(&ui);
+    ui.set_view_mode(with_app(|a| view_mode(a.cfg.file_view.as_deref())));
     ui.set_history_in_window(with_app(|a| a.cfg.history_window.unwrap_or(true)));
     let languages: Vec<SharedString> =
         std::iter::once("All languages".into()).chain(LANGUAGES.iter().map(|l| capitalize(l).into())).collect();

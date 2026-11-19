@@ -472,6 +472,24 @@ fn wire_settings(ui: &AppWindow) {
         xmlview::set_accent();
         history::set_accent();
     });
+    let w = ui.as_weak();
+    ui.on_text_scale_chosen(move |scale| {
+        accent::set_text_scale(scale);
+        with_app(|a| a.cfg.text_size = Some(accent::text_size_setting()));
+        if let Some(ui) = w.upgrade() {
+            save_settings(&ui);
+            accent::apply(&ui);
+        }
+        viewer::set_accent();
+        editor::set_accent();
+        xmlview::set_accent();
+        history::set_accent();
+    });
+    let w = ui.as_weak();
+    ui.on_view_mode_changed(move |mode| {
+        with_app(|a| a.cfg.file_view = Some(view_name(mode).to_owned()));
+        with_ui(&w, save_settings);
+    });
     ui.on_color_hex(accent::hex_string);
     ui.on_parse_hex(|s| accent::parse_hex(&s).unwrap_or(slint::Color::from_argb_u8(0, 0, 0, 0)));
     let w = ui.as_weak();
@@ -676,6 +694,23 @@ pub(crate) fn theme_name(mode: i32) -> &'static str {
         1 => "light",
         2 => "dark",
         _ => "system",
+    }
+}
+
+/// The file list view of the setting `file_view`: 0 list, 1 icons, 2 large icons.
+pub(crate) fn view_mode(name: Option<&str>) -> i32 {
+    match name {
+        Some("icons") => 1,
+        Some("large-icons") => 2,
+        _ => 0,
+    }
+}
+
+fn view_name(mode: i32) -> &'static str {
+    match mode {
+        1 => "icons",
+        2 => "large-icons",
+        _ => "list",
     }
 }
 

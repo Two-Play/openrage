@@ -22,6 +22,10 @@ pub struct Config {
     pub accent: Option<String>,
     /// Show the change history in its own window (default) instead of the file list.
     pub history_window: Option<bool>,
+    /// GUI text size in percent (100 = normal).
+    pub text_size: Option<u32>,
+    /// GUI file list view: `list`, `icons` or `large-icons`.
+    pub file_view: Option<String>,
     /// Enabled plugins with the permissions the user granted them:
     /// `(id, "perm+perm")` (see `crate::plugins`).
     pub plugins: Vec<(String, String)>,
@@ -60,6 +64,8 @@ impl Config {
                 "theme" => cfg.theme = Some(v.to_owned()),
                 "accent" => cfg.accent = Some(v.to_owned()),
                 "history_window" => cfg.history_window = Some(v == "true"),
+                "text_size" => cfg.text_size = v.parse().ok(),
+                "file_view" => cfg.file_view = Some(v.to_owned()),
                 "write_in_game" => cfg.write_in_game.push(PathBuf::from(v)),
                 "asi_hint_off" => cfg.asi_hint_off.push(PathBuf::from(v)),
                 "plugin" => {
@@ -101,6 +107,12 @@ impl Config {
         }
         if let Some(h) = self.history_window {
             text.push_str(&format!("history_window={h}\n"));
+        }
+        if let Some(t) = self.text_size {
+            text.push_str(&format!("text_size={t}\n"));
+        }
+        if let Some(v) = &self.file_view {
+            text.push_str(&format!("file_view={v}\n"));
         }
         for g in &self.write_in_game {
             text.push_str(&format!("write_in_game={}\n", g.display()));
