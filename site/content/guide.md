@@ -115,9 +115,10 @@ change anything, open other files or go online.
   OpenRAGE does the same. You first see what the plugin is, what it may do and its SHA-256 checksum (compare it with
   the one the author publishes). **Uninstall** removes it again. A plugin folder also works: put it into your plugin
   folder (`~/.config/openrage/plugins` on Linux, `%APPDATA%\openrage\plugins` on Windows, or `plugins` next to the
-  program); **Open plugin folder** opens it, **Reload plugins** picks up new ones. The download comes with three example plugins: *Strings* (shows and
+  program); **Open plugin folder** opens it, **Reload plugins** picks up new ones. The download comes with four example plugins: *Strings* (shows and
   exports the readable text of any file), *Text patch* (applies an OpenIV `.oxt` file to a `.gxt2`) and *OBJ tools*
-  (exports models as OBJ with their textures, shows `.obj` files in 3D).
+  (exports models as OBJ with their textures, shows `.obj` files in 3D, replaces props and vehicle bodies with an OBJ)
+  and *Hex tools* (a number and RAGE hash converter in the **Tools** menu, and hex dumps of any file).
 - **Enable:** **Settings → Plugins** lists each plugin with what it does, its licence and the permissions it asks
   for. New plugins are off; turning one on grants what it asks for. A new version that asks for more is off again
   until you confirm. Plugins that cannot be loaded are listed with the reason.
@@ -131,6 +132,8 @@ change anything, open other files or go online.
 - **Changing files:** plugins with the *write-mods* permission can change game files. That only works while editing
   is unlocked; the changes go into the `mods` folder, never into the game's own files, and each run is one entry in
   **History** that you can undo.
+- **Tools:** some plugins add a small window of their own to the **Tools** menu, such as *Hex tools*' number
+  converter: fill in the fields and the result follows as you type; **Copy result** copies it.
 - **Command line:** everything also works with [`openrage plugin`](@/cli.md#plugins).
 
 Want to write one? See [Writing plugins](@/plugins.md).

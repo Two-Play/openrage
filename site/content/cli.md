@@ -116,6 +116,7 @@ openrage mkdir x64e.rpf/my_folder
 openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --mods   # new geometry for an Enhanced .ydr (preview)
 openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --out new.ydr --shader 0
 openrage replace-model x64i.rpf/…/prop_x.ydr hi.obj --lod med.obj --lod low.obj --mods   # with detail levels
+openrage replace-model x64e.rpf/levels/gta5/vehicles.rpf/adder.yft car.obj --mods   # a vehicle body: parts named like bones move with them
 openrage oiv info mod.oiv                      # what a package would change
 openrage oiv install mod.oiv                   # install into the mods folder
 openrage oiv list / oiv uninstall "Name 1.0" [-y]   # installed packages, uninstall
@@ -146,6 +147,7 @@ openrage plugin preview --file car.obj --glb car.glb   # save a 3D model preview
 openrage plugin run obj-tools export x64e.rpf/levels/gta5/vehicles.rpf/adder.yft --out adder/
 openrage plugin run strings export x64a.rpf/data/x.dat --out exported/
 openrage plugin run strings export x64a.rpf/data --out exported/   # batch actions also take folders and archives
+openrage plugin tool hex-tools numbers --set value=0x1F   # a plugin's tool window, on the command line
 openrage plugin run gxt2-patch apply update/update.rpf/x64/data/lang/american_rel.rpf/global.gxt2 --pick patch.oxt
 ```
 
