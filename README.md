@@ -69,7 +69,7 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 
 ## Installation
 
-Download the [latest release](https://github.com/Two-Play/openrage/releases/latest) for Linux (AppImage or `.tar.gz`) or Windows (`.zip`) and start `openrage-gui`. On first start it finds your game and sets up the keys. Step by step: **[Getting started](https://two-play.github.io/openrage/getting-started/)**.
+Download the [latest release](https://github.com/Two-Play/openrage/releases/latest) for Linux (AppImage, Flatpak or `.tar.gz`) or Windows (`.zip`) and start `openrage-gui`. On first start it finds your game and sets up the keys. Step by step: **[Getting started](https://two-play.github.io/openrage/getting-started/)**.
 
 To build from source (Rust, pinned in `rust-toolchain.toml`; on Linux also the fontconfig, xkbcommon, Wayland and ALSA development packages):
 

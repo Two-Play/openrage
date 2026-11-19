@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- File types OpenRAGE opens from a file manager: double-clicking a package
+     shows its install dialog. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-openrage-plugin">
+    <comment>OpenRAGE plugin</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.orp"/>
+  </mime-type>
+  <mime-type type="application/x-openiv-package">
+    <comment>OpenIV package</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.oiv"/>
+  </mime-type>
+</mime-info>

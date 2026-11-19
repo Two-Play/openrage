@@ -8,4 +8,5 @@ Icon=openrage
 Terminal=false
 Categories=Development;
 Keywords=GTA;RDR2;OpenIV;mod;rpf;
+MimeType=application/x-openrage-plugin;application/x-openiv-package;
 StartupWMClass=openrage

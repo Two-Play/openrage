@@ -147,8 +147,10 @@ fn main() -> anyhow::Result<()> {
     let ui = AppWindow::new()?;
     // Wayland shows a window's icon only through its app id and the desktop
     // entry of the same name (`openrage.desktop`, icon `openrage`); X11 uses
-    // it as WM_CLASS. Must be set before the first window is shown.
-    if let Err(e) = slint::set_xdg_app_id("openrage") {
+    // it as WM_CLASS. Must be set before the first window is shown. In the
+    // Flatpak the desktop entry is named after the Flatpak's id.
+    let app_id = std::env::var("FLATPAK_ID").unwrap_or_else(|_| "openrage".to_owned());
+    if let Err(e) = slint::set_xdg_app_id(&app_id) {
         eprintln!("app id: {e}");
     }
     let cfg = Config::load();
