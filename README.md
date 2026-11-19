@@ -34,7 +34,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 
 OpenIV's last release was in January 2022. OpenRAGE picks up where it left off and stays compatible with it.
 
-- **Explorer and search:** archives, even nested ones, open like folders; names, hashes and full text of the whole game in milliseconds.
+- **Explorer and search:** archives, even nested ones, open like folders, as a list or as icons; names, hashes and full text of the whole game in milliseconds.
 - **Every major format:** textures, models, audio, animations, metadata as XML, collisions, paths, nav meshes, cutscenes, scripts, game text.
 - **Coming from OpenIV?** Your `mods` folder and `.oiv` packages work as they are ([how to switch](https://two-play.github.io/openrage/getting-started/#coming-from-openiv)).
 - **Mods, safely:** changes go to OpenIV's `mods` folder, never into your game files; every change and every `.oiv` package can be undone.
