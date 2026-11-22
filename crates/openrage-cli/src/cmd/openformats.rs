@@ -172,37 +172,62 @@ pub(crate) fn cmd_verify_openformats(game_dir: &Path, within: &str, keys: Option
         s.imported += 1;
         Ok(())
     };
-    let all: Vec<Stats> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let mut s = Stats::default();
-            let mut nested = Vec::new();
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    let entry = a.entry(id);
-                    let rage_rpf::EntryKind::Resource { system_flags, graphics_flags, .. } = entry.kind else { return };
-                    if Kind::of_game_file(&entry.name).is_none() {
-                        return;
+    // Archives are read in parallel, but one archive holds thousands of
+    // models (all vehicles are in one): the files go through a short queue
+    // to one worker per core, so a big archive does not leave the others idle.
+    type Job = (String, String, (u32, u32), Result<Resource, String>);
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let (send, receive) = std::sync::mpsc::sync_channel::<Job>(workers * 2);
+    let receive = std::sync::Mutex::new(receive);
+    let all: Vec<Stats> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut s = Stats::default();
+                    loop {
+                        let job = receive.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ()));
+                        let Ok((path, name, flags, res)) = job else { break };
+                        let result =
+                            res.map_err(|e| anyhow::anyhow!(e)).and_then(|res| check(&res, &name, flags, &mut s));
+                        if let Err(e) = result {
+                            s.errors.push(format!("{path}: {e:#}"));
+                        }
                     }
-                    let name = entry.name.clone();
-                    let result = a
-                        .read_resource(id)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|res| check(&res, &name, (system_flags, graphics_flags), &mut s));
-                    if let Err(e) = result {
-                        s.errors.push(format!("{p}: {e:#}"));
-                    }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            s.errors.extend(nested);
-            s
-        })
-        .collect();
+                    s
+                })
+            })
+            .collect();
+        let read_errors: Vec<String> = starts
+            .par_iter()
+            .flat_map_iter(|(prefix, rpf, dir)| {
+                let mut nested = Vec::new();
+                let send = send.clone();
+                vfs::walk(
+                    rpf,
+                    *dir,
+                    prefix,
+                    true,
+                    &mut |a, id, p| {
+                        let entry = a.entry(id);
+                        let rage_rpf::EntryKind::Resource { system_flags, graphics_flags, .. } = entry.kind else {
+                            return;
+                        };
+                        if Kind::of_game_file(&entry.name).is_none() {
+                            return;
+                        }
+                        let res = a.read_resource(id).map_err(|e| e.to_string());
+                        let _ = send.send((p.to_owned(), entry.name.clone(), (system_flags, graphics_flags), res));
+                    },
+                    &mut |e| nested.push(e.to_string()),
+                );
+                nested
+            })
+            .collect();
+        drop(send);
+        let mut all: Vec<Stats> = handles.into_iter().map(|h| h.join().expect("verify worker")).collect();
+        all.push(Stats { errors: read_errors, ..Default::default() });
+        all
+    });
     let mut total = Stats::default();
     for s in all {
         total.text += s.text;
