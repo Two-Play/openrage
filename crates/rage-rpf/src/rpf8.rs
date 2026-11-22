@@ -24,10 +24,13 @@ use rage_core::hash::joaat;
 
 use crate::RpfError;
 
-const MAGIC: u32 = 0x5250_4638;
-const HEADER_LEN: u64 = 16;
-const SIGNATURE_LEN: u64 = 256;
-const ENTRY_LEN: usize = 24;
+pub(crate) const MAGIC: u32 = 0x5250_4638;
+pub(crate) const HEADER_LEN: u64 = 16;
+pub(crate) const SIGNATURE_LEN: u64 = 256;
+pub(crate) const ENTRY_LEN: usize = 24;
+/// `RSC8`: the start of a resource as stored in an archive, and of a
+/// resource saved as a file of its own.
+pub const RSC8_MAGIC: u32 = 0x3843_5352;
 /// Decryption tag of an archive whose entry table is not encrypted.
 pub const PLAINTEXT: u16 = 0xFF;
 
@@ -93,6 +96,9 @@ pub struct Entry {
     pub size_or_flags: u64,
     /// The path, when the archive's name table or a name list knows it.
     pub path: Option<String>,
+    /// The three words as stored, so that bits OpenRAGE does not interpret
+    /// survive a rewrite of the table.
+    pub(crate) raw: [u64; 3],
 }
 
 /// Extensions by id; `#` stands for the platform character.
@@ -181,7 +187,52 @@ impl Entry {
             },
             size_or_flags: q2,
             path: None,
+            raw: [q0, q1, q2],
         }
+    }
+
+    /// A new entry for data stored as is (no key, no compression, unsigned).
+    pub fn new_plain(hash: u32, ext_id: u8, is_resource: bool, size_or_flags: u64) -> Entry {
+        Entry {
+            hash,
+            ext_id,
+            key_id: 0xFF,
+            encryption_config: 0,
+            is_resource,
+            signed: false,
+            offset: 0,
+            size_on_disk: 0,
+            compression: Compression::None,
+            size_or_flags,
+            path: None,
+            raw: [0; 3],
+        }
+    }
+
+    /// The 24 bytes of this entry in a table. Bits that are not fields of
+    /// [`Entry`] keep their stored value.
+    pub fn to_bytes(&self) -> [u8; ENTRY_LEN] {
+        let [mut q0, mut q1, _] = self.raw;
+        q0 &= !(0xFFFF_FFFF | 0xFF << 32 | 0xFF << 40 | 0xFF << 48 | 0b11 << 56);
+        q0 |= u64::from(self.hash)
+            | u64::from(self.encryption_config) << 32
+            | u64::from(self.key_id) << 40
+            | u64::from(self.ext_id) << 48
+            | u64::from(self.is_resource) << 56
+            | u64::from(self.signed) << 57;
+        let comp = match self.compression {
+            Compression::None => 0,
+            Compression::Deflate => 1,
+            Compression::Oodle => 2,
+            Compression::Unknown(n) => u64::from(n),
+        };
+        q1 &= !(0x0FFF_FFFF | 0x7FFF_FFFF << 28 | 0x1F << 59);
+        q1 |= (self.size_on_disk >> 4) & 0x0FFF_FFFF | ((self.offset >> 4) & 0x7FFF_FFFF) << 28 | (comp & 0x1F) << 59;
+        let mut out = [0u8; ENTRY_LEN];
+        out[0..8].copy_from_slice(&q0.to_le_bytes());
+        out[8..16].copy_from_slice(&q1.to_le_bytes());
+        out[16..24].copy_from_slice(&self.size_or_flags.to_le_bytes());
+        out
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -267,6 +318,11 @@ pub fn set_defaults(keys: Option<Arc<Rdr2Keys>>, names: Option<Arc<crate::rpf8_n
 /// The keys registered with [`set_defaults`].
 pub fn default_keys() -> Option<Arc<Rdr2Keys>> {
     defaults().read().ok()?.0.clone()
+}
+
+/// The names registered with [`set_defaults`].
+pub fn default_names() -> Option<Arc<crate::rpf8_names::NameIndex>> {
+    defaults().read().ok()?.1.clone()
 }
 
 /// Whether keys were registered with [`set_defaults`].
@@ -517,6 +573,53 @@ impl Rpf8 {
         self.entries.as_deref()
     }
 
+    /// An entry's bytes exactly as stored in the archive (still encrypted,
+    /// compressed and signed where the entry is).
+    pub fn read_stored(&self, entry: &Entry) -> Result<Vec<u8>, RpfError> {
+        self.read_stored_head(entry, entry.size_on_disk)
+    }
+
+    /// The first `len` stored bytes of an entry (fewer if it is shorter).
+    pub fn read_stored_head(&self, entry: &Entry, len: u64) -> Result<Vec<u8>, RpfError> {
+        let mut f = File::open(&self.path)?;
+        f.seek(SeekFrom::Start(self.base + entry.offset))?;
+        let mut data = vec![0u8; len.min(entry.size_on_disk) as usize];
+        f.read_exact(&mut data)?;
+        Ok(data)
+    }
+
+    /// The archive's own name table (the last `names length` bytes) as stored.
+    pub fn read_name_table(&self) -> Result<Vec<u8>, RpfError> {
+        let len = u64::from(self.header.names_length);
+        let mut f = File::open(&self.path)?;
+        f.seek(SeekFrom::Start(self.base + self.size - len))?;
+        let mut data = vec![0u8; len as usize];
+        f.read_exact(&mut data)?;
+        Ok(data)
+    }
+
+    /// A resource entry as a file of its own: the 16-byte `RSC8` header
+    /// (marked uncompressed) followed by the virtual and physical pages.
+    /// [`resource_file_flags`] reads such a file back; the archive editor
+    /// stores it as is.
+    pub fn resource_file(&self, entry: &Entry) -> Result<Vec<u8>, RpfError> {
+        let pages = self.read(entry)?;
+        let stored = self.read_stored_head(entry, 16)?;
+        let info =
+            if stored.len() == 16 && u32::from_le_bytes(stored[0..4].try_into().unwrap_or_default()) == RSC8_MAGIC {
+                u32::from_le_bytes(stored[4..8].try_into().unwrap_or_default())
+            } else {
+                // An encrypted prefix: the version is all that is known.
+                entry.resource_version().unwrap_or(0)
+            };
+        let mut out = Vec::with_capacity(16 + pages.len());
+        out.extend(RSC8_MAGIC.to_le_bytes());
+        out.extend(uncompressed_info(info).to_le_bytes());
+        out.extend(entry.size_or_flags.to_le_bytes());
+        out.extend(pages);
+        Ok(out)
+    }
+
     /// Reads an entry's data: decrypted and decompressed (deflate or Oodle).
     /// Resources come without their 16-byte on-disk prefix: virtual pages,
     /// then physical pages.
@@ -603,6 +706,40 @@ impl Rpf8 {
             }),
         }
     }
+}
+
+/// The info word of an `RSC8` header with its compressor field (bits 8–12,
+/// the compression id minus one) set to "none" (0x1F).
+pub fn uncompressed_info(info: u32) -> u32 {
+    info | 0x1F << 8
+}
+
+/// The page flags of a resource saved as a file of its own (`RSC8` header),
+/// which become the entry's [`Entry::size_or_flags`]; `None` if `file` is no
+/// such resource or its pages are shorter than the flags say.
+pub fn resource_file_flags(file: &[u8]) -> Option<u64> {
+    if file.len() < 16 || u32::from_le_bytes(file[0..4].try_into().ok()?) != RSC8_MAGIC {
+        return None;
+    }
+    let flags = u64::from_le_bytes(file[8..16].try_into().ok()?);
+    let size = (flags & 0xFFFF_FFF0) + (flags >> 32 & 0xFFFF_FFF0);
+    (file.len() as u64 - 16 >= size).then_some(flags)
+}
+
+/// Reads a resource saved as a file of its own (`RSC8` header, uncompressed
+/// pages, as [`Rpf8::resource_file`] writes it), e.g. a replacement in LML's
+/// replace folder.
+pub fn parse_resource_file(file: &[u8]) -> Option<rage_resource::Resource> {
+    let flags = resource_file_flags(file)?;
+    let virtual_len = (flags & 0xFFFF_FFF0) as usize;
+    let physical_len = (flags >> 32 & 0xFFFF_FFF0) as usize;
+    let version = ((flags as u32 & 0xF) << 4) | ((flags >> 32) as u32 & 0xF);
+    let pages = &file[16..];
+    Some(rage_resource::Resource {
+        version,
+        system: pages[..virtual_len].to_vec(),
+        graphics: pages[virtual_len..virtual_len + physical_len].to_vec(),
+    })
 }
 
 /// Matches the NUL-separated paths of a name table to the entries.

@@ -42,7 +42,10 @@ pub fn extract_rpf8(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        match rpf.read(&rpf.entries().expect("entries")[i]) {
+        let entry = &rpf.entries().expect("entries")[i];
+        // Resources as RSC8 files (header and pages), so they can be put back.
+        let data = if entry.is_resource { rpf.resource_file(entry) } else { rpf.read(entry) };
+        match data {
             Ok(data) => {
                 fs::write(&target, &data)?;
                 s.files += 1;

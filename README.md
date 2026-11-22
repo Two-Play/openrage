@@ -4,7 +4,7 @@
 
 # OpenRAGE
 
-**The open-source successor to OpenIV — mod GTA V and explore Red Dead Redemption 2 on Linux and Windows.**
+**The open-source successor to OpenIV — mod GTA V and Red Dead Redemption 2 on Linux and Windows.**
 
 Browse and search every archive, preview textures, models, sounds and animations, read metadata as XML,<br>
 edit game text and install `.oiv` packages — compatible with OpenIV's `mods` folder, with undo.
@@ -61,7 +61,7 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 | Game | Archives | Formats |
 |---|---|---|
 | **GTA V** (Legacy & Enhanced) | ✅ read and edit (mods folder, with undo) | ✅ textures (also inside models) · models · audio · animations · metadata · text · collisions · paths · cutscenes · scripts · ASI mods (manager, Proton fix on Linux) · ◐ model import from OBJ with compressed textures and detail levels (Enhanced `.ydr` and vehicle bodies `.yft`, preview; explorer via the OBJ tools plugin) |
-| **Red Dead Redemption 2** | ✅ read, with keys from your own game | ◐ textures · models with moving parts and cloth · texts · metadata · audio · animations on fitting models · ped outfits (read-only) |
+| **Red Dead Redemption 2** | ✅ read, with keys from your own game · ◐ edit (Lenny's Mod Loader `lml/replace` folder, with undo; nested archives rewritten; not yet tried in the game) | ◐ textures (replace same-shape) · models with moving parts and cloth · texts · metadata · audio · animations on fitting models · ped outfits (read-only) |
 | **GTA VI** | 🔜 next: as fast as possible once it comes to PC | – |
 | **GTA IV** (Complete Edition) | ✅ read (IMG3, RPF2, RPF3), key from your own `GTAIV.exe` | ◐ textures · models · collisions · animations · text · scripts · maps in 3D · cutscenes (played with their cast, camera, subtitles and particle effects) · particle effect lists (`.wpfl`) · editing `.img`, `.rpf`, placement files, loose files and textures (`.wtd`, inside `.wdr`) (update folder, or the game files with originals kept) |
 

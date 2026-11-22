@@ -7,8 +7,10 @@
 //!   (structure name, offset, unused, length).
 //! * `PSCH`: schema: count, (name, offset) index, then structure infos
 //!   (`type<<24 | count`, length, unused, 12-byte entries: name, type, subtype,
-//!   offset u16, reference key) and enum infos (`type<<24 | count`, (name, value)).
-//! * `STRF`, `STRS`, `STRE`, `PSIG`, `CHKS`: strings and checksums (not needed).
+//!   offset u16, reference key) and enum infos (`type<<24 | count`, (name, value);
+//!   RDR2 has 8 zero bytes between name and value).
+//! * `STRF`, `STRS`, `STRE`, `PSIG`, `CHKS`: strings and checksums (not needed
+//!   to read; kept as they are when the file is written back, see [`Pso::from_xml`]).
 //!
 //! Pointers are 8 bytes; the first big-endian u32 holds the 1-based block
 //! (bits 0–11) and the offset (bits 12–31).
@@ -19,6 +21,8 @@ use std::collections::HashMap;
 
 use crate::names;
 use crate::xml::{self, Writer};
+
+mod write;
 
 pub const MAGIC: &[u8; 4] = b"PSIN";
 const ARRAYINFO: u32 = 0x100;
@@ -99,6 +103,11 @@ pub struct Pso {
     enums: HashMap<u32, Vec<(u32, i32)>>,
     /// Bit where the offset of a pointer starts: 12 (GTA V) or 20 (RDR2).
     offset_shift: u32,
+    /// Every section of the file as it was (ident and whole section), in order.
+    sections: Vec<([u8; 4], Vec<u8>)>,
+    /// Structures that describe the key/item pairs of maps (GTA V), with
+    /// their names; one per map type, all usually named `0x100`.
+    pairs: Vec<(u32, StructInfo)>,
 }
 
 pub fn is_pso(data: &[u8]) -> bool {
@@ -170,6 +179,7 @@ fn parse_with(file: &[u8], offset_shift: u32) -> Result<Pso, PsoError> {
     let mut data = None;
     let mut map = None;
     let mut schema = None;
+    let mut sections = Vec::new();
     let mut pos = 0;
     while pos + 8 <= file.len() {
         let ident: [u8; 4] = file[pos..pos + 4].try_into().unwrap_or_default();
@@ -178,6 +188,7 @@ fn parse_with(file: &[u8], offset_shift: u32) -> Result<Pso, PsoError> {
             return Err(err(format!("section {} has bad length {len}", String::from_utf8_lossy(&ident))));
         }
         let section = &file[pos..pos + len];
+        sections.push((ident, section.to_vec()));
         match &ident {
             b"PSIN" => data = Some(section),
             b"PMAP" => map = Some(section),
@@ -209,6 +220,8 @@ fn parse_with(file: &[u8], offset_shift: u32) -> Result<Pso, PsoError> {
 
     let mut structs = HashMap::new();
     let mut enums = HashMap::new();
+    let mut pairs = Vec::new();
+    let (key_name, item_name) = (names::parse("Key"), names::parse("Item"));
     let n = u32_at(schema, 8).map_err(err)? as usize;
     for i in 0..n.min(0x10000) {
         let name = u32_at(schema, 12 + i * 8).map_err(err)?;
@@ -228,20 +241,26 @@ fn parse_with(file: &[u8], offset_shift: u32) -> Result<Pso, PsoError> {
                         key: u32_at(schema, p + 8).map_err(err)?,
                     });
                 }
-                structs.entry(name).or_insert(StructInfo { length, entries });
+                let info = StructInfo { length, entries };
+                if info.find(key_name).is_some() && info.find(item_name).is_some() {
+                    pairs.push((name, info.clone()));
+                }
+                structs.entry(name).or_insert(info);
             }
             1 => {
+                // GTA V: (name, value) pairs; RDR2: name, 8 zero bytes, value.
+                let (size, value_at) = if offset_shift == 20 { (16, 12) } else { (8, 4) };
                 let mut values = Vec::new();
                 for e in 0..(x & 0xFF_FFFF) as usize {
-                    let p = off + 4 + e * 8;
-                    values.push((u32_at(schema, p).map_err(err)?, u32_at(schema, p + 4).map_err(err)? as i32));
+                    let p = off + 4 + e * size;
+                    values.push((u32_at(schema, p).map_err(err)?, u32_at(schema, p + value_at).map_err(err)? as i32));
                 }
                 enums.entry(name).or_insert(values);
             }
             t => return Err(err(format!("unknown schema element type {t}"))),
         }
     }
-    Ok(Pso { data: data.to_vec(), root_block, blocks, structs, enums, offset_shift })
+    Ok(Pso { data: data.to_vec(), root_block, blocks, structs, enums, offset_shift, sections, pairs })
 }
 
 /// Parses a PSO file and writes it as XML (see [`Pso::to_xml`]).
@@ -291,12 +310,12 @@ impl Pso {
         w.finish()
     }
 
+    /// The name of an enum value; a value the enum does not list as its number.
     fn enum_name(&self, key: u32, value: i32) -> String {
         self.enums
             .get(&key)
             .and_then(|v| v.iter().find(|(_, x)| *x == value))
-            .map(|(n, _)| names::field(*n))
-            .unwrap_or_default()
+            .map_or_else(|| value.to_string(), |(n, _)| names::field(*n))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -641,7 +660,7 @@ impl Pso {
                         .map(|b| {
                             let (id, off) = self.unpack(ptr_at(b, 0).unwrap_or(0));
                             let len = (item.sub == 3).then(|| u16::from_be_bytes([b[8], b[9]]) as usize);
-                            xml::escape(&self.string_at(id, off, len).unwrap_or_default())
+                            self.string_at(id, off, len).unwrap_or_default()
                         })
                         .collect();
                     w.item_array(level, ename, &v);

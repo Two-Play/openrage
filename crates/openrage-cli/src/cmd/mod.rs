@@ -9,6 +9,7 @@ mod rdr2;
 mod search;
 mod verify;
 mod verify_gta4;
+mod verify_rdr2;
 mod view;
 
 pub(crate) use archive::*;
@@ -20,4 +21,5 @@ pub(crate) use rdr2::*;
 pub(crate) use search::*;
 pub(crate) use verify::*;
 pub(crate) use verify_gta4::*;
+pub(crate) use verify_rdr2::*;
 pub(crate) use view::*;
