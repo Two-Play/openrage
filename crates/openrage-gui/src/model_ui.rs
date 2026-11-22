@@ -205,7 +205,21 @@ pub(crate) fn suggest_models(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, profi
     }
     let mut candidates: Vec<suggest::Candidate> = Vec::new();
     let mut load: Vec<String> = named.clone();
-    if let Some(animal) = &profile.animal {
+    if is_rdr2_dir(game_dir) {
+        // RDR2's people and animals share bone names: rank them all by their
+        // base skeletons (vehicles and objects follow below as for GTA V).
+        if profile.kinds.contains(&suggest::Kind::Ped) || profile.rdr2_peds {
+            // The game has some 90,000 `.ymt` files; the outfit files are among them.
+            let outfits: Vec<String> = search(".ymt", 200_000)
+                .into_iter()
+                .filter(|v| {
+                    let (dir, name) = v.rsplit_once('/').unwrap_or(("", v));
+                    openrage_app::models::is_rdr2_ped_file(name, dir)
+                })
+                .collect();
+            candidates.extend(suggest::rdr2_ped_candidates(game_dir, outfits));
+        }
+    } else if let Some(animal) = &profile.animal {
         load.extend(search(&format!("a_c_{animal}"), 160).into_iter().filter(|v| v.ends_with(".ydd")));
     } else if profile.kinds.contains(&suggest::Kind::Ped) {
         // All peds share one skeleton: no need to load each.
@@ -243,9 +257,17 @@ pub(crate) fn suggest_models(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, profi
         load.extend(vehicles);
     }
     if profile.kinds.contains(&suggest::Kind::Prop) && named.is_empty() {
-        // Objects sharing a word of the dictionary name.
-        if let Some(word) = profile.hints.iter().filter(|h| !h.contains('@')).max_by_key(|h| h.len()) {
-            load.extend(search(word, 400).into_iter().filter(|v| is_model(v)).take(80));
+        // Objects sharing a word of the dictionary or clip names: the
+        // longest that names any model (RDR2's prop clips name models whose
+        // file names are not known).
+        let mut words: Vec<&String> = profile.hints.iter().filter(|h| !h.contains('@')).collect();
+        words.sort_by_key(|h| std::cmp::Reverse(h.len()));
+        for word in words.into_iter().take(6) {
+            let models: Vec<String> = search(word, 400).into_iter().filter(|v| is_model(v)).take(80).collect();
+            if !models.is_empty() {
+                load.extend(models);
+                break;
+            }
         }
     }
     load.sort();
