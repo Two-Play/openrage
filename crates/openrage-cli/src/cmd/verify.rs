@@ -21,128 +21,110 @@ pub(crate) fn cmd_verify_textures(
     }
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
-    let all: Vec<Stats> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let mut s = Stats::default();
-            let mut nested_errors = Vec::new();
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    // Models with textures of their own: check the writer in memory.
-                    if rebuild
-                        && openrage_app::textures::gta5_model_ext(p).is_some()
-                        && let rage_rpf::EntryKind::Resource { system_flags, graphics_flags, .. } = a.entry(id).kind
-                    {
-                        let check = a.read_resource(id).map_err(anyhow::Error::from).and_then(|res| {
-                            openrage_app::textures::check_model_textures(&res, p, system_flags, graphics_flags)
-                        });
-                        match check {
-                            Ok(openrage_app::textures::ModelCheck::Ok { grown }) => {
-                                s.models += 1;
-                                s.grown += grown as usize;
-                            }
-                            Ok(openrage_app::textures::ModelCheck::NoTextures) => {}
-                            Ok(openrage_app::textures::ModelCheck::Unreadable(why)) => {
-                                s.unreadable.push(format!("{p}: {why}"))
-                            }
-                            Err(e) => s.errors.push(format!("{p}: model textures: {e:#}")),
+    let (all, nested) = for_each_entry_parallel(
+        &starts,
+        |e| e.resource_version().is_some(),
+        |a, id, p, s: &mut Stats| {
+            // Models with textures of their own: check the writer in memory.
+            if rebuild
+                && openrage_app::textures::gta5_model_ext(p).is_some()
+                && let rage_rpf::EntryKind::Resource { system_flags, graphics_flags, .. } = a.entry(id).kind
+            {
+                let check = a.read_resource(id).map_err(anyhow::Error::from).and_then(|res| {
+                    openrage_app::textures::check_model_textures(&res, p, system_flags, graphics_flags)
+                });
+                match check {
+                    Ok(openrage_app::textures::ModelCheck::Ok { grown }) => {
+                        s.models += 1;
+                        s.grown += grown as usize;
+                    }
+                    Ok(openrage_app::textures::ModelCheck::NoTextures) => {}
+                    Ok(openrage_app::textures::ModelCheck::Unreadable(why)) => s.unreadable.push(format!("{p}: {why}")),
+                    Err(e) => s.errors.push(format!("{p}: model textures: {e:#}")),
+                }
+                return;
+            }
+            if !a.entry(id).name.to_ascii_lowercase().ends_with(".ytd") || a.entry(id).resource_version().is_none() {
+                return;
+            }
+            s.dicts += 1;
+            let dict = match a
+                .read_resource(id)
+                .map_err(anyhow::Error::from)
+                .and_then(|r| Ok(rage_formats::ytd::parse(&r)?))
+            {
+                Ok(d) => d,
+                Err(e) => return s.errors.push(format!("{p}: {e:#}")),
+            };
+            s.errors.extend(dict.errors.iter().map(|e| format!("{p}: {e}")));
+            if rebuild && dict.errors.is_empty() {
+                let check = rage_formats::ytd_write::rebuild(&dict)
+                    .and_then(|file| rage_resource::Resource::from_rsc7(&file))
+                    .and_then(|res| rage_formats::ytd::parse(&res));
+                match check {
+                    Ok(back) => {
+                        let mut a: Vec<_> = dict
+                            .textures
+                            .iter()
+                            .map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data))
+                            .collect();
+                        let mut b: Vec<_> = back
+                            .textures
+                            .iter()
+                            .map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data))
+                            .collect();
+                        a.sort_by(|x, y| x.0.cmp(y.0));
+                        b.sort_by(|x, y| x.0.cmp(y.0));
+                        if a != b || !back.errors.is_empty() {
+                            s.errors.push(format!("{p}: rebuilt dictionary differs from the original"));
                         }
-                        return;
-                    }
-                    if !a.entry(id).name.to_ascii_lowercase().ends_with(".ytd")
-                        || a.entry(id).resource_version().is_none()
-                    {
-                        return;
-                    }
-                    s.dicts += 1;
-                    let dict = match a
-                        .read_resource(id)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|r| Ok(rage_formats::ytd::parse(&r)?))
-                    {
-                        Ok(d) => d,
-                        Err(e) => return s.errors.push(format!("{p}: {e:#}")),
-                    };
-                    s.errors.extend(dict.errors.iter().map(|e| format!("{p}: {e}")));
-                    if rebuild && dict.errors.is_empty() {
-                        let check = rage_formats::ytd_write::rebuild(&dict)
-                            .and_then(|file| rage_resource::Resource::from_rsc7(&file))
-                            .and_then(|res| rage_formats::ytd::parse(&res));
-                        match check {
-                            Ok(back) => {
-                                let mut a: Vec<_> = dict
-                                    .textures
-                                    .iter()
-                                    .map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data))
+                        // Structures must match byte for byte, apart from pointers.
+                        let pointers: &[(usize, usize)] = match dict.layout {
+                            rage_formats::ytd::Layout::Legacy => &[(0x28, 0x30), (0x70, 0x78)],
+                            rage_formats::ytd::Layout::Enhanced | rage_formats::ytd::Layout::Rdr2 => &[(0x28, 0x40)],
+                            rage_formats::ytd::Layout::Gta4 => &[(0x14, 0x18), (0x48, 0x4C)],
+                        };
+                        let masked = |t: &[u8]| {
+                            let mut t = t.to_vec();
+                            for &(from, to) in pointers {
+                                t[from..to].fill(0);
+                            }
+                            t
+                        };
+                        for (t, st) in dict.textures.iter().zip(&dict.stored) {
+                            let Some(j) = back.textures.iter().position(|x| x.name == t.name) else { continue };
+                            let (x, y) = (masked(&st.template), masked(&back.stored[j].template));
+                            if x != y {
+                                let diffs: Vec<String> = (0..x.len())
+                                    .filter(|&i| x[i] != y[i])
+                                    .map(|i| format!("{i:#x}: {:02x}→{:02x}", x[i], y[i]))
                                     .collect();
-                                let mut b: Vec<_> = back
-                                    .textures
-                                    .iter()
-                                    .map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data))
-                                    .collect();
-                                a.sort_by(|x, y| x.0.cmp(y.0));
-                                b.sort_by(|x, y| x.0.cmp(y.0));
-                                if a != b || !back.errors.is_empty() {
-                                    s.errors.push(format!("{p}: rebuilt dictionary differs from the original"));
-                                }
-                                // Structures must match byte for byte, apart from pointers.
-                                let pointers: &[(usize, usize)] = match dict.layout {
-                                    rage_formats::ytd::Layout::Legacy => &[(0x28, 0x30), (0x70, 0x78)],
-                                    rage_formats::ytd::Layout::Enhanced | rage_formats::ytd::Layout::Rdr2 => {
-                                        &[(0x28, 0x40)]
-                                    }
-                                    rage_formats::ytd::Layout::Gta4 => &[(0x14, 0x18), (0x48, 0x4C)],
-                                };
-                                let masked = |t: &[u8]| {
-                                    let mut t = t.to_vec();
-                                    for &(from, to) in pointers {
-                                        t[from..to].fill(0);
-                                    }
-                                    t
-                                };
-                                for (t, st) in dict.textures.iter().zip(&dict.stored) {
-                                    let Some(j) = back.textures.iter().position(|x| x.name == t.name) else { continue };
-                                    let (x, y) = (masked(&st.template), masked(&back.stored[j].template));
-                                    if x != y {
-                                        let diffs: Vec<String> = (0..x.len())
-                                            .filter(|&i| x[i] != y[i])
-                                            .map(|i| format!("{i:#x}: {:02x}→{:02x}", x[i], y[i]))
-                                            .collect();
-                                        s.errors.push(format!(
-                                            "{p}/{}: rebuilt texture structure differs ({}x{} {} mips {}; {})",
-                                            t.name,
-                                            t.width,
-                                            t.height,
-                                            t.format.name(),
-                                            t.levels,
-                                            diffs.join(", ")
-                                        ));
-                                        break;
-                                    }
-                                }
+                                s.errors.push(format!(
+                                    "{p}/{}: rebuilt texture structure differs ({}x{} {} mips {}; {})",
+                                    t.name,
+                                    t.width,
+                                    t.height,
+                                    t.format.name(),
+                                    t.levels,
+                                    diffs.join(", ")
+                                ));
+                                break;
                             }
-                            Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
                         }
                     }
-                    for t in &dict.textures {
-                        s.textures += 1;
-                        match t.to_rgba() {
-                            Some(_) => s.decoded += 1,
-                            None => *s.undecodable.entry(t.format.name()).or_default() += 1,
-                        }
-                    }
-                },
-                &mut |e| nested_errors.push(e.to_string()),
-            );
-            s.errors.extend(nested_errors);
-            s
-        })
-        .collect();
-    let mut total = Stats::default();
+                    Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
+                }
+            }
+            for t in &dict.textures {
+                s.textures += 1;
+                match t.to_rgba() {
+                    Some(_) => s.decoded += 1,
+                    None => *s.undecodable.entry(t.format.name()).or_default() += 1,
+                }
+            }
+        },
+    );
+    let mut total = Stats { errors: nested, ..Default::default() };
     for s in all {
         total.dicts += s.dicts;
         total.textures += s.textures;
@@ -155,6 +137,8 @@ pub(crate) fn cmd_verify_textures(
             *total.undecodable.entry(k).or_default() += v;
         }
     }
+    total.errors.sort();
+    total.unreadable.sort();
     for e in total.errors.iter().take(50) {
         outln!("FAIL {e}");
     }
@@ -190,48 +174,37 @@ pub(crate) fn cmd_verify_media(game_dir: &Path, within: &str, keys: Option<Arc<G
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     type Counts = (usize, usize, f32, usize);
-    let all: Vec<(Counts, Vec<String>)> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let mut c: Counts = (0, 0, 0.0, 0);
-            let (mut errors, mut nested) = (Vec::new(), Vec::new());
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    let name = a.entry(id).name.to_ascii_lowercase();
-                    if !media::is_media(&name) {
-                        return;
-                    }
-                    let result = a.read(id).map_err(anyhow::Error::from).and_then(|d| {
-                        if name.ends_with(".bik") {
-                            let b = media::bink(&d)?;
-                            c.1 += 1;
-                            c.2 += b.duration();
-                        } else {
-                            let g = media::gfx(&d)?;
-                            c.0 += 1;
-                            c.3 += g.exports.len();
-                        }
-                        Ok(())
-                    });
-                    if let Err(e) = result {
-                        errors.push(format!("{p}: {e:#}"));
-                    }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (c, errors)
-        })
-        .collect();
+    let (all, nested): (Vec<(Counts, Vec<String>)>, _) = for_each_entry_parallel(
+        &starts,
+        |e| media::is_media(&e.name.to_ascii_lowercase()),
+        |a, id, p, (c, errors): &mut (Counts, Vec<String>)| {
+            let name = a.entry(id).name.to_ascii_lowercase();
+            if !media::is_media(&name) {
+                return;
+            }
+            let result = a.read(id).map_err(anyhow::Error::from).and_then(|d| {
+                if name.ends_with(".bik") {
+                    let b = media::bink(&d)?;
+                    c.1 += 1;
+                    c.2 += b.duration();
+                } else {
+                    let g = media::gfx(&d)?;
+                    c.0 += 1;
+                    c.3 += g.exports.len();
+                }
+                Ok(())
+            });
+            if let Err(e) = result {
+                errors.push(format!("{p}: {e:#}"));
+            }
+        },
+    );
     let mut t: Counts = (0, 0, 0.0, 0);
     for (c, _) in &all {
         t = (t.0 + c.0, t.1 + c.1, t.2 + c.2, t.3 + c.3);
     }
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.1).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.1).chain(&nested).collect();
+    errors.sort();
     for e in errors.iter().take(30) {
         outln!("FAIL {e}");
     }
@@ -255,51 +228,40 @@ pub(crate) fn cmd_verify_scripts(game_dir: &Path, within: &str, keys: Option<Arc
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     type Counts = (usize, usize, usize, usize, usize);
-    let all: Vec<(Counts, Vec<String>)> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let mut c: Counts = (0, 0, 0, 0, 0);
-            let (mut errors, mut nested) = (Vec::new(), Vec::new());
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    if !a.entry(id).name.to_ascii_lowercase().ends_with(".ysc") {
-                        return;
+    let (all, nested): (Vec<(Counts, Vec<String>)>, _) = for_each_entry_parallel(
+        &starts,
+        |e| e.name.to_ascii_lowercase().ends_with(".ysc"),
+        |a, id, p, (c, errors): &mut (Counts, Vec<String>)| {
+            if !a.entry(id).name.to_ascii_lowercase().ends_with(".ysc") {
+                return;
+            }
+            c.0 += 1;
+            match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| Ok(ysc::parse(&r)?)) {
+                Ok(s) => match s.table {
+                    Some(t) => {
+                        if t == ysc::Table::Current {
+                            c.1 += 1;
+                        } else {
+                            c.2 += 1;
+                        }
+                        c.3 += s.check().unwrap_or(0);
+                        c.4 += s.code.len();
                     }
-                    c.0 += 1;
-                    match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| Ok(ysc::parse(&r)?)) {
-                        Ok(s) => match s.table {
-                            Some(t) => {
-                                if t == ysc::Table::Current {
-                                    c.1 += 1;
-                                } else {
-                                    c.2 += 1;
-                                }
-                                c.3 += s.check().unwrap_or(0);
-                                c.4 += s.code.len();
-                            }
-                            None => errors.push(format!(
-                                "{p}: no opcode table fits ({})",
-                                s.check().err().map(|e| e.to_string()).unwrap_or_default()
-                            )),
-                        },
-                        Err(e) => errors.push(format!("{p}: {e:#}")),
-                    }
+                    None => errors.push(format!(
+                        "{p}: no opcode table fits ({})",
+                        s.check().err().map(|e| e.to_string()).unwrap_or_default()
+                    )),
                 },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (c, errors)
-        })
-        .collect();
+                Err(e) => errors.push(format!("{p}: {e:#}")),
+            }
+        },
+    );
     let mut t: Counts = (0, 0, 0, 0, 0);
     for (c, _) in &all {
         t = (t.0 + c.0, t.1 + c.1, t.2 + c.2, t.3 + c.3, t.4 + c.4);
     }
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.1).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.1).chain(&nested).collect();
+    errors.sort();
     for e in errors.iter().take(30) {
         outln!("FAIL {e}");
     }
@@ -324,53 +286,42 @@ pub(crate) fn cmd_verify_paths(game_dir: &Path, within: &str, keys: Option<Arc<G
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     type Counts = (usize, usize, usize, usize, f32, usize);
-    let all: Vec<(Counts, Vec<String>)> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let mut c: Counts = (0, 0, 0, 0, 0.0, 0);
-            let (mut errors, mut nested) = (Vec::new(), Vec::new());
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    let name = a.entry(id).name.to_ascii_lowercase();
-                    if !paths::is_path_file(&name) {
-                        return;
+    let (all, nested): (Vec<(Counts, Vec<String>)>, _) = for_each_entry_parallel(
+        &starts,
+        |e| paths::is_path_file(&e.name.to_ascii_lowercase()),
+        |a, id, p, (c, errors): &mut (Counts, Vec<String>)| {
+            let name = a.entry(id).name.to_ascii_lowercase();
+            if !paths::is_path_file(&name) {
+                return;
+            }
+            c.0 += 1;
+            let ext = name.rsplit('.').next().unwrap_or_default().to_owned();
+            match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| Ok(paths::parse(&r, &ext)?)) {
+                Ok((d, s)) => {
+                    c.1 += s.nodes + s.polygons;
+                    c.2 += s.links;
+                    c.3 += s.points;
+                    c.4 += s.duration;
+                    c.5 += s.skipped;
+                    let bad = d
+                        .meshes
+                        .iter()
+                        .flat_map(|m| &m.positions)
+                        .any(|p| p.iter().any(|v| !v.is_finite() || v.abs() > 20000.0));
+                    if bad {
+                        errors.push(format!("{p}: positions out of the map"));
                     }
-                    c.0 += 1;
-                    let ext = name.rsplit('.').next().unwrap_or_default().to_owned();
-                    match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| Ok(paths::parse(&r, &ext)?)) {
-                        Ok((d, s)) => {
-                            c.1 += s.nodes + s.polygons;
-                            c.2 += s.links;
-                            c.3 += s.points;
-                            c.4 += s.duration;
-                            c.5 += s.skipped;
-                            let bad = d
-                                .meshes
-                                .iter()
-                                .flat_map(|m| &m.positions)
-                                .any(|p| p.iter().any(|v| !v.is_finite() || v.abs() > 20000.0));
-                            if bad {
-                                errors.push(format!("{p}: positions out of the map"));
-                            }
-                        }
-                        Err(e) => errors.push(format!("{p}: {e:#}")),
-                    }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (c, errors)
-        })
-        .collect();
+                }
+                Err(e) => errors.push(format!("{p}: {e:#}")),
+            }
+        },
+    );
     let mut t: Counts = (0, 0, 0, 0, 0.0, 0);
     for (c, _) in &all {
         t = (t.0 + c.0, t.1 + c.1, t.2 + c.2, t.3 + c.3, t.4 + c.4, t.5 + c.5);
     }
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.1).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.1).chain(&nested).collect();
+    errors.sort();
     for e in errors.iter().take(30) {
         outln!("FAIL {e}");
     }
@@ -495,41 +446,27 @@ pub(crate) fn cmd_verify_collision_writer(game_dir: &Path, within: &str, keys: O
         Ok(())
     };
     type Counts = (usize, (usize, usize, usize), Vec<String>);
-    let all: Vec<Counts> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let (mut files, mut s, mut errors, mut nested) = (0, (0, 0, 0), Vec::new(), Vec::new());
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    let name = a.entry(id).name.to_ascii_lowercase();
-                    let ydr = name.ends_with(".ydr");
-                    if !ydr && !name.ends_with(".ybn") {
-                        return;
-                    }
-                    let Ok(res) = a.read_resource(id) else { return };
-                    if ydr
-                        && (res.version != drawable::VERSION_YDR_ENHANCED
-                            || ybn_write::collision_of(&res, true).is_err())
-                    {
-                        return;
-                    }
-                    files += 1;
-                    if let Err(e) = check(&res, ydr, &mut s) {
-                        errors.push(format!("{p}: {e:#}"));
-                    }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (files, s, errors)
-        })
-        .collect();
+    let (all, nested) = for_each_entry_parallel(
+        &starts,
+        |e| {
+            let name = e.name.to_ascii_lowercase();
+            name.ends_with(".ydr") || name.ends_with(".ybn")
+        },
+        |a, id, p, (files, s, errors): &mut Counts| {
+            let ydr = a.entry(id).name.to_ascii_lowercase().ends_with(".ydr");
+            let Ok(res) = a.read_resource(id) else { return };
+            if ydr && (res.version != drawable::VERSION_YDR_ENHANCED || ybn_write::collision_of(&res, true).is_err()) {
+                return;
+            }
+            *files += 1;
+            if let Err(e) = check(&res, ydr, s) {
+                errors.push(format!("{p}: {e:#}"));
+            }
+        },
+    );
     let sum = |f: fn(&Counts) -> usize| all.iter().map(f).sum::<usize>();
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.2).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.2).chain(&nested).collect();
+    errors.sort();
     outln!(
         "{} collisions ({} game hierarchies as expected), {} written anew and read back the same, {} skipped (no triangles, or over {}), {} errors ({:.1}s)",
         sum(|x| x.0),
@@ -550,45 +487,30 @@ pub(crate) fn cmd_verify_collisions(game_dir: &Path, within: &str, keys: Option<
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     type Counts = (usize, usize, usize, usize);
-    let all: Vec<(Counts, Vec<String>)> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let mut c: Counts = (0, 0, 0, 0);
-            let (mut errors, mut nested) = (Vec::new(), Vec::new());
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    if !a.entry(id).name.to_ascii_lowercase().ends_with(".ybn") {
-                        return;
-                    }
-                    c.0 += 1;
-                    match a
-                        .read_resource(id)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|r| Ok(rage_formats::ybn::parse(&r)?))
-                    {
-                        Ok((_, s)) => {
-                            c.1 += s.bounds;
-                            c.2 += s.triangles;
-                            c.3 += s.primitives;
-                        }
-                        Err(e) => errors.push(format!("{p}: {e:#}")),
-                    }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (c, errors)
-        })
-        .collect();
+    let (all, nested): (Vec<(Counts, Vec<String>)>, _) = for_each_entry_parallel(
+        &starts,
+        |e| e.name.to_ascii_lowercase().ends_with(".ybn"),
+        |a, id, p, (c, errors): &mut (Counts, Vec<String>)| {
+            if !a.entry(id).name.to_ascii_lowercase().ends_with(".ybn") {
+                return;
+            }
+            c.0 += 1;
+            match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| Ok(rage_formats::ybn::parse(&r)?)) {
+                Ok((_, s)) => {
+                    c.1 += s.bounds;
+                    c.2 += s.triangles;
+                    c.3 += s.primitives;
+                }
+                Err(e) => errors.push(format!("{p}: {e:#}")),
+            }
+        },
+    );
     let mut t: Counts = (0, 0, 0, 0);
     for (c, _) in &all {
         t = (t.0 + c.0, t.1 + c.1, t.2 + c.2, t.3 + c.3);
     }
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.1).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.1).chain(&nested).collect();
+    errors.sort();
     for e in errors.iter().take(30) {
         outln!("FAIL {e}");
     }
@@ -611,50 +533,35 @@ pub(crate) fn cmd_verify_particles(game_dir: &Path, within: &str, keys: Option<A
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     type Counts = (usize, usize, usize, usize, usize);
-    let all: Vec<(Counts, Vec<String>)> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let mut c: Counts = (0, 0, 0, 0, 0);
-            let (mut errors, mut nested) = (Vec::new(), Vec::new());
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    if !a.entry(id).name.to_ascii_lowercase().ends_with(".ypt") {
-                        return;
+    let (all, nested): (Vec<(Counts, Vec<String>)>, _) = for_each_entry_parallel(
+        &starts,
+        |e| e.name.to_ascii_lowercase().ends_with(".ypt"),
+        |a, id, p, (c, errors): &mut (Counts, Vec<String>)| {
+            if !a.entry(id).name.to_ascii_lowercase().ends_with(".ypt") {
+                return;
+            }
+            c.0 += 1;
+            match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| Ok(rage_formats::ypt::parse(&r)?)) {
+                Ok(d) => {
+                    c.1 += d.effects.len();
+                    c.2 += d.textures.as_ref().map_or(0, |t| t.textures.len());
+                    c.3 += d.drawables.len();
+                    c.4 += d.drawables.iter().map(|(_, m)| m.triangle_count()).sum::<usize>();
+                    let bad_tex = d.textures.as_ref().map_or(0, |t| t.errors.len());
+                    if !d.errors.is_empty() || bad_tex > 0 {
+                        errors.push(format!("{p}: {} {bad_tex} texture errors", d.errors.join("; ")));
                     }
-                    c.0 += 1;
-                    match a
-                        .read_resource(id)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|r| Ok(rage_formats::ypt::parse(&r)?))
-                    {
-                        Ok(d) => {
-                            c.1 += d.effects.len();
-                            c.2 += d.textures.as_ref().map_or(0, |t| t.textures.len());
-                            c.3 += d.drawables.len();
-                            c.4 += d.drawables.iter().map(|(_, m)| m.triangle_count()).sum::<usize>();
-                            let bad_tex = d.textures.as_ref().map_or(0, |t| t.errors.len());
-                            if !d.errors.is_empty() || bad_tex > 0 {
-                                errors.push(format!("{p}: {} {bad_tex} texture errors", d.errors.join("; ")));
-                            }
-                        }
-                        Err(e) => errors.push(format!("{p}: {e:#}")),
-                    }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (c, errors)
-        })
-        .collect();
+                }
+                Err(e) => errors.push(format!("{p}: {e:#}")),
+            }
+        },
+    );
     let mut t: Counts = (0, 0, 0, 0, 0);
     for (c, _) in &all {
         t = (t.0 + c.0, t.1 + c.1, t.2 + c.2, t.3 + c.3, t.4 + c.4);
     }
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.1).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.1).chain(&nested).collect();
+    errors.sort();
     for e in errors.iter().take(30) {
         outln!("FAIL {e}");
     }
@@ -678,40 +585,29 @@ pub(crate) fn cmd_verify_text(game_dir: &Path, within: &str, keys: Option<Arc<Gt
     use openrage_app::texttable::{self, Kind};
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
-    let all: Vec<(usize, usize, Vec<String>)> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let (mut files, mut entries, mut errors) = (0, 0, Vec::new());
-            let mut nested = Vec::new();
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    let Some(kind) = Kind::of(&a.entry(id).name) else { return };
-                    files += 1;
-                    let result = a.read(id).map_err(anyhow::Error::from).and_then(|data| {
-                        let (text, n) = texttable::to_text(kind, &data)?;
-                        let back = texttable::from_text(kind, &text)?;
-                        if back != data {
-                            bail!("converting back changes the file ({} → {} bytes)", data.len(), back.len());
-                        }
-                        Ok(n)
-                    });
-                    match result {
-                        Ok(n) => entries += n,
-                        Err(e) => errors.push(format!("{p}: {e:#}")),
-                    }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (files, entries, errors)
-        })
-        .collect();
+    let (all, nested) = for_each_entry_parallel(
+        &starts,
+        |e| Kind::of(&e.name).is_some(),
+        |a, id, p, (files, entries, errors): &mut (usize, usize, Vec<String>)| {
+            let Some(kind) = Kind::of(&a.entry(id).name) else { return };
+            *files += 1;
+            let result = a.read(id).map_err(anyhow::Error::from).and_then(|data| {
+                let (text, n) = texttable::to_text(kind, &data)?;
+                let back = texttable::from_text(kind, &text)?;
+                if back != data {
+                    bail!("converting back changes the file ({} → {} bytes)", data.len(), back.len());
+                }
+                Ok(n)
+            });
+            match result {
+                Ok(n) => *entries += n,
+                Err(e) => errors.push(format!("{p}: {e:#}")),
+            }
+        },
+    );
     let (files, entries): (usize, usize) = all.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.2).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.2).chain(&nested).collect();
+    errors.sort();
     for e in errors.iter().take(30) {
         outln!("FAIL {e}");
     }
@@ -947,40 +843,27 @@ pub(crate) fn cmd_verify_model_writer(game_dir: &Path, within: &str, keys: Optio
         Ok(written)
     };
     type Counts = (usize, usize, usize, usize, Vec<String>);
-    let results: Vec<Counts> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let (mut seen, mut written, mut children, mut entries) = (0, 0, 0, 0);
-            let (mut errors, mut nested) = (Vec::new(), Vec::new());
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    let name = a.entry(id).name.to_ascii_lowercase();
-                    if !name.ends_with(".ydr") && !name.ends_with(".yft") && !name.ends_with(".ydd") {
-                        return;
-                    }
-                    seen += 1;
-                    match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| check(&r, &name)) {
-                        Ok((0, _, _)) => {}
-                        Ok((_, c, e)) => {
-                            written += 1;
-                            children += c;
-                            entries += e;
-                        }
-                        Err(e) => errors.push(format!("{p}: {e:#}")),
-                    }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (seen, written, children, entries, errors)
-        })
-        .collect();
+    let is_model = |name: &str| name.ends_with(".ydr") || name.ends_with(".yft") || name.ends_with(".ydd");
+    let (results, nested) = for_each_entry_parallel(
+        &starts,
+        |e| is_model(&e.name.to_ascii_lowercase()),
+        |a, id, p, (seen, written, children, entries, errors): &mut Counts| {
+            let name = a.entry(id).name.to_ascii_lowercase();
+            *seen += 1;
+            match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| check(&r, &name)) {
+                Ok((0, _, _)) => {}
+                Ok((_, c, e)) => {
+                    *written += 1;
+                    *children += c;
+                    *entries += e;
+                }
+                Err(e) => errors.push(format!("{p}: {e:#}")),
+            }
+        },
+    );
     let sum = |f: fn(&Counts) -> usize| results.iter().map(f).sum::<usize>();
-    let errors: Vec<&String> = results.iter().flat_map(|r| &r.4).collect();
+    let mut errors: Vec<&String> = results.iter().flat_map(|r| &r.4).chain(&nested).collect();
+    errors.sort();
     outln!(
         "{} models, {} written anew and read back identically ({} fragment child models, {} dictionary drawables among them), {} errors ({:.1}s)",
         sum(|r| r.0),
@@ -1002,41 +885,26 @@ pub(crate) fn cmd_verify_meta(game_dir: &Path, within: &str, keys: Option<Arc<Gt
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     type Counts = BTreeMap<String, (usize, usize)>;
-    let all: Vec<(Counts, Vec<String>, Vec<String>)> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let (mut counts, mut errors, mut problems) = (Counts::new(), Vec::new(), Vec::new());
-            let mut nested = Vec::new();
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    let name = &a.entry(id).name;
-                    if !metadata::is_metadata(name) {
-                        return;
+    let (all, nested) = for_each_entry_parallel(
+        &starts,
+        |e| metadata::is_metadata(&e.name),
+        |a, id, p, (counts, errors, problems): &mut (Counts, Vec<String>, Vec<String>)| {
+            let name = &a.entry(id).name;
+            let ext = name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+            let result = a.read(id).map_err(anyhow::Error::from).and_then(|d| metadata::from_bytes(&d));
+            let c = counts.entry(ext).or_insert((0, 0));
+            c.0 += 1;
+            match result {
+                Ok(x) => {
+                    c.1 += x.text.len();
+                    if let Some(e) = x.errors.first() {
+                        problems.push(format!("{p}: {} problems, first: {e}", x.errors.len()));
                     }
-                    let ext = name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
-                    let result = a.read(id).map_err(anyhow::Error::from).and_then(|d| metadata::from_bytes(&d));
-                    let c = counts.entry(ext).or_insert((0, 0));
-                    c.0 += 1;
-                    match result {
-                        Ok(x) => {
-                            c.1 += x.text.len();
-                            if let Some(e) = x.errors.first() {
-                                problems.push(format!("{p}: {} problems, first: {e}", x.errors.len()));
-                            }
-                        }
-                        Err(e) => errors.push(format!("{p}: {e:#}")),
-                    }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (counts, errors, problems)
-        })
-        .collect();
+                }
+                Err(e) => errors.push(format!("{p}: {e:#}")),
+            }
+        },
+    );
     let mut counts = BTreeMap::<String, (usize, usize)>::new();
     for (c, _, _) in &all {
         for (k, v) in c {
@@ -1045,8 +913,10 @@ pub(crate) fn cmd_verify_meta(game_dir: &Path, within: &str, keys: Option<Arc<Gt
             e.1 += v.1;
         }
     }
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.1).collect();
-    let problems: Vec<&String> = all.iter().flat_map(|x| &x.2).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.1).chain(&nested).collect();
+    errors.sort();
+    let mut problems: Vec<&String> = all.iter().flat_map(|x| &x.2).collect();
+    problems.sort();
     for e in errors.iter().take(30) {
         outln!("FAIL {e}");
     }
@@ -1108,48 +978,33 @@ pub(crate) fn cmd_verify_pso_rebuild(game_dir: &Path, within: &str, keys: Option
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     // Per archive: identical, same XML, unreadable, errors.
-    let all: Vec<(usize, usize, usize, Vec<String>)> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let (mut same, mut xml, mut unreadable, mut errors) = (0, 0, 0, Vec::new());
-            let mut nested = Vec::new();
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    let e = a.entry(id);
-                    if e.is_dir() || e.is_archive() || e.resource_version().is_some() {
-                        return;
-                    }
-                    if !openrage_app::metadata::is_metadata(&e.name) {
-                        return;
-                    }
-                    let data = match a.read(id) {
-                        Ok(d) => d,
-                        Err(err) => return errors.push(format!("{p}: {err}")),
-                    };
-                    if !rage_formats::pso::is_pso(&data) {
-                        return;
-                    }
-                    match pso_round_trip(&data, false) {
-                        Ok(PsoRoundTrip::Identical) => same += 1,
-                        Ok(PsoRoundTrip::SameXml) => xml += 1,
-                        Ok(PsoRoundTrip::Unreadable) => unreadable += 1,
-                        Err(err) => errors.push(format!("{p}: {err}")),
-                    }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (same, xml, unreadable, errors)
-        })
-        .collect();
+    let (all, nested) = for_each_entry_parallel(
+        &starts,
+        |e| {
+            !(e.is_dir() || e.is_archive() || e.resource_version().is_some())
+                && openrage_app::metadata::is_metadata(&e.name)
+        },
+        |a, id, p, (same, xml, unreadable, errors): &mut (usize, usize, usize, Vec<String>)| {
+            let data = match a.read(id) {
+                Ok(d) => d,
+                Err(err) => return errors.push(format!("{p}: {err}")),
+            };
+            if !rage_formats::pso::is_pso(&data) {
+                return;
+            }
+            match pso_round_trip(&data, false) {
+                Ok(PsoRoundTrip::Identical) => *same += 1,
+                Ok(PsoRoundTrip::SameXml) => *xml += 1,
+                Ok(PsoRoundTrip::Unreadable) => *unreadable += 1,
+                Err(err) => errors.push(format!("{p}: {err}")),
+            }
+        },
+    );
     let same: usize = all.iter().map(|x| x.0).sum();
     let xml: usize = all.iter().map(|x| x.1).sum();
     let unreadable: usize = all.iter().map(|x| x.2).sum();
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.3).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.3).chain(&nested).collect();
+    errors.sort();
     for e in errors.iter().take(40) {
         outln!("FAIL {e}");
     }
@@ -1176,66 +1031,49 @@ pub(crate) type AnimStats = (usize, usize, usize, usize, usize, Vec<String>);
 pub(crate) fn cmd_verify_animations(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
-    let all: Vec<AnimStats> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let (mut files, mut clips, mut anims, mut mismatch, mut badq) = (0, 0, 0, 0, 0);
-            let mut errors = Vec::new();
-            let mut nested = Vec::new();
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    if !a.entry(id).name.to_ascii_lowercase().ends_with(".ycd")
-                        || a.entry(id).resource_version().is_none()
-                    {
-                        return;
-                    }
-                    files += 1;
-                    let parsed = a
-                        .read_resource(id)
-                        .map_err(|e| e.to_string())
-                        .and_then(|r| rage_formats::clip::parse_ycd(&r).map_err(|e| e.to_string()));
-                    match parsed {
-                        Ok(d) => {
-                            clips += d.clips.len();
-                            anims += d.animations.len();
-                            for an in &d.animations {
-                                let blocks = an.block_frames();
-                                let sum: usize = blocks.iter().sum();
-                                let overlapped = sum.saturating_sub(blocks.len().saturating_sub(1));
-                                if sum != an.frames && overlapped != an.frames {
-                                    mismatch += 1;
-                                }
-                                for (t, tr) in an.tracks.iter().enumerate() {
-                                    for f in (0..an.frames).step_by(7) {
-                                        match an.value(t, f as f32) {
-                                            Some(v) if tr.format == 1 => {
-                                                let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-                                                if !(0.99..=1.01).contains(&n) {
-                                                    badq += 1;
-                                                }
-                                            }
-                                            Some(v) if v.iter().any(|x| !x.is_finite()) => badq += 1,
-                                            _ => {}
+    let (all, nested) = for_each_entry_parallel(
+        &starts,
+        |e| e.name.to_ascii_lowercase().ends_with(".ycd") && e.resource_version().is_some(),
+        |a, id, p, (files, clips, anims, mismatch, badq, errors): &mut AnimStats| {
+            *files += 1;
+            let parsed = a
+                .read_resource(id)
+                .map_err(|e| e.to_string())
+                .and_then(|r| rage_formats::clip::parse_ycd(&r).map_err(|e| e.to_string()));
+            match parsed {
+                Ok(d) => {
+                    *clips += d.clips.len();
+                    *anims += d.animations.len();
+                    for an in &d.animations {
+                        let blocks = an.block_frames();
+                        let sum: usize = blocks.iter().sum();
+                        let overlapped = sum.saturating_sub(blocks.len().saturating_sub(1));
+                        if sum != an.frames && overlapped != an.frames {
+                            *mismatch += 1;
+                        }
+                        for (t, tr) in an.tracks.iter().enumerate() {
+                            for f in (0..an.frames).step_by(7) {
+                                match an.value(t, f as f32) {
+                                    Some(v) if tr.format == 1 => {
+                                        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                                        if !(0.99..=1.01).contains(&n) {
+                                            *badq += 1;
                                         }
                                     }
+                                    Some(v) if v.iter().any(|x| !x.is_finite()) => *badq += 1,
+                                    _ => {}
                                 }
                             }
                         }
-                        Err(e) => errors.push(format!("{p}: {e}")),
                     }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (files, clips, anims, mismatch, badq, errors)
-        })
-        .collect();
+                }
+                Err(e) => errors.push(format!("{p}: {e}")),
+            }
+        },
+    );
     let sum = |f: fn(&AnimStats) -> usize| all.iter().map(f).sum::<usize>();
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.5).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.5).chain(&nested).collect();
+    errors.sort();
     for e in errors.iter().take(40) {
         outln!("FAIL {e}");
     }
@@ -1259,67 +1097,63 @@ pub(crate) fn cmd_verify_audio(game_dir: &Path, within: &str, keys: Option<Arc<G
     let starts = archive_roots(game_dir, within, keys.clone())?;
     let started = Instant::now();
     // (containers, sounds, seconds, encrypted, not audio, errors)
-    let all: Vec<(usize, usize, f64, usize, usize, Vec<String>)> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let (mut files, mut sounds, mut secs, mut encrypted, mut errors) = (0, 0, 0f64, 0, Vec::new());
-            let mut not_audio = 0usize;
-            let mut nested = Vec::new();
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    if !openrage_app::audio::is_audio(&a.entry(id).name) {
-                        return;
-                    }
-                    files += 1;
-                    let result = a
-                        .read(id)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|d| openrage_app::audio::parse(d, keys.as_deref()))
-                        .and_then(|awc| {
-                            if awc.encrypted || awc.flags & 0xA != 0 {
-                                encrypted += 1;
-                            }
-                            let pcms = if awc.stream_format.is_some() {
-                                vec![awc.decode_stream()?]
-                            } else {
-                                (0..awc.sounds.len()).map(|i| awc.decode_sound(i)).collect::<Result<Vec<_>, _>>()?
-                            };
-                            Ok(pcms)
-                        });
-                    match result {
-                        Ok(pcms) => {
-                            sounds += pcms.len();
-                            secs += pcms.iter().map(|p| p.duration_secs() as f64).sum::<f64>();
+    let (all, nested) =
+        for_each_entry_parallel(
+            &starts,
+            |e| openrage_app::audio::is_audio(&e.name),
+            |a,
+             id,
+             p,
+             (files, sounds, secs, encrypted, not_audio, errors): &mut (
+                usize,
+                usize,
+                f64,
+                usize,
+                usize,
+                Vec<String>,
+            )| {
+                *files += 1;
+                let result = a
+                    .read(id)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|d| openrage_app::audio::parse(d, keys.as_deref()))
+                    .and_then(|awc| {
+                        if awc.encrypted || awc.flags & 0xA != 0 {
+                            *encrypted += 1;
                         }
-                        // A few files only share the extension (e.g. shader caches).
-                        Err(e)
-                            if matches!(
-                                e.downcast_ref::<rage_formats::awc::AwcError>(),
-                                Some(rage_formats::awc::AwcError::NotAwc)
-                            ) =>
-                        {
-                            files -= 1;
-                            not_audio += 1;
-                        }
-                        Err(e) => errors.push(format!("{p}: {e:#}")),
+                        let pcms = if awc.stream_format.is_some() {
+                            vec![awc.decode_stream()?]
+                        } else {
+                            (0..awc.sounds.len()).map(|i| awc.decode_sound(i)).collect::<Result<Vec<_>, _>>()?
+                        };
+                        Ok(pcms)
+                    });
+                match result {
+                    Ok(pcms) => {
+                        *sounds += pcms.len();
+                        *secs += pcms.iter().map(|p| p.duration_secs() as f64).sum::<f64>();
                     }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (files, sounds, secs, encrypted, not_audio, errors)
-        })
-        .collect();
+                    // A few files only share the extension (e.g. shader caches).
+                    Err(e)
+                        if matches!(
+                            e.downcast_ref::<rage_formats::awc::AwcError>(),
+                            Some(rage_formats::awc::AwcError::NotAwc)
+                        ) =>
+                    {
+                        *files -= 1;
+                        *not_audio += 1;
+                    }
+                    Err(e) => errors.push(format!("{p}: {e:#}")),
+                }
+            },
+        );
     let files: usize = all.iter().map(|x| x.0).sum();
     let sounds: usize = all.iter().map(|x| x.1).sum();
     let secs: f64 = all.iter().map(|x| x.2).sum();
     let encrypted: usize = all.iter().map(|x| x.3).sum();
     let not_audio: usize = all.iter().map(|x| x.4).sum();
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.5).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.5).chain(&nested).collect();
+    errors.sort();
     for e in errors.iter().take(40) {
         outln!("FAIL {e}");
     }
@@ -1339,48 +1173,34 @@ pub(crate) fn cmd_verify_models(game_dir: &Path, within: &str, keys: Option<Arc<
     use rage_formats::drawable;
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
-    let all: Vec<(usize, usize, Vec<String>)> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let (mut models, mut tris, mut errors) = (0usize, 0usize, Vec::new());
-            let mut nested = Vec::new();
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    let n = a.entry(id).name.to_ascii_lowercase();
-                    let drawable_file = n.ends_with(".ydr") || n.ends_with(".yft") || n.ends_with(".ydd");
-                    if !drawable_file || a.entry(id).resource_version().is_none() {
-                        return;
-                    }
-                    models += 1;
-                    let parsed = a.read_resource(id).map_err(|e| e.to_string()).and_then(|r| {
-                        let r = if n.ends_with(".ydd") {
-                            drawable::parse_ydd(&r).map(|v| v.into_iter().map(|(_, d)| d).collect::<Vec<_>>())
-                        } else if n.ends_with(".yft") {
-                            drawable::parse_fragment(&r).map(|f| {
-                                std::iter::once(f.drawable).chain(f.children.into_iter().map(|c| c.drawable)).collect()
-                            })
-                        } else {
-                            drawable::parse_ydr(&r).map(|d| vec![d])
-                        };
-                        r.map_err(|e| e.to_string())
-                    });
-                    match parsed {
-                        Ok(ds) => tris += ds.iter().map(|d| d.triangle_count()).sum::<usize>(),
-                        Err(e) => errors.push(format!("{p}: {e}")),
-                    }
-                },
-                &mut |e| nested.push(e.to_string()),
-            );
-            errors.extend(nested);
-            (models, tris, errors)
-        })
-        .collect();
+    let is_model = |n: &str| n.ends_with(".ydr") || n.ends_with(".yft") || n.ends_with(".ydd");
+    let (all, nested) = for_each_entry_parallel(
+        &starts,
+        |e| is_model(&e.name.to_ascii_lowercase()) && e.resource_version().is_some(),
+        |a, id, p, (models, tris, errors): &mut (usize, usize, Vec<String>)| {
+            let n = a.entry(id).name.to_ascii_lowercase();
+            *models += 1;
+            let parsed = a.read_resource(id).map_err(|e| e.to_string()).and_then(|r| {
+                let r = if n.ends_with(".ydd") {
+                    drawable::parse_ydd(&r).map(|v| v.into_iter().map(|(_, d)| d).collect::<Vec<_>>())
+                } else if n.ends_with(".yft") {
+                    drawable::parse_fragment(&r).map(|f| {
+                        std::iter::once(f.drawable).chain(f.children.into_iter().map(|c| c.drawable)).collect()
+                    })
+                } else {
+                    drawable::parse_ydr(&r).map(|d| vec![d])
+                };
+                r.map_err(|e| e.to_string())
+            });
+            match parsed {
+                Ok(ds) => *tris += ds.iter().map(|d| d.triangle_count()).sum::<usize>(),
+                Err(e) => errors.push(format!("{p}: {e}")),
+            }
+        },
+    );
     let (models, tris): (usize, usize) = all.iter().fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-    let errors: Vec<&String> = all.iter().flat_map(|x| &x.2).collect();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.2).chain(&nested).collect();
+    errors.sort();
     for e in errors.iter().take(40) {
         outln!("FAIL {e}");
     }
@@ -1392,6 +1212,166 @@ pub(crate) fn cmd_verify_models(game_dir: &Path, within: &str, keys: Option<Arc<
 }
 
 pub(crate) type Start = (String, Arc<Rpf7>, EntryId);
+
+/// What a worker gets: the archive the file is in (a nested one too), the file, its path, and the
+/// archive root it was found under (to report that root done once all its files are checked).
+type Job<A, I> = (Arc<A>, I, String, Arc<Pending>);
+
+/// Files of one archive root still queued or being checked, plus one while it is walked.
+struct Pending {
+    left: std::sync::atomic::AtomicUsize,
+    prefix: String,
+    report: bool,
+}
+
+impl Pending {
+    fn done(&self) {
+        if self.left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 && self.report {
+            eprintln!("  checked {}", self.prefix);
+        }
+    }
+}
+
+/// Runs `work` on every file `walk` finds below the archive roots, on one
+/// thread per core, each with its own stats (returned unmerged), plus the
+/// errors of walking (nested archives that do not open).
+///
+/// Roots are walked in parallel (rayon), and the files go through a short
+/// queue to the workers: one big archive (all vehicles are in one) does not
+/// leave the other cores idle. Reading and decompressing happen in the
+/// workers too. The workers are plain threads, not rayon tasks: walkers wait
+/// on a full queue, and waiting rayon tasks could starve rayon workers.
+fn run_parallel<A, I, S>(
+    starts: &[(String, Arc<A>, I)],
+    report: bool,
+    walk: impl Fn(&Arc<A>, I, &str, &mut dyn FnMut(&Arc<A>, I, &str), &mut Vec<String>) + Sync,
+    work: impl Fn(&A, I, &str, &mut S) + Sync,
+) -> (Vec<S>, Vec<String>)
+where
+    A: Send + Sync,
+    I: Copy + Send + Sync,
+    S: Default + Send,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let (send, receive) = std::sync::mpsc::sync_channel::<Job<A, I>>(workers * 4);
+    // Owned by the workers only: should they all stop (a panic), the walkers stop waiting.
+    let receive = Arc::new(std::sync::Mutex::new(receive));
+    let work = &work;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let receive = Arc::clone(&receive);
+                scope.spawn(move || {
+                    let mut s = S::default();
+                    loop {
+                        // The lock is held only while waiting for the next file.
+                        let job = receive.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok((archive, id, path, pending)) = job else { break };
+                        work(&archive, id, &path, &mut s);
+                        pending.done();
+                    }
+                    s
+                })
+            })
+            .collect();
+        drop(receive);
+        let errors: Vec<String> = starts
+            .par_iter()
+            .flat_map_iter(|(prefix, archive, dir)| {
+                let pending = Arc::new(Pending { left: AtomicUsize::new(1), prefix: prefix.clone(), report });
+                let mut errors = Vec::new();
+                let send = send.clone();
+                walk(
+                    archive,
+                    *dir,
+                    prefix,
+                    &mut |a, id, p| {
+                        pending.left.fetch_add(1, Ordering::AcqRel);
+                        if send.send((Arc::clone(a), id, p.to_owned(), Arc::clone(&pending))).is_err() {
+                            pending.done();
+                        }
+                    },
+                    &mut errors,
+                );
+                pending.done();
+                errors
+            })
+            .collect();
+        drop(send);
+        let stats = handles.into_iter().map(|h| h.join().expect("verify worker")).collect();
+        (stats, errors)
+    })
+}
+
+/// Runs `work` on every entry below the archive roots (nested archives too)
+/// that `wanted` accepts, on every core, also within one archive.
+/// Returns the stats of every worker, unmerged, and the errors of nested
+/// archives that do not open.
+pub(crate) fn for_each_entry_parallel<S: Default + Send>(
+    starts: &[Start],
+    wanted: impl Fn(&rage_rpf::Entry) -> bool + Sync,
+    work: impl Fn(&Rpf7, EntryId, &str, &mut S) + Sync,
+) -> (Vec<S>, Vec<String>) {
+    for_each_entry_parallel_reporting(starts, false, wanted, work)
+}
+
+/// [`for_each_entry_parallel`], printing `checked <root>` once all files of a root are checked.
+pub(crate) fn for_each_entry_parallel_reporting<S: Default + Send>(
+    starts: &[Start],
+    report: bool,
+    wanted: impl Fn(&rage_rpf::Entry) -> bool + Sync,
+    work: impl Fn(&Rpf7, EntryId, &str, &mut S) + Sync,
+) -> (Vec<S>, Vec<String>) {
+    // Like `vfs::walk`, but every archive shared, so workers can read from it.
+    fn walk(
+        archive: &Arc<Rpf7>,
+        dir: EntryId,
+        prefix: &str,
+        wanted: &(dyn Fn(&rage_rpf::Entry) -> bool + Sync),
+        emit: &mut dyn FnMut(&Arc<Rpf7>, EntryId, &str),
+        errors: &mut Vec<String>,
+    ) {
+        for child in archive.children(dir) {
+            let entry = archive.entry(child);
+            let path = if prefix.is_empty() { entry.name.clone() } else { format!("{prefix}/{}", entry.name) };
+            if wanted(entry) {
+                emit(archive, child, &path);
+            }
+            if entry.is_dir() {
+                walk(archive, child, &path, wanted, emit, errors);
+            } else if entry.is_archive() {
+                match archive.open_child(child) {
+                    Ok(inner) => walk(&Arc::new(inner), Rpf7::ROOT, &path, wanted, emit, errors),
+                    Err(e) => errors.push(e.to_string()),
+                }
+            }
+        }
+    }
+    run_parallel(starts, report, |a, dir, prefix, emit, errors| walk(a, dir, prefix, &wanted, emit, errors), work)
+}
+
+/// [`for_each_entry_parallel`] for GTA IV archives (`.rpf`, `.img`; not nested).
+pub(crate) fn for_each_gta4_entry_parallel<S: Default + Send>(
+    starts: &[crate::cmd::verify_gta4::Gta4Start],
+    report: bool,
+    wanted: impl Fn(&rage_rpf::Gta4Archive, rage_rpf::Gta4EntryId) -> bool + Sync,
+    work: impl Fn(&rage_rpf::Gta4Archive, rage_rpf::Gta4EntryId, &str, &mut S) + Sync,
+) -> Vec<S> {
+    let (stats, _) = run_parallel(
+        starts,
+        report,
+        |a, dir, prefix, emit, _| {
+            vfs::walk_gta4(a, dir, prefix, &mut |id, p| {
+                if wanted(a, id) {
+                    emit(a, id, p)
+                }
+            })
+        },
+        work,
+    );
+    stats
+}
 
 /// Resolves `within` to the archive directories to process: either one
 /// directory inside an archive, or every `.rpf` below a real directory.
@@ -1436,44 +1416,30 @@ pub(crate) struct VerifyStats {
 pub(crate) fn cmd_verify(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
-    let stats: Vec<VerifyStats> = starts
-        .par_iter()
-        .map(|(prefix, rpf, dir)| {
-            let mut s = VerifyStats { archives: 1, ..Default::default() };
-            let mut nested_errors = Vec::new();
-            vfs::walk(
-                rpf,
-                *dir,
-                prefix,
-                true,
-                &mut |a, id, p| {
-                    let e = a.entry(id);
-                    let result = if e.is_dir() {
-                        return;
-                    } else if e.is_archive() {
-                        s.archives += 1;
-                        return;
-                    } else if e.resource_version().is_some() {
-                        s.resources += 1;
-                        a.read_resource_pages(id)
-                    } else {
-                        s.files += 1;
-                        a.read(id)
-                    };
-                    match result {
-                        Ok(data) => s.bytes += data.len() as u64,
-                        Err(err) => s.errors.push(format!("{p}: {err}")),
-                    }
-                },
-                &mut |e| nested_errors.push(e.to_string()),
-            );
-            s.errors.extend(nested_errors);
-            eprintln!("  checked {prefix}");
-            s
-        })
-        .collect();
+    let (stats, nested) = for_each_entry_parallel_reporting(
+        &starts,
+        true,
+        |e| !e.is_dir(),
+        |a, id, p, s: &mut VerifyStats| {
+            let e = a.entry(id);
+            let result = if e.is_archive() {
+                s.archives += 1;
+                return;
+            } else if e.resource_version().is_some() {
+                s.resources += 1;
+                a.read_resource_pages(id)
+            } else {
+                s.files += 1;
+                a.read(id)
+            };
+            match result {
+                Ok(data) => s.bytes += data.len() as u64,
+                Err(err) => s.errors.push(format!("{p}: {err}")),
+            }
+        },
+    );
 
-    let mut total = VerifyStats::default();
+    let mut total = VerifyStats { archives: starts.len(), errors: nested, ..Default::default() };
     for s in stats {
         total.archives += s.archives;
         total.files += s.files;
@@ -1481,6 +1447,7 @@ pub(crate) fn cmd_verify(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKey
         total.bytes += s.bytes;
         total.errors.extend(s.errors);
     }
+    total.errors.sort();
     for e in &total.errors {
         outln!("FAIL {e}");
     }
