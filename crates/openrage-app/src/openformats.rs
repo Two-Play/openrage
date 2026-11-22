@@ -225,7 +225,7 @@ fn skeleton(s: &of::OfSkeleton) -> Skeleton {
 /// Whether two values read from text and from the game are the same (the
 /// text keeps seven significant digits).
 fn close(a: f32, b: f32) -> bool {
-    (a - b).abs() <= 1e-5 + 1e-5 * a.abs().max(b.abs())
+    a == b || (a - b).abs() <= 1e-5 + 1e-5 * a.abs().max(b.abs()) || (a.is_nan() && b.is_nan())
 }
 
 fn same_geometry(a: &OfGeometry, b: &OfGeometry) -> bool {
@@ -369,10 +369,12 @@ fn write_meshes(
         for m in &lod.models {
             let bone = bone_map(m.bone as usize)
                 .with_context(|| format!("model on bone {}, which the game file's skeleton does not have", m.bone))?;
-            // Fixed models: from their bone's space to the target bone's.
+            // Fixed models: from their bone's space to the target bone's. A
+            // model on bone 0 is in model space (as the game's models are read).
+            let space = |b: usize| if b == 0 { Some(&math::IDENTITY) } else { world.get(b) };
             let to_target = (!skinned_template && bone != target_bone)
                 .then(|| {
-                    let (a, b) = (world.get(bone)?, world.get(target_bone)?);
+                    let (a, b) = (space(bone)?, space(target_bone)?);
                     Some(math::mul(&math::inverse_affine(b), a))
                 })
                 .flatten();

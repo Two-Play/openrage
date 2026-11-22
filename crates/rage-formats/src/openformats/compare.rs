@@ -126,9 +126,20 @@ pub fn difference(a: &OfDrawable, b: &OfDrawable) -> Option<String> {
 /// The first difference between a texture and the same texture written as
 /// DDS and read back.
 pub fn texture_difference(x: &crate::texture::Texture, y: &crate::texture::Texture) -> Option<String> {
-    let same = write::same_texture_name(&x.name, &y.name)
-        && (x.width, x.height, x.depth, x.levels, x.format, x.dimension, x.usage)
-            == (y.width, y.height, y.depth, y.levels, y.format, y.dimension, y.usage)
-        && x.data == y.data;
-    (!same).then(|| format!("texture {} differs after reading back", x.name))
+    let what = if !write::same_texture_name(&x.name, &y.name) {
+        format!("named {}", y.name)
+    } else if (x.width, x.height, x.depth, x.levels) != (y.width, y.height, y.depth, y.levels) {
+        format!("{}×{}×{} with {} levels", y.width, y.height, y.depth, y.levels)
+    } else if x.format != y.format {
+        format!("format {} instead of {}", y.format.name(), x.format.name())
+    } else if x.dimension != y.dimension {
+        format!("{:?} instead of {:?}", y.dimension, x.dimension)
+    } else if x.usage != y.usage {
+        format!("usage {} instead of {}", y.usage, x.usage)
+    } else if x.data != y.data {
+        format!("{} bytes of pixels instead of {}", y.data.len(), x.data.len())
+    } else {
+        return None;
+    };
+    Some(format!("texture {} differs after reading back: {what}", x.name))
 }

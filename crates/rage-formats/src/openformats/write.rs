@@ -21,18 +21,46 @@ fn join(sep: char, parts: &[&str]) -> String {
 }
 
 /// Whether a texture name read back from a file name (`.otx`) is the texture
-/// `name`: file names are lowercase and have `_` for characters such as spaces.
+/// `name`: file names are lowercase.
 pub fn same_texture_name(name: &str, from_file: &str) -> bool {
-    name.eq_ignore_ascii_case(from_file) || file_stem(name) == file_stem(from_file)
+    name.eq_ignore_ascii_case(from_file)
 }
 
-/// A file name for a texture or drawable name.
+/// A file name for a texture or drawable name: lowercase, other characters
+/// than letters, digits and `_-.+` as `%` and their hex code (spaces would
+/// split the lines that name the file, `?` and `*` are not allowed on
+/// Windows); [`name_of_file_stem`] turns it back.
 pub fn file_stem(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || "_-.+".contains(c) { c.to_ascii_lowercase() } else { '_' })
-        .collect();
+    let mut s = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || b"_-.+".contains(&b) {
+            s.push(b.to_ascii_lowercase() as char);
+        } else {
+            s.push_str(&format!("%{b:02x}"));
+        }
+    }
     if s.is_empty() { "unnamed".to_owned() } else { s }
+}
+
+/// The name a file stem stands for ([`file_stem`]).
+pub fn name_of_file_stem(stem: &str) -> String {
+    let b = stem.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = (b[i] == b'%').then(|| stem.get(i + 1..i + 3)).flatten().and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(v) => {
+                out.push(v);
+                i += 3;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A drawable (`.ydr`): `<name>.odr` and the folder `<name>/` with its
@@ -310,7 +338,7 @@ fn textures_files(textures: &[OfTexture], base: &str, otd: &str, dir: &str) -> V
         ));
         x.line(format!("PixelFormat {}", pixel_format(t.format)));
         x.line(format!("Levels {}", t.levels));
-        x.line(format!("Usage {}", USAGES.iter().find(|(u, _)| *u == t.usage).map_or("DEFAULT", |u| u.1)));
+        x.line(format!("Usage {}", usage_name(t.usage)));
         x.line("UsageFlags -");
         x.line("ExtraFlags 0");
         x.close();

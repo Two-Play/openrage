@@ -319,8 +319,23 @@ fn enhanced_parameter_names() {
 
 #[test]
 fn texture_names_from_file_names() {
-    assert_eq!(file_stem("generic_ cav_detail_dash"), "generic__cav_detail_dash");
-    assert!(same_texture_name("generic_ cav_detail_dash", "generic__cav_detail_dash"));
-    assert!(same_texture_name("Prop_Thing_D", "prop_thing_d"));
+    for name in ["generic_ cav_detail_dash", "font_?", "font_!", "font_specailcharacter_,", "a%b", "Prop_Thing_D"] {
+        let stem = file_stem(name);
+        assert!(stem.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.+%".contains(&b)), "{stem}");
+        assert!(same_texture_name(name, &name_of_file_stem(&stem)), "{name} → {stem}");
+    }
+    assert_eq!(file_stem("generic_ cav_detail_dash"), "generic_%20cav_detail_dash");
+    assert_ne!(file_stem("font_?"), file_stem("font_!"));
     assert!(!same_texture_name("prop_thing_d", "prop_thing_n"));
+}
+
+#[test]
+fn usages() {
+    for code in 0..32u8 {
+        assert_eq!(usage_code(&usage_name(code)), Some(code));
+    }
+    assert_eq!(usage_name(20), "DIFFUSE");
+    assert_eq!(usage_name(0), "UNKNOWN");
+    assert_eq!(usage_name(7), "USAGE_7");
+    assert_eq!(usage_code("nonsense"), None);
 }

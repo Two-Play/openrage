@@ -90,8 +90,11 @@ pub fn to_dds(tex: &Texture) -> Vec<u8> {
     h[6] = tex.levels.max(1);
     // h[7..18] reserved; pixel format at h[18..26]
     h[18] = 32;
-    let dx10 = legacy_pixel_format(tex.format).is_none();
-    match legacy_pixel_format(tex.format) {
+    // Arrays of 2D textures need the DX10 header for their size.
+    let array = tex.dimension == Dimension::Texture2D && tex.depth > 1;
+    let legacy = legacy_pixel_format(tex.format).filter(|_| !array);
+    let dx10 = legacy.is_none();
+    match legacy {
         Some((flags, cc, bits, masks)) => {
             h[19] = flags;
             h[20] = cc;
@@ -118,7 +121,8 @@ pub fn to_dds(tex: &Texture) -> Vec<u8> {
     if dx10 {
         let resource_dimension = if tex.dimension == Dimension::Texture3D { 4 } else { 3 };
         let misc = if tex.dimension == Dimension::Cube { 0x4 } else { 0 };
-        for v in [tex.format.0, resource_dimension, misc, 1, 0] {
+        let array_size = if array { tex.depth } else { 1 };
+        for v in [tex.format.0, resource_dimension, misc, array_size, 0] {
             out.extend_from_slice(&v.to_le_bytes());
         }
     }
@@ -139,6 +143,7 @@ pub fn from_dds(name: &str, file: &[u8]) -> Result<Texture, DdsError> {
     let masks = [h(22), h(23), h(24), h(25)];
     let caps2 = h(27);
     let mut data_start = 128;
+    let mut array_size = 1;
     let mut dimension = if caps2 & DDSCAPS2_CUBEMAP_ALL != 0 {
         Dimension::Cube
     } else if caps2 & DDSCAPS2_VOLUME != 0 {
@@ -162,6 +167,7 @@ pub fn from_dds(name: &str, file: &[u8]) -> Result<Texture, DdsError> {
                 if x(2) & 0x4 != 0 {
                     dimension = Dimension::Cube;
                 }
+                array_size = x(3).max(1);
                 Format(x(0))
             }
             other => return Err(DdsError::UnsupportedFourCc(String::from_utf8_lossy(other).into_owned())),
@@ -184,7 +190,7 @@ pub fn from_dds(name: &str, file: &[u8]) -> Result<Texture, DdsError> {
     let depth = match dimension {
         Dimension::Cube => 6,
         Dimension::Texture3D => h(5).max(1),
-        Dimension::Texture2D => 1,
+        Dimension::Texture2D => array_size,
     };
     let tex =
         Texture { name: name.to_owned(), width, height, depth, levels, format, dimension, usage: 0, data: Vec::new() };
@@ -221,6 +227,24 @@ mod tests {
         assert_eq!(&dds[84..88], b"DX10");
         assert_eq!(u32::from_le_bytes(dds[128..132].try_into().unwrap()), 98);
         assert_eq!(dds.len(), 128 + 20 + 24);
+    }
+
+    #[test]
+    fn texture_arrays() {
+        let t = Texture {
+            name: "noise".into(),
+            width: 4,
+            height: 4,
+            depth: 3,
+            levels: 1,
+            format: Format::R8_UNORM,
+            dimension: Dimension::Texture2D,
+            usage: 0,
+            data: (0..48).collect(),
+        };
+        let back = from_dds("noise", &to_dds(&t)).unwrap();
+        assert_eq!((back.format, back.depth, back.dimension), (Format::R8_UNORM, 3, Dimension::Texture2D));
+        assert_eq!(back.data, t.data);
     }
 
     #[test]

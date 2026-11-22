@@ -51,7 +51,9 @@ mod write;
 pub use compare::{difference, texture_difference};
 pub use parse::{Source, parse_odd, parse_odr, parse_oft, parse_otd};
 pub use read::{read_drawable_at, read_ydd, read_ydr, read_yft, read_ytd};
-pub use write::{ExportedFile, export_odd, export_odr, export_oft, export_otd, file_stem, same_texture_name};
+pub use write::{
+    ExportedFile, export_odd, export_odr, export_oft, export_otd, file_stem, name_of_file_stem, same_texture_name,
+};
 
 use crate::texture::Texture;
 
@@ -322,6 +324,7 @@ pub struct OfFragment {
 
 /// Texture usage names in `.otx` files, by the game's usage code.
 pub(crate) const USAGES: &[(u8, &str)] = &[
+    (0, "UNKNOWN"),
     (1, "DEFAULT"),
     (2, "TERRAIN"),
     (3, "CLOUDDENSITY"),
@@ -345,6 +348,19 @@ pub(crate) const USAGES: &[(u8, &str)] = &[
     (25, "TINTPALETTE"),
     (26, "SKIPPROCESSING"),
 ];
+
+/// The name of a usage code in `.otx` files (`USAGE_<n>` for codes without one).
+pub(crate) fn usage_name(code: u8) -> String {
+    USAGES.iter().find(|(u, _)| *u == code).map_or_else(|| format!("USAGE_{code}"), |u| u.1.to_owned())
+}
+
+/// The usage code of a name in an `.otx` file.
+pub(crate) fn usage_code(name: &str) -> Option<u8> {
+    match USAGES.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)) {
+        Some((code, _)) => Some(*code),
+        None => name.get(6..).filter(|_| name.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("USAGE_")))?.parse().ok(),
+    }
+}
 
 /// Shader parameter names (the game stores their hashes) and how many
 /// numbers each has; textures have 0.

@@ -217,6 +217,19 @@ pub(crate) fn cmd_verify_openformats(game_dir: &Path, within: &str, keys: Option
     for e in total.errors.iter().take(50) {
         outln!("FAIL {e}");
     }
+    // Kinds of failures (the message without the file and the numbers).
+    let mut kinds: HashMap<String, usize> = HashMap::new();
+    for e in &total.errors {
+        let message = e.split_once(": ").map_or(e.as_str(), |(_, m)| m);
+        let message = message.rsplit_once(" differs ").map_or(message.to_owned(), |(_, m)| format!("differs {m}"));
+        let kind: String = message.split(|c: char| c.is_ascii_digit()).collect::<Vec<_>>().join("#");
+        *kinds.entry(kind).or_default() += 1;
+    }
+    let mut kinds: Vec<_> = kinds.into_iter().collect();
+    kinds.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    for (kind, n) in kinds.iter().take(30) {
+        outln!("{n:>7}× {kind}");
+    }
     let mut reasons: Vec<_> = total.not_writable.values().collect();
     reasons.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
     let skipped: usize = reasons.iter().map(|(n, _)| n).sum();
@@ -241,7 +254,8 @@ pub(crate) fn cmd_verify_openformats(game_dir: &Path, within: &str, keys: Option
 /// original: the same meshes (to the text's precision), shaders, textures
 /// and bones.
 fn compare_read_back(a: &rage_formats::drawable::Drawable, b: &rage_formats::drawable::Drawable) -> Result<()> {
-    let close = |x: f32, y: f32| (x - y).abs() <= 1e-4 + 1e-5 * x.abs().max(y.abs()) || (x.is_nan() && y.is_nan());
+    let close =
+        |x: f32, y: f32| x == y || (x - y).abs() <= 1e-4 + 1e-5 * x.abs().max(y.abs()) || (x.is_nan() && y.is_nan());
     let close_all = |x: &[f32], y: &[f32]| x.len() == y.len() && x.iter().zip(y).all(|(p, q)| close(*p, *q));
     if a.meshes.len() != b.meshes.len() {
         bail!("{} meshes, {} after importing", a.meshes.len(), b.meshes.len());

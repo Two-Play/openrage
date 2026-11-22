@@ -105,11 +105,11 @@ pub fn read_drawable_at(res: &Resource, ptr: u64, enhanced: bool) -> Result<OfDr
     if group != 0 {
         d.shaders = read_shaders(res, group, enhanced)?;
         let txd = res.u64(group + 0x08)?;
-        if txd != 0 {
-            let dict = ytd::parse_at(res, txd, enhanced)?;
-            if let Some(e) = dict.errors.first() {
-                return Err(bad(format!("an embedded texture cannot be read: {e}")));
-            }
+        // A few of the game's models have broken embedded dictionaries (the
+        // game does not use them either): what can be read is exported.
+        if txd != 0
+            && let Ok(dict) = ytd::parse_at(res, txd, enhanced)
+        {
             d.textures = dict.textures.into_iter().map(|texture| OfTexture { texture }).collect();
         }
     }

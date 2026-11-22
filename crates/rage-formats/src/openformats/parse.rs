@@ -96,11 +96,12 @@ pub fn parse_otd(src: Source, path: &str) -> Result<Vec<OfTexture>, ResourceErro
         let x = document(src, &otx)?;
         let image = x.root.get("Image").ok_or_else(|| bad(format!("{otx}: no Image")))?;
         let dds = resolve(dir_of(&otx), image.arg(0)?);
-        let mut texture = crate::dds::from_dds(&stem_of(&otx), &src(&dds)?).map_err(|e| bad(format!("{dds}: {e}")))?;
+        let mut texture = crate::dds::from_dds(&name_of_file_stem(&stem_of(&otx)), &src(&dds)?)
+            .map_err(|e| bad(format!("{dds}: {e}")))?;
         if let Some(usage) = x.root.get("Usage").and_then(|u| u.args().first())
-            && let Some((code, _)) = USAGES.iter().find(|(_, n)| n.eq_ignore_ascii_case(usage))
+            && let Some(code) = usage_code(usage)
         {
-            texture.usage = *code;
+            texture.usage = code;
         }
         out.push(OfTexture { texture });
     }
