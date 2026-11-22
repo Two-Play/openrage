@@ -226,6 +226,8 @@ pub struct Fragment {
     pub drawable: Drawable,
     /// Children with meshes of their own (e.g. wheels).
     pub children: Vec<FragmentChild>,
+    /// Cloth (RDR2's flags and straps) in its rest pose, in model space.
+    pub cloths: Vec<Drawable>,
 }
 
 impl Drawable {
@@ -811,9 +813,40 @@ pub fn parse_yft(res: &Resource) -> Result<Drawable, ResourceError> {
 /// meshes of their own (wheels, see [`read_fragment_children_rdr2`]).
 pub fn parse_fragment_rdr2(res: &Resource) -> Result<Fragment, ResourceError> {
     let body = read_drawable_gen(res, fragment_drawable_rdr2(res)?, Gen::Rdr2)?;
-    // Children are optional extras, as in GTA V.
-    let children = read_fragment_children_rdr2(res, &body).unwrap_or_default();
-    Ok(Fragment { drawable: body, children })
+    // Cloth and children are optional extras, as in GTA V.
+    let (cloth_ptrs, cloths) = read_cloths_rdr2(res, &body).unwrap_or_default();
+    let children = read_fragment_children_rdr2(res, &body, &cloth_ptrs).unwrap_or_default();
+    Ok(Fragment { drawable: body, children, cloths })
+}
+
+/// The cloth of an RDR2 fragment (flags, straps, awnings), in its rest pose:
+/// a list at `0x48` of the fragment (16-byte entries, `u16` count at
+/// `0x50`), each cloth with its drawable at `0x18`. A cloth drawable without
+/// shaders of its own uses the body's. Returns the drawables' addresses too
+/// (a cloth's drawable can also be a child of the physics LOD).
+fn read_cloths_rdr2(res: &Resource, body: &Drawable) -> Result<(Vec<u64>, Vec<Drawable>), ResourceError> {
+    let ok = |p: u64| (0x5000_0000..0x6000_0000).contains(&p);
+    let list = res.u64(Resource::ROOT + 0x48)?;
+    if !ok(list) {
+        return Ok(Default::default());
+    }
+    let (mut ptrs, mut out) = (Vec::new(), Vec::new());
+    for i in 0..res.u16(Resource::ROOT + 0x50)?.min(64) as u64 {
+        let cloth = res.u64(list + i * 16)?;
+        let ptr = if ok(cloth) { res.u64(cloth + 0x18)? } else { 0 };
+        if !ok(ptr) || ptrs.contains(&ptr) {
+            continue;
+        }
+        let mut drawable = read_drawable_gen(res, ptr, Gen::Rdr2)?;
+        if drawable.shaders.is_empty() {
+            drawable.shaders = body.shaders.clone();
+        }
+        ptrs.push(ptr);
+        if !drawable.meshes.is_empty() {
+            out.push(drawable);
+        }
+    }
+    Ok((ptrs, out))
 }
 
 /// Only the skeleton of an RDR2 `.yft` (much faster than reading the meshes).
@@ -835,10 +868,15 @@ fn fragment_drawable_rdr2(res: &Resource) -> Result<u64, ResourceError> {
             })
     };
     let candidates = std::iter::once(0x20).chain((0..0xC0).step_by(8));
-    candidates
-        .filter_map(|o| res.u64(root + o).ok())
-        .find(|&p| looks_like_drawable(p))
-        .ok_or_else(|| bad("fragment without a drawable"))
+    let found = candidates.filter_map(|o| res.u64(root + o).ok()).find(|&p| looks_like_drawable(p));
+    // A fragment that is all cloth (a strap): the body has shaders and a
+    // skeleton but no meshes of its own.
+    let ok = |q: u64| (0x5000_0000..0x6000_0000).contains(&q);
+    let body_of_cloth = || {
+        let p = res.u64(root + 0x20).ok().filter(|&p| ok(p))?;
+        (res.u64(p + 0x10).is_ok_and(ok) && res.u64(root + 0x48).is_ok_and(ok)).then_some(p)
+    };
+    found.or_else(body_of_cloth).ok_or_else(|| bad("fragment without a drawable"))
 }
 
 /// The children of an RDR2 fragment that have meshes. The physics LOD group
@@ -848,7 +886,11 @@ fn fragment_drawable_rdr2(res: &Resource) -> Result<u64, ResourceError> {
 /// bone is named by its group (group of each child: `u16` list at `0x110`;
 /// groups at `0xC8`, with the parent group at `+0x06` and the name at
 /// `+0x4F`), and a group without a bone of that name sits on its parent's.
-fn read_fragment_children_rdr2(res: &Resource, body: &Drawable) -> Result<Vec<FragmentChild>, ResourceError> {
+fn read_fragment_children_rdr2(
+    res: &Resource,
+    body: &Drawable,
+    cloths: &[u64],
+) -> Result<Vec<FragmentChild>, ResourceError> {
     let ok = |p: u64| (0x5000_0000..0x6000_0000).contains(&p);
     let group = res.u64(Resource::ROOT + 0x90)?;
     if !ok(group) {
@@ -879,7 +921,7 @@ fn read_fragment_children_rdr2(res: &Resource, body: &Drawable) -> Result<Vec<Fr
         }
         None
     };
-    let mut seen = Vec::new();
+    let mut seen = cloths.to_vec();
     let mut out = Vec::new();
     for i in 0..count {
         let ptr = res.u64(list + i * 8)?;
@@ -914,7 +956,7 @@ pub fn parse_fragment(res: &Resource) -> Result<Fragment, ResourceError> {
     }
     // Children are optional extras: a fragment without readable ones is still fine.
     let children = read_fragment_children(res, enhanced).unwrap_or_default();
-    Ok(Fragment { drawable: d, children })
+    Ok(Fragment { drawable: d, children, cloths: Vec::new() })
 }
 
 fn read_fragment_children(res: &Resource, enhanced: bool) -> Result<Vec<FragmentChild>, ResourceError> {

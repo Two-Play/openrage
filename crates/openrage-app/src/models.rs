@@ -371,7 +371,7 @@ fn streamed_ped(rpf: &rage_rpf::Rpf7, folder: rage_rpf::EntryId) -> Result<Strea
 }
 
 fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Drawable)>, Vec<Part>) {
-    let drawable::Fragment { drawable: body, children } = fragment;
+    let drawable::Fragment { drawable: body, children, cloths } = fragment;
     let skeleton = body.skeleton.clone().unwrap_or_default();
     let world = skeleton.world_transforms();
     let mut drawables = vec![(name.to_owned(), body)];
@@ -383,6 +383,20 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
         visible: true,
         bone: None,
     }];
+    // Cloth (RDR2's flags and straps) in its rest pose: the game moves it.
+    for (k, cloth) in cloths.into_iter().enumerate() {
+        let label = if k == 0 { "cloth".to_owned() } else { format!("cloth_{k}") };
+        let index = drawables.len();
+        parts.push(Part {
+            name: label.clone(),
+            group: "Cloth".into(),
+            drawable: index,
+            transform: math::IDENTITY,
+            visible: true,
+            bone: None,
+        });
+        drawables.push((label, cloth));
+    }
     let mut wheels: Vec<(String, usize)> = Vec::new();
     for child in children {
         let bone = skeleton.find_tag(child.bone_tag);
@@ -2048,14 +2062,18 @@ mod tests {
         });
         let body = Drawable { skeleton: Some(drawable::Skeleton { bones: bones.collect() }), ..Default::default() };
         let wheel = |tag| drawable::FragmentChild { bone_tag: tag, drawable: Drawable::default() };
-        let fragment = drawable::Fragment { drawable: body, children: vec![wheel(1), wheel(2)] };
+        let cloth = Drawable { meshes: vec![drawable::Mesh::default()], ..Default::default() };
+        let fragment = drawable::Fragment { drawable: body, children: vec![wheel(1), wheel(2)], cloths: vec![cloth] };
         let (drawables, parts) = fragment_parts(fragment, "cart");
-        assert_eq!(drawables.len(), 3);
+        assert_eq!(drawables.len(), 4);
         let shown: Vec<(&str, bool)> = parts.iter().map(|p| (p.name.as_str(), p.visible)).collect();
-        // The blurred wheel stays hidden; only the plain right wheel gets a copy.
-        assert_eq!(shown, [("cart", true), ("wheel_lf", true), ("wheel_lf_fast", false), ("wheel_rf", true)]);
-        assert_eq!(parts[3].drawable, 1);
-        assert_eq!(parts[3].transform[12], 1.0);
+        // The cloth in place; the blurred wheel hidden; only the plain right wheel gets a copy.
+        let expected =
+            [("cart", true), ("cloth", true), ("wheel_lf", true), ("wheel_lf_fast", false), ("wheel_rf", true)];
+        assert_eq!(shown, expected);
+        assert_eq!((parts[1].group.as_str(), parts[1].transform), ("Cloth", math::IDENTITY));
+        assert_eq!(parts[4].drawable, 2);
+        assert_eq!(parts[4].transform[12], 1.0);
     }
 
     #[test]

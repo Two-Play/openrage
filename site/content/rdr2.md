@@ -61,7 +61,7 @@ Only the Steam version of 2 April 2024 is known so far; other versions report wh
 |---|---|---|
 | Archives | `.rpf` (RPF8) | browse and extract |
 | Textures | `.ytd` | view, export DDS/PNG |
-| Models | `.ydr`, `.ydd`, `.yft` | view, export glTF |
+| Models | `.ydr`, `.ydd`, `.yft` | view with moving parts and cloth, export glTF |
 | Peds and animals | `metapeds` outfits | put together with outfits, tints and face shapes |
 | Animations | `.ycd` | play, partly approximated |
 | Metadata | `.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.meta` | view as XML |
@@ -99,7 +99,11 @@ Fragments (`.yft`) show their moving parts like GTA V's: a wagon's wheels sit on
 other side, and follow animations. The blurred wheels the game shows at speed (`wheel_lf_fast`) are listed under
 *Parts* but hidden.
 
-**Not yet:** cloth.
+**Cloth** shows in its rest pose, as the game stores it before it moves it: flags, awnings and straps of fragments are
+listed as *Cloth* under *Parts*, and people's coats and skirts are part of their outfits' models (their `.yld` files
+only hold the simulation). The cloth does not sway: it moves only with the bones it hangs from.
+
+**Checked:** all 113,468 models, with 628 moving parts and 894 cloths of fragments.
 
 ## Peds and animals
 
