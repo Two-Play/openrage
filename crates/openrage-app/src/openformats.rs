@@ -399,6 +399,7 @@ fn write_meshes(
                         .unwrap_or_default(),
                     indices: g.indices.clone(),
                     bones: Vec::new(),
+                    blend: Vec::new(),
                 };
                 if let Some(t) = &to_target {
                     mesh.positions.iter_mut().for_each(|p| *p = math::transform_point(t, *p));
@@ -421,6 +422,29 @@ fn write_meshes(
                             .collect::<Result<_>>()?,
                         _ => vec![bone as u16; mesh.positions.len()],
                     };
+                    // All four bones with their weights (peds, clothing).
+                    if let (Some(idx), Some(w)) =
+                        (g.attribute(component::BLEND_INDICES), g.attribute(component::BLEND_WEIGHTS))
+                    {
+                        mesh.blend = idx
+                            .iter()
+                            .zip(w)
+                            .map(|(i, w)| {
+                                let mut b = ydr_write::Blend::default();
+                                for k in 0..4 {
+                                    if w[k] > 0.0 {
+                                        b.bones[k] = bone_map(i[k] as usize).unwrap_or(0) as u16;
+                                        b.weights[k] = w[k];
+                                    }
+                                }
+                                let sum: f32 = b.weights.iter().sum();
+                                if sum > 0.0 {
+                                    b.weights.iter_mut().for_each(|x| *x /= sum);
+                                }
+                                b
+                            })
+                            .collect();
+                    }
                 }
                 meshes.extend(crate::obj::split(mesh));
             }

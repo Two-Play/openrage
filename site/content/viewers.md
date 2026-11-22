@@ -40,6 +40,10 @@ rotate, scroll to zoom.
 ### Complete models
 
 - **Vehicles** come with their wheels on every wheel bone and their liveries.
+- **Vehicle mods** (tuning parts: bonnets, bumpers, spoilers, …) from the vehicle's `<name>_mods.rpf` archives are
+  listed under **Parts** as *Mods: bonnet*, *Mods: spoiler* …, hidden at first, each on the bone the game's
+  `carcols` files put it on. Showing one does not hide the original part it replaces; hide that yourself. The parts
+  also open on their own (`sultan_hood_1.yft`).
 - **Peds** are put together from their components (head, hair, upper body, legs, accessories), the first variant of each.
 - **Textures** come from the model itself, the `.ytd` next to it (`adder.ytd`, `adder+hi.ytd`) and, for vehicles,
   `vehshare.ytd`.
@@ -68,10 +72,6 @@ the skeleton (`.skel`) and the textures (`.otx` with a `.dds` each) in a folder 
 its parameters, every detail level, every geometry with all its vertex data (positions, bone weights, colours, all
 texture coordinates, tangents) is in there, readable and editable as text, and the files go back into the game with
 **Import openFormats…** (see [Modding](@/modding.md#openformats-openiv)).
-
-### Not yet
-
-Vehicle mods and tuning parts.
 
 ## Animations
 

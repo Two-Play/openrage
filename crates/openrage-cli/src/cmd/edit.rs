@@ -200,6 +200,9 @@ pub(crate) struct ReplaceOptions<'a> {
     pub(crate) shader: Option<u16>,
     pub(crate) lods: &'a [PathBuf],
     pub(crate) textures: bool,
+    pub(crate) drawable: Option<&'a str>,
+    /// An OBJ model to build the collision from (`.ydr`); for a `.ybn` the OBJ itself is.
+    pub(crate) collision: Option<&'a Path>,
 }
 
 pub(crate) fn cmd_replace_model(
@@ -215,18 +218,25 @@ pub(crate) fn cmd_replace_model(
         bail!("{vpath} is not a file inside an archive")
     };
     let lower = vpath.to_ascii_lowercase();
-    if !lower.ends_with(".ydr") && !lower.ends_with(".yft") {
-        bail!("{vpath} is not a drawable (.ydr) or fragment (.yft)");
+    if lower.ends_with(".ybn") {
+        let template = rpf.read_resource(id)?;
+        let file = with_collision(game_dir, vpath, &template, false, obj, keys.clone())?;
+        return save_model(game_dir, vpath, obj, file, &o, keys);
+    }
+    if o.collision.is_some() && !lower.ends_with(".ydr") {
+        bail!("--collision is for drawables (.ydr); vehicles and other fragments keep theirs");
+    }
+    if !lower.ends_with(".ydr") && !lower.ends_with(".yft") && !lower.ends_with(".ydd") {
+        bail!("{vpath} is not a drawable (.ydr), fragment (.yft) or drawable dictionary (.ydd)");
     }
     if o.lods.len() > 3 {
         bail!("at most three further detail levels (--lod)");
     }
     let template = rpf.read_resource(id)?;
-    let shaders = ydr_write::usable_shaders(&template)?;
     // Every level's OBJ, and the textures their materials name.
     let mut files = vec![obj.to_path_buf()];
     files.extend(o.lods.iter().cloned());
-    let mut levels_text = Vec::new();
+    let mut levels = Vec::new();
     let mut textures = std::collections::HashMap::new();
     for f in &files {
         let text = fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
@@ -254,55 +264,85 @@ pub(crate) fn cmd_replace_model(
                 textures.insert(material, texture);
             }
         }
-        levels_text.push(text);
+        levels.push(obj::read(&text).with_context(|| format!("reading {}", f.display()))?);
     }
-    let mut fitter =
-        obj::Fitter::new(&shaders, o.shader, &textures)?.with_shader_info(ydr_write::shader_infos(&template)?);
-    // Vehicles: parts named like bones (`door_dside_f`, `bonnet`) move with them.
-    // Wheels have models of their own: parts named after them are left out.
-    if let Some(bones) = ydr_write::skinned_bones(&template)? {
-        let own = ydr_write::bones_with_own_models(&template);
-        fitter = fitter.with_bones(obj::Bones::new(bones).with_own_models(own));
-    }
-    let mut levels = Vec::new();
-    for text in &levels_text {
-        levels.push(fitter.level(obj::read(text)?));
-    }
-    for (material, m) in &fitter.materials {
-        let texture =
-            m.texture.as_ref().map(|t| format!(", texture {} ({}×{})", t.name, t.width, t.height)).unwrap_or_default();
-        outln!("material {material:<24} → shader {}{texture}", m.shader);
-    }
-    if !fitter.textures_kept.is_empty() {
-        outln!("kept the shader's own texture (it takes no other): {}", fitter.textures_kept.join(", "));
-    }
-    if let Some(bones) = fitter.bones() {
-        for (part, bone) in &bones.matched {
-            outln!("part {part:<28} → bone {bone}");
+    // Vehicles: parts named like bones (`door_dside_f`, `bonnet`) move with them,
+    // parts named after the wheel (`wheel_lf`) replace its model.
+    // Drawable dictionaries: parts named after a drawable go to it.
+    let options = obj::ImportOptions { shader: o.shader, drawable: o.drawable };
+    let imported = obj::import(&template, vpath, levels, &textures, options, || {
+        obj::find_texture_donor(game_dir, vpath, keys.clone())
+    })?;
+    let several = imported.targets.len() > 1;
+    for t in &imported.targets {
+        if t.materials.is_empty() {
+            continue;
         }
-        if !bones.unmatched.is_empty() {
-            outln!("parts on the body ({}): {}", bones.body_name(), bones.unmatched.join(", "));
+        let place = match t.place {
+            _ if !several => String::new(),
+            ydr_write::Place::Main => "body: ".to_owned(),
+            ydr_write::Place::Child(_) => format!("{} (own model): ", t.names.join(", ")),
+            ydr_write::Place::Entry(_) => format!("{}: ", t.names.join(", ")),
+        };
+        for (material, m) in &t.materials {
+            let texture = m
+                .texture
+                .as_ref()
+                .map(|t| format!(", texture {} ({}×{})", t.name, t.width, t.height))
+                .unwrap_or_default();
+            outln!("{place}material {material:<24} → shader {}{texture}", m.shader);
         }
-        if !bones.left_out.is_empty() {
-            outln!("left out (the vehicle's own models stay): {}", bones.left_out.join(", "));
+        if !t.textures_kept.is_empty() {
+            outln!("{place}kept the shader's own texture (it takes no other): {}", t.textures_kept.join(", "));
+        }
+        if let Some(bones) = t.bones() {
+            for (part, bone) in &bones.matched {
+                outln!("part {part:<28} → bone {bone}");
+            }
+            if !bones.unmatched.is_empty() {
+                outln!("parts on the body ({}): {}", bones.body_name(), bones.unmatched.join(", "));
+            }
+            if !bones.left_out.is_empty() {
+                outln!("left out (the game draws the wheel's own model there): {}", bones.left_out.join(", "));
+            }
+        }
+        if matches!(t.place, ydr_write::Place::Child(_)) {
+            outln!("parts {} → the model of {}", t.parts.join(", "), t.names.join(", "));
+        }
+        if t.has_weights() {
+            outln!("{place}bone weights from the nearest vertex of the original mesh");
         }
     }
-    let materials: Vec<ydr_write::NewMaterial> = fitter.materials.into_iter().map(|(_, m)| m).collect();
-    let donor = (materials.iter().any(|m| m.texture.is_some()) && !ydr_write::can_donate_textures(&template))
-        .then(|| obj::find_texture_donor(game_dir, vpath, keys.clone()))
-        .flatten();
-    let level_refs: Vec<&[ydr_write::NewMesh]> = levels.iter().map(Vec::as_slice).collect();
-    let file = ydr_write::replace_lods(&template, &level_refs, Some(&materials), donor.as_ref())?;
-    // What the game will read: check it reads back.
-    let check = ydr_write::read_back(&file)?;
-    let vertices: usize = check.meshes.iter().map(|m| m.positions.len()).sum();
-    let triangles: usize = check.meshes.iter().map(|m| m.indices.len() / 3).sum();
-    outln!(
-        "{} detail level(s); closest: {} meshes, {vertices} vertices, {triangles} triangles ({})",
-        levels.len(),
-        check.meshes.len(),
-        human(file.len() as u64)
-    );
+    if !imported.unplaced.is_empty() {
+        outln!("left out (named after no drawable; --drawable picks one for them): {}", imported.unplaced.join(", "));
+    }
+    let file = imported.file;
+    let back = rage_resource::Resource::from_rsc7(&file)?;
+    for t in imported.targets.iter().filter(|t| !t.materials.is_empty()) {
+        let check = ydr_write::read_at(&back, t.place)?;
+        let vertices: usize = check.meshes.iter().map(|m| m.positions.len()).sum();
+        let triangles: usize = check.meshes.iter().map(|m| m.indices.len() / 3).sum();
+        let what =
+            if several { format!("{}: ", t.names.first().map_or("body", String::as_str)) } else { String::new() };
+        outln!("{what}closest level: {} meshes, {vertices} vertices, {triangles} triangles", check.meshes.len());
+    }
+    outln!("{} detail level(s), {}", imported.levels, human(file.len() as u64));
+    let file = match o.collision {
+        Some(col) => with_collision(game_dir, vpath, &back, true, col, keys.clone())?,
+        None => file,
+    };
+    save_model(game_dir, vpath, obj, file, &o, keys)
+}
+
+/// `file` (the model built from `obj`) to `--out` and/or the mods folder.
+fn save_model(
+    game_dir: &Path,
+    vpath: &str,
+    obj: &Path,
+    file: Vec<u8>,
+    o: &ReplaceOptions,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
     if let Some(out) = o.out {
         fs::write(out, &file).with_context(|| format!("writing {}", out.display()))?;
         outln!("Saved {}", out.display());
@@ -312,6 +352,41 @@ pub(crate) fn cmd_replace_model(
         cmd_edit(game_dir, vpath, Op::Set(file), &format!("Replaced the meshes of {vpath} with {name}"), keys)?;
     }
     Ok(())
+}
+
+/// `res` (a `.ybn`, or a `.ydr` with `ydr`) with its collision built from
+/// the OBJ file `col`.
+fn with_collision(
+    game_dir: &Path,
+    vpath: &str,
+    res: &rage_resource::Resource,
+    ydr: bool,
+    col: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<Vec<u8>> {
+    use rage_formats::ybn_write;
+    let text = fs::read_to_string(col).with_context(|| format!("reading {}", col.display()))?;
+    let meshes = openrage_app::obj::read(&text).with_context(|| format!("reading {}", col.display()))?;
+    let names = openrage_app::models::collision_material_names(game_dir, keys.clone());
+    let (mesh, matched) = openrage_app::obj::collision_mesh(&meshes, names);
+    for (material, name) in &matched {
+        match name {
+            Some(n) => outln!("collision material {material:<20} → {n}"),
+            None => outln!("collision material {material:<20} → the original's first (no such collision material)"),
+        }
+    }
+    let donor = (!ybn_write::can_donate(res, ydr))
+        .then(|| openrage_app::obj::find_collision_donor(game_dir, vpath, keys))
+        .flatten();
+    let file = ybn_write::replace_collision(res, ydr, &mesh, donor.as_ref().map(|(r, y)| (r, *y)))?;
+    let back = rage_resource::Resource::from_rsc7(&file)?;
+    let at = ybn_write::collision_of(&back, ydr)?;
+    for b in ybn_write::bvh_bounds(&back, at) {
+        ybn_write::check_bvh(&back, b).context("the written collision")?;
+    }
+    let (_, stats) = rage_formats::ybn::parse_at(&back, at).context("the written collision does not read back")?;
+    outln!("collision: {} triangles, {} vertices", stats.triangles, stats.vertices);
+    Ok(file)
 }
 
 pub(crate) fn cmd_put(game_dir: &Path, file: &Path, target: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {

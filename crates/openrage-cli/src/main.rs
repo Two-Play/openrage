@@ -182,6 +182,9 @@ fn run() -> Result<()> {
         Command::Verify { path, scripts: true, .. } => cmd_verify_scripts(&game_dir, &path, keys),
         Command::Verify { path, paths: true, .. } => cmd_verify_paths(&game_dir, &path, keys),
         Command::Verify { path, collisions: true, .. } if gta4 => cmd_verify_gta4_collisions(&game_dir, &path),
+        Command::Verify { path, collisions: true, rebuild: true, .. } => {
+            cmd_verify_collision_writer(&game_dir, &path, keys)
+        }
         Command::Verify { path, collisions: true, .. } => cmd_verify_collisions(&game_dir, &path, keys),
         Command::Verify { path, particles: true, .. } => cmd_verify_particles(&game_dir, &path, keys),
         Command::Verify { path, text: true, .. } if gta4 => cmd_verify_gta4_text(&game_dir, &path),
@@ -223,8 +226,16 @@ fn run() -> Result<()> {
         Command::ImportOpenformats { path, file, out, mods } => {
             cmd_import_openformats(&game_dir, &path, &file, out.as_deref(), mods, keys)
         }
-        Command::ReplaceModel { path, obj, out, mods, shader, lod, no_textures } => {
-            let options = ReplaceOptions { out: out.as_deref(), mods, shader, lods: &lod, textures: !no_textures };
+        Command::ReplaceModel { path, obj, out, mods, shader, lod, no_textures, drawable, collision } => {
+            let options = ReplaceOptions {
+                out: out.as_deref(),
+                mods,
+                shader,
+                lods: &lod,
+                textures: !no_textures,
+                drawable: drawable.as_deref(),
+                collision: collision.as_deref(),
+            };
             cmd_replace_model(&game_dir, &path, &obj, options, keys)
         }
         Command::World { x, y, z, radius } => {

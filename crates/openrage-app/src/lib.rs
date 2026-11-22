@@ -38,6 +38,7 @@ pub mod suggest;
 pub mod texttable;
 pub mod textures;
 pub mod tint;
+pub mod vehicle_mods;
 pub mod world;
 pub mod xmltree;
 
