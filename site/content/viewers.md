@@ -20,6 +20,7 @@ Texture dictionaries (`.ytd`) open like folders: double-click one to list its te
 - Selecting a texture shows it in the preview; selecting a `.ytd` previews its first texture.
 - **Extract…** writes DDS files exactly like OpenIV and CodeWalker (DX10 headers for BC7 and other modern formats).
 - **Save PNG…** writes images.
+- **Export openFormats…** on a `.ytd` writes it as OpenIV's `.otd` with a `.dds` and `.otx` per texture.
 - With nothing selected, the whole dictionary is exported into a folder named after it.
 
 ### Supported layouts
@@ -64,6 +65,13 @@ software fallback.
 
 **Export glTF…** writes a binary glTF 2.0 file (`.glb`) with one node per shown part and the textures embedded.
 Blender and most other 3D tools open it directly.
+
+**Export openFormats…** (right-click a `.ydr`, `.yft`, `.ydd` or `.ytd`) writes OpenIV's text formats: `.odr`
+(drawable), `.oft` (fragment), `.odd` (drawable dictionary) or `.otd` (texture dictionary), with the meshes (`.mesh`),
+the skeleton (`.skel`) and the textures (`.otx` with a `.dds` each) in a folder named after the file. Every shader with
+its parameters, every detail level, every geometry with all its vertex data (positions, bone weights, colours, all
+texture coordinates, tangents) is in there, readable and editable as text, and the files go back into the game with
+**Import openFormats…** (see [Modding](@/modding.md#openformats-openiv)).
 
 ## Animations
 

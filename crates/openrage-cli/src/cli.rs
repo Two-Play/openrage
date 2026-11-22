@@ -107,6 +107,12 @@ pub(crate) enum Command {
         /// as it should, undo the edit and check that the copy is the original again.
         #[arg(long)]
         rebuild: bool,
+        /// With --models: write every model (.ydr, .yft, .ydd) and texture dictionary (.ytd) as
+        /// OpenIV openFormats text and read it back, checking that nothing changes; GTA V
+        /// Enhanced drawables and fragments are also imported back onto themselves (meshes
+        /// written anew) and must read back as the original.
+        #[arg(long, requires = "models")]
+        openformats: bool,
     },
     /// Convert a metadata file (.ymap, .ytyp, .ymt, .ymf, .cut, .pso) to XML.
     Xml {
@@ -298,6 +304,31 @@ pub(crate) enum Command {
         /// original (OBJ materials named like a collision material, e.g. CONCRETE, get it).
         #[arg(long, value_name = "OBJ")]
         collision: Option<PathBuf>,
+    },
+    /// Export a model or texture dictionary as OpenIV openFormats text files: .ydr → .odr,
+    /// .yft → .oft, .ydd → .odd, .ytd → .otd, with meshes (.mesh), skeletons (.skel) and
+    /// textures (.otx + .dds) in a folder named after the file.
+    ExportOpenformats {
+        /// The file in the game, e.g. `x64i.rpf/levels/gta5/props/…/prop_x.ydr`.
+        path: String,
+        /// Folder to write into.
+        #[arg(short, long, default_value = ".")]
+        out: PathBuf,
+    },
+    /// Import openFormats files (.odr, .oft, .otd) onto the game file they belong to: its
+    /// meshes, detail levels and embedded textures (dictionaries: textures) are replaced, its
+    /// shaders, skeleton and physics stay. GTA V Enhanced models; texture dictionaries of both.
+    ImportOpenformats {
+        /// The file in the game, e.g. `x64i.rpf/levels/gta5/props/…/prop_x.ydr`.
+        path: String,
+        /// The main openFormats file (`prop_x.odr`).
+        file: PathBuf,
+        /// Write the new game file to this file.
+        #[arg(short, long, required_unless_present = "mods")]
+        out: Option<PathBuf>,
+        /// Put the new file into the mods folder in place of the original (can be undone).
+        #[arg(long, conflicts_with = "out")]
+        mods: bool,
     },
     /// Show a model (.ydr, .yft, .ydd; GTA IV .wdr, .wft, .wdd) and optionally export it as glTF (.glb).
     Model {

@@ -24,6 +24,7 @@ pub mod models;
 pub mod natives;
 pub mod obj;
 pub mod oiv;
+pub mod openformats;
 pub mod palette;
 pub mod paths;
 pub mod plugins;
