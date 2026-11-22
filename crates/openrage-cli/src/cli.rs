@@ -96,6 +96,8 @@ pub(crate) enum Command {
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
         /// With --models: write every GTA V Enhanced drawable (.ydr) anew with its own meshes and
         /// check that it reads back identically.
+        /// With --meta: convert every PSO file (.ymt, .ymf, .pso, …) to XML and back, and check
+        /// that it comes out byte for byte the same or at least reads back to the same XML.
         /// GTA IV without --textures: rebuild the table of every .rpf package in memory and
         /// check that it matches the stored one byte for byte (nothing is written).
         #[arg(long)]
@@ -208,6 +210,10 @@ pub(crate) enum Command {
         /// Instead of only reading files, convert all metadata (.ymap, .ytyp, .ymt, .ymf) to XML.
         #[arg(long, conflicts_with_all = ["textures", "models", "text"])]
         meta: bool,
+        /// With --meta: convert every PSO file to XML and back, and check that it comes out the
+        /// same bytes or at least reads back to the same XML.
+        #[arg(long, requires = "meta")]
+        rebuild: bool,
         /// Instead of only reading files, decode every sound of every audio container.
         #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta"])]
         audio: bool,

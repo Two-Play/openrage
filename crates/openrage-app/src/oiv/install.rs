@@ -3,20 +3,20 @@
 //! The same walk over the package script runs in two modes: a dry run that
 //! reads everything and reports what would happen (and what cannot work), and
 //! the real installation. Archive changes are batched per top-level archive
-//! and written with the in-place editor; text and XML edits read the current
-//! file (including earlier changes of the same package). All journal entries
+//! and written with the in-place editor; text, XML and PSO edits read the
+//! current file (including earlier changes of the same package). All journal entries
 //! carry the package's group, so the package can be uninstalled as a whole.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rage_crypto::GtaVKeys;
 use rage_rpf::ArchiveWriter;
 use rage_rpf::vfs::{self, Node};
 
-use super::package::{Command, Package};
+use super::package::{Command, Package, XmlCmd};
 use super::{text, xml};
 use crate::install::{self, Op};
 use crate::journal::{Entry, Journal};
@@ -55,8 +55,11 @@ fn norm(p: &str) -> String {
 fn escaping_path(cmd: &Command) -> Option<&str> {
     let raw = match cmd {
         Command::Add { target, .. } | Command::Delete { target } => target,
-        Command::Archive { path, .. } | Command::Text { path, .. } | Command::Xml { path, .. } => path,
-        Command::Pso { .. } | Command::Defragment { .. } => return None,
+        Command::Archive { path, .. }
+        | Command::Text { path, .. }
+        | Command::Xml { path, .. }
+        | Command::Pso { path, .. } => path,
+        Command::Defragment { .. } => return None,
     };
     let n = norm(raw);
     (!n.is_empty() && vfs::safe_relative_path(&n).is_none()).then_some(raw.as_str())
@@ -67,6 +70,16 @@ fn join(a: &str, b: &str) -> String {
         (true, _) => b.to_owned(),
         (_, true) => a.to_owned(),
         _ => format!("{a}/{b}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn xpath_literals() {
+        assert_eq!(super::quoted("/A/Item[Name = 'adder']/B[@x=\"1\"]"), ["adder", "1"]);
+        assert!(super::quoted("/A/B").is_empty());
+        assert_eq!(super::changed_lines("a\n b\nc", "a\nb\nd\ne"), (2, 1));
     }
 }
 
@@ -348,10 +361,19 @@ impl Run<'_> {
                     self.step("Edit", &vpath, format!("{} XML command(s)", commands.len()));
                     self.write_edited(scope, path, encode(&doc, enc))?;
                 }
-                Command::Pso { path } => {
-                    self.report
-                        .blockers
-                        .push(format!("{}: PSO/META edits are not supported yet", Self::vpath(scope, path)));
+                Command::Pso { path, commands } => {
+                    let vpath = Self::vpath(scope, path);
+                    let Some(bytes) = self.read(&vpath) else {
+                        self.report.blockers.push(format!("PSO file {vpath} does not exist"));
+                        continue;
+                    };
+                    match edit_pso(&bytes, commands) {
+                        Ok((data, detail)) => {
+                            self.step("Edit", &vpath, detail);
+                            self.write_edited(scope, path, data)?;
+                        }
+                        Err(e) => self.report.blockers.push(format!("{vpath}: {e:#}")),
+                    }
                 }
                 Command::Defragment { archive } => {
                     self.report.warnings.push(format!("defragmentation of {archive} skipped (only saves disk space)"));
@@ -360,6 +382,66 @@ impl Run<'_> {
         }
         Ok(())
     }
+}
+
+/// Applies XML edits to a PSO file: converts it to XML, edits that, and
+/// writes it back with the file's own schema. Returns the new file and a
+/// summary of the change for the preview.
+fn edit_pso(bytes: &[u8], commands: &[XmlCmd]) -> Result<(Vec<u8>, String)> {
+    use rage_formats::pso;
+    if !pso::is_pso(bytes) {
+        bail!("not a PSO file (only PSO metadata can be edited with <pso>; resource metadata cannot yet)");
+    }
+    // Hashes print as names only when the name is known: names the XPaths
+    // compare with (`Item[Name = 'adder']`) are made known first, so they
+    // select what the author meant.
+    rage_formats::names::register(commands.iter().flat_map(|c| {
+        let xpath = match c {
+            XmlCmd::Add { xpath, .. } | XmlCmd::Replace { xpath, .. } | XmlCmd::Remove { xpath } => xpath,
+        };
+        quoted(xpath)
+    }));
+    let file = pso::parse(bytes)?;
+    let (before, problems) = file.to_xml_with_limit(1 << 30);
+    if let Some(p) = problems.first() {
+        bail!("parts of the file cannot be read ({p}), so it cannot be written back safely");
+    }
+    let mut doc = before.clone();
+    for c in commands {
+        doc = xml::apply(&doc, c)?;
+    }
+    let data = file.from_xml(&doc).context("the edited XML does not fit the file's structure")?;
+    let (added, removed) = changed_lines(&before, &doc);
+    let detail = format!("{} XML command(s) on the PSO data: {added} line(s) added, {removed} removed", commands.len());
+    Ok((data, detail))
+}
+
+/// The quoted literals of an XPath (`'…'` or `"…"`).
+fn quoted(xpath: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = xpath;
+    while let Some(start) = rest.find(['\'', '"']) {
+        let q = &rest[start..start + 1];
+        let Some(len) = rest[start + 1..].find(q) else { break };
+        out.push(rest[start + 1..start + 1 + len].to_owned());
+        rest = &rest[start + 2 + len..];
+    }
+    out
+}
+
+/// Lines only in `after` and lines only in `before` (counted with repeats).
+fn changed_lines(before: &str, after: &str) -> (usize, usize) {
+    let mut count: HashMap<&str, isize> = HashMap::new();
+    // Trimmed, so that re-indented lines do not count as changed.
+    for l in before.lines() {
+        *count.entry(l.trim()).or_default() -= 1;
+    }
+    for l in after.lines() {
+        *count.entry(l.trim()).or_default() += 1;
+    }
+    let added = count.values().filter(|n| **n > 0).map(|n| *n as usize).sum();
+    let removed = count.values().filter(|n| **n < 0).map(|n| n.unsigned_abs()).sum();
+    (added, removed)
 }
 
 fn run(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, pkg: &Package, dry: bool) -> Result<Report> {
