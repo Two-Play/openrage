@@ -1531,6 +1531,8 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
     // The rest from shared dictionaries elsewhere, through the texture index.
     if let Some(game) = crate::rdr2::game_folder(rpf.path()) {
         rdr2_shared_textures(&game, &drawables, &mut external, 32);
+        // Palette shaders: colours from the palettes (vehicles: their first variation).
+        crate::palette::apply(&crate::palette::carvariations(&game), &stem, &mut drawables, &mut external);
     }
     let skeleton = base.or_else(|| drawables.iter().find_map(|(_, d)| d.skeleton.clone()));
     let mut model = LoadedModel {

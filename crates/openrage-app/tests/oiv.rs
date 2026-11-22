@@ -18,9 +18,33 @@ fn fake_game(name: &str) -> PathBuf {
     w.add_file("common/data/dlclist.xml", DLCLIST.as_bytes().to_vec()).unwrap();
     w.add_file("common/data/settings.txt", b"a=1\nb=2\n".to_vec()).unwrap();
     w.add_file("common/data/old.dat", b"old".to_vec()).unwrap();
+    w.add_file("common/data/peds.ymt", tiny_pso()).unwrap();
     std::fs::write(root.join("update/update.rpf"), w.build().unwrap()).unwrap();
     std::fs::write(root.join("GTA5.exe"), b"").unwrap();
     root
+}
+
+/// A PSO file like the game's: a list of two items (a hash and a float each),
+/// the items in block 1 and the root structure in block 2.
+fn tiny_pso() -> Vec<u8> {
+    use rage_core::hash::{jenkins_bytes, joaat};
+    let h = |name: &str| jenkins_bytes(name.as_bytes());
+    let (root, item) = (h("CPedModelInfo__InitDataList"), h("CPedModelInfo__InitData"));
+    let be = |values: &[u32]| values.iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<u8>>();
+    let mut psin = b"PSIN\0\0\0\0pppppppp".to_vec();
+    psin.extend(be(&[joaat("adder"), 1.5f32.to_bits(), joaat("banshee"), 2f32.to_bits()]));
+    psin.extend(be(&[1, 0, 0x0002_0002, 0])); // pointer to block 1, count and capacity 2
+    psin[4..8].copy_from_slice(&48u32.to_be_bytes());
+    let mut pmap = b"PMAP".to_vec();
+    pmap.extend(be(&[48, 2, 0x0002_7070, item, 16, 0, 16, root, 32, 0, 16]));
+    // Structure infos: entry count, length, 0, then (name, type << 24 | subtype << 16 | offset, key).
+    let root_info = be(&[2, 16, 0, 0x100, 0x0c00_0000, item, h("InitDatas"), 0x0d00_0000, 0]);
+    let item_info = be(&[2, 8, 0, h("Name"), 0x0b07_0000, 0, h("Radius"), 0x0700_0004, 0]);
+    let mut psch = b"PSCH".to_vec();
+    psch.extend(be(&[28 + 36 + 36, 2, root, 28, item, 28 + 36]));
+    psch.extend(root_info);
+    psch.extend(item_info);
+    [psin, pmap, psch].concat()
 }
 
 fn package(assembly: &str, files: &[(&str, &[u8])]) -> Package {
@@ -65,6 +89,17 @@ const ASSEMBLY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
         <replace line="b=" condition="StartWith">b=42</replace>
         <add>c=3</add>
       </text>
+      <pso path="common\data\peds.ymt">
+        <replace xpath="/CPedModelInfo__InitDataList/InitDatas/Item[Name = 'banshee']/Radius">
+          <Radius value="4.5" />
+        </replace>
+        <add xpath="/CPedModelInfo__InitDataList/InitDatas" append="Last">
+          <Item>
+            <Name>zentorno</Name>
+            <Radius value="3" />
+          </Item>
+        </add>
+      </pso>
       <xml path="common\data\dlclist.xml">
         <add xpath="/SMandatoryPacksData/Paths" append="Last">
           <Item>dlcpacks:/testmod/</Item>
@@ -92,6 +127,8 @@ fn installs_and_uninstalls() {
     assert!(actions.contains(&"Add plugin.asi".to_owned()), "{actions:?}");
     assert!(actions.contains(&"Delete update/update.rpf/common/data/old.dat".to_owned()));
     assert!(actions.contains(&"Create update/x64/dlcpacks/testmod/dlc.rpf".to_owned()));
+    let pso_step = plan.steps.iter().find(|s| s.target.ends_with("peds.ymt")).expect("PSO edit planned");
+    assert_eq!(pso_step.detail, "2 XML command(s) on the PSO data: 5 line(s) added, 1 removed");
     // The dry run changed nothing.
     assert!(!game.join("mods").exists() && !game.join("plugin.asi").exists());
 
@@ -107,6 +144,11 @@ fn installs_and_uninstalls() {
         "{dlclist}"
     );
     assert_eq!(read(&game, "update/x64/dlcpacks/testmod/dlc.rpf/setup2.xml").unwrap(), b"<setup/>");
+    let peds = read(&game, "update/update.rpf/common/data/peds.ymt").unwrap();
+    let (xml, errors) = rage_formats::pso::to_xml(&peds).unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(xml.contains("<Radius value=\"4.5\" />") && xml.contains("<Radius value=\"1.5\" />"), "{xml}");
+    assert_eq!(xml.matches("<Item>").count(), 3, "{xml}");
     assert_eq!(std::fs::read(game.join("update/update.rpf")).unwrap(), original, "game archive untouched");
 
     let undone = uninstall(&game, "Test Mod 1.0").unwrap();
@@ -115,6 +157,7 @@ fn installs_and_uninstalls() {
     assert!(!game.join("mods/update/x64/dlcpacks/testmod/dlc.rpf").exists());
     assert!(!game.join("mods/update/update.rpf").exists());
     assert_eq!(read(&game, "update/update.rpf/common/data/old.dat").unwrap(), b"old");
+    assert_eq!(read(&game, "update/update.rpf/common/data/peds.ymt").unwrap(), tiny_pso());
 }
 
 #[test]
@@ -124,7 +167,7 @@ fn reports_blockers() {
         r#"createIfNotExist="False" type="RPF7">
       <add source="water.xml">"#,
         r#"createIfNotExist="False" type="RPF7">
-      <pso path="x.ymt"/>
+      <pso path="x.ymt"><remove xpath="/A"/></pso>
       <add source="water.xml">"#,
     );
     let pkg = package(&bad, &[("plugin.asi", b"ASI")]);

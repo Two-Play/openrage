@@ -51,6 +51,12 @@ pub(crate) fn load_ytd(
                 .with_context(|| format!("{path} has no textures of its own"))
         }
         Node::Gta4File(a, id) => Ok(rage_formats::ytd::parse_gta4(&a.read_resource(id)?)?),
+        // An RDR2 dictionary replaced in lml/replace (an RSC8 file).
+        Node::PlainFile(p) => {
+            let res = rage_rpf::rpf8::parse_resource_file(&std::fs::read(&p)?)
+                .with_context(|| format!("{path} is not a file inside an archive or an RSC8 resource"))?;
+            Ok(rage_formats::ytd::parse_rdr2(&res)?)
+        }
         _ => bail!("{path} is not a file inside an archive"),
     }
 }
@@ -137,7 +143,7 @@ pub(crate) fn cmd_edit_textures(
 
 pub(crate) fn report(applied: &install::Applied, started: Instant) {
     if applied.created {
-        outln!("Copied the archive into the overlay folder first (mods; GTA IV: update).");
+        outln!("Copied the archive into the overlay folder first (mods; GTA IV: update; RDR2: lml/replace).");
     }
     outln!(
         "Written to {} ({} appended{}, {:.2}s). Undo with `openrage undo`.",

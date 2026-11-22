@@ -1069,6 +1069,103 @@ pub(crate) fn cmd_verify_meta(game_dir: &Path, within: &str, keys: Option<Arc<Gt
     Ok(())
 }
 
+/// What converting one PSO file to XML and back gave.
+pub(crate) enum PsoRoundTrip {
+    /// The same bytes.
+    Identical,
+    /// Other bytes that read back to the same XML.
+    SameXml,
+    /// The original has parts that cannot be read, so its XML is incomplete.
+    Unreadable,
+}
+
+/// Converts a PSO file to XML and back, and compares.
+pub(crate) fn pso_round_trip(data: &[u8], rdr2: bool) -> Result<PsoRoundTrip, String> {
+    use rage_formats::pso;
+    let parse = |d: &[u8]| if rdr2 { pso::parse_rdr2(d) } else { pso::parse(d) };
+    let original = parse(data).map_err(|e| e.to_string())?;
+    let (xml, problems) = original.to_xml_with_limit(1 << 30);
+    if !problems.is_empty() {
+        return Ok(PsoRoundTrip::Unreadable);
+    }
+    let written = original.from_xml(&xml).map_err(|e| format!("writing: {e}"))?;
+    if written == data {
+        return Ok(PsoRoundTrip::Identical);
+    }
+    let (again, problems) = parse(&written).map_err(|e| format!("reading back: {e}"))?.to_xml_with_limit(1 << 30);
+    if let Some(p) = problems.first() {
+        return Err(format!("reading back: {p}"));
+    }
+    if again != xml {
+        let line = xml.lines().zip(again.lines()).position(|(a, b)| a != b).unwrap_or(0);
+        let show = |t: &str| t.lines().nth(line).unwrap_or("(end)").trim().chars().take(120).collect::<String>();
+        return Err(format!("XML differs at line {}: {} → {}", line + 1, show(&xml), show(&again)));
+    }
+    Ok(PsoRoundTrip::SameXml)
+}
+
+pub(crate) fn cmd_verify_pso_rebuild(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let starts = archive_roots(game_dir, within, keys)?;
+    let started = Instant::now();
+    // Per archive: identical, same XML, unreadable, errors.
+    let all: Vec<(usize, usize, usize, Vec<String>)> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let (mut same, mut xml, mut unreadable, mut errors) = (0, 0, 0, Vec::new());
+            let mut nested = Vec::new();
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    let e = a.entry(id);
+                    if e.is_dir() || e.is_archive() || e.resource_version().is_some() {
+                        return;
+                    }
+                    if !openrage_app::metadata::is_metadata(&e.name) {
+                        return;
+                    }
+                    let data = match a.read(id) {
+                        Ok(d) => d,
+                        Err(err) => return errors.push(format!("{p}: {err}")),
+                    };
+                    if !rage_formats::pso::is_pso(&data) {
+                        return;
+                    }
+                    match pso_round_trip(&data, false) {
+                        Ok(PsoRoundTrip::Identical) => same += 1,
+                        Ok(PsoRoundTrip::SameXml) => xml += 1,
+                        Ok(PsoRoundTrip::Unreadable) => unreadable += 1,
+                        Err(err) => errors.push(format!("{p}: {err}")),
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (same, xml, unreadable, errors)
+        })
+        .collect();
+    let same: usize = all.iter().map(|x| x.0).sum();
+    let xml: usize = all.iter().map(|x| x.1).sum();
+    let unreadable: usize = all.iter().map(|x| x.2).sum();
+    let errors: Vec<&String> = all.iter().flat_map(|x| &x.3).collect();
+    for e in errors.iter().take(40) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} PSO files: {same} identical, {xml} with other bytes but the same XML, {unreadable} not fully readable \
+         (skipped), {} errors ({:.1}s)",
+        same + xml + unreadable + errors.len(),
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() {
+        bail!("{} PSO files do not convert back", errors.len());
+    }
+    Ok(())
+}
+
 pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
 }
