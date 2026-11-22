@@ -145,6 +145,15 @@ Packages of format 2.x:
 | Archives | new archives and DLC packs (`createIfNotExist`) |
 | Text edits | `add`, `insert`, `replace`, `delete` with Equal, StartWith or Mask |
 | XML edits | by XPath: `add` (First, Last, Before, After), `replace`, `remove`, keeping the formatting |
+| PSO edits | `<pso>`: binary metadata (`.ymt`, `.ymf`, `.ytyp`, … in PSO form) is converted to XML, edited with the same commands as `<xml>`, and written back as PSO |
+
+PSO edits work on the XML OpenRAGE shows for the file (**View as XML**, `openrage xml`), the same as CodeWalker's:
+hashes appear as their names where the name is known, otherwise as `hash_XXXXXXXX`; names that an XPath compares with
+(`Item[modelName = 'adder']`) are always recognised. The file keeps its own structure definitions, so the edit can
+change values and add or remove items, but not invent fields the file's structures do not have; the preview says so
+before anything is written. Written back unchanged, 80% of GTA V's PSO files come out byte for byte the same and every
+one reads back to the same XML (`openrage verify --meta --rebuild`); the rest differ only in bytes the XML does not
+carry, such as the unused fourth number of a 3D vector.
 
 ### Uninstalling
 
@@ -152,7 +161,8 @@ Every installed package can be **uninstalled** from **History** (or `openrage oi
 
 ### Not supported yet
 
-`<pso>` edits: such packages are refused with an explanation. `<defragmentation>` is skipped, as it only saves disk space.
+`<pso>` edits of metadata in resource form (`RSC7` `.ymt` files such as ped variations) are refused with an
+explanation; only PSO files can be edited that way. `<defragmentation>` is skipped, as it only saves disk space.
 
 ## ASI mods (GTA V)
 

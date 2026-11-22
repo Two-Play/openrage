@@ -4550,6 +4550,7 @@ dependencies = [
  "png",
  "rage-core",
  "rage-resource",
+ "roxmltree",
  "symphonia",
  "texpresso",
  "texture2ddecoder",

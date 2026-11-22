@@ -9,12 +9,14 @@ pub(crate) struct Checks {
     pub(crate) models: bool,
     pub(crate) texts: bool,
     pub(crate) meta: bool,
+    /// With `meta`: convert every PSO file to XML and back instead.
+    pub(crate) rebuild: bool,
     pub(crate) audio: bool,
     pub(crate) anims: bool,
 }
 
 pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
-    let Checks { textures, models, texts: text, meta, audio, anims } = checks;
+    let Checks { textures, models, texts: text, meta, rebuild, audio, anims } = checks;
     use rage_rpf::rpf8::{Compression, Rpf8};
     let keys = openrage_app::rdr2::load_keys()?;
     let start = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
@@ -49,6 +51,9 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
         textures: usize,
         /// Triangles of the models, or strings of the text tables.
         triangles: usize,
+        /// PSO files rebuilt byte for byte, and ones not fully readable.
+        identical: usize,
+        unreadable: usize,
         lines: Vec<String>,
     }
     /// Parses a texture dictionary and decodes all its textures; returns how many.
@@ -129,7 +134,7 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
         Ok(Some((awc.sounds.len(), secs)))
     }
     fn walk(rpf: &Rpf8, depth: usize, list: bool, checks: Checks, t: &mut Tally) {
-        let Checks { textures, models, texts, meta, audio, anims } = checks;
+        let Checks { textures, models, texts, meta, rebuild, audio, anims } = checks;
         let h = rpf.header();
         let Some(entries) = rpf.entries() else { return };
         t.readable += 1;
@@ -192,6 +197,32 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
                             t.triangles += secs.round() as usize;
                         }
                         Ok(None) => {}
+                        Err(err) => {
+                            t.failed += 1;
+                            t.lines.push(format!("{indent}{name}: {err}"));
+                        }
+                    }
+                }
+            } else if meta && rebuild {
+                if matches!(e.ext_id, 1 | 11 | 73 | 74) && !e.is_resource {
+                    let result = rpf.read(e).map_err(|err| err.to_string()).and_then(|d| {
+                        if rage_formats::pso::is_pso(&d) {
+                            super::verify::pso_round_trip(&d, true).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    });
+                    use super::verify::PsoRoundTrip;
+                    match result {
+                        Ok(None) => {}
+                        Ok(Some(r)) => {
+                            t.textures += 1;
+                            match r {
+                                PsoRoundTrip::Identical => t.identical += 1,
+                                PsoRoundTrip::SameXml => {}
+                                PsoRoundTrip::Unreadable => t.unreadable += 1,
+                            }
+                        }
                         Err(err) => {
                             t.failed += 1;
                             t.lines.push(format!("{indent}{name}: {err}"));
@@ -307,6 +338,7 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
     let (mut ok, mut nested, mut plain, mut entries_total, mut failed, mut empty) = (0, 0, 0, 0usize, 0, 0);
     let mut textures_total = 0;
     let mut triangles_total = 0;
+    let (mut identical, mut unreadable) = (0, 0);
     for (_, t) in &tallies {
         for l in &t.lines {
             outln!("{l}");
@@ -321,6 +353,8 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
         failed += t.failed;
         textures_total += t.textures;
         triangles_total += t.triangles;
+        identical += t.identical;
+        unreadable += t.unreadable;
     }
     if textures {
         outln!("\n{textures_total} textures decoded");
@@ -331,7 +365,13 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
     if text {
         outln!("\n{textures_total} text tables read ({triangles_total} strings)");
     }
-    if meta {
+    if meta && rebuild {
+        outln!(
+            "\n{textures_total} PSO files converted to XML and back: {identical} identical, {} with other bytes but \
+             the same XML, {unreadable} not fully readable (skipped)",
+            textures_total - identical - unreadable
+        );
+    } else if meta {
         outln!("\n{textures_total} metadata files converted ({triangles_total} parts not read)");
     }
     if audio {

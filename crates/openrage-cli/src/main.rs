@@ -107,12 +107,17 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    if let Command::Rpf8 { path, list, textures, models, text, meta, audio, anims } = &cli.command {
-        return cmd_rpf8(
-            path,
-            *list,
-            Checks { textures: *textures, models: *models, texts: *text, meta: *meta, audio: *audio, anims: *anims },
-        );
+    if let Command::Rpf8 { path, list, textures, models, text, meta, rebuild, audio, anims } = &cli.command {
+        let checks = Checks {
+            textures: *textures,
+            models: *models,
+            texts: *text,
+            meta: *meta,
+            rebuild: *rebuild,
+            audio: *audio,
+            anims: *anims,
+        };
+        return cmd_rpf8(path, *list, checks);
     }
     // Managing plugins needs no game; previews and actions use it when there is one.
     if let Command::Plugin(cmd) = &cli.command
@@ -179,6 +184,7 @@ fn run() -> Result<()> {
         Command::Verify { path, particles: true, .. } => cmd_verify_particles(&game_dir, &path, keys),
         Command::Verify { path, text: true, .. } if gta4 => cmd_verify_gta4_text(&game_dir, &path),
         Command::Verify { path, text: true, .. } => cmd_verify_text(&game_dir, &path, keys),
+        Command::Verify { path, meta: true, rebuild: true, .. } => cmd_verify_pso_rebuild(&game_dir, &path, keys),
         Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
         Command::Verify { path, cutscenes: true, .. } if gta4 => cmd_verify_gta4_cutscenes(&game_dir, &path),
         Command::Verify { cutscenes: true, .. } => bail!("--cutscenes checks GTA IV cutscenes; this is not GTA IV"),

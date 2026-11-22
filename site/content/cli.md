@@ -94,6 +94,7 @@ openrage rdr2-names <RDR2>                     # find RDR2 file names in the gam
 openrage rpf8 --list <RDR2>/common_0.rpf       # RDR2 archive contents
 openrage rpf8 --text <RDR2>                    # read every RDR2 text table (.yldb)
 openrage rpf8 --meta <RDR2>                    # convert all RDR2 metadata (.ymap, .ytyp, .ymt, .ymf) to XML
+openrage rpf8 --meta --rebuild <RDR2>          # every RDR2 PSO file → XML → PSO, compared
 openrage rpf8 --audio <RDR2>/x64/audio        # decode every RDR2 sound
 openrage rpf8 --anims <RDR2>/anim_0.rpf       # read every RDR2 clip dictionary
 openrage --game <RDR2> rdr2-ped                # list the RDR2 peds (people and animals) with their base skeletons
@@ -175,6 +176,7 @@ openrage verify --models --rebuild             # write every Enhanced .ydr anew 
 openrage verify --audio                        # decode every sound of the game
 openrage verify --animations                   # parse every clip dictionary, evaluate all frames
 openrage verify --meta                         # convert every metadata file of the game
+openrage verify --meta --rebuild               # every PSO file → XML → PSO, same bytes or at least the same XML
 openrage verify --text                         # every .gxt2/.nametable → text → back, identical
 openrage verify --particles                    # parse every particle dictionary
 openrage verify --collisions                   # build the meshes of every collision file

@@ -305,7 +305,7 @@ Every format is verified against the complete game (GTA V Enhanced):
 | Models (`.ydr`, `.yft`, `.ydd`) | 168,779 models | all load (583 million triangles) |
 | Audio (`.awc`) | 7,758 containers, 252,742 sounds | all decode (279.8 hours) |
 | Animations (`.ycd`) | 25,961 dictionaries, 332,771 clips | all evaluate |
-| Metadata (`.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.cut`, `.pso`) | 30,280 files | all convert to XML |
+| Metadata (`.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.cut`, `.pso`) | 30,280 files | all convert to XML; all 4,943 PSO files convert back (3,973 byte-identical, the rest to the same XML) |
 | Text tables (`.gxt2`, `.nametable`) | 19,858 files, 9.16 million strings | text → binary is byte-identical |
 | Particles (`.ypt`) | 1,544 dictionaries, 12,987 effects | all read, incl. 1,694 textures and 1,223 models |
 | Collisions (`.ybn`) | 14,692 files, 70,454 bounds | all read (101 million triangles, 4.7 million shapes) |
