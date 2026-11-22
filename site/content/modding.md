@@ -95,7 +95,8 @@ How it works:
   `openrage undo`), `--out` writes the file elsewhere.
 - **Collisions:** `--collision col.obj` builds a drawable's (`.ydr`) collision from an OBJ model instead of keeping
   the original, and `replace-model …/x.ybn col.obj` replaces a collision file's. Every triangle goes into one
-  triangle mesh with a bounding volume hierarchy, built the way the game's own are (up to 32,767 triangles). An OBJ
+  triangle mesh with a bounding volume hierarchy, built the way the game's own are (up to 32,767 triangles; vertices on a grid of 1/65,534 of the collision's size,
+  under a centimetre for a 600 m map collision). An OBJ
   material named after a collision material of the game's `materials.dat` (`CONCRETE`, `WOOD_HIGH_DENSITY`, …, any
   case) gets it; others get the original collision's first material. The new collision replaces all parts of the
   original (also its boxes and spheres); it keeps its flags. Vehicles and other fragments (`.yft`) keep their

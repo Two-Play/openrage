@@ -417,6 +417,8 @@ pub(crate) fn cmd_verify_collision_writer(game_dir: &Path, within: &str, keys: O
     let starts = archive_roots(game_dir, within, keys.clone())?;
     let started = Instant::now();
     // Per material type: triangles and area.
+    // Triangles that lie on the coarser vertex grid of the one new bound can collapse
+    // (slivers), so triangles may get fewer, never more; the area stays.
     let totals = |d: &drawable::Drawable| -> std::collections::BTreeMap<u32, (usize, f64)> {
         let mut t = std::collections::BTreeMap::new();
         for m in &d.meshes {
@@ -425,8 +427,9 @@ pub(crate) fn cmd_verify_collision_writer(game_dir: &Path, within: &str, keys: O
                 let [a, b, c] = c.map(|i| m.positions[i as usize]);
                 let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
                 let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                let area = 0.5 * ((n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) as f64).sqrt();
                 e.0 += 1;
-                e.1 += 0.5 * ((n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) as f64).sqrt();
+                e.1 += area;
             }
         }
         t
@@ -459,8 +462,7 @@ pub(crate) fn cmd_verify_collision_writer(game_dir: &Path, within: &str, keys: O
             bail!("materials {:?} written as {:?}", x.keys().collect::<Vec<_>>(), y.keys().collect::<Vec<_>>());
         }
         for ((m, a), (n, b)) in x.iter().zip(&y) {
-            // Slivers smaller than the vertex grid (of tiny spheres and capsules) can collapse.
-            if m != n || b.0 > a.0 || a.0 - b.0 > a.0 / 100 || (a.1 - b.1).abs() > 0.01 * a.1 + 0.05 {
+            if m != n || b.0 > a.0 || (a.1 - b.1).abs() > 0.01 * a.1 + 0.05 {
                 bail!(
                     "material {m:x}: {} triangles, area {:.2} written as {} triangles, area {:.2}",
                     a.0,

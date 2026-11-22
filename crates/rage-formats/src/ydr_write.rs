@@ -903,8 +903,12 @@ fn texture_templates_in(res: &Resource, root: u64) -> Option<(Vec<u8>, Vec<u8>)>
     if count == 0 {
         return None;
     }
-    let first = res.u64(res.u64(root + 0x30).ok()?).ok()?;
-    let texture = res.bytes(first, DictLayout::Enhanced.texture_size()).ok()?.to_vec();
+    // The first texture there is (some dictionaries list empty entries).
+    let list = res.u64(root + 0x30).ok()?;
+    let texture = (0..count as u64)
+        .filter_map(|i| res.u64(list + i * 8).ok().filter(|&t| (SYS..GFX).contains(&t)))
+        .find_map(|t| res.bytes(t, DictLayout::Enhanced.texture_size()).ok())?
+        .to_vec();
     let root = res.bytes(root, DICTIONARY_ROOT_SIZE).ok()?.to_vec();
     Some((root, texture))
 }
