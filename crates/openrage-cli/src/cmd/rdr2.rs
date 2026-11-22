@@ -54,6 +54,9 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
         /// PSO files rebuilt byte for byte, and ones not fully readable.
         identical: usize,
         unreadable: usize,
+        /// Fragment children with meshes (wheels) and cloths.
+        parts: usize,
+        cloths: usize,
         lines: Vec<String>,
     }
     /// Parses a texture dictionary and decodes all its textures; returns how many.
@@ -74,12 +77,19 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
         }
         Ok(dict.textures.len())
     }
-    /// Parses a model; returns its triangle count.
-    fn check_model(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
+    /// Parses a model; returns its triangle count, and for a fragment its
+    /// children with meshes and its cloths.
+    fn check_model(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<(usize, usize, usize), String> {
         use rage_formats::drawable;
         let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
+        let (mut parts, mut cloths) = (0, 0);
         let drawables = match e.ext_id {
-            3 => vec![drawable::parse_fragment_rdr2(&res).map_err(|err| err.to_string())?.drawable],
+            3 => {
+                // The body, the children with meshes (wheels) and the cloth.
+                let f = drawable::parse_fragment_rdr2(&res).map_err(|err| err.to_string())?;
+                (parts, cloths) = (f.children.len(), f.cloths.len());
+                std::iter::once(f.drawable).chain(f.children.into_iter().map(|c| c.drawable)).chain(f.cloths).collect()
+            }
             4 => drawable::parse_ydd_rdr2(&res).map_err(|err| err.to_string())?.into_iter().map(|(_, d)| d).collect(),
             _ => vec![drawable::parse_ydr_rdr2(&res).map_err(|err| err.to_string())?],
         };
@@ -94,7 +104,7 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
                 }
             }
         }
-        Ok(triangles)
+        Ok((triangles, parts, cloths))
     }
     /// Converts a metadata file to XML; returns how many problems it had.
     fn check_meta(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
@@ -249,9 +259,11 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
             } else if models {
                 if matches!(e.ext_id, 2..=4) && e.is_resource {
                     match check_model(rpf, e) {
-                        Ok(n) => {
+                        Ok((n, parts, cloths)) => {
                             t.textures += 1;
                             t.triangles += n;
+                            t.parts += parts;
+                            t.cloths += cloths;
                         }
                         Err(err) => {
                             t.failed += 1;
@@ -339,6 +351,7 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
     let mut textures_total = 0;
     let mut triangles_total = 0;
     let (mut identical, mut unreadable) = (0, 0);
+    let (mut parts_total, mut cloths_total) = (0, 0);
     for (_, t) in &tallies {
         for l in &t.lines {
             outln!("{l}");
@@ -355,12 +368,17 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
         triangles_total += t.triangles;
         identical += t.identical;
         unreadable += t.unreadable;
+        parts_total += t.parts;
+        cloths_total += t.cloths;
     }
     if textures {
         outln!("\n{textures_total} textures decoded");
     }
     if models {
-        outln!("\n{textures_total} models parsed ({triangles_total} triangles)");
+        outln!(
+            "\n{textures_total} models parsed ({triangles_total} triangles; fragments: {parts_total} parts, \
+             {cloths_total} cloths)"
+        );
     }
     if text {
         outln!("\n{textures_total} text tables read ({triangles_total} strings)");

@@ -785,25 +785,30 @@ pub fn parse_ycd_rdr2(res: &Resource) -> Result<ClipDictionary, ResourceError> {
         let name_ptr = res.u64(clip + 0x28)?;
         let name = if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() };
         let name = name.strip_prefix("pack:/").unwrap_or(&name).trim_end_matches(".clip").to_owned();
-        // Parts (played one after another): each a list of animation
-        // layers and a duration. The first layer is the part's animation:
-        // pointer, then start, end and rate at 0x28.
-        let list = res.u64(clip + 0x68)?;
-        let n = res.u16(clip + 0x70)? as u64;
+        // A layer: animation pointer, then start, end and rate at 0x28.
+        let layer = |at: u64| -> Result<Option<ClipPart>, ResourceError> {
+            Ok(index_of(res.u64(at)?).map(|animation| ClipPart {
+                animation,
+                start: f32::from_bits(res.u32(at + 0x28).unwrap_or(0)),
+                end: f32::from_bits(res.u32(at + 0x2C).unwrap_or(0)),
+                rate: f32::from_bits(res.u32(at + 0x30).unwrap_or(0)),
+            }))
+        };
         let mut parts = Vec::new();
-        for i in 0..n.min(256) {
-            let part = list + i * RDR2_CLIP_PART;
-            let (layers, layer_count) = (res.u64(part)?, res.u16(part + 8)?);
-            if layers == 0 || layer_count == 0 {
-                continue;
-            }
-            if let Some(animation) = index_of(res.u64(layers)?) {
-                parts.push(ClipPart {
-                    animation,
-                    start: f32::from_bits(res.u32(layers + 0x28)?),
-                    end: f32::from_bits(res.u32(layers + 0x2C)?),
-                    rate: f32::from_bits(res.u32(layers + 0x30)?),
-                });
+        if res.u32(clip + 0x20)? == RDR2_CLIP_SINGLE {
+            // One animation (props, destruction): the layer is in the clip.
+            parts.extend(layer(clip + 0x68)?);
+        } else {
+            // Parts (played one after another): each a list of animation
+            // layers and a duration. The first layer is the part's animation.
+            let list = res.u64(clip + 0x68)?;
+            let n = res.u16(clip + 0x70)? as u64;
+            for i in 0..n.min(256) {
+                let part = list + i * RDR2_CLIP_PART;
+                let (layers, layer_count) = (res.u64(part)?, res.u16(part + 8)?);
+                if layers != 0 && layer_count != 0 {
+                    parts.extend(layer(layers)?);
+                }
             }
         }
         let sequential = parts.len() > 1;
@@ -815,6 +820,10 @@ pub fn parse_ycd_rdr2(res: &Resource) -> Result<ClipDictionary, ResourceError> {
 
 /// Resource version of Red Dead Redemption 2's clip dictionaries.
 pub const RDR2_VERSION: u32 = 58;
+
+/// Kind (at `0x20` of a clip) of an RDR2 clip that plays one animation; the
+/// others (`2`) have a list of parts.
+const RDR2_CLIP_SINGLE: u32 = 1;
 
 /// Size of a part of an RDR2 clip (layer list, count, capacity, duration).
 const RDR2_CLIP_PART: u64 = 0x18;
@@ -896,6 +905,59 @@ mod tests {
         let (i, part, at) = actor.part_at(9.0).unwrap();
         assert_eq!((i, part.animation, at), (2, 0, 1.0));
         assert_eq!(actor.part_at(20.0).unwrap().0, 2);
+    }
+
+    /// A minimal RDR2 clip dictionary: one animation (no tracks) and one clip
+    /// of `kind`: its layer in the clip, or in a list of parts.
+    fn rdr2_ycd(kind: u32) -> Resource {
+        const BASE: u64 = 0x5000_0000;
+        let mut m = vec![0u8; 0x400];
+        let mut put = |at: usize, v: &[u8]| m[at..at + v.len()].copy_from_slice(v);
+        let ptr = |o: usize| (BASE + o as u64).to_le_bytes();
+        // Root: clips map (buckets 0x100, 1) and animation dictionaries (0x110, 1).
+        put(0x48, &ptr(0x100));
+        put(0x50, &1u16.to_le_bytes());
+        put(0x70, &ptr(0x110));
+        put(0x78, &1u16.to_le_bytes());
+        put(0x100, &ptr(0x120)); // clip map entry
+        put(0x128, &ptr(0x200)); // -> clip
+        put(0x110, &ptr(0x140)); // animation dictionary
+        put(0x140 + 0x48, &ptr(0x1C0));
+        put(0x140 + 0x50, &1u16.to_le_bytes());
+        put(0x1C0, &ptr(0x1D0)); // animation map entry
+        put(0x1D8, &ptr(0x300)); // -> animation
+        put(0x300 + 0x24, &31u16.to_le_bytes());
+        put(0x300 + 0x28, &1.0f32.to_le_bytes());
+        // The clip: kind, name, then the layer or the part list at 0x68.
+        put(0x200 + 0x20, &kind.to_le_bytes());
+        put(0x200 + 0x28, &ptr(0x3C0));
+        put(0x3C0, b"pack:/p_door01x.clip\0");
+        let layer = if kind == RDR2_CLIP_SINGLE {
+            0x200 + 0x68
+        } else {
+            put(0x200 + 0x68, &ptr(0x2C0));
+            put(0x200 + 0x70, &1u16.to_le_bytes());
+            put(0x2C0, &ptr(0x2E0)); // part: layers, count
+            put(0x2C8, &1u16.to_le_bytes());
+            0x2E0
+        };
+        put(layer, &ptr(0x300));
+        put(layer + 0x28, &0.0f32.to_le_bytes());
+        put(layer + 0x2C, &1.0f32.to_le_bytes());
+        put(layer + 0x30, &1.0f32.to_le_bytes());
+        Resource { version: RDR2_VERSION, system: m, graphics: Vec::new() }
+    }
+
+    #[test]
+    fn rdr2_clips_of_one_animation_and_of_parts() {
+        for kind in [RDR2_CLIP_SINGLE, 2] {
+            let dict = parse_ycd(&rdr2_ycd(kind)).unwrap();
+            assert_eq!(dict.animations.len(), 1);
+            let clip = &dict.clips[0];
+            assert_eq!(clip.name, "p_door01x");
+            assert_eq!(clip.parts.len(), 1, "kind {kind}");
+            assert_eq!((clip.parts[0].animation, clip.parts[0].end, clip.parts[0].rate), (0, 1.0, 1.0));
+        }
     }
 
     #[test]
