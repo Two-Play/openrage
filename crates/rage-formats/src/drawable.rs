@@ -126,10 +126,23 @@ pub mod param {
     /// `TextureSampler`: the base colour (GTA IV).
     pub const TEXTURE_SAMPLER: u32 = 0x2b5170fd;
 
+    /// RDR2 `lyr0DiffuseTex`: the colour of the first layer of layered
+    /// shaders (`standard_vehicle_2lyr`, …). With a tint palette it holds a
+    /// shade (and masks) that the palette colours.
+    pub const LYR0_DIFFUSE_TEX: u32 = 0x346394ea;
+    /// RDR2 `TintPaletteTex`: palette colours, one column per palette slot
+    /// (vertex colour blue), one row per tint.
+    pub const TINT_PALETTE_TEX: u32 = 0x2c8d7182;
+    /// RDR2 `vehTintPaletteTex`: vehicle colours, one row per colour
+    /// (`carcols.ymt`), columns from dark to light.
+    pub const VEH_TINT_PALETTE_TEX: u32 = 0x7b21acbf;
+
     /// Parameters that hold the base colour.
-    pub const BASE: [u32; 3] = [DIFFUSE_TEX, DIFFUSE_SAMPLER, TEXTURE_SAMPLER];
+    pub const BASE: [u32; 4] = [DIFFUSE_TEX, DIFFUSE_SAMPLER, TEXTURE_SAMPLER, LYR0_DIFFUSE_TEX];
     /// Parameters that never hold the base colour.
-    pub const NOT_BASE: [u32; 9] = [
+    pub const NOT_BASE: [u32; 11] = [
+        TINT_PALETTE_TEX,
+        VEH_TINT_PALETTE_TEX,
         DIFFUSE_TEX2,
         DIFFUSE_SAMPLER2,
         DIRT_TEX,
@@ -952,6 +965,12 @@ mod tests {
         // Unknown parameters: by name.
         let unknown = s(&[(0, "plate01_n"), (0, "plate01")]);
         assert_eq!(unknown.base_texture(), Some("plate01"));
+        // RDR2 palette shaders: the shade in lyr0DiffuseTex, not the palette.
+        let pal = s(&[
+            (param::TINT_PALETTE_TEX, "w_repeater_cloth_strap01_pal"),
+            (param::LYR0_DIFFUSE_TEX, "w_repeater_cloth_strap01_ab"),
+        ]);
+        assert_eq!(pal.base_texture(), Some("w_repeater_cloth_strap01_ab"));
     }
 
     #[test]
