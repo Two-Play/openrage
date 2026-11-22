@@ -3,7 +3,7 @@ id = "obj-tools"
 name = "OBJ tools"
 version = "0.1.0"
 api = "0.3"
-description = "Shows Wavefront OBJ models in the 3D view, exports the game's models as OBJ with their textures (PNG) and replaces a model's meshes with an OBJ (GTA V Enhanced .ydr, and vehicle bodies .yft)."
+description = "Shows Wavefront OBJ models in the 3D view, exports the game's models as OBJ with their textures (PNG) and replaces a model's meshes with an OBJ (GTA V Enhanced .ydr, vehicles and their parts .yft with their wheels, drawable dictionaries .ydd)."
 authors = ["OpenRAGE contributors"]
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/Two-Play/openrage"
@@ -31,7 +31,7 @@ batch = true
 id = "replace"
 title = "Replace with OBJ…"
 kind = "modify"
-extensions = ["ydr", "yft"]
+extensions = ["ydr", "yft", "ydd"]
 # The OBJ, and optionally its .mtl and the PNG textures it names.
 pick = ["obj", "mtl", "png"]
 pick-title = "Choose the OBJ model (and its .mtl and PNG textures)"

@@ -117,7 +117,11 @@ openrage mkdir x64e.rpf/my_folder
 openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --mods   # new geometry for an Enhanced .ydr (preview)
 openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --out new.ydr --shader 0
 openrage replace-model x64i.rpf/…/prop_x.ydr hi.obj --lod med.obj --lod low.obj --mods   # with detail levels
-openrage replace-model x64e.rpf/levels/gta5/vehicles.rpf/adder.yft car.obj --mods   # a vehicle body: parts named like bones move with them
+openrage replace-model x64e.rpf/levels/gta5/vehicles.rpf/adder.yft car.obj --mods   # a vehicle: parts named like bones move with them, `wheel_lf` replaces the wheel
+openrage replace-model …/a_m_y_hipster_01.ydd ped.obj --mods     # a dictionary: parts named after drawables (uppr_000_u) replace them
+openrage replace-model …/a_m_y_hipster_01.ydd shirt.obj --drawable uppr_000_r --out new.ydd   # the whole OBJ on one drawable
+openrage replace-model …/prop_x.ydr model.obj --collision col.obj --mods   # with a collision built from col.obj
+openrage replace-model …/hei_ch3_12_0.ybn col.obj --out new.ybn  # a collision file from an OBJ
 openrage oiv info mod.oiv                      # what a package would change
 openrage oiv install mod.oiv                   # install into the mods folder
 openrage oiv list / oiv uninstall "Name 1.0" [-y]   # installed packages, uninstall
@@ -172,7 +176,8 @@ openrage licenses --all                        # every license text
 openrage verify                                # decode every entry of every archive
 openrage verify --textures [--rebuild]         # decode (and rebuild) every texture dictionary
 openrage verify --models                       # parse every model of the game
-openrage verify --models --rebuild             # write every Enhanced .ydr anew with its meshes, read back identical
+openrage verify --models --rebuild             # write every Enhanced .ydr, .yft (with wheels) and .ydd anew, read back identical
+openrage verify --collisions --rebuild         # write every Enhanced collision (.ybn, in .ydr) anew from its triangles
 openrage verify --audio                        # decode every sound of the game
 openrage verify --animations                   # parse every clip dictionary, evaluate all frames
 openrage verify --meta                         # convert every metadata file of the game
