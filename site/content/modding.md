@@ -132,9 +132,12 @@ embedded texture dictionary line of an `.odr`, the `.oft` layout (OpenRAGE write
 not the physics) and vertex layouts OpenIV's exports have not shown, which OpenRAGE names with their layout
 (`N40597755555555996996`) instead of OpenIV's code. Whether OpenIV reads OpenRAGE's exports has not been tested yet.
 
-**Checked** on GTA V Enhanced with `openrage verify --models --openformats`: every model and texture dictionary
-of the game is written as openFormats and read back unchanged, and every drawable and fragment is imported back
-onto itself and reads back with the same meshes, shaders, bones and textures.
+**Checked** on GTA V Enhanced with `openrage verify --models --openformats`: all 258,595 models and texture
+dictionaries of the game (248 GB of text) are written as openFormats and read back unchanged, apart from one texture
+stored as a cube map with 32 slices, which DDS cannot hold. 144,907 drawables and fragments are imported back onto
+themselves and read back with the same meshes, shaders, bones and textures; 749 more (mostly race track and stunt
+props) use shaders for some meshes that no geometry of the model shows the writer how to fill, so they cannot be
+written yet.
 
 ### Vehicles
 
