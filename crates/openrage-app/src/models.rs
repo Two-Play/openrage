@@ -447,6 +447,57 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
     (drawables, parts)
 }
 
+/// A vehicle's mod parts ([`crate::vehicle_mods`]), hidden at first, each on
+/// the bone the game puts it on, grouped by kind (`Mods: bonnet`).
+fn add_mod_parts(
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    vehicle: &str,
+    drawables: &mut Vec<(String, Drawable)>,
+    parts: &mut Vec<Part>,
+) {
+    let Some(skeleton) = drawables.first().and_then(|(_, d)| d.skeleton.clone()) else { return };
+    // Vehicles only: their skeleton has a chassis.
+    if skeleton.find_name("chassis").is_none() {
+        return;
+    }
+    let world = skeleton.world_transforms();
+    let mods = crate::vehicle_mods::mod_parts(game_dir, keys.clone(), vehicle);
+    let total = mods.len() as u64;
+    for (k, m) in mods.into_iter().enumerate() {
+        crate::progress::set("Loading the mod parts", k as u64, total);
+        let Ok((Node::ArchiveFile(rpf, id), _)) = rage_mods::resolve(game_dir, &m.vpath, keys.clone()) else {
+            continue;
+        };
+        let Some(fragment) = rpf.read_resource(id).ok().and_then(|r| drawable::parse_fragment(&r).ok()) else {
+            continue;
+        };
+        if fragment.drawable.meshes.is_empty() {
+            continue;
+        }
+        // By name, or by its hash where `carcols` keeps one.
+        let bone = m.bone.as_deref().and_then(|b| {
+            let hash = rage_formats::names::parse(&b.to_ascii_lowercase());
+            skeleton.find_name(b).or_else(|| {
+                skeleton.bones.iter().position(|x| rage_core::hash::joaat(&x.name.to_ascii_lowercase()) == hash)
+            })
+        });
+        let kind = m.kind.as_deref().map(crate::vehicle_mods::kind_label).unwrap_or_else(|| "other".into());
+        parts.push(Part {
+            name: m.name.clone(),
+            group: format!("Mods: {kind}"),
+            drawable: drawables.len(),
+            transform: bone.and_then(|b| world.get(b)).copied().unwrap_or(math::IDENTITY),
+            visible: false,
+            bone,
+        });
+        let mut d = fragment.drawable;
+        // Its own one-bone skeleton is not the vehicle's.
+        d.skeleton = None;
+        drawables.push((m.name, d));
+    }
+}
+
 pub fn is_model(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.ends_with(".ydr")
@@ -606,7 +657,7 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
     let lower = name.to_ascii_lowercase();
     let stem = name.split('.').next().unwrap_or(&name).to_owned();
     let mut external = Vec::new();
-    let (drawables, parts) = if rage_formats::paths::is_path_file(&lower) {
+    let (mut drawables, mut parts) = if rage_formats::paths::is_path_file(&lower) {
         let ext = lower.rsplit('.').next().unwrap_or_default();
         let (path, _) = rage_formats::paths::parse(&res, ext)?;
         let part = Part {
@@ -732,6 +783,10 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         bail!("{name} is not a model (.ydr, .yft, .ydd, .ypt, .ybn, .ynd, .yvr, .ywr)");
     };
 
+    if lower.ends_with(".yft") {
+        add_mod_parts(game_dir, keys.clone(), &stem, &mut drawables, &mut parts);
+    }
+
     // Textures usually live next to the model: adder.yft → adder.ytd (+ vehshare.ytd for vehicles).
     let dir = rpf.entry(id).parent.unwrap_or(rage_rpf::Rpf7::ROOT);
     let mut candidates = vec![format!("{stem}.ytd"), format!("{stem}+hi.ytd")];
@@ -782,7 +837,6 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         let tid = rpf.find_child(dir, &format!("{stem}.yft"))?;
         drawable::parse_fragment(&rpf.read_resource(tid).ok()?).ok()?.drawable.skeleton
     });
-    let mut drawables = drawables;
     if let Some(sk) = &skeleton {
         fit_to_skeleton(&mut drawables, sk);
     }

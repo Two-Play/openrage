@@ -114,6 +114,9 @@ The import keeps that:
 - **Export, edit, import:** *OBJ tools* exports a vehicle with one object per bone, so an export can be edited in
   Blender and brought back with every door still opening.
 - The skeleton, physics, damage and the vehicle's detail levels stay; every level shows the new body (and wheel).
+- **Mod parts** (`sultan_hood_1.yft` in `sultan_mods.rpf`) are fragments of their own, in the space of the bone they
+  go on: import onto them like any `.yft`. They have no textures of their own, so the shared vehicle textures
+  (`vehshare.ytd`) lend the texture structure.
 - `openrage replace-model x64e.rpf/levels/gta5/vehicles.rpf/adder.yft car.obj --mods`.
 
 ### Peds and clothing

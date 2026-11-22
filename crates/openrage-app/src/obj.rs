@@ -900,7 +900,7 @@ pub fn find_texture_donor(
     keys: Option<Arc<GtaVKeys>>,
 ) -> Option<rage_resource::Resource> {
     let parent = vpath.rsplit_once('/').map_or("", |(p, _)| p);
-    let Ok((Node::ArchiveDir(rpf, dir), _)) = rage_mods::resolve(game_dir, parent, keys) else { return None };
+    let Ok((Node::ArchiveDir(rpf, dir), _)) = rage_mods::resolve(game_dir, parent, keys.clone()) else { return None };
     let donates = |r: &rage_resource::Resource| rage_formats::ydr_write::can_donate_textures(r);
     // Drawables first, then texture dictionaries (vehicle archives have only
     // fragments and dictionaries).
@@ -938,8 +938,17 @@ pub fn find_texture_donor(
         },
         &mut |_| {},
     );
-    found
+    // Archives of fragments only (vehicle mod parts): the game's shared vehicle textures.
+    found.or_else(|| {
+        let Ok((Node::ArchiveFile(rpf, id), _)) = rage_mods::resolve(game_dir, SHARED_TEXTURES, keys) else {
+            return None;
+        };
+        rpf.read_resource(id).ok().filter(donates)
+    })
 }
+
+/// A texture dictionary every GTA V installation has, as the last donor.
+const SHARED_TEXTURES: &str = "x64e.rpf/levels/gta5/vehicles.rpf/vehshare.ytd";
 
 /// The mesh without the triangles whose first corner belongs to a part
 /// `drop` names (by index into its part names); unused vertices go too.
