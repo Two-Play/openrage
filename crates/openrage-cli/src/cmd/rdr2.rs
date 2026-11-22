@@ -74,7 +74,11 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
         use rage_formats::drawable;
         let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
         let drawables = match e.ext_id {
-            3 => vec![drawable::parse_fragment_rdr2(&res).map_err(|err| err.to_string())?.drawable],
+            3 => {
+                // The body and the children with meshes (wheels).
+                let f = drawable::parse_fragment_rdr2(&res).map_err(|err| err.to_string())?;
+                std::iter::once(f.drawable).chain(f.children.into_iter().map(|c| c.drawable)).collect()
+            }
             4 => drawable::parse_ydd_rdr2(&res).map_err(|err| err.to_string())?.into_iter().map(|(_, d)| d).collect(),
             _ => vec![drawable::parse_ydr_rdr2(&res).map_err(|err| err.to_string())?],
         };

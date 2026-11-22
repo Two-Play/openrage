@@ -806,10 +806,25 @@ pub fn parse_yft(res: &Resource) -> Result<Drawable, ResourceError> {
     Ok(parse_fragment(res)?.drawable)
 }
 
-/// A `.yft` file with the child drawables (wheels and other parts).
 /// A Red Dead Redemption 2 `.yft`: its main drawable (at `0x20` of the
-/// fragment; found among the root's pointers if not). Children are not read yet.
+/// fragment; found among the root's pointers if not) and the children with
+/// meshes of their own (wheels, see [`read_fragment_children_rdr2`]).
 pub fn parse_fragment_rdr2(res: &Resource) -> Result<Fragment, ResourceError> {
+    let body = read_drawable_gen(res, fragment_drawable_rdr2(res)?, Gen::Rdr2)?;
+    // Children are optional extras, as in GTA V.
+    let children = read_fragment_children_rdr2(res, &body).unwrap_or_default();
+    Ok(Fragment { drawable: body, children })
+}
+
+/// Only the skeleton of an RDR2 `.yft` (much faster than reading the meshes).
+pub fn fragment_skeleton_rdr2(res: &Resource) -> Result<Option<Skeleton>, ResourceError> {
+    let skeleton = res.u64(fragment_drawable_rdr2(res)? + 0x18)?;
+    Ok(if skeleton != 0 { Some(read_skeleton_gen(res, skeleton, Gen::Rdr2)?) } else { None })
+}
+
+/// The main drawable of an RDR2 fragment: at `0x20`, else the first of the
+/// root's pointers that looks like one.
+fn fragment_drawable_rdr2(res: &Resource) -> Result<u64, ResourceError> {
     let root = Resource::ROOT;
     let looks_like_drawable = |p: u64| -> bool {
         let ok = |q: u64| (0x5000_0000..0x6000_0000).contains(&q);
@@ -820,11 +835,70 @@ pub fn parse_fragment_rdr2(res: &Resource) -> Result<Fragment, ResourceError> {
             })
     };
     let candidates = std::iter::once(0x20).chain((0..0xC0).step_by(8));
-    let drawable = candidates
+    candidates
         .filter_map(|o| res.u64(root + o).ok())
         .find(|&p| looks_like_drawable(p))
-        .ok_or_else(|| bad("fragment without a drawable"))?;
-    Ok(Fragment { drawable: read_drawable_gen(res, drawable, Gen::Rdr2)?, children: Vec::new() })
+        .ok_or_else(|| bad("fragment without a drawable"))
+}
+
+/// The children of an RDR2 fragment that have meshes. The physics LOD group
+/// is at `0x90` of the fragment, its first LOD at `0x10`. Unlike GTA V's, a
+/// child is a drawable itself (list at `0x118` of the LOD, `u8` count at
+/// `0x146`) without a shader group: its meshes use the body's shaders. Its
+/// bone is named by its group (group of each child: `u16` list at `0x110`;
+/// groups at `0xC8`, with the parent group at `+0x06` and the name at
+/// `+0x4F`), and a group without a bone of that name sits on its parent's.
+fn read_fragment_children_rdr2(res: &Resource, body: &Drawable) -> Result<Vec<FragmentChild>, ResourceError> {
+    let ok = |p: u64| (0x5000_0000..0x6000_0000).contains(&p);
+    let group = res.u64(Resource::ROOT + 0x90)?;
+    if !ok(group) {
+        return Ok(Vec::new());
+    }
+    let Some(lod) = (0..3).map(|i| res.u64(group + 0x10 + i * 8)).find_map(|p| p.ok().filter(|&p| ok(p))) else {
+        return Ok(Vec::new());
+    };
+    let (groups, group_of, list) = (res.u64(lod + 0xC8)?, res.u64(lod + 0x110)?, res.u64(lod + 0x118)?);
+    let (group_count, count) = (res.u8(lod + 0x140)? as u64, res.u8(lod + 0x146)? as u64);
+    if !ok(groups) || !ok(group_of) || !ok(list) {
+        return Ok(Vec::new());
+    }
+    let skeleton = body.skeleton.as_ref();
+    // The bone of group `g`: by its name, else its parent's (at most 64 steps up).
+    let bone_of = |mut g: u64| -> Option<u16> {
+        let skeleton = skeleton?;
+        for _ in 0..64 {
+            if g >= group_count {
+                return None;
+            }
+            let at = res.u64(groups + g * 8).ok().filter(|&p| ok(p))?;
+            let name = res.string(at + 0x4F).ok()?;
+            if let Some(b) = skeleton.find_name(&name) {
+                return Some(skeleton.bones[b].tag);
+            }
+            g = res.u8(at + 0x06).ok().filter(|&p| p != 0xFF)? as u64;
+        }
+        None
+    };
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for i in 0..count {
+        let ptr = res.u64(list + i * 8)?;
+        if !ok(ptr) || seen.contains(&ptr) {
+            continue;
+        }
+        seen.push(ptr);
+        let mut drawable = read_drawable_gen(res, ptr, Gen::Rdr2)?;
+        if drawable.meshes.is_empty() {
+            continue;
+        }
+        if drawable.shaders.is_empty() {
+            drawable.shaders = body.shaders.clone();
+        }
+        let g = res.u16(group_of + i * 2)? as u64;
+        let bone_tag = bone_of(g).or_else(|| skeleton.and_then(|s| s.bones.first()).map(|b| b.tag)).unwrap_or(0);
+        out.push(FragmentChild { bone_tag, drawable });
+    }
+    Ok(out)
 }
 
 pub fn parse_fragment(res: &Resource) -> Result<Fragment, ResourceError> {

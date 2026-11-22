@@ -391,11 +391,13 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
         let index = drawables.len();
         drawables.push((bone_name.clone(), child.drawable));
         let transform = bone.and_then(|b| world.get(b)).copied().unwrap_or(math::IDENTITY);
-        if bone_name.starts_with("wheel_") {
+        // RDR2's blurred wheels for high speeds (`wheel_lf_fast`) stay hidden.
+        let variant = is_wheel_variant(&bone_name);
+        if bone_name.starts_with("wheel_") && !variant {
             wheels.push((bone_name.clone(), index));
         }
         let group = if bone_name.starts_with("wheel_") { "Wheels" } else { "Parts" };
-        parts.push(Part { name: bone_name, group: group.into(), drawable: index, transform, visible: true, bone });
+        parts.push(Part { name: bone_name, group: group.into(), drawable: index, transform, visible: !variant, bone });
     }
     // Copy wheels to the wheel bones that have no drawable of their own.
     if !wheels.is_empty() {
@@ -403,7 +405,7 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
         let is_rear = |n: &str| n.ends_with('r') || n.contains("_lm") || n.contains("_rm");
         for (b, bone) in skeleton.bones.iter().enumerate() {
             let n = bone.name.to_ascii_lowercase();
-            let is_wheel_bone = n.starts_with("wheel_") && !n.contains("mesh");
+            let is_wheel_bone = n.starts_with("wheel_") && !n.contains("mesh") && !is_wheel_variant(&n);
             if !is_wheel_bone || wheels.iter().any(|(w, _)| w.eq_ignore_ascii_case(&n)) {
                 continue;
             }
@@ -430,6 +432,13 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
         }
     }
     (drawables, parts)
+}
+
+/// RDR2 wheel bones besides the wheel itself: the blurred one shown at
+/// speed (`wheel_lf_fast`) and the one for upgrades (`wheel_lf_mod`).
+fn is_wheel_variant(bone: &str) -> bool {
+    let n = bone.to_ascii_lowercase();
+    n.starts_with("wheel_") && (n.ends_with("_fast") || n.ends_with("_mod"))
 }
 
 pub fn is_model(name: &str) -> bool {
@@ -1400,7 +1409,7 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
             })
             .collect()
     } else if lower.ends_with(".yft") {
-        vec![(stem.clone(), drawable::parse_fragment_rdr2(&res)?.drawable)]
+        Vec::new()
     } else {
         bail!("{name}: only .ydr, .ydd and .yft models of Red Dead Redemption 2 can be shown so far");
     };
@@ -1411,23 +1420,30 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
     if let Some(sk) = &base {
         fit_to_skeleton(&mut drawables, sk);
     }
-    let layout = if drawables.len() > 1 && base.is_none() {
-        grid_layout(&drawables)
+    let parts = if lower.ends_with(".yft") {
+        // Fragments: the body and its children (wheels) on their bones.
+        let (d, p) = fragment_parts(drawable::parse_fragment_rdr2(&res)?, &stem);
+        drawables = d;
+        p
     } else {
-        vec![math::IDENTITY; drawables.len()]
+        let layout = if drawables.len() > 1 && base.is_none() {
+            grid_layout(&drawables)
+        } else {
+            vec![math::IDENTITY; drawables.len()]
+        };
+        drawables
+            .iter()
+            .enumerate()
+            .map(|(k, (n, _))| Part {
+                name: n.clone(),
+                group: String::new(),
+                drawable: k,
+                transform: layout[k],
+                visible: true,
+                bone: None,
+            })
+            .collect()
     };
-    let parts = drawables
-        .iter()
-        .enumerate()
-        .map(|(k, (n, _))| Part {
-            name: n.clone(),
-            group: String::new(),
-            drawable: k,
-            transform: layout[k],
-            visible: true,
-            bone: None,
-        })
-        .collect();
     // Texture dictionaries in the same folder: `<stem>.ytd` first, then those
     // whose name shares the model's prefix, then the rest; at most eight.
     let dir = full.rsplit_once('/').map_or("", |(d, _)| d).to_owned();
@@ -1992,6 +2008,37 @@ mod tests {
         // Head, pelvis, and the hair bone falls back to the head.
         assert_eq!(mesh.bone_indices[0], [2, 1, 2, 2]);
         assert!(mesh.bone_tags.is_empty());
+    }
+
+    #[test]
+    fn rdr2_wheels_on_their_bones() {
+        let bone = |name: &str, tag: u16, x: f32| drawable::Bone {
+            name: name.into(),
+            tag,
+            parent: if tag == 0 { -1 } else { 0 },
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            translation: [x, 0.0, 0.0],
+            scale: [1.0; 3],
+        };
+        let names = ["chassis", "wheel_lf", "wheel_lf_fast", "wheel_rf", "wheel_rf_fast", "wheel_rf_mod"];
+        let bones = names.iter().enumerate().map(|(i, n)| {
+            let x = match (i, n.contains("_r")) {
+                (0, _) => 0.0,
+                (_, true) => 1.0,
+                _ => -1.0,
+            };
+            bone(n, i as u16, x)
+        });
+        let body = Drawable { skeleton: Some(drawable::Skeleton { bones: bones.collect() }), ..Default::default() };
+        let wheel = |tag| drawable::FragmentChild { bone_tag: tag, drawable: Drawable::default() };
+        let fragment = drawable::Fragment { drawable: body, children: vec![wheel(1), wheel(2)] };
+        let (drawables, parts) = fragment_parts(fragment, "cart");
+        assert_eq!(drawables.len(), 3);
+        let shown: Vec<(&str, bool)> = parts.iter().map(|p| (p.name.as_str(), p.visible)).collect();
+        // The blurred wheel stays hidden; only the plain right wheel gets a copy.
+        assert_eq!(shown, [("cart", true), ("wheel_lf", true), ("wheel_lf_fast", false), ("wheel_rf", true)]);
+        assert_eq!(parts[3].drawable, 1);
+        assert_eq!(parts[3].transform[12], 1.0);
     }
 
     #[test]

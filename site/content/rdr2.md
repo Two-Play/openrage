@@ -95,7 +95,11 @@ Drawables, drawable dictionaries and fragments open in the viewer and export as 
 shared texture dictionaries elsewhere in the game; `rdr2-names` indexes them once (162,256 textures) so the viewer
 finds them.
 
-**Not yet:** moving parts of fragments, skeleton animations of models and cloth.
+Fragments (`.yft`) show their moving parts like GTA V's: a wagon's wheels sit on their bones, one wheel copied to the
+other side, and follow animations. The blurred wheels the game shows at speed (`wheel_lf_fast`) are listed under
+*Parts* but hidden.
+
+**Not yet:** skeleton animations of models and cloth.
 
 ## Peds and animals
 
