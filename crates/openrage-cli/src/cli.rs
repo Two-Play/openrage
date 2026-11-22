@@ -250,10 +250,13 @@ pub(crate) enum Command {
         #[arg(long, value_name = "TEXT", conflicts_with = "out")]
         import: Option<PathBuf>,
     },
-    /// Replace the meshes of a GTA V Enhanced drawable (.ydr) or vehicle body (.yft) with a
-    /// Wavefront OBJ model. The model's shaders and textures stay; OBJ materials go to its
-    /// shaders in order. Vehicles: OBJ parts named like a bone (`door_dside_f`, `bonnet`) move
-    /// with it, other parts with the body.
+    /// Replace the meshes of a GTA V Enhanced drawable (.ydr), fragment (.yft: vehicles, their
+    /// mod parts) or drawable dictionary (.ydd: peds, clothing) with a Wavefront OBJ model. The
+    /// model's shaders and textures stay; OBJ materials go to its shaders in order. Vehicles: OBJ
+    /// parts named like a bone (`door_dside_f`, `bonnet`) move with it, parts named after the
+    /// wheel (`wheel_lf`) replace its model, other parts move with the body. Dictionaries: parts
+    /// named after a drawable (`uppr_000_u`) replace it. Models blended between bones take the
+    /// weights of the original's nearest vertex.
     ReplaceModel {
         /// The model in the game, e.g. `x64i.rpf/levels/gta5/props/…/prop_x.ydr` or
         /// `x64e.rpf/levels/gta5/vehicles.rpf/adder.yft`.
@@ -275,6 +278,10 @@ pub(crate) enum Command {
         /// Keep the drawable's textures instead of embedding the ones the OBJ's materials name.
         #[arg(long)]
         no_textures: bool,
+        /// Drawable dictionaries (.ydd): the drawable (name or index) for the OBJ's parts that
+        /// are named after none.
+        #[arg(long)]
+        drawable: Option<String>,
     },
     /// Show a model (.ydr, .yft, .ydd; GTA IV .wdr, .wft, .wdd) and optionally export it as glTF (.glb).
     Model {

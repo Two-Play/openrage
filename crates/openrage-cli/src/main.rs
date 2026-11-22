@@ -208,8 +208,15 @@ fn run() -> Result<()> {
             cmd_model(&game_dir, &path, outfit, view, keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
-        Command::ReplaceModel { path, obj, out, mods, shader, lod, no_textures } => {
-            let options = ReplaceOptions { out: out.as_deref(), mods, shader, lods: &lod, textures: !no_textures };
+        Command::ReplaceModel { path, obj, out, mods, shader, lod, no_textures, drawable } => {
+            let options = ReplaceOptions {
+                out: out.as_deref(),
+                mods,
+                shader,
+                lods: &lod,
+                textures: !no_textures,
+                drawable: drawable.as_deref(),
+            };
             cmd_replace_model(&game_dir, &path, &obj, options, keys)
         }
         Command::World { x, y, z, radius } => {

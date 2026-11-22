@@ -272,6 +272,21 @@ impl LoadedModel {
 
 /// Ped component names (`head_000_r`, `uppr_001_u`, …) by hash: drawable
 /// dictionaries of peds only store the hashes.
+/// The names of a `.ydd`'s drawables as the viewer shows them (and OBJ
+/// export names their parts): ped components by name (`uppr_000_u`), others
+/// `<file>#<hash>`, or `<file>#<index>` without a hash.
+pub fn dictionary_names(stem: &str, hashes: &[u32]) -> Vec<String> {
+    hashes
+        .iter()
+        .enumerate()
+        .map(|(i, &hash)| match ped_component_names().get(&hash) {
+            Some(n) => n.clone(),
+            None if hash != 0 => format!("{stem}#{hash:08x}"),
+            None => format!("{stem}#{i}"),
+        })
+        .collect()
+}
+
 fn ped_component_names() -> &'static HashMap<u32, String> {
     static NAMES: OnceLock<HashMap<u32, String>> = OnceLock::new();
     NAMES.get_or_init(|| {
@@ -655,18 +670,10 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         }
         (drawables, parts)
     } else if lower.ends_with(".ydd") {
-        let drawables: Vec<(String, Drawable)> = drawable::parse_ydd(&res)?
-            .into_iter()
-            .enumerate()
-            .map(|(i, (hash, d))| {
-                let name = match ped_component_names().get(&hash) {
-                    Some(n) => n.clone(),
-                    None if hash != 0 => format!("{stem}#{hash:08x}"),
-                    None => format!("{stem}#{i}"),
-                };
-                (name, d)
-            })
-            .collect();
+        let parsed = drawable::parse_ydd(&res)?;
+        let hashes: Vec<u32> = parsed.iter().map(|(h, _)| *h).collect();
+        let drawables: Vec<(String, Drawable)> =
+            dictionary_names(&stem, &hashes).into_iter().zip(parsed).map(|(name, (_, d))| (name, d)).collect();
         let names: Vec<String> = drawables.iter().map(|(n, _)| n.clone()).collect();
         // Peds are assembled in place; other dictionaries are laid out in a grid.
         let layout =

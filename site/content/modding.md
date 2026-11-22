@@ -63,12 +63,12 @@ other texture, mesh, shader and bone unchanged. GTA V Legacy uses the same struc
 
 ## Models (preview)
 
-A drawable (`.ydr`) or a vehicle body (`.yft`) of GTA V Enhanced can get new geometry and textures from a Wavefront
-OBJ file:
+A drawable (`.ydr`), a vehicle with its wheels or one of its mod parts (`.yft`) and the drawables of a dictionary
+(`.ydd`: peds, clothing) of GTA V Enhanced can get new geometry and textures from a Wavefront OBJ file:
 
 - **In the explorer:** turn on the *OBJ tools* plugin (it comes with OpenRAGE, **Settings → Plugins**), unlock
-  editing, right-click the `.ydr` or `.yft` → **Replace with OBJ…** and choose the OBJ together with its `.mtl` and PNG
-  textures. The change goes into the `mods` folder and is one entry in **History**. *OBJ tools* also exports models as
+  editing, right-click the `.ydr`, `.yft` or `.ydd` → **Replace with OBJ…** and choose the OBJ together with its
+  `.mtl` and PNG textures. The change goes into the `mods` folder and is one entry in **History**. *OBJ tools* also exports models as
   OBJ with their textures, so you can export, edit (e.g. in Blender) and bring them back.
 - **From the command line:** `openrage replace-model x64i.rpf/levels/gta5/props/…/prop_x.ydr model.obj --mods`
   (it finds the `.mtl` and textures next to the OBJ), or `openrage plugin run obj-tools replace <path>.ydr --pick
@@ -93,10 +93,10 @@ How it works:
 - OBJ is converted from Y-up to the game's Z-up; missing normals are computed, tangents always. Meshes over 65,535
   vertices are split. `--mods` puts the result into the `mods` folder in place of the original (undo with **Undo** /
   `openrage undo`), `--out` writes the file elsewhere.
-- Not yet: GTA V Legacy, `.ydd`, peds and other models blended between bones, and collisions (the original collision
-  stays). The written drawables and vehicles read back identically in OpenRAGE (`openrage verify --models --rebuild`
-  rewrites every `.ydr` and `.yft` of the game, also with shader copies and embedded textures); please report how
-  they behave in the game.
+- Not yet: GTA V Legacy, and collisions (the original collision stays). The written drawables, vehicles with their
+  wheels and dictionaries read back identically in OpenRAGE (`openrage verify --models --rebuild` rewrites every
+  `.ydr`, `.yft` with its wheel models and every drawable of every `.ydd` of the game, with all bone weights, also with
+  shader copies and embedded textures); please report how they behave in the game.
 
 ### Vehicles
 
@@ -106,12 +106,27 @@ The import keeps that:
 - **Parts by name:** an OBJ object or group (`o`, `g`) named like a bone goes on that bone, e.g. `door_dside_f`,
   `door_pside_f`, `bonnet`, `boot`, `bumper_f`. Blender's `.001` and the numbers *OBJ tools* adds (`bonnet_6`) are
   ignored. Everything else goes on the body (`bodyshell`). `replace-model` lists which part went where.
-- **Wheels** are models of their own: parts named after a wheel bone (`wheel_lf` …) are left out, and the original
-  wheels stay.
+- **Wheels** are models of their own. A part named after the wheel bone that has the vehicle's wheel model (usually
+  `wheel_lf`) replaces that model: it is moved into the bone's space, and the game copies it to every wheel bone
+  (turned around on the right). Parts named after the other wheel bones (`wheel_rf`, `wheel_lr` …, which *OBJ tools*
+  exports as copies) are left out. A vehicle with a rear wheel model of its own (`wheel_lr`) gets that one replaced
+  the same way. The wheel's collision and the radius the game drives it with stay.
 - **Export, edit, import:** *OBJ tools* exports a vehicle with one object per bone, so an export can be edited in
   Blender and brought back with every door still opening.
-- The skeleton, physics, damage, the wheels and the vehicle's detail levels stay; every level shows the new body.
+- The skeleton, physics, damage and the vehicle's detail levels stay; every level shows the new body (and wheel).
 - `openrage replace-model x64e.rpf/levels/gta5/vehicles.rpf/adder.yft car.obj --mods`.
+
+### Peds and clothing
+
+- **Drawable dictionaries (`.ydd`):** parts named after a drawable (`uppr_000_u`, as *OBJ tools* exports them)
+  replace that drawable; the others keep theirs. `--drawable uppr_000_u` (name or index) puts the parts named after
+  none on that drawable.
+- **Bone weights:** peds and clothing are blended between bones, but OBJ has no place for weights. Every new vertex
+  takes the bones and weights of the nearest vertex of the original drawable, so a changed shirt keeps moving with
+  the body where it lies close to the original; parts far from any original vertex follow the nearest one and can
+  look stiff. Exported and re-imported unchanged, every vertex keeps its weights (a vertex on a seam may take those
+  of the other side).
+- `openrage replace-model …/a_m_y_hipster_01.ydd ped.obj --mods`.
 
 ## Text files and game text
 
