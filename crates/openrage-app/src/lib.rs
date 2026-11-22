@@ -28,6 +28,7 @@ pub mod paths;
 pub mod plugins;
 pub mod progress;
 pub mod rdr2;
+pub mod rdr2_install;
 pub mod render;
 pub mod repack;
 pub mod setup;

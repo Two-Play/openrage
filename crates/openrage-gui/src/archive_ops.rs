@@ -78,6 +78,8 @@ pub(crate) fn selected_entry() -> Option<(String, String)> {
             }
             // GTA IV archives: every listed entry (removed ones are shown greyed out).
             Location::Gta4(..) if item.mark != Some(Mark::Removed) => {}
+            // RDR2 archives: files and nested archives (folders are only paths).
+            Location::Rpf8(..) if item.kind != ItemKind::Dir => {}
             _ => return None,
         }
         Some((browser::join(&l.vpath, &item.name), item.name.clone()))
@@ -260,7 +262,7 @@ pub(crate) fn run_archive_ops(
 pub(crate) fn archive_import(ui: &AppWindow, dropped: Option<Vec<PathBuf>>) {
     let Some(dir) = with_app(|a| {
         let l = a.listing.as_ref()?;
-        matches!(l.location, Location::Archive(..) | Location::Gta4(..)).then(|| l.vpath.clone())
+        matches!(l.location, Location::Archive(..) | Location::Gta4(..) | Location::Rpf8(..)).then(|| l.vpath.clone())
     }) else {
         ui.set_status("Open a folder inside an archive to import files.".into());
         return;

@@ -4,11 +4,16 @@ description = "Change the game safely with OpenRAGE: edit mode, editing archives
 
 [extra]
 docs = true
-lead = "Every change goes to OpenIV's `mods` folder, never into your game files, and every change can be undone."
+lead = "Every change goes to OpenIV's `mods` folder (RDR2: the replace folder of Lenny's Mod Loader), never into your game files, and every change can be undone."
 toc = true
 +++
 
 ## Edit mode
+
+> [!NOTE]
+> **Red Dead Redemption 2** works the same way, but changes go into `lml/replace`, the replace folder of
+> [Lenny's Mod Loader](https://www.rdr2mods.com/downloads/rdr2/tools/76-lennys-mod-loader-rdr/): changed files
+> loose, changed nested archives as copies. See [Changing files](@/rdr2.md#changing-files) for what LML allows.
 
 OpenRAGE starts read-only, like OpenIV.
 
