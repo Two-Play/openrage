@@ -95,6 +95,10 @@ Drawables, drawable dictionaries and fragments open in the viewer and export as 
 shared texture dictionaries elsewhere in the game; `rdr2-names` indexes them once (162,256 textures) so the viewer
 finds them.
 
+Many vehicles, weapons and props are coloured from palettes: their colour texture holds a shade, and the palette
+colour comes from a slot per vertex. OpenRAGE bakes them into ordinary textures: vehicles in the colours of their
+first variation (`carvariations.ymt`), props and weapons in their first tint.
+
 **Not yet:** moving parts of fragments, skeleton animations of models and cloth.
 
 ## Peds and animals
