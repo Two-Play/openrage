@@ -23,6 +23,7 @@ pub mod media;
 pub mod meta;
 pub mod model_textures;
 pub mod names;
+pub mod openformats;
 pub mod paths;
 pub mod pso;
 pub mod rbf;

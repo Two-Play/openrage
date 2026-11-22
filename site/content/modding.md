@@ -103,6 +103,39 @@ How it works:
   rewrites every `.ydr` and `.yft` of the game, also with shader copies and embedded textures); please report how
   they behave in the game.
 
+### openFormats (OpenIV)
+
+OpenIV's text formats go both ways: export a model or texture dictionary, edit the text files or textures (in a text
+editor, a script or a tool that reads openFormats), and import them back.
+
+- **In the explorer:** right-click a `.ydr`, `.yft`, `.ydd` or `.ytd` → **Export openFormats…** and choose a folder.
+  To bring the files back, unlock editing, right-click the same file → **Import openFormats…** and pick the `.odr`,
+  `.oft` or `.otd`. The change goes into the `mods` folder and is one entry in **History**.
+- **From the command line:** `openrage export-openformats x64i.rpf/levels/gta5/props/…/prop_x.ydr -o out/`, then
+  `openrage import-openformats x64i.rpf/levels/gta5/props/…/prop_x.ydr out/prop_x.odr --mods` (or `--out new.ydr`).
+
+What an import takes over (GTA V Enhanced models; texture dictionaries of both versions):
+
+- **Meshes and detail levels** of the `.mesh` files: positions, normals, colours, texture coordinates and, for
+  vehicles, the bone each vertex moves with. They are written like an OBJ import (above): every geometry keeps a
+  shader of the model and its vertex layout; meshes attached to other bones are moved onto the model's.
+- **Textures:** changed `.dds` files of a model's own textures replace them (any size and format); a `.otd` onto a
+  `.ytd` replaces, adds and removes textures.
+- **Kept from the game file:** the shaders (an `.odr` must name the model's shaders; changed parameters are reported
+  and not taken over), the skeleton, the physics and the parts of a fragment (wheels), collisions. Unchanged meshes
+  stay as they are, so a texture edit changes only the texture. `.odd` files cannot be imported yet.
+- The import says what it took over and what it kept (status bar and **History**, or the command's output).
+
+The files follow OpenIV's own exports (a prop exported by OpenRAGE matches OpenIV's `.odr`, `.mesh` and `.skel`
+line for line, apart from the last digit of some numbers). Not taken from OpenIV, so possibly different there: the
+embedded texture dictionary line of an `.odr`, the `.oft` layout (OpenRAGE writes the main drawable and its parts,
+not the physics) and vertex layouts OpenIV's exports have not shown, which OpenRAGE names with their layout
+(`N40597755555555996996`) instead of OpenIV's code. Whether OpenIV reads OpenRAGE's exports has not been tested yet.
+
+**Checked** on GTA V Enhanced with `openrage verify --models --openformats`: every model and texture dictionary
+of the game is written as openFormats and read back unchanged, and every drawable and fragment is imported back
+onto itself and reads back with the same meshes, shaders, bones and textures.
+
 ### Vehicles
 
 A vehicle body is one model on the vehicle's skeleton: every part moves with a bone (doors, bonnet, boot, bumpers).

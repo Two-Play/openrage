@@ -77,6 +77,7 @@ openrage textures …/prop_x.ydr [--set name=new.dds]          # a model's own t
 openrage model …/vehicles.rpf/adder.yft                       # meshes, shaders, textures
 openrage model …/adder.yft --export adder.glb                  # glTF with embedded textures
 openrage model …/adder.yft --render adder.png [--yaw 1.2]      # software-rendered image
+openrage export-openformats …/prop_x.ydr -o out/              # OpenIV openFormats: .odr/.oft/.odd/.otd + .mesh, .skel, .dds
 openrage audio x64/audio/sfx/RADIO_02_POP.rpf/alright.awc --export out/   # sounds → .wav
 openrage clips x64c.rpf/anim/ingame/clip_move_.rpf/move_m@generic.ycd     # clips of a .ycd
 openrage model …/a_m_y_hipster_01.ydd --render pose.png --anim "…/move_m@generic.ycd:walk@0.5"
@@ -118,6 +119,7 @@ openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --mods   # new geometry
 openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --out new.ydr --shader 0
 openrage replace-model x64i.rpf/…/prop_x.ydr hi.obj --lod med.obj --lod low.obj --mods   # with detail levels
 openrage replace-model x64e.rpf/levels/gta5/vehicles.rpf/adder.yft car.obj --mods   # a vehicle body: parts named like bones move with them
+openrage import-openformats x64i.rpf/…/prop_x.ydr out/prop_x.odr --mods   # edited openFormats back into the game (.odr, .oft, .otd)
 openrage oiv info mod.oiv                      # what a package would change
 openrage oiv install mod.oiv                   # install into the mods folder
 openrage oiv list / oiv uninstall "Name 1.0" [-y]   # installed packages, uninstall
@@ -173,6 +175,7 @@ openrage verify                                # decode every entry of every arc
 openrage verify --textures [--rebuild]         # decode (and rebuild) every texture dictionary
 openrage verify --models                       # parse every model of the game
 openrage verify --models --rebuild             # write every Enhanced .ydr anew with its meshes, read back identical
+openrage verify --models --openformats         # every model and .ytd as openFormats and back; Enhanced models imported onto themselves
 openrage verify --audio                        # decode every sound of the game
 openrage verify --animations                   # parse every clip dictionary, evaluate all frames
 openrage verify --meta                         # convert every metadata file of the game

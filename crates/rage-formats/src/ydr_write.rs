@@ -695,6 +695,32 @@ pub fn replace_lods(
     build(template, lods, materials, donor)
 }
 
+/// The drawable (or fragment) `template` with embedded textures replaced
+/// (same name, any size or format) or added; everything else stays as it is.
+/// The textures are found by name, so shaders bound to a replaced texture
+/// show the new one.
+pub fn replace_embedded_textures(template: &Resource, textures: &[Texture]) -> Result<Vec<u8>, ResourceError> {
+    check_template(template)?;
+    let group = template.u64(drawable_root(template)? + 0x10)?;
+    if group == 0 {
+        return Err(bad("the model has no shader group"));
+    }
+    let mut b = Builder::new();
+    let sys = b.add(Segment::System, template.system.clone());
+    if !template.graphics.is_empty() {
+        b.add(Segment::Graphics, template.graphics.clone());
+    }
+    b.add_pages_info(sys, 0x08);
+    let mut list = Vec::new();
+    for t in textures {
+        let mut name = t.name.clone().into_bytes();
+        name.push(0);
+        list.push((t.clone(), b.add(Segment::System, name)));
+    }
+    add_textures(&mut b, sys, template, group, list, None)?;
+    b.build(template.version)
+}
+
 /// Whether `res` (an Enhanced drawable, fragment or texture dictionary) has a texture
 /// structure that [`replace_with_materials`] can copy (as the `donor`).
 pub fn can_donate_textures(res: &Resource) -> bool {

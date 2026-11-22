@@ -173,6 +173,7 @@ fn run() -> Result<()> {
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path, models: true, .. } if gta4 => cmd_verify_gta4_models(&game_dir, &path),
+        Command::Verify { path, models: true, openformats: true, .. } => cmd_verify_openformats(&game_dir, &path, keys),
         Command::Verify { path, models: true, rebuild: true, .. } => cmd_verify_model_writer(&game_dir, &path, keys),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
@@ -218,6 +219,10 @@ fn run() -> Result<()> {
             cmd_model(&game_dir, &path, outfit, view, keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
+        Command::ExportOpenformats { path, out } => cmd_export_openformats(&game_dir, &path, &out, keys),
+        Command::ImportOpenformats { path, file, out, mods } => {
+            cmd_import_openformats(&game_dir, &path, &file, out.as_deref(), mods, keys)
+        }
         Command::ReplaceModel { path, obj, out, mods, shader, lod, no_textures } => {
             let options = ReplaceOptions { out: out.as_deref(), mods, shader, lods: &lod, textures: !no_textures };
             cmd_replace_model(&game_dir, &path, &obj, options, keys)

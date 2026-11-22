@@ -178,6 +178,10 @@ export struct FileRow {
     // Has a 3D or image view (model, texture).
     can-view: bool,
     is-model: bool,
+    // A GTA V model or texture dictionary: exportable as OpenIV openFormats text.
+    is-openformats: bool,
+    // … and openFormats files can be imported onto it (not drawable dictionaries).
+    can-import-openformats: bool,
     // A text file (opens in the text editor).
     can-edit-text: bool,
     // Binary metadata (.ymap, .ytyp, .ymt, …) shown as XML.
@@ -553,6 +557,11 @@ component FileItem inherits Rectangle {
                 icon: @image-url("icons/menu/export.svg");
                 activated => { root.action("gltf"); }
             }
+            if item.is-openformats: MenuItem {
+                title: @tr("Export openFormats…");
+                icon: @image-url("icons/menu/export.svg");
+                activated => { root.action("openformats-export"); }
+            }
             if root.texture-mode: MenuItem {
                 title: @tr("Save PNG…");
                 icon: @image-url("icons/menu/image.svg");
@@ -564,6 +573,12 @@ component FileItem inherits Rectangle {
                 icon: @image-url("icons/menu/replace.svg");
                 enabled: root.can-edit;
                 activated => { root.action("replace"); }
+            }
+            if root.archive-mode && item.can-import-openformats: MenuItem {
+                title: @tr("Import openFormats…");
+                icon: @image-url("icons/menu/replace.svg");
+                enabled: root.can-edit;
+                activated => { root.action("openformats-import"); }
             }
             if root.archive-mode: MenuItem {
                 title: @tr("Rename…");

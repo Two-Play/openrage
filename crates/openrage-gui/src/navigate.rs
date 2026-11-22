@@ -414,6 +414,12 @@ pub(crate) fn file_row(item: &Item) -> FileRow {
         can_open: is_openable(item),
         can_view: is_viewable(item),
         is_model: is_model_item(item),
+        is_openformats: item.kind == ItemKind::Resource
+            && item.mark != Some(Mark::Removed)
+            && openrage_app::openformats::Kind::of_game_file(&item.name).is_some(),
+        can_import_openformats: item.kind == ItemKind::Resource
+            && item.mark != Some(Mark::Removed)
+            && openrage_app::openformats::Kind::of_game_file(&item.name).is_some_and(|k| k.can_import()),
         can_edit_text: is_text_file(item),
         is_meta: is_meta_file(item),
         is_gfx: item.name.to_ascii_lowercase().ends_with(".gfx"),
