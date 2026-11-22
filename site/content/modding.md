@@ -93,7 +93,16 @@ How it works:
 - OBJ is converted from Y-up to the game's Z-up; missing normals are computed, tangents always. Meshes over 65,535
   vertices are split. `--mods` puts the result into the `mods` folder in place of the original (undo with **Undo** /
   `openrage undo`), `--out` writes the file elsewhere.
-- Not yet: GTA V Legacy, and collisions (the original collision stays). The written drawables, vehicles with their
+- **Collisions:** `--collision col.obj` builds a drawable's (`.ydr`) collision from an OBJ model instead of keeping
+  the original, and `replace-model …/x.ybn col.obj` replaces a collision file's. Every triangle goes into one
+  triangle mesh with a bounding volume hierarchy, built the way the game's own are (up to 32,767 triangles). An OBJ
+  material named after a collision material of the game's `materials.dat` (`CONCRETE`, `WOOD_HIGH_DENSITY`, …, any
+  case) gets it; others get the original collision's first material. The new collision replaces all parts of the
+  original (also its boxes and spheres); it keeps its flags. Vehicles and other fragments (`.yft`) keep their
+  collision: theirs is split over the physics parts with their masses and joints.
+  `openrage verify --collisions --rebuild` writes every collision of the game anew from its own triangles and checks
+  the result, and first checks the game's own hierarchies against how OpenRAGE reads them.
+- Not yet: GTA V Legacy. The written drawables, vehicles with their
   wheels and dictionaries read back identically in OpenRAGE (`openrage verify --models --rebuild` rewrites every
   `.ydr`, `.yft` with its wheel models and every drawable of every `.ydd` of the game, with all bone weights, also with
   shader copies and embedded textures); please report how they behave in the game.

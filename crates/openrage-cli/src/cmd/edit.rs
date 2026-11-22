@@ -195,6 +195,8 @@ pub(crate) struct ReplaceOptions<'a> {
     pub(crate) lods: &'a [PathBuf],
     pub(crate) textures: bool,
     pub(crate) drawable: Option<&'a str>,
+    /// An OBJ model to build the collision from (`.ydr`); for a `.ybn` the OBJ itself is.
+    pub(crate) collision: Option<&'a Path>,
 }
 
 pub(crate) fn cmd_replace_model(
@@ -210,6 +212,14 @@ pub(crate) fn cmd_replace_model(
         bail!("{vpath} is not a file inside an archive")
     };
     let lower = vpath.to_ascii_lowercase();
+    if lower.ends_with(".ybn") {
+        let template = rpf.read_resource(id)?;
+        let file = with_collision(game_dir, vpath, &template, false, obj, keys.clone())?;
+        return save_model(game_dir, vpath, obj, file, &o, keys);
+    }
+    if o.collision.is_some() && !lower.ends_with(".ydr") {
+        bail!("--collision is for drawables (.ydr); vehicles and other fragments keep theirs");
+    }
     if !lower.ends_with(".ydr") && !lower.ends_with(".yft") && !lower.ends_with(".ydd") {
         bail!("{vpath} is not a drawable (.ydr), fragment (.yft) or drawable dictionary (.ydd)");
     }
@@ -311,6 +321,22 @@ pub(crate) fn cmd_replace_model(
         outln!("{what}closest level: {} meshes, {vertices} vertices, {triangles} triangles", check.meshes.len());
     }
     outln!("{} detail level(s), {}", imported.levels, human(file.len() as u64));
+    let file = match o.collision {
+        Some(col) => with_collision(game_dir, vpath, &back, true, col, keys.clone())?,
+        None => file,
+    };
+    save_model(game_dir, vpath, obj, file, &o, keys)
+}
+
+/// `file` (the model built from `obj`) to `--out` and/or the mods folder.
+fn save_model(
+    game_dir: &Path,
+    vpath: &str,
+    obj: &Path,
+    file: Vec<u8>,
+    o: &ReplaceOptions,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
     if let Some(out) = o.out {
         fs::write(out, &file).with_context(|| format!("writing {}", out.display()))?;
         outln!("Saved {}", out.display());
@@ -320,6 +346,41 @@ pub(crate) fn cmd_replace_model(
         cmd_edit(game_dir, vpath, Op::Set(file), &format!("Replaced the meshes of {vpath} with {name}"), keys)?;
     }
     Ok(())
+}
+
+/// `res` (a `.ybn`, or a `.ydr` with `ydr`) with its collision built from
+/// the OBJ file `col`.
+fn with_collision(
+    game_dir: &Path,
+    vpath: &str,
+    res: &rage_resource::Resource,
+    ydr: bool,
+    col: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<Vec<u8>> {
+    use rage_formats::ybn_write;
+    let text = fs::read_to_string(col).with_context(|| format!("reading {}", col.display()))?;
+    let meshes = openrage_app::obj::read(&text).with_context(|| format!("reading {}", col.display()))?;
+    let names = openrage_app::models::collision_material_names(game_dir, keys.clone());
+    let (mesh, matched) = openrage_app::obj::collision_mesh(&meshes, names);
+    for (material, name) in &matched {
+        match name {
+            Some(n) => outln!("collision material {material:<20} → {n}"),
+            None => outln!("collision material {material:<20} → the original's first (no such collision material)"),
+        }
+    }
+    let donor = (!ybn_write::can_donate(res, ydr))
+        .then(|| openrage_app::obj::find_collision_donor(game_dir, vpath, keys))
+        .flatten();
+    let file = ybn_write::replace_collision(res, ydr, &mesh, donor.as_ref().map(|(r, y)| (r, *y)))?;
+    let back = rage_resource::Resource::from_rsc7(&file)?;
+    let at = ybn_write::collision_of(&back, ydr)?;
+    for b in ybn_write::bvh_bounds(&back, at) {
+        ybn_write::check_bvh(&back, b).context("the written collision")?;
+    }
+    let (_, stats) = rage_formats::ybn::parse_at(&back, at).context("the written collision does not read back")?;
+    outln!("collision: {} triangles, {} vertices", stats.triangles, stats.vertices);
+    Ok(file)
 }
 
 pub(crate) fn cmd_put(game_dir: &Path, file: &Path, target: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {

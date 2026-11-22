@@ -947,6 +947,77 @@ pub fn find_texture_donor(
     })
 }
 
+/// An OBJ model as a collision: every triangle, with the material type
+/// its OBJ material is named after (`CONCRETE`, `metal_solid_medium`: a name
+/// of the game's `materials.dat`, ignoring case; others get the original's
+/// first material). Returns the mesh and per OBJ material the name it matched.
+pub fn collision_mesh(
+    meshes: &[ObjMesh],
+    names: &[String],
+) -> (rage_formats::ybn_write::CollisionMesh, Vec<(String, Option<String>)>) {
+    let mut out = rage_formats::ybn_write::CollisionMesh::default();
+    let mut matched = Vec::new();
+    for m in meshes {
+        let k = names.iter().position(|n| n.eq_ignore_ascii_case(m.material.trim()));
+        if !matched.iter().any(|(n, _): &(String, Option<String>)| *n == m.material) {
+            matched.push((m.material.clone(), k.map(|k| names[k].clone())));
+        }
+        let base = out.positions.len() as u32;
+        out.positions.extend_from_slice(&m.positions);
+        out.indices.extend(m.indices.iter().map(|i| i + base));
+        out.materials.extend(std::iter::repeat_n(k.and_then(|k| u8::try_from(k).ok()), m.indices.len() / 3));
+    }
+    (out, matched)
+}
+
+/// A collision with a triangle mesh (a `.ybn`; `true`: a `.ydr`) to lend
+/// its structure to a model whose collision has none (only boxes, spheres):
+/// one in the archive of `vpath`, else the first one of the game.
+pub fn find_collision_donor(
+    game_dir: &Path,
+    vpath: &str,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Option<(rage_resource::Resource, bool)> {
+    use rage_formats::ybn_write::can_donate;
+    let look = |rpf: &rage_rpf::Rpf7, from: rage_rpf::EntryId, limit: usize| {
+        let mut found = None;
+        let mut seen = 0;
+        rage_rpf::vfs::walk(
+            rpf,
+            from,
+            "",
+            true,
+            &mut |a, id, p| {
+                let ydr = p.to_ascii_lowercase().ends_with(".ydr");
+                if found.is_some() || seen > limit || !(ydr || p.to_ascii_lowercase().ends_with(".ybn")) {
+                    return;
+                }
+                seen += 1;
+                if let Ok(r) = a.read_resource(id)
+                    && can_donate(&r, ydr)
+                {
+                    found = Some((r, ydr));
+                }
+            },
+            &mut |_| {},
+        );
+        found
+    };
+    let parent = vpath.rsplit_once('/').map_or("", |(p, _)| p);
+    if let Ok((Node::ArchiveDir(rpf, _), _)) = rage_mods::resolve(game_dir, parent, keys.clone())
+        && let Some(f) = look(&rpf, rage_rpf::Rpf7::ROOT, 5000)
+    {
+        return Some(f);
+    }
+    let mut rpfs = Vec::new();
+    crate::detect::collect_rpfs(game_dir, &mut rpfs);
+    rpfs.sort();
+    rpfs.iter().find_map(|p| {
+        let rpf = rage_rpf::Rpf7::open(p, keys.clone()).ok()?;
+        look(&rpf, rage_rpf::Rpf7::ROOT, 2000)
+    })
+}
+
 /// A texture dictionary every GTA V installation has, as the last donor.
 const SHARED_TEXTURES: &str = "x64e.rpf/levels/gta5/vehicles.rpf/vehshare.ytd";
 

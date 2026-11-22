@@ -391,6 +391,159 @@ pub(crate) fn cmd_verify_paths(game_dir: &Path, within: &str, keys: Option<Arc<G
     Ok(())
 }
 
+/// The triangles of a collision as a mesh to write: every triangle, also
+/// of spheres, boxes and capsules (as the viewer builds them), with its
+/// material type.
+pub(crate) fn collision_mesh(d: &rage_formats::drawable::Drawable) -> rage_formats::ybn_write::CollisionMesh {
+    let mut out = rage_formats::ybn_write::CollisionMesh::default();
+    for m in &d.meshes {
+        let material = d
+            .shaders
+            .get(m.shader as usize)
+            .map_or(0, |s| s.name_hash.wrapping_sub(rage_formats::ybn::MATERIAL_BASE) as u8);
+        let base = out.positions.len() as u32;
+        out.positions.extend_from_slice(&m.positions);
+        out.indices.extend(m.indices.iter().map(|i| i + base));
+        out.materials.extend(std::iter::repeat_n(Some(material), m.indices.len() / 3));
+    }
+    out
+}
+
+/// Checks the game's collision hierarchies against the writer's reading of
+/// them, then writes every Enhanced `.ybn` and drawable collision anew from
+/// its own triangles (`ybn_write`) and compares what the reader gets back.
+pub(crate) fn cmd_verify_collision_writer(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    use rage_formats::{drawable, ybn, ybn_write};
+    let starts = archive_roots(game_dir, within, keys.clone())?;
+    let started = Instant::now();
+    // Per material type: triangles and area.
+    let totals = |d: &drawable::Drawable| -> std::collections::BTreeMap<u32, (usize, f64)> {
+        let mut t = std::collections::BTreeMap::new();
+        for m in &d.meshes {
+            let e = t.entry(d.shaders[m.shader as usize].name_hash).or_insert((0usize, 0f64));
+            for c in m.indices.as_chunks::<3>().0 {
+                let [a, b, c] = c.map(|i| m.positions[i as usize]);
+                let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+                let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+                e.0 += 1;
+                e.1 += 0.5 * ((n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) as f64).sqrt();
+            }
+        }
+        t
+    };
+    // (game hierarchies checked, written anew, skipped: no triangle mesh to copy / too large)
+    // Collisions of boxes and spheres only borrow the structure of a triangle mesh.
+    let donor = openrage_app::obj::find_collision_donor(game_dir, within, keys.clone());
+    let donor = donor.as_ref().map(|(r, y)| (r, *y));
+    let check = |res: &rage_resource::Resource, ydr: bool, s: &mut (usize, usize, usize)| -> Result<()> {
+        let root = ybn_write::collision_of(res, ydr)?;
+        for b in ybn_write::bvh_bounds(res, root) {
+            ybn_write::check_bvh(res, b).context("the game's own hierarchy")?;
+            s.0 += 1;
+        }
+        let (before, _) = ybn::parse_at(res, root)?;
+        let mesh = collision_mesh(&before);
+        if mesh.indices.len() / 3 > ybn_write::MAX_TRIANGLES || mesh.indices.is_empty() {
+            s.2 += 1;
+            return Ok(());
+        }
+        let file = ybn_write::replace_collision(res, ydr, &mesh, donor)?;
+        let back = rage_resource::Resource::from_rsc7(&file)?;
+        let at = ybn_write::collision_of(&back, ydr)?;
+        for b in ybn_write::bvh_bounds(&back, at) {
+            ybn_write::check_bvh(&back, b).context("the written hierarchy")?;
+        }
+        let (after, _) = ybn::parse_at(&back, at)?;
+        let (x, y) = (totals(&before), totals(&after));
+        if x.len() != y.len() {
+            bail!("materials {:?} written as {:?}", x.keys().collect::<Vec<_>>(), y.keys().collect::<Vec<_>>());
+        }
+        for ((m, a), (n, b)) in x.iter().zip(&y) {
+            // Slivers smaller than the vertex grid (of tiny spheres and capsules) can collapse.
+            if m != n || b.0 > a.0 || a.0 - b.0 > a.0 / 100 || (a.1 - b.1).abs() > 0.01 * a.1 + 0.05 {
+                bail!(
+                    "material {m:x}: {} triangles, area {:.2} written as {} triangles, area {:.2}",
+                    a.0,
+                    a.1,
+                    b.0,
+                    b.1
+                );
+            }
+        }
+        let slack: Vec<f32> = (0..3).map(|k| (before.bounds_max[k] - before.bounds_min[k]) / 30000.0 + 1e-3).collect();
+        if (0..3).any(|k| {
+            (before.bounds_min[k] - after.bounds_min[k]).abs() > slack[k]
+                || (before.bounds_max[k] - after.bounds_max[k]).abs() > slack[k]
+        }) {
+            bail!(
+                "box {:?}..{:?} written as {:?}..{:?}",
+                before.bounds_min,
+                before.bounds_max,
+                after.bounds_min,
+                after.bounds_max
+            );
+        }
+        if ydr {
+            let (a, b) = (drawable::parse_ydr(res)?, drawable::parse_ydr(&back)?);
+            if a.meshes.len() != b.meshes.len() {
+                bail!("the drawable's meshes changed");
+            }
+        }
+        s.1 += 1;
+        Ok(())
+    };
+    type Counts = (usize, (usize, usize, usize), Vec<String>);
+    let all: Vec<Counts> = starts
+        .par_iter()
+        .map(|(prefix, rpf, dir)| {
+            let (mut files, mut s, mut errors, mut nested) = (0, (0, 0, 0), Vec::new(), Vec::new());
+            vfs::walk(
+                rpf,
+                *dir,
+                prefix,
+                true,
+                &mut |a, id, p| {
+                    let name = a.entry(id).name.to_ascii_lowercase();
+                    let ydr = name.ends_with(".ydr");
+                    if !ydr && !name.ends_with(".ybn") {
+                        return;
+                    }
+                    let Ok(res) = a.read_resource(id) else { return };
+                    if ydr
+                        && (res.version != drawable::VERSION_YDR_ENHANCED
+                            || ybn_write::collision_of(&res, true).is_err())
+                    {
+                        return;
+                    }
+                    files += 1;
+                    if let Err(e) = check(&res, ydr, &mut s) {
+                        errors.push(format!("{p}: {e:#}"));
+                    }
+                },
+                &mut |e| nested.push(e.to_string()),
+            );
+            errors.extend(nested);
+            (files, s, errors)
+        })
+        .collect();
+    let sum = |f: fn(&Counts) -> usize| all.iter().map(f).sum::<usize>();
+    let errors: Vec<&String> = all.iter().flat_map(|x| &x.2).collect();
+    outln!(
+        "{} collisions ({} game hierarchies as expected), {} written anew and read back the same, {} skipped (no triangles, or over {}), {} errors ({:.1}s)",
+        sum(|x| x.0),
+        sum(|x| x.1.0),
+        sum(|x| x.1.1),
+        sum(|x| x.1.2),
+        rage_formats::ybn_write::MAX_TRIANGLES,
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    for e in errors.iter().take(30) {
+        outln!("  {e}");
+    }
+    if errors.is_empty() { Ok(()) } else { bail!("{} collisions failed", errors.len()) }
+}
+
 pub(crate) fn cmd_verify_collisions(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();

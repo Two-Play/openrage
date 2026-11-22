@@ -568,7 +568,8 @@ fn register_gta4_materials(archive: &rage_rpf::Gta4Archive, bounds: &[(String, D
 }
 
 /// Names of the collision materials, read once from the game's `materials.dat`.
-fn collision_material_names(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> &'static [String] {
+/// The names of the game's collision materials (`materials.dat`), by type.
+pub fn collision_material_names(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> &'static [String] {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     NAMES.get_or_init(|| {
         for path in ["update/update.rpf/common/data/materials/materials.dat", "common.rpf/data/materials/materials.dat"]
