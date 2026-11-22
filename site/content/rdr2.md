@@ -99,7 +99,7 @@ Fragments (`.yft`) show their moving parts like GTA V's: a wagon's wheels sit on
 other side, and follow animations. The blurred wheels the game shows at speed (`wheel_lf_fast`) are listed under
 *Parts* but hidden.
 
-**Not yet:** skeleton animations of models and cloth.
+**Not yet:** cloth.
 
 ## Peds and animals
 
@@ -131,13 +131,20 @@ openrage model …/metapeds.rpf/<ped>.ymt --outfit 2 --export ped.glb
 
 ## Animations
 
-Clip dictionaries (`.ycd`) open like GTA V's: select one to list its clips, or paste its path into the viewer's
-animation search to play a clip on a model.
+Clip dictionaries (`.ycd`) open like GTA V's: select one to see its clips and a list of fitting models, best first;
+click one, or double-click the dictionary, to open it in the viewer with the animation playing. In the viewer, paste a
+dictionary's path into the animation search.
+
+- **People and animals** share the main bones' names in RDR2, so every ped (`…/metapeds.rpf/<ped>.ymt`) is ranked by
+  how many of the dictionary's bones its base skeleton has: a sitting clip lists Arthur and the other people first, a
+  cow last. Most dictionaries are named only by a hash, so the bones decide.
+- **Vehicles, doors and destruction** play on their models: wheels and other parts of fragments move with their
+  bones, and a destruction clip (`des_…`) lists the models it was made for.
 
 RDR2 uses one kind of animation data whose key values are not fully understood yet. Those tracks are interpolated, so
 the timing is right to four frames but fast motion comes out softened; the viewer says so.
 
-**Checked:** 359,466 clips, every frame evaluated.
+**Checked:** 607,406 clips with 220,688 animations, every frame evaluated.
 
 ## Metadata
 

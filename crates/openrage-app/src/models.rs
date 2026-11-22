@@ -1611,13 +1611,8 @@ fn load_rdr2_ped_inner(game: &Path, ped: &str, outfit: usize) -> Result<LoadedMo
     }
     // The base skeleton: as the ped list names it, else guessed from the name.
     crate::progress::set("Reading the skeleton", 0, 0);
-    let fragment = metaped::peds(game)
-        .ok()
-        .and_then(|peds| peds.iter().find(|p| p.name.eq_ignore_ascii_case(ped)).map(metaped::base_fragment));
-    let base = fragment
-        .as_deref()
-        .and_then(|frag| rdr2_skeleton_named(game, frag))
-        .or_else(|| rdr2_base_skeleton_in(game, ped));
+    let fragment = rdr2_ped_base(game, ped);
+    let base = rdr2_ped_skeleton(game, ped);
     // Human heads name face bones the base skeletons lack: add them from
     // the one face rig the game has.
     let base = base.map(|mut sk| {
@@ -1879,12 +1874,34 @@ const RDR2_BASE_SKELETONS: &str = "packs_0.rpf/packs/base/models/metaped_fragmen
 /// The base skeleton of an RDR2 ped part: `a_c_cow_merge_4` → `meta_base_cow`,
 /// `a_c_bear_01_merge_2` → `meta_base_bear_01` (the longest name that exists,
 /// with or without the `a_c_`/`cs_` prefix).
-fn rdr2_base_skeleton(rpf: &rage_rpf::Rpf8, stem: &str) -> Option<drawable::Skeleton> {
+pub(crate) fn rdr2_base_skeleton(rpf: &rage_rpf::Rpf8, stem: &str) -> Option<drawable::Skeleton> {
     rdr2_base_skeleton_in(&crate::rdr2::game_folder(rpf.path())?, stem)
 }
 
+/// The file of an RDR2 ped's base skeleton, as the ped list names it (`meta_base_male.yft`).
+pub(crate) fn rdr2_ped_base(game: &Path, ped: &str) -> Option<String> {
+    let peds = crate::metaped::peds(game).ok()?;
+    peds.iter().find(|p| p.name.eq_ignore_ascii_case(ped)).map(crate::metaped::base_fragment)
+}
+
+/// The skeleton an RDR2 ped is put together on: as the ped list names it,
+/// else guessed from the ped's name.
+pub(crate) fn rdr2_ped_skeleton(game: &Path, ped: &str) -> Option<drawable::Skeleton> {
+    rdr2_ped_base(game, ped)
+        .and_then(|frag| rdr2_skeleton_named(game, &frag))
+        .or_else(|| rdr2_base_skeleton_in(game, ped))
+}
+
+/// The archive with RDR2's base skeletons (`metaped_fragments.rpf`).
+pub(crate) fn rdr2_base_skeletons(game: &Path) -> Option<Arc<rage_rpf::Rpf8>> {
+    match rage_mods::resolve(game, RDR2_BASE_SKELETONS, None).ok()?.0 {
+        Node::Rpf8Dir(frags, _) => Some(frags),
+        _ => None,
+    }
+}
+
 /// A base skeleton by its file name (`meta_base_male.yft`).
-fn rdr2_skeleton_named(game: &Path, file: &str) -> Option<drawable::Skeleton> {
+pub(crate) fn rdr2_skeleton_named(game: &Path, file: &str) -> Option<drawable::Skeleton> {
     let (Node::Rpf8Dir(frags, _), _) = rage_mods::resolve(game, RDR2_BASE_SKELETONS, None).ok()? else {
         return None;
     };
