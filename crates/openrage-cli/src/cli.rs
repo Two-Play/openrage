@@ -100,6 +100,9 @@ pub(crate) enum Command {
         /// that it comes out byte for byte the same or at least reads back to the same XML.
         /// GTA IV without --textures: rebuild the table of every .rpf package in memory and
         /// check that it matches the stored one byte for byte (nothing is written).
+        /// RDR2 without --textures: edit a temporary copy of every archive (top-level ones up to
+        /// 512 MB, and every nested one) with the RPF8 writer, check that every entry reads back
+        /// as it should, undo the edit and check that the copy is the original again.
         #[arg(long)]
         rebuild: bool,
     },

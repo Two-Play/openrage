@@ -246,6 +246,24 @@ pub fn rdr2_block_count(format: Format, width: u32, height: u32, levels: u32) ->
 }
 
 fn read_rdr2(res: &Resource, p: u64) -> Result<(Texture, u64), ResourceError> {
+    let (mut tex, data_ptr, rows) = rdr2_rows(res, p)?;
+    let total = rows.iter().map(|&(at, len)| at + len).max().unwrap_or(0);
+    let src = res.bytes(data_ptr, total)?;
+    let mut data = Vec::with_capacity(tex.expected_size().unwrap_or(0));
+    for (at, len) in rows {
+        data.extend_from_slice(&src[at..at + len]);
+    }
+    tex.data = data;
+    Ok((tex, data_ptr))
+}
+
+/// One tightly packed row of a stored texture: offset from the data pointer, length.
+pub(crate) type Row = (usize, usize);
+
+/// An RDR2 texture's description (without pixel data), its data pointer,
+/// and where its tightly packed rows lie in the padded stored data: the
+/// offset from the data pointer and the length of each row, in order.
+pub(crate) fn rdr2_rows(res: &Resource, p: u64) -> Result<(Texture, u64, Vec<Row>), ResourceError> {
     let name = res.string(res.u64(p + 0x28)?)?;
     let depth = res.u16(p + 0x1C)? as u32;
     let dimension = match res.u8(p + 0x1E)? {
@@ -253,7 +271,7 @@ fn read_rdr2(res: &Resource, p: u64) -> Result<(Texture, u64), ResourceError> {
         3 => Dimension::Texture3D,
         _ => Dimension::Texture2D,
     };
-    let mut tex = Texture {
+    let tex = Texture {
         width: res.u16(p + 0x18)? as u32,
         height: res.u16(p + 0x1A)? as u32,
         depth: if dimension == Dimension::Cube { depth.max(6) } else { depth.max(1) },
@@ -300,21 +318,19 @@ fn read_rdr2(res: &Resource, p: u64) -> Result<(Texture, u64), ResourceError> {
             tex.levels
         )));
     }
-    let src = res.bytes(data_ptr, stored_blocks * stride)?;
-    let mut data = Vec::with_capacity(tex.expected_size().unwrap_or(0));
+    res.bytes(data_ptr, stored_blocks * stride)?;
+    let mut out = Vec::new();
     let mut at = 0;
     // Slices one after another, each with its mip levels.
     for _ in 0..slices {
         for &[cols, rows, pcols, prows] in &grids {
             for r in 0..rows {
-                let start = at + r * pcols * block;
-                data.extend_from_slice(&src[start..start + cols * block]);
+                out.push((at + r * pcols * block, cols * block));
             }
             at += pcols * prows * block;
         }
     }
-    tex.data = data;
-    Ok((tex, data_ptr))
+    Ok((tex, data_ptr, out))
 }
 
 /// Reads a texture dictionary located at `root` (e.g. one embedded in a drawable).

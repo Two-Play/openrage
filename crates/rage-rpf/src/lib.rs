@@ -28,6 +28,8 @@ mod rpf7;
 #[cfg(feature = "rdr2")]
 pub mod rpf8;
 #[cfg(feature = "rdr2")]
+pub mod rpf8_editor;
+#[cfg(feature = "rdr2")]
 pub mod rpf8_exe;
 #[cfg(feature = "rdr2")]
 pub mod rpf8_keys;
