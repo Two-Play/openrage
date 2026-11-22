@@ -132,7 +132,9 @@ table at the start are rewritten, and entries in the way of a grown table move t
 openrage --game <RDR2> verify --rebuild            # every archive: edit a copy, read it back, undo
 ```
 
-**Checked:** RDR2_CHECK_NUMBERS
+**Checked:** `verify --rebuild` over the whole game (Steam version, November 2026): 4,905 archives edited and undone
+(467,546 entries, every nested archive included) and 81,021 texture dictionaries (379,191 textures) written in place
+and read back, 0 failed. 58 archives over 512 MB were not copied whole; their nested archives were checked.
 
 **Not checked in the game:** these changes were tested in OpenRAGE only, not in RDR2 itself. In particular, whether
 LML picks up files from `lml/replace` for archives in subfolders (`x64/dlcpacks/…`, `x64/audio/sfx/…`), whether the
