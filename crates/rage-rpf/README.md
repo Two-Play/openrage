@@ -33,6 +33,9 @@ PE and verifies it with SHA-256 fingerprints; no key, IV, cipher table,
 executable data or archive data is shipped. The first encrypted metadata span
 can be decrypted as a reproducible static check.
 
+See [RPF9.md](RPF9.md) for the measured header layout, TFIT chain,
+build fingerprints, validation coverage and open questions.
+
 The complete RPF9 table-of-contents mapping and trailer are not understood
 yet. File listing, extraction, editing and writing are deliberately disabled
 instead of treating the format as RPF7/RPF8.
