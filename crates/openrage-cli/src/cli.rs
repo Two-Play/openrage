@@ -232,6 +232,18 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta", "audio"])]
         anims: bool,
     },
+    /// Inspect an RPF9 archive from the analysed Xbox Series/Scarlett build.
+    ///
+    /// Header inspection needs only the archive. With --exe, OpenRAGE takes
+    /// TFIT material from your own executable and decrypts the first metadata
+    /// span as a static validation. Full listing and extraction are not yet
+    /// implemented.
+    Rpf9 {
+        path: PathBuf,
+        /// Xbox Series/Scarlett PE from the analysed 1.0.2.1 build.
+        #[arg(long)]
+        exe: Option<PathBuf>,
+    },
     /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
     Media {
         path: String,
