@@ -235,14 +235,31 @@ pub(crate) enum Command {
     /// Inspect an RPF9 archive from the analysed Xbox Series/Scarlett build.
     ///
     /// Header inspection needs only the archive. With --exe, OpenRAGE takes
-    /// TFIT material from your own executable and decrypts the first metadata
-    /// span as a static validation. Full listing and extraction are not yet
-    /// implemented.
+    /// TFIT material from your own executable and reads the encrypted TOC.
+    /// Entries use stored hashes; --extract decrypts and decompresses supported files.
     Rpf9 {
         path: PathBuf,
         /// Xbox Series/Scarlett PE from the analysed 1.0.2.1 build.
         #[arg(long)]
         exe: Option<PathBuf>,
+        /// Enter a directly stored nested archive by index; repeat for deeper levels.
+        #[arg(long, requires = "exe")]
+        nested: Vec<u32>,
+        /// Candidate paths, one per line (<=1MiB), matched against native name hashes.
+        #[arg(long, requires_all = ["exe", "list"])]
+        names: Option<PathBuf>,
+        /// List logical entries, stored hashes and physical extents.
+        #[arg(long, requires = "exe")]
+        list: bool,
+        /// Export one logical entry verbatim, including stored padding.
+        #[arg(long, requires_all = ["exe", "output"], conflicts_with = "extract")]
+        extract_raw: Option<u32>,
+        /// Decrypt and decompress one logical entry to --output.
+        #[arg(long, requires_all = ["exe", "output"], conflicts_with = "extract_raw")]
+        extract: Option<u32>,
+        /// Destination for an export; an existing file is never replaced.
+        #[arg(long, requires = "exe")]
+        output: Option<PathBuf>,
     },
     /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
     Media {

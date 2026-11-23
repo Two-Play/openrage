@@ -119,8 +119,17 @@ fn run() -> Result<()> {
         };
         return cmd_rpf8(path, *list, checks);
     }
-    if let Command::Rpf9 { path, exe } = &cli.command {
-        return cmd_rpf9(path, exe.as_deref());
+    if let Command::Rpf9 { path, exe, nested, names, list, extract_raw, extract, output } = &cli.command {
+        return cmd_rpf9(
+            path,
+            exe.as_deref(),
+            nested,
+            names.as_deref(),
+            *list,
+            *extract_raw,
+            *extract,
+            output.as_deref(),
+        );
     }
     // Managing plugins needs no game; previews and actions use it when there is one.
     if let Command::Plugin(cmd) = &cli.command
