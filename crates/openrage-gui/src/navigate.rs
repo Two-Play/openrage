@@ -25,6 +25,12 @@ pub(crate) fn start_browsing(ui: &AppWindow) {
     });
     ui.set_window_title(title.into());
     start_index_update(ui);
+    // GTA VI: its archives are read through once to find their files. That
+    // starts now, not when an archive is opened first.
+    match with_app(|a| a.game_dir.clone()).filter(|d| detect::is_gta6_dir(d)) {
+        Some(dir) => openrage_app::rpf9::index_in_background(&dir),
+        None => openrage_app::rpf9::stop_background(),
+    }
     refresh_asi(ui);
     refresh_tool_menu(ui);
     refresh_undo(ui);
@@ -594,6 +600,15 @@ pub(crate) fn show_folder_info(ui: &AppWindow) {
                     kv("Entries", grouped(h.entry_count as usize)),
                     note("Read-only. Names come from `openrage rdr2-names`; unnamed files are under hash/."),
                 ]
+            }
+            Location::Rpf9(rpf, _) => {
+                let mut meta = vec![
+                    kv("Type", "Recovered from a GTA VI archive"),
+                    kv("Archive", rpf.display_name().rsplit('/').next().unwrap_or_default()),
+                ];
+                meta.extend(crate::preview::rpf9_archive_info(rpf));
+                meta.push(note("Read-only. Extract… saves the files unpacked."));
+                meta
             }
             Location::Gta4(a, _) => {
                 let mut meta = vec![kv("Type", "Inside a GTA IV archive")];

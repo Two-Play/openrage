@@ -1,8 +1,8 @@
 //! Reader for RAGE RPF archives.
 //!
 //! Supports RPF7 (GTA V Legacy and Enhanced, including nested archives),
-//! the GTA IV archives (IMG3, RPF2, RPF3) and, with the `rdr2` feature,
-//! RPF8 (RDR2).
+//! the GTA IV archives (IMG3, RPF2, RPF3), the unencrypted data of RPF9
+//! (GTA VI; see [`rpf9`]) and, with the `rdr2` feature, RPF8 (RDR2).
 //!
 //! # Licence of the `rdr2` feature
 //!
@@ -33,6 +33,7 @@ pub mod rpf8_exe;
 pub mod rpf8_keys;
 #[cfg(feature = "rdr2")]
 pub mod rpf8_names;
+pub mod rpf9;
 mod toc;
 pub mod vfs;
 pub mod writer;
@@ -61,4 +62,5 @@ pub use gta4::{Gta4Archive, Gta4Entry, Gta4EntryId, Gta4EntryKind, Gta4Format};
 pub use rpf7::{Encryption, Entry, EntryId, EntryKind, Rpf7};
 #[cfg(feature = "rdr2")]
 pub use rpf8::Rpf8;
+pub use rpf9::Rpf9;
 pub use writer::{ArchiveWriter, RawEntry, entry_for, file_entry, resource_entry};

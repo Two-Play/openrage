@@ -155,6 +155,25 @@ fn main() -> anyhow::Result<()> {
     }
     let cfg = Config::load();
     plugins::reload(&cfg);
+    // GTA VI archives are read through once to find their files: show how far that is.
+    let status = ui.as_weak();
+    openrage_app::rpf9::register(std::sync::Arc::new(move |step| {
+        static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let text = match step {
+            Some((name, done, total)) => {
+                let percent = done * 100 / total.max(1);
+                if SHOWN.swap(percent, Ordering::Relaxed) == percent {
+                    return;
+                }
+                format!("Indexing {name} (read once, then remembered)… {percent} %")
+            }
+            None => {
+                SHOWN.store(u64::MAX, Ordering::Relaxed);
+                String::new()
+            }
+        };
+        let _ = status.upgrade_in_event_loop(move |ui| ui.set_status(text.into()));
+    }));
     let keys = load_keys().unwrap_or(None);
     // Several games set up and none chosen as default: ask (after the window is up).
     let known = installed_games(&cfg);
@@ -166,7 +185,9 @@ fn main() -> anyhow::Result<()> {
         default.or_else(|| cfg.game_dir.clone().filter(|d| known.contains(d))).or_else(|| known.first().cloned())
     };
     let rdr2_ready = game_dir.as_deref().is_some_and(|d| {
-        (is_rdr2_dir(d) && register_rdr2(d)) || (is_gta4_dir(d) && openrage_app::gta4::register(d).is_ok())
+        (is_rdr2_dir(d) && register_rdr2(d))
+            || (is_gta4_dir(d) && openrage_app::gta4::register(d).is_ok())
+            || detect::is_gta6_dir(d)
     });
 
     APP.with(|a| {

@@ -444,6 +444,10 @@ pub fn is_model(name: &str) -> bool {
         || n.ends_with(".wft")
         || n.ends_with(".wbn")
         || n.ends_with(".wbd")
+        // GTA VI: drawables, fragments and drawable dictionaries.
+        || n.ends_with(".#dr")
+        || n.ends_with(".#ft")
+        || n.ends_with(".#dd")
         || rage_formats::paths::is_path_file(&n)
 }
 
@@ -584,6 +588,15 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
     }
     if let Node::Gta4File(archive, id) = node {
         return load_gta4(&archive, id);
+    }
+    if let Node::Rpf9File(rpf, i) = node {
+        let drawables = crate::gta6_models::load(&rpf, i)?;
+        let textures = crate::gta6_textures::for_drawables(game_dir, &drawables);
+        let mut model = LoadedModel::from_drawables(drawables);
+        if let Some(textures) = textures {
+            model.add_textures("texture pools".to_owned(), textures);
+        }
+        return Ok(model);
     }
     let Node::ArchiveFile(rpf, id) = node else { bail!("{vpath} is not a file inside an archive") };
     let name = rpf.entry(id).name.clone();

@@ -51,6 +51,27 @@ Vorbis audio (Red Dead Redemption 2) is decoded with lewton
 (https://github.com/RustAudio/lewton), licensed under the MIT or Apache-2.0
 license.
 
+## opus-rs
+
+Opus audio (GTA VI) is decoded with opus-rs
+(https://github.com/restsend/opus-rs), a port of libopus, licensed under the
+BSD 3-Clause licence.
+
+## Leonida
+
+What is known about GTA VI's formats (RPF9 archives, audio containers, PSIN
+and RBF0 metadata, texture pools) comes from the documentation of Leonida
+(https://github.com/ItsNotRexed/Leonida, GPL-3.0). The PSIN reader in
+`crates/rage-formats/src/psin.rs` follows its `tools/psin_data.py`, the
+texture pool reader in `crates/rage-formats/src/ttpf.rs` its
+`tools/ttpf_mips.py` and `tools/tex_headers.py`.
+
+## rpf9-explorer
+
+The layout of GTA VI's models (`crates/rage-formats/src/drawable6.rs`) is the
+one found by rpf9-explorer (https://github.com/breadbbbb/rpf9-explorer). Its
+decoder was read to learn the layout; no code was taken from it.
+
 ## RDR2-RPF-Tool
 
 The TFIT2-CBC cipher and the strided file encryption of Red Dead Redemption 2

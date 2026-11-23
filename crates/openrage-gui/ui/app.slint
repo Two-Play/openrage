@@ -1107,6 +1107,8 @@ export component AppWindow inherits Window {
     in property <string> setup-log;
     in property <bool> setup-running;
     in property <bool> setup-can-cancel;
+    // Other games are set up: leaving the setup goes back to their list.
+    in property <bool> setup-has-games;
 
     callback navigate(string);
     callback go-back();
@@ -1172,6 +1174,7 @@ export component AppWindow inherits Window {
     callback setup-browse-magic();
     callback setup-pick-detected(string);
     callback setup-run();
+    callback setup-leave();
     callback theme-changed(int);
     // Accent color (View → Accent color): mode 0 style, 1 orange, 2 custom color.
     callback accent-chosen(int, color);
@@ -3653,7 +3656,7 @@ export component AppWindow inherits Window {
             height: 48px;
         }
         Text {
-            text: @tr("OpenRAGE reads the archive keys from your own copy of GTA V. No keys or game files are included with OpenRAGE.");
+            text: @tr("Choose the folder of your game. OpenRAGE reads the archive keys from your own copy; no keys or game files are included. GTA VI archives open without keys.");
             wrap: word-wrap;
             color: Theme.text-muted;
         }
@@ -3684,7 +3687,7 @@ export component AppWindow inherits Window {
                     text <=> root.setup-game-dir;
                     edited => { root.setup-game-dir-edited(); }
                     accessible-label: @tr("Game directory");
-                    placeholder-text: @tr("Folder containing GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe or RDR2.exe");
+                    placeholder-text: @tr("Folder of GTA V, GTA IV, Red Dead Redemption 2 or GTA VI");
                 }
                 Button {
                     text: @tr("Browse…");
@@ -3736,12 +3739,17 @@ export component AppWindow inherits Window {
                 indeterminate: true;
             }
             if root.setup-can-cancel: Button {
-                text: @tr("Close");
+                text: @tr("Cancel");
                 enabled: !root.setup-running;
                 clicked => { root.setup-visible = false; }
             }
+            if !root.setup-can-cancel: Button {
+                text: root.setup-has-games ? @tr("Back to the games") : @tr("Quit");
+                enabled: !root.setup-running;
+                clicked => { root.setup-leave(); }
+            }
             Button {
-                text: @tr("Derive keys");
+                text: @tr("Open");
                 primary: true;
                 enabled: !root.setup-running && root.setup-game-dir != "";
                 clicked => { root.setup-run(); }

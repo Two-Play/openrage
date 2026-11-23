@@ -75,6 +75,7 @@ pub(crate) fn plugin_preview(
             rpf.read(entry).ok()?
         }
         Node::Gta4File(a, id) if a.entry(id).size() <= MAX => a.read(id).ok()?,
+        Node::Rpf9File(rpf, i) if rpf.entries().ok()?.get(i)?.size <= MAX => rpf.read_at(i).ok()?,
         _ => return None,
     };
     if !specific && rage_core::text::decode_text(&data, 4096).is_some() {

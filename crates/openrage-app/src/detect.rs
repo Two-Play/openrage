@@ -74,6 +74,27 @@ pub fn is_rdr2_dir(dir: &Path) -> bool {
     dir.join(RDR2_EXE).is_file()
 }
 
+/// Whether a folder holds GTA VI: no known program, but archives in the
+/// RPF9 format. They open without keys (see [`rage_rpf::rpf9`]).
+pub fn is_gta6_dir(dir: &Path) -> bool {
+    if is_gta5_dir(dir) || is_rdr2_dir(dir) || crate::gta4::is_gta4_dir(dir) {
+        return false;
+    }
+    if dir.join("common.rpf").is_file() {
+        return rage_rpf::Rpf9::file_is_rpf9(&dir.join("common.rpf"));
+    }
+    let Ok(rd) = fs::read_dir(dir) else { return false };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rpf")))
+        .any(|p| rage_rpf::Rpf9::file_is_rpf9(&p))
+}
+
+/// Whether a folder holds a game OpenRAGE can open.
+pub fn is_game_dir(dir: &Path) -> bool {
+    is_gta5_dir(dir) || is_rdr2_dir(dir) || crate::gta4::is_gta4_dir(dir) || is_gta6_dir(dir)
+}
+
 /// The icon of the game in `dir`, from its own program: (width, height, RGBA).
 pub fn game_icon(dir: &Path) -> Option<(u32, u32, Vec<u8>)> {
     let programs: &[&str] = if is_rdr2_dir(dir) {
@@ -87,7 +108,7 @@ pub fn game_icon(dir: &Path) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 /// Short name of the game installed in `dir`: "GTA V Enhanced", "GTA V",
-/// "GTA IV", "RDR2", or `None` when no known executable is there.
+/// "GTA IV", "RDR2", "GTA VI", or `None` when the folder holds no known game.
 pub fn game_name(dir: &Path) -> Option<&'static str> {
     if is_rdr2_dir(dir) {
         Some("RDR2")
@@ -97,6 +118,8 @@ pub fn game_name(dir: &Path) -> Option<&'static str> {
         Some("GTA V")
     } else if crate::gta4::is_gta4_dir(dir) {
         Some("GTA IV")
+    } else if is_gta6_dir(dir) {
+        Some("GTA VI")
     } else {
         None
     }

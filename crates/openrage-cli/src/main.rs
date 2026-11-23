@@ -107,6 +107,10 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    if let Command::Ttpf { path, export, from, count, max_side } = &cli.command {
+        return cmd_ttpf(path, export.as_deref(), *from, *count, *max_side);
+    }
+
     if let Command::Rpf8 { path, list, textures, models, text, meta, audio, anims } = &cli.command {
         return cmd_rpf8(
             path,
@@ -153,10 +157,30 @@ fn run() -> Result<()> {
         eprintln!("warning: {e}");
         None
     });
+    // GTA VI archives are read through once to find their files; say so.
+    openrage_app::rpf9::register(Arc::new(|step| {
+        use std::io::IsTerminal;
+        static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let err = std::io::stderr();
+        match step {
+            Some((name, 0, _)) => {
+                eprintln!("Indexing {name}: reading the whole archive once, the result is kept for next time.");
+            }
+            Some((_, done, total)) if err.is_terminal() && total > 0 => {
+                let percent = done * 100 / total;
+                if SHOWN.swap(percent, std::sync::atomic::Ordering::Relaxed) != percent {
+                    eprint!("\r{percent:>3} %");
+                }
+            }
+            None if err.is_terminal() => eprint!("\r      \r"),
+            _ => {}
+        }
+    }));
 
     match cli.command {
         Command::Keys { .. }
         | Command::Rpf8 { .. }
+        | Command::Ttpf { .. }
         | Command::Rdr2Keys { .. }
         | Command::Rdr2Names { .. }
         | Command::Licenses { .. } => {

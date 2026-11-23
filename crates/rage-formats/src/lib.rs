@@ -8,9 +8,11 @@
 #![forbid(unsafe_code)]
 
 pub mod awc;
+pub mod bcpack;
 pub mod clip;
 pub mod dds;
 pub mod drawable;
+pub mod drawable6;
 pub mod expression;
 pub mod geometry;
 pub mod gltf;
@@ -24,11 +26,13 @@ pub mod meta;
 pub mod model_textures;
 pub mod names;
 pub mod paths;
+pub mod psin;
 pub mod pso;
 pub mod rbf;
 pub mod sco;
 pub mod shaders;
 pub mod texture;
+pub mod ttpf;
 pub mod wad;
 pub mod wbn;
 pub mod wdr;

@@ -61,6 +61,24 @@ pub(crate) fn start_extract(ui: &AppWindow) {
         });
         return;
     }
+    // GTA VI: the selected file or folder of the recovery view, or the whole folder.
+    let gta6 = with_app(|a| {
+        let listing = a.listing.as_ref()?;
+        let Location::Rpf9(rpf, dir) = &listing.location else { return None };
+        let item = a.selected.map(|s| &listing.items[s]);
+        let find = |name: &str| rpf.loaded().and_then(|entries| rpf.find(&entries, &browser::join(dir, name)));
+        Some(match item {
+            Some(item) if item.kind == ItemKind::Dir => (Arc::clone(rpf), browser::join(dir, &item.name), None),
+            Some(item) => (Arc::clone(rpf), dir.clone(), find(&item.name)),
+            None => (Arc::clone(rpf), dir.clone(), None),
+        })
+    });
+    if let Some((rpf, dir, file)) = gta6 {
+        spawn_extract(ui, move |out, cancel, progress| {
+            openrage_app::rpf9::extract(&rpf, &dir, file, out, cancel, progress)
+        });
+        return;
+    }
     let target = with_app(|a| -> Result<(Arc<Rpf7>, EntryId), String> {
         let listing = a.listing.as_ref().ok_or("nothing to extract")?;
         let item = a.selected.map(|s| &listing.items[s]);

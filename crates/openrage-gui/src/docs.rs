@@ -16,6 +16,7 @@ pub(crate) fn read_file(ui: &AppWindow, vpath: &str) -> anyhow::Result<Vec<u8>> 
             Ok(rpf.read(entry)?)
         }
         Node::Gta4File(a, id) => Ok(a.read(id)?),
+        Node::Rpf9File(rpf, i) => Ok(rpf.read_at(i)?),
         _ => anyhow::bail!("{vpath} is not a file"),
     }
 }
@@ -53,8 +54,25 @@ pub(crate) fn open_text_file(ui: &AppWindow, vpath: String) {
     open_text_data(ui, vpath, &data);
 }
 
+/// A table of strings that each end with a zero byte (GTA VI keeps texts
+/// that way), one string per line; `None` for anything else.
+pub(crate) fn zero_ended_strings(data: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(data).ok()?;
+    let plain = |c: char| !c.is_control() || matches!(c, '\0' | '\t' | '\r' | '\n');
+    (text.contains('\0') && text.chars().all(plain)).then(|| {
+        let lines: Vec<String> = text.trim_end_matches('\0').split('\0').map(|s| s.replace('\n', "\\n")).collect();
+        lines.join("\n").into_bytes()
+    })
+}
+
 pub(crate) fn open_text_data(ui: &AppWindow, vpath: String, data: &[u8]) {
-    match editor::Document::from_file(vpath.clone(), data) {
+    let opened = editor::Document::from_file(vpath.clone(), data).or_else(|e| {
+        let mut doc =
+            zero_ended_strings(data).and_then(|lines| editor::Document::from_bytes(vpath.clone(), &lines)).ok_or(e)?;
+        doc.locked_reason = "A table of strings, shown one per line for reading.".into();
+        Ok::<_, String>(doc)
+    });
+    match opened {
         Ok(doc) => {
             editor::open(ui, doc);
             ui.set_status(SharedString::new());

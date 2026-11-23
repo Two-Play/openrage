@@ -8,6 +8,9 @@
 //! `0x60` string (u16 length + ASCII). `FD FF` + i32 length + bytes is element
 //! content; `FF FF` closes the current element. The first `n` values after an
 //! element (its attribute count) are its attributes.
+//!
+//! GTA VI: most files have `FB FF 01 00` after the magic, and with it
+//! integers and floats of 8 bytes instead of 4.
 
 use crate::xml::{self, Writer};
 
@@ -24,6 +27,10 @@ pub enum RbfError {
 pub enum Value {
     Element(Element),
     Uint(String, u32),
+    /// GTA VI: an 8-byte integer.
+    Uint64(String, u64),
+    /// GTA VI: an 8-byte float.
+    Float64(String, f64),
     Bool(String, bool),
     Float(String, f32),
     Float3(String, [f32; 3]),
@@ -84,6 +91,12 @@ impl Reader<'_> {
     fn f32(&mut self) -> Result<f32, RbfError> {
         Ok(f32::from_bits(self.u32()?))
     }
+    fn u64(&mut self) -> Result<u64, RbfError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap_or_default()))
+    }
+    fn f64(&mut self) -> Result<f64, RbfError> {
+        Ok(f64::from_bits(self.u64()?))
+    }
     fn string(&mut self) -> Result<String, RbfError> {
         let n = self.u16()? as usize;
         Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
@@ -95,7 +108,9 @@ pub fn parse(data: &[u8]) -> Result<Element, RbfError> {
     if !is_rbf(data) {
         return Err(RbfError::Invalid("missing RBF0 header".into()));
     }
-    let mut r = Reader { d: data, pos: 4 };
+    // GTA VI: with these four bytes, numbers take 8 bytes.
+    let wide = data.get(4..8) == Some(&[0xFB, 0xFF, 0x01, 0x00]);
+    let mut r = Reader { d: data, pos: if wide { 8 } else { 4 } };
     let mut names: Vec<String> = Vec::new();
     let mut stack: Vec<Element> = Vec::new();
     while r.pos < data.len() {
@@ -139,6 +154,9 @@ pub fn parse(data: &[u8]) -> Result<Element, RbfError> {
                         stack.push(Element { name, pending, ..Default::default() });
                         continue;
                     }
+                    0x10 if wide => Value::Uint64(name, r.u64()?),
+                    0x40 if wide => Value::Float64(name, r.f64()?),
+                    0x50 if wide => Value::Float3(name, [r.f64()? as f32, r.f64()? as f32, r.f64()? as f32]),
                     0x10 => Value::Uint(name, r.u32()?),
                     0x20 => Value::Bool(name, true),
                     0x30 => Value::Bool(name, false),
@@ -163,6 +181,16 @@ pub fn to_xml(data: &[u8]) -> Result<(String, Vec<String>, String), RbfError> {
     Ok((text, errors, root.name))
 }
 
+/// An 8-byte float as text: like a 4-byte one when it is one exactly.
+fn float64(v: f64) -> String {
+    if f64::from(v as f32) == v { xml::float(v as f32) } else { v.to_string() }
+}
+
+/// An 8-byte integer as text: small ones as numbers, the rest (hashes) in hex.
+fn uint64(v: u64) -> String {
+    if v < 1 << 31 { v.to_string() } else { format!("0x{v:016X}") }
+}
+
 fn bool_text(b: bool) -> &'static str {
     if b { "True" } else { "False" }
 }
@@ -174,6 +202,8 @@ fn write(w: &mut Writer, level: usize, e: &Element) {
             Value::Str(n, v) => (n, xml::escape(v)),
             Value::Float(n, v) => (n, xml::float(*v)),
             Value::Uint(n, v) => (n, v.to_string()),
+            Value::Uint64(n, v) => (n, uint64(*v)),
+            Value::Float64(n, v) => (n, float64(*v)),
             Value::Bool(n, v) => (n, bool_text(*v).to_owned()),
             _ => continue,
         };
@@ -203,10 +233,14 @@ fn write(w: &mut Writer, level: usize, e: &Element) {
                 }
                 // Matrices and float lists: little-endian floats, a row per line
                 // (matrix34: the three axes and the position).
-                Some(kind @ ("matrix34" | "matrix44" | "float_array" | "vector3_array" | "vector4_array")) => {
+                Some(
+                    kind @ ("matrix34" | "matrix44" | "float_array" | "vector2_array" | "vec2v_array" | "vector3_array"
+                    | "vector4_array"),
+                ) => {
                     let per_row = match kind {
                         "matrix34" | "vector3_array" => 3,
                         "float_array" => 1,
+                        "vector2_array" | "vec2v_array" => 2,
                         _ => 4,
                     };
                     let floats: Vec<String> =
@@ -222,6 +256,8 @@ fn write(w: &mut Writer, level: usize, e: &Element) {
             },
             Value::Element(c) => write(w, inner, c),
             Value::Uint(n, v) => w.value(inner, n, &format!("0x{v:08X}")),
+            Value::Uint64(n, v) => w.value(inner, n, &uint64(*v)),
+            Value::Float64(n, v) => w.value(inner, n, &float64(*v)),
             Value::Bool(n, v) => w.value(inner, n, bool_text(*v)),
             Value::Float(n, v) => w.value(inner, n, &xml::float(*v)),
             Value::Float3(n, v) => w.empty(
@@ -253,5 +289,26 @@ mod tests {
         let (text, errors, _) = to_xml(&d).unwrap();
         assert!(errors.is_empty());
         assert!(text.contains("<root a=\"x\">\n <v value=\"1.5\" />\n</root>"), "{text}");
+    }
+
+    /// GTA VI: 8-byte numbers after the four bytes that announce them.
+    #[test]
+    fn parses_wide_numbers() {
+        let mut d = b"RBF0\xFB\xFF\x01\x00".to_vec();
+        d.extend([0, 0, 1, 0, b'r', 0, 0, 0, 0, 1, 0]);
+        d.extend([1, 0x10, 1, 0, b'n']);
+        d.extend(7u64.to_le_bytes());
+        d.extend([2, 0x40, 1, 0, b'v']);
+        d.extend(0.25f64.to_le_bytes());
+        // The same name with another type, as GTA VI's files have it.
+        d.extend([2, 0x10]);
+        d.extend(u64::MAX.to_le_bytes());
+        d.extend([0xFF, 0xFF]);
+        let (text, errors, _) = to_xml(&d).unwrap();
+        assert!(errors.is_empty());
+        assert!(
+            text.contains("<r n=\"7\">\n <v value=\"0.25\" />\n <v value=\"0xFFFFFFFFFFFFFFFF\" />\n</r>"),
+            "{text}"
+        );
     }
 }
