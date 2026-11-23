@@ -8,6 +8,7 @@ Read and write RAGE archives, part of
 | RPF7 (incl. nested archives, AES and NG encryption) | GTA V Legacy and Enhanced | yes | yes |
 | IMG3, RPF2, RPF3 | GTA IV | yes | yes |
 | RPF8 | Red Dead Redemption 2 | with the `rdr2` feature | no |
+| RPF9 (Scarlett 1.0.2.1) | experimental header and first metadata span | partial | no |
 
 `vfs` resolves paths that cross archive boundaries
 (`update/update.rpf/x64/data/lang/americandlc.rpf/global.gxt2`).
@@ -23,6 +24,18 @@ for id in rpf.children(rage_rpf::Rpf7::ROOT) {
 Untrusted archives are expected: nesting depth (`MAX_NESTING`) and unpacked
 sizes (`MAX_UNPACKED`) are limited, and `vfs::safe_relative_path` must be used
 for every extraction path.
+
+## Experimental RPF9 support
+
+`rpf9` parses and validates the 0x40-byte plaintext header. `rpf9_exe`
+extracts the TFIT-CBC material from the user's own analysed Scarlett 1.0.2.1
+PE and verifies it with SHA-256 fingerprints; no key, IV, cipher table,
+executable data or archive data is shipped. The first encrypted metadata span
+can be decrypted as a reproducible static check.
+
+The complete RPF9 table-of-contents mapping and trailer are not understood
+yet. File listing, extraction, editing and writing are deliberately disabled
+instead of treating the format as RPF7/RPF8.
 
 ## The `rdr2` feature and its licence
 
