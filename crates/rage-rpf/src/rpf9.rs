@@ -119,9 +119,9 @@ impl Header {
         {
             errors.push("expected 0x40 <= region_b_offset <= metadata_end <= file size".to_owned());
         }
-        if self.metadata_end % ALIGNMENT != 0
-            || self.region_b_offset % ALIGNMENT != 0
-            || self.trailer_size % ALIGNMENT != 0
+        if !self.metadata_end.is_multiple_of(ALIGNMENT)
+            || !self.region_b_offset.is_multiple_of(ALIGNMENT)
+            || !self.trailer_size.is_multiple_of(ALIGNMENT)
         {
             errors.push("metadata offsets or trailer size are not 16-byte aligned".to_owned());
         }
@@ -223,14 +223,14 @@ impl TfitDecryptor {
             .expect("validated fixed tables")
         };
         let mut words = [0u32; 4];
-        for group in 0..4 {
+        for (group, word) in words.iter_mut().enumerate() {
             let mut value = 0u32;
             for index in 0..4 {
                 let position = group * 4 + index;
                 value = (value << 8)
                     ^ u32::from(initial[position * 256 + usize::from(block[position])]);
             }
-            words[group] = value ^ key(group);
+            *word = value ^ key(group);
         }
 
         for round in 1..14 {
@@ -277,13 +277,13 @@ impl TfitDecryptor {
         ciphertext: &[u8],
         iv: [u8; 16],
     ) -> Result<Vec<u8>, Rpf9Error> {
-        if ciphertext.len() % 16 != 0 {
+        if !ciphertext.len().is_multiple_of(16) {
             return Err(Rpf9Error::InvalidCiphertextLength(ciphertext.len()));
         }
         let mut previous = iv;
         let mut output = Vec::with_capacity(ciphertext.len());
-        for chunk in ciphertext.chunks_exact(16) {
-            let current: [u8; 16] = chunk.try_into().expect("exact chunk");
+        for chunk in ciphertext.as_chunks::<16>().0 {
+            let current = *chunk;
             let decoded = self.decrypt_block(current);
             output.extend(decoded.iter().zip(previous).map(|(a, b)| a ^ b));
             previous = current;
