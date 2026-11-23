@@ -1,0 +1,385 @@
+//! Experimental, read-only support for the RPF9 variant observed on Scarlett.
+//!
+//! This module deliberately stops at the part of the format that has been
+//! validated: the plaintext 0x40-byte header and TFIT-CBC decryption. The
+//! complete table-of-contents mapping is not known yet, so this is not an
+//! archive browser and cannot extract or write files.
+
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
+pub const MAGIC: u32 = 0x5250_4639;
+pub const HEADER_SIZE: usize = 0x40;
+pub const FORMAT_CONSTANT: u32 = 0x0004_7A00;
+pub const REGION_CONSTANT: u32 = 0x0000_0150;
+pub const ALIGNMENT: u32 = 0x10;
+pub const KEY_BLOB_MAGIC: u32 = 0x4E3B_9B8E;
+pub const KEY_BLOB_SIZE: usize = 0x10F4;
+pub const FIXED_TABLES_SIZE: usize = 0x5000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Header {
+    pub metadata_end: u32,
+    pub region_b_offset: u32,
+    pub trailer_size: u32,
+    pub archive_id: u64,
+    pub format_constant: u32,
+    pub region_constant: u32,
+    pub field_20_low: u16,
+    pub region_b_mode: u16,
+    pub entry_count: u32,
+    pub profile_tag: u32,
+    pub index_width: u8,
+    pub byte_2d: u8,
+    pub crypto_profile: u8,
+    pub byte_2f: u8,
+    pub alignment: u32,
+    pub reserved: [u8; 12],
+}
+
+impl Header {
+    pub fn parse(bytes: &[u8]) -> Result<Self, Rpf9Error> {
+        if bytes.len() < HEADER_SIZE {
+            return Err(Rpf9Error::TruncatedHeader(bytes.len()));
+        }
+        let magic = u32_at(bytes, 0).expect("header length checked");
+        if magic != MAGIC {
+            return Err(Rpf9Error::BadMagic(magic));
+        }
+        let packed_20 = u32_at(bytes, 0x20).expect("header length checked");
+        let packed_2c = u32_at(bytes, 0x2C).expect("header length checked");
+        Ok(Self {
+            metadata_end: u32_at(bytes, 0x04).expect("header length checked"),
+            region_b_offset: u32_at(bytes, 0x08).expect("header length checked"),
+            trailer_size: u32_at(bytes, 0x0C).expect("header length checked"),
+            archive_id: u64_at(bytes, 0x10).expect("header length checked"),
+            format_constant: u32_at(bytes, 0x18).expect("header length checked"),
+            region_constant: u32_at(bytes, 0x1C).expect("header length checked"),
+            field_20_low: packed_20 as u16,
+            region_b_mode: (packed_20 >> 16) as u16,
+            entry_count: u32_at(bytes, 0x24).expect("header length checked"),
+            profile_tag: u32_at(bytes, 0x28).expect("header length checked"),
+            index_width: packed_2c as u8,
+            byte_2d: (packed_2c >> 8) as u8,
+            crypto_profile: (packed_2c >> 16) as u8,
+            byte_2f: (packed_2c >> 24) as u8,
+            alignment: u32_at(bytes, 0x30).expect("header length checked"),
+            reserved: bytes[0x34..0x40].try_into().expect("header length checked"),
+        })
+    }
+
+    pub fn region_a_size(self) -> Option<u32> {
+        self.region_b_offset.checked_sub(HEADER_SIZE as u32)
+    }
+
+    pub fn region_b_size(self) -> Option<u32> {
+        self.metadata_end.checked_sub(self.region_b_offset)
+    }
+
+    pub fn predicted_region_b_size(self) -> Option<u32> {
+        let raw = self
+            .entry_count
+            .checked_mul(8 + u32::from(self.index_width))?;
+        Some(align_up(raw, ALIGNMENT))
+    }
+
+    /// The first encrypted span is `align16(u16(header + 0x1a) * 8)`.
+    pub fn first_metadata_span_size(self) -> usize {
+        let records = (self.format_constant >> 16) as u16;
+        align_up(u32::from(records) * 8, ALIGNMENT) as usize
+    }
+
+    pub fn validation_errors(self, file_size: u64) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.format_constant != FORMAT_CONSTANT {
+            errors.push(format!(
+                "+0x18 is {:#010x}, expected {FORMAT_CONSTANT:#010x}",
+                self.format_constant
+            ));
+        }
+        if self.region_constant != REGION_CONSTANT {
+            errors.push(format!(
+                "+0x1c is {:#010x}, expected {REGION_CONSTANT:#010x}",
+                self.region_constant
+            ));
+        }
+        if self.alignment != ALIGNMENT {
+            errors.push(format!(
+                "+0x30 is {:#x}, expected {ALIGNMENT:#x}",
+                self.alignment
+            ));
+        }
+        if self.reserved.iter().any(|&b| b != 0) {
+            errors.push("reserved bytes +0x34..+0x3f are non-zero".to_owned());
+        }
+        if !(HEADER_SIZE as u32 <= self.region_b_offset
+            && self.region_b_offset <= self.metadata_end
+            && u64::from(self.metadata_end) <= file_size)
+        {
+            errors.push("expected 0x40 <= region_b_offset <= metadata_end <= file size".to_owned());
+        }
+        if self.metadata_end % ALIGNMENT != 0
+            || self.region_b_offset % ALIGNMENT != 0
+            || self.trailer_size % ALIGNMENT != 0
+        {
+            errors.push("metadata offsets or trailer size are not 16-byte aligned".to_owned());
+        }
+        if u64::from(self.trailer_size) > file_size.saturating_sub(u64::from(self.metadata_end)) {
+            errors.push("trailer overlaps the metadata region".to_owned());
+        }
+        if !matches!(self.index_width, 1 | 2) {
+            errors.push(format!("unexpected index width {}", self.index_width));
+        }
+        let expected_width = if self.entry_count <= 255 { 1 } else { 2 };
+        if self.index_width != expected_width {
+            errors.push(format!(
+                "index width {} disagrees with count-derived width {expected_width}",
+                self.index_width
+            ));
+        }
+        if self.region_b_mode == 1 && self.region_b_size() != self.predicted_region_b_size() {
+            errors.push(format!(
+                "compact region B has size {:?}, predicted {:?}",
+                self.region_b_size(),
+                self.predicted_region_b_size()
+            ));
+        }
+        errors
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Rpf9Error {
+    #[error("RPF9 header is truncated ({0} bytes, expected at least {HEADER_SIZE})")]
+    TruncatedHeader(usize),
+    #[error("not an RPF9 archive (magic {0:#010x})")]
+    BadMagic(u32),
+    #[error("invalid RPF9 header: {0}")]
+    InvalidHeader(String),
+    #[error("invalid RPF9 TFIT material: {0}")]
+    InvalidMaterial(String),
+    #[error("TFIT-CBC input length {0} is not a multiple of 16")]
+    InvalidCiphertextLength(usize),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+pub struct CryptoMaterial {
+    key_blob: Vec<u8>,
+    fixed_tables: Vec<u8>,
+    iv: [u8; 16],
+}
+
+impl CryptoMaterial {
+    pub(crate) fn from_parts(
+        key_blob: Vec<u8>,
+        fixed_tables: Vec<u8>,
+        iv: [u8; 16],
+    ) -> Result<Self, Rpf9Error> {
+        if key_blob.len() != KEY_BLOB_SIZE {
+            return Err(Rpf9Error::InvalidMaterial(format!(
+                "key blob is {:#x} bytes, expected {KEY_BLOB_SIZE:#x}",
+                key_blob.len()
+            )));
+        }
+        if u32_at(&key_blob, 0) != Some(KEY_BLOB_MAGIC) {
+            return Err(Rpf9Error::InvalidMaterial("bad key-blob magic".to_owned()));
+        }
+        if fixed_tables.len() != FIXED_TABLES_SIZE {
+            return Err(Rpf9Error::InvalidMaterial(format!(
+                "fixed tables are {:#x} bytes, expected {FIXED_TABLES_SIZE:#x}",
+                fixed_tables.len()
+            )));
+        }
+        Ok(Self {
+            key_blob,
+            fixed_tables,
+            iv,
+        })
+    }
+
+    pub fn decryptor(self) -> TfitDecryptor {
+        TfitDecryptor { material: self }
+    }
+}
+
+pub struct TfitDecryptor {
+    material: CryptoMaterial,
+}
+
+impl TfitDecryptor {
+    const FINAL_PERMUTATION: [usize; 16] = [0, 5, 10, 15, 12, 1, 6, 11, 8, 13, 2, 7, 4, 9, 14, 3];
+
+    pub fn decrypt_block(&self, block: [u8; 16]) -> [u8; 16] {
+        let key =
+            |i: usize| u32_at(&self.material.key_blob, 4 + i * 4).expect("validated key blob");
+        let initial = &self.material.fixed_tables[..0x1000];
+        let table = |table: usize, byte: u8| {
+            u32_at(
+                &self.material.fixed_tables,
+                0x1000 + table * 0x400 + usize::from(byte) * 4,
+            )
+            .expect("validated fixed tables")
+        };
+        let mut words = [0u32; 4];
+        for group in 0..4 {
+            let mut value = 0u32;
+            for index in 0..4 {
+                let position = group * 4 + index;
+                value = (value << 8)
+                    ^ u32::from(initial[position * 256 + usize::from(block[position])]);
+            }
+            words[group] = value ^ key(group);
+        }
+
+        for round in 1..14 {
+            let data: [u8; 16] = std::array::from_fn(|i| words[i / 4].to_be_bytes()[i % 4]);
+            let at = round * 4;
+            words = [
+                table(0, data[0])
+                    ^ table(7, data[7])
+                    ^ table(10, data[10])
+                    ^ table(13, data[13])
+                    ^ key(at),
+                table(1, data[1])
+                    ^ table(4, data[4])
+                    ^ table(11, data[11])
+                    ^ table(14, data[14])
+                    ^ key(at + 1),
+                table(2, data[2])
+                    ^ table(5, data[5])
+                    ^ table(8, data[8])
+                    ^ table(15, data[15])
+                    ^ key(at + 2),
+                table(3, data[3])
+                    ^ table(6, data[6])
+                    ^ table(9, data[9])
+                    ^ table(12, data[12])
+                    ^ key(at + 3),
+            ];
+        }
+
+        let data: [u8; 16] = std::array::from_fn(|i| words[i / 4].to_be_bytes()[i % 4]);
+        let final_tables = &self.material.key_blob[0xF4..];
+        std::array::from_fn(|position| {
+            let source = Self::FINAL_PERMUTATION[position];
+            final_tables[position * 256 + usize::from(data[source])]
+        })
+    }
+
+    pub fn decrypt_cbc(&self, ciphertext: &[u8]) -> Result<Vec<u8>, Rpf9Error> {
+        self.decrypt_cbc_with_iv(ciphertext, self.material.iv)
+    }
+
+    pub fn decrypt_cbc_with_iv(
+        &self,
+        ciphertext: &[u8],
+        iv: [u8; 16],
+    ) -> Result<Vec<u8>, Rpf9Error> {
+        if ciphertext.len() % 16 != 0 {
+            return Err(Rpf9Error::InvalidCiphertextLength(ciphertext.len()));
+        }
+        let mut previous = iv;
+        let mut output = Vec::with_capacity(ciphertext.len());
+        for chunk in ciphertext.chunks_exact(16) {
+            let current: [u8; 16] = chunk.try_into().expect("exact chunk");
+            let decoded = self.decrypt_block(current);
+            output.extend(decoded.iter().zip(previous).map(|(a, b)| a ^ b));
+            previous = current;
+        }
+        Ok(output)
+    }
+}
+
+pub fn read_header(path: &Path) -> Result<(Header, u64), Rpf9Error> {
+    let mut file = File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let mut bytes = Vec::with_capacity(HEADER_SIZE);
+    file.by_ref()
+        .take(HEADER_SIZE as u64)
+        .read_to_end(&mut bytes)?;
+    let header = Header::parse(&bytes)?;
+    let errors = header.validation_errors(file_size);
+    if !errors.is_empty() {
+        return Err(Rpf9Error::InvalidHeader(errors.join("; ")));
+    }
+    Ok((header, file_size))
+}
+
+pub fn decrypt_first_metadata_span(
+    path: &Path,
+    cipher: &TfitDecryptor,
+) -> Result<Vec<u8>, Rpf9Error> {
+    let (header, _) = read_header(path)?;
+    let span_size = header.first_metadata_span_size();
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+    let mut encrypted = vec![0u8; span_size];
+    file.read_exact(&mut encrypted)?;
+    cipher.decrypt_cbc(&encrypted)
+}
+
+fn align_up(value: u32, alignment: u32) -> u32 {
+    value.div_ceil(alignment) * alignment
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(at..at.checked_add(8)?)?.try_into().ok()?,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header() -> [u8; HEADER_SIZE] {
+        let mut b = [0u8; HEADER_SIZE];
+        b[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        b[4..8].copy_from_slice(&0x110u32.to_le_bytes());
+        b[8..12].copy_from_slice(&0xF0u32.to_le_bytes());
+        b[12..16].copy_from_slice(&0x40u32.to_le_bytes());
+        b[16..24].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        b[24..28].copy_from_slice(&FORMAT_CONSTANT.to_le_bytes());
+        b[28..32].copy_from_slice(&REGION_CONSTANT.to_le_bytes());
+        b[32..36].copy_from_slice(&0x0001_1234u32.to_le_bytes());
+        b[36..40].copy_from_slice(&3u32.to_le_bytes());
+        b[40..44].copy_from_slice(&0xAABB_CCDDu32.to_le_bytes());
+        b[44..48].copy_from_slice(&0x0009_0001u32.to_le_bytes());
+        b[48..52].copy_from_slice(&ALIGNMENT.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn parses_and_validates_header() {
+        let bytes = header();
+        let h = Header::parse(&bytes).unwrap();
+        assert_eq!(h.archive_id, 0x1122_3344_5566_7788);
+        assert_eq!(h.region_b_mode, 1);
+        assert_eq!(h.entry_count, 3);
+        assert_eq!(h.index_width, 1);
+        assert_eq!(h.crypto_profile, 9);
+        assert_eq!(h.first_metadata_span_size(), 0x20);
+        assert_eq!(h.region_b_size(), Some(0x20));
+        assert_eq!(h.predicted_region_b_size(), Some(0x20));
+        assert!(h.validation_errors(0x200).is_empty());
+    }
+
+    #[test]
+    fn rejects_short_and_other_formats() {
+        assert!(matches!(
+            Header::parse(&[]),
+            Err(Rpf9Error::TruncatedHeader(0))
+        ));
+        let mut bytes = header();
+        bytes[..4].copy_from_slice(b"NOPE");
+        assert!(matches!(Header::parse(&bytes), Err(Rpf9Error::BadMagic(_))));
+    }
+}
