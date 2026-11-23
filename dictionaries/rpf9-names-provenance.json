@@ -1,0 +1,10 @@
+{
+  "previous_candidate_lines": 80976,
+  "extended_gpu_candidate_lines": 104992,
+  "added_candidate_lines": 26821,
+  "merged_candidate_lines": 107797,
+  "dictionary_bytes": 1731118,
+  "extended_run_candidates": 832157301,
+  "hash_width_required": 64,
+  "cpu_rechecked_unique_gpu_candidates": true
+}
