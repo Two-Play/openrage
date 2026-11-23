@@ -95,7 +95,7 @@ impl TocView {
             let name = match candidate {
                 Some(p) if extent.flags as u8 != 0xff => format!("{p}.{ext}"),
                 Some(p) => p.to_owned(),
-                None => format!("{ext}/{:06}_{hash:016x}.{ext}", e.index),
+                None => format!("{ext}/{hash:016x}.{ext}"),
             };
             let name =
                 if used_names.insert(name.clone()) { name } else { format!("{ext}/{:06}_{hash:016x}.{ext}", e.index) };
