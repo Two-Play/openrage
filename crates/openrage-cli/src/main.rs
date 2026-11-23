@@ -119,6 +119,9 @@ fn run() -> Result<()> {
         };
         return cmd_rpf8(path, *list, checks);
     }
+    if let Command::Rpf9 { path, exe } = &cli.command {
+        return cmd_rpf9(path, exe.as_deref());
+    }
     // Managing plugins needs no game; previews and actions use it when there is one.
     if let Command::Plugin(cmd) = &cli.command
         && (game_dir.is_none()
@@ -163,6 +166,7 @@ fn run() -> Result<()> {
     match cli.command {
         Command::Keys { .. }
         | Command::Rpf8 { .. }
+        | Command::Rpf9 { .. }
         | Command::Rdr2Keys { .. }
         | Command::Rdr2Names { .. }
         | Command::Licenses { .. } => {
