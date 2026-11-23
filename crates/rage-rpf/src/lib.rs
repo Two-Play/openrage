@@ -2,7 +2,7 @@
 //!
 //! Supports RPF7 (GTA V Legacy and Enhanced, including nested archives),
 //! the GTA IV archives (IMG3, RPF2, RPF3) and, with the `rdr2` feature,
-//! RPF8 (RDR2).
+//! RPF8 (RDR2), plus experimental read-only RPF9 inspection for Scarlett.
 //!
 //! # Licence of the `rdr2` feature
 //!
@@ -35,6 +35,8 @@ pub mod rpf8_exe;
 pub mod rpf8_keys;
 #[cfg(feature = "rdr2")]
 pub mod rpf8_names;
+pub mod rpf9;
+pub mod rpf9_exe;
 mod toc;
 pub mod vfs;
 pub mod writer;
