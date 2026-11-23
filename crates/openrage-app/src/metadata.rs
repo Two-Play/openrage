@@ -12,7 +12,7 @@ use rage_resource::Resource;
 use rage_rpf::vfs::Node;
 
 /// Extensions of files that hold metadata.
-pub const EXTENSIONS: &[&str] = &["ymap", "ytyp", "ymt", "ymf", "cut", "pso"];
+pub const EXTENSIONS: &[&str] = &["ymap", "ytyp", "ymt", "ymf", "cut", "pso", "psin", "rbf0"];
 
 pub fn is_metadata(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -72,6 +72,11 @@ fn from_bytes_for(data: &[u8], rdr2: bool) -> Result<Xml> {
         }
         return from_resource(&res);
     }
+    if rage_formats::psin::is_psin(data) {
+        let psin = rage_formats::psin::parse(data)?;
+        let (text, errors) = psin.to_xml();
+        return Ok(Xml { text, encoding: Encoding::Pso, root: Some(psin.root_type()), errors });
+    }
     if rage_formats::pso::is_pso(data) {
         let pso = if rdr2 { rage_formats::pso::parse_rdr2(data)? } else { rage_formats::pso::parse(data)? };
         let (text, errors) = pso.to_xml();
@@ -116,6 +121,7 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
         Node::ArchiveFile(rpf, id) => rpf.read(id)?,
         Node::PlainFile(p) => std::fs::read(p)?,
         Node::Rpf8File(rpf, i) => return from_rpf8(&rpf, i),
+        Node::Rpf9File(rpf, i) => rpf.read_at(i)?,
         _ => bail!("{vpath} is not a file"),
     };
     from_bytes(&data)

@@ -21,6 +21,12 @@
 //! a stream keeps each channel's headers in a chunk (`0x7F`) of a stream
 //! named after the channel. The data is cut into 2048-byte units of Vorbis
 //! packets, each with a 16-bit length.
+//!
+//! GTA VI keeps RDR2's layout with two more optional tables in front of the
+//! streams (flags `0x20` and `0x40`) and Opus instead of Vorbis: the same
+//! 2048-byte units of packets, always 48 kHz, mono or stereo (channel count
+//! at 29 of the format chunk). A format chunk counts samples of all channels
+//! together. The encoder's lookahead ([`OPUS_PRE_SKIP`] samples) is not stored.
 
 use rage_core::bytes::LeRead;
 
@@ -64,6 +70,7 @@ pub enum Codec {
     Pcm16,
     Adpcm,
     Vorbis,
+    Opus,
     Other(u8),
 }
 
@@ -73,6 +80,7 @@ impl Codec {
             0 => Self::Pcm16,
             4 => Self::Adpcm,
             8 => Self::Vorbis,
+            11 => Self::Opus,
             other => Self::Other(other),
         }
     }
@@ -82,6 +90,7 @@ impl Codec {
             Self::Pcm16 => "PCM".into(),
             Self::Adpcm => "IMA ADPCM".into(),
             Self::Vorbis => "Vorbis".into(),
+            Self::Opus => "Opus".into(),
             Self::Other(c) => format!("codec {c}"),
         }
     }
@@ -106,6 +115,8 @@ pub struct Sound {
     pub channel: Option<usize>,
     /// Vorbis: where its three headers are (offset and size in the data).
     pub headers: Option<(usize, usize)>,
+    /// Channels of a single sound (GTA VI's Opus sounds can be stereo).
+    pub channels: u8,
 }
 
 impl Sound {
@@ -177,6 +188,32 @@ impl Awc {
         if flags & 1 != 0 {
             o += 2 * count;
         }
+        // GTA VI: two more tables, if only with them the chunk table ends
+        // where the header says the data starts.
+        let extra = if flags & 0x20 != 0 { (count + 1) * 4 } else { 0 } + if flags & 0x40 != 0 { 4 } else { 0 };
+        let table_end = |from: usize| -> Option<usize> {
+            let words = data.get(from..from + count * 4)?.as_chunks::<4>().0;
+            Some(from + count * 4 + words.iter().map(|w| usize::from(w[3] >> 5) * 8).sum::<usize>())
+        };
+        // Whether the chunks of a table that starts at `from` are inside the file.
+        let fits = |from: usize| -> bool {
+            let Some(end) = table_end(from) else { return false };
+            data.get(from + count * 4..end).is_some_and(|table| {
+                table.as_chunks::<8>().0.iter().all(|c| {
+                    let v = u64::from_le_bytes(*c);
+                    (v & 0x0FFF_FFFF) + ((v >> 28) & 0x0FFF_FFFF) <= data.len() as u64
+                })
+            })
+        };
+        let header_end = u32_at(&data, 12)? as usize;
+        // The tables' bytes read as stream words can add up to the same end
+        // by chance: then the chunks decide.
+        let gta6 =
+            extra > 0 && table_end(o + extra) == Some(header_end) && (table_end(o) != Some(header_end) || !fits(o));
+        if gta6 {
+            o += extra;
+        }
+        let rdr2 = rdr2 || gta6;
         let mut infos = Vec::with_capacity(count);
         for _ in 0..count {
             let v = u32_at(&data, o)?;
@@ -248,6 +285,22 @@ impl Awc {
                 if d.len() < 32 {
                     return Err(damaged("short format chunk"));
                 }
+                let codec = Codec::from_byte(d[28]);
+                if codec == Codec::Opus {
+                    // Samples of all channels together, always at 48 kHz
+                    // (whatever the rate field says).
+                    let channels = d[29].clamp(1, 2);
+                    self.sounds.push(Sound {
+                        id: *id,
+                        samples: u32_at(d, 0)? / u32::from(channels),
+                        sample_rate: OPUS_RATE,
+                        codec,
+                        channel: None,
+                        headers: None,
+                        channels,
+                    });
+                    continue;
+                }
                 let header_size = u16_at(d, 30)? as usize;
                 // Without headers of its own, a Vorbis sound has them in a
                 // headers chunk of the same stream.
@@ -260,9 +313,10 @@ impl Awc {
                     id: *id,
                     samples: u32_at(d, 0)?,
                     sample_rate: u16_at(d, 8)? as u32,
-                    codec: Codec::from_byte(d[28]),
+                    codec,
                     channel: None,
                     headers,
+                    channels: 1,
                 });
                 continue;
             }
@@ -278,6 +332,7 @@ impl Awc {
                 codec: Codec::from_byte(d[19]),
                 channel: None,
                 headers: None,
+                channels: 1,
             });
         }
         Ok(())
@@ -311,9 +366,28 @@ impl Awc {
                 codec: Codec::from_byte(*d.get(o + 12).ok_or_else(|| damaged("truncated"))?),
                 channel: Some(c),
                 headers,
+                channels: 1,
             });
         }
         self.stream_format = Some(StreamFormat { block_count, block_size, channels });
+        // An Opus channel can be stereo, which only its packets say; its
+        // sample count then counts both sides.
+        if self.sounds.iter().any(|s| s.codec == Codec::Opus) {
+            let stereo: Vec<bool> = self
+                .stream_channels_with(24)?
+                .iter()
+                .map(|blocks| {
+                    blocks.first().and_then(|(data, ..)| opus_packets(data).next()).map(opus_packet_channels) == Some(2)
+                })
+                .collect();
+            for (sound, stereo) in self.sounds.iter_mut().zip(stereo) {
+                sound.sample_rate = OPUS_RATE;
+                if stereo {
+                    sound.channels = 2;
+                    sound.samples /= 2;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -509,6 +583,78 @@ pub fn decode_vorbis(headers: &[u8], data: &[u8]) -> Result<Vec<i16>, AwcError> 
     Ok(out)
 }
 
+/// Opus is always decoded at this rate.
+pub const OPUS_RATE: u32 = 48_000;
+/// Samples the Opus encoder puts in front of a sound (its lookahead). The
+/// containers do not store it; this is what GTA VI's sounds measure.
+pub const OPUS_PRE_SKIP: usize = 312;
+
+/// The Opus packets of 2048-byte units: each unit holds packets with a
+/// 16-bit length in front; a zero length ends the unit.
+fn opus_packets(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    data.chunks(2048).flat_map(|unit| {
+        let mut at = 0;
+        std::iter::from_fn(move || {
+            let len = usize::from(u16::from_le_bytes([*unit.get(at)?, *unit.get(at + 1)?]));
+            if len == 0 || at + 2 + len > unit.len() {
+                return None;
+            }
+            at += 2 + len;
+            Some(&unit[at - len..at])
+        })
+    })
+}
+
+/// Channels of an Opus packet (1 or 2), from its first byte.
+fn opus_packet_channels(packet: &[u8]) -> usize {
+    if packet.first().is_some_and(|toc| toc & 4 != 0) { 2 } else { 1 }
+}
+
+/// Samples per channel an Opus packet decodes to at 48 kHz, from its first
+/// bytes (RFC 6716, section 3.1); 0 for a packet that is not valid.
+fn opus_packet_samples(packet: &[u8]) -> usize {
+    let Some(&toc) = packet.first() else { return 0 };
+    let config = toc >> 3;
+    let frame = match config {
+        // SILK: 10, 20, 40, 60 ms.
+        0..=11 => [480, 960, 1920, 2880][usize::from(config & 3)],
+        // Hybrid: 10, 20 ms.
+        12..=15 => [480, 960][usize::from(config & 1)],
+        // CELT: 2.5, 5, 10, 20 ms.
+        _ => [120, 240, 480, 960][usize::from(config & 3)],
+    };
+    let frames = match toc & 3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => usize::from(packet.get(1).copied().unwrap_or(0) & 0x3F),
+    };
+    frame * frames
+}
+
+/// Decodes Opus packets to interleaved samples of `channels` channels.
+fn decode_opus_packets<'a>(packets: impl Iterator<Item = &'a [u8]>, channels: usize) -> Result<Vec<i16>, AwcError> {
+    /// The longest an Opus packet can be: 120 ms.
+    const MAX_FRAME: usize = 5760;
+    let mut decoder =
+        opus_rs::OpusDecoder::new(OPUS_RATE as i32, channels).map_err(|e| damaged(format!("Opus decoder: {e}")))?;
+    let mut frame = vec![0f32; MAX_FRAME * channels];
+    let mut out = Vec::new();
+    for packet in packets {
+        let n = decoder.decode(packet, MAX_FRAME, &mut frame).map_err(|e| damaged(format!("Opus packet: {e}")))?;
+        out.extend(frame[..n * channels].iter().map(|s| (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16));
+    }
+    Ok(out)
+}
+
+/// Decodes a sound stored as Opus: `frames` samples per channel, after the
+/// encoder's lookahead.
+pub fn decode_opus(data: &[u8], channels: usize, frames: usize) -> Result<Vec<i16>, AwcError> {
+    let mut out = decode_opus_packets(opus_packets(data), channels)?;
+    out.drain(..(OPUS_PRE_SKIP * channels).min(out.len()));
+    out.truncate(frames * channels);
+    Ok(out)
+}
+
 fn decode_codec(sound: &Sound, all: &[u8], data: &[u8], samples: usize) -> Result<Vec<i16>, AwcError> {
     let mut out = match sound.codec {
         Codec::Pcm16 => data.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c)).collect(),
@@ -517,6 +663,7 @@ fn decode_codec(sound: &Sound, all: &[u8], data: &[u8], samples: usize) -> Resul
             let (at, len) = sound.headers.ok_or_else(|| damaged("Vorbis sound without headers"))?;
             decode_vorbis(all.get(at..at + len).ok_or_else(|| damaged("Vorbis headers outside the file"))?, data)?
         }
+        Codec::Opus => return decode_opus(data, usize::from(sound.channels.max(1)), samples),
         Codec::Other(7) => decode_mp3(data)?,
         Codec::Other(c) => return Err(damaged(format!("unsupported codec {c}"))),
     };
@@ -538,7 +685,8 @@ impl Awc {
         let chunk = self.chunk(stream, CHUNK_DATA).ok_or_else(|| damaged("sound without data"))?;
         let data = &self.data[chunk.offset..chunk.offset + chunk.size];
         let samples = decode_codec(sound, &self.data, data, sound.samples as usize)?;
-        Ok(Pcm { sample_rate: sound.sample_rate, channels: 1, samples })
+        let channels = if sound.codec == Codec::Opus { u16::from(sound.channels.max(1)) } else { 1 };
+        Ok(Pcm { sample_rate: sound.sample_rate, channels, samples })
     }
 
     /// The data of each channel of a multi-channel stream: per block the bytes
@@ -607,8 +755,45 @@ impl Awc {
         Ok(channels)
     }
 
+    /// Decodes an Opus stream. Each block repeats the end of the one before
+    /// (the samples to skip): those packets are left out, and each channel is
+    /// decoded in one go. A stereo channel becomes two channels of the result.
+    fn decode_opus_stream(&self) -> Result<Pcm, AwcError> {
+        let blocks = self.stream_channels_with(24)?;
+        let mut decoded: Vec<Vec<i16>> = Vec::new();
+        for (blocks, sound) in blocks.iter().zip(&self.sounds) {
+            let mut packets = Vec::new();
+            for (data, skip, _) in blocks {
+                let mut skipped = 0;
+                for packet in opus_packets(data) {
+                    if skipped < *skip {
+                        skipped += opus_packet_samples(packet).max(1);
+                    } else {
+                        packets.push(packet);
+                    }
+                }
+            }
+            let channels = usize::from(sound.channels.max(1));
+            let mut pcm = decode_opus_packets(packets.into_iter(), channels)?;
+            pcm.drain(..(OPUS_PRE_SKIP * channels).min(pcm.len()));
+            pcm.truncate(sound.samples as usize * channels);
+            for c in 0..channels {
+                decoded.push(pcm.iter().skip(c).step_by(channels).copied().collect());
+            }
+        }
+        let frames = decoded.iter().map(Vec::len).max().unwrap_or(0);
+        let mut samples = Vec::with_capacity(frames * decoded.len());
+        for i in 0..frames {
+            samples.extend(decoded.iter().map(|ch| ch.get(i).copied().unwrap_or(0)));
+        }
+        Ok(Pcm { sample_rate: OPUS_RATE, channels: decoded.len().max(1) as u16, samples })
+    }
+
     /// Decodes a multi-channel stream to one interleaved signal.
     pub fn decode_stream(&self) -> Result<Pcm, AwcError> {
+        if self.sounds.first().is_some_and(|s| s.codec == Codec::Opus) {
+            return self.decode_opus_stream();
+        }
         let channels = self.stream_channels()?;
         let mut decoded = Vec::with_capacity(channels.len());
         for (blocks, sound) in channels.iter().zip(&self.sounds) {
@@ -721,6 +906,58 @@ mod tests {
         assert_eq!(awc.sounds[0].sample_rate, 32000);
         assert_eq!(awc.sounds[0].codec, Codec::Pcm16);
         assert_eq!(awc.decode_sound(0).unwrap().samples, vec![5, -5, 300]);
+    }
+
+    /// GTA VI: the three optional tables in front of the streams, and a
+    /// stereo Opus sound of two packets without content (silence).
+    #[test]
+    fn parses_gta6_opus() {
+        let mut unit = vec![0u8; 2048];
+        // Two packets of one byte: 20 ms of full-band stereo, no data.
+        unit[..6].copy_from_slice(&[1, 0, 0xFC, 1, 0, 0xFC]);
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0xFF61u16.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        let tables = 2 + 8 + 4;
+        let format_at = 16 + tables + 4 + 16;
+        out.extend_from_slice(&(format_at as u32).to_le_bytes());
+        out.extend_from_slice(&[0xEE; 14]);
+        out.extend_from_slice(&(0x1234u32 | (2 << 29)).to_le_bytes());
+        let chunk =
+            |kind: u8, size: usize, offset: usize| ((kind as u64) << 56) | ((size as u64) << 28) | offset as u64;
+        out.extend_from_slice(&chunk(CHUNK_FORMAT_RDR2, 32, format_at).to_le_bytes());
+        out.extend_from_slice(&chunk(CHUNK_DATA, unit.len(), format_at + 32).to_le_bytes());
+        let frames = 2 * 960 - OPUS_PRE_SKIP as u32;
+        let mut format = vec![0u8; 32];
+        format[0..4].copy_from_slice(&(frames * 2).to_le_bytes());
+        format[8..10].copy_from_slice(&32000u16.to_le_bytes());
+        format[28] = 11;
+        format[29] = 2;
+        out.extend_from_slice(&format);
+        out.extend_from_slice(&unit);
+
+        let awc = Awc::parse(out, None).unwrap();
+        let sound = &awc.sounds[0];
+        assert_eq!((sound.codec, sound.channels, sound.samples, sound.sample_rate), (Codec::Opus, 2, frames, 48000));
+        let pcm = awc.decode_sound(0).unwrap();
+        assert_eq!((pcm.channels, pcm.sample_rate, pcm.samples.len()), (2, 48000, frames as usize * 2));
+        assert!(pcm.samples.iter().all(|s| *s == 0));
+    }
+
+    #[test]
+    fn opus_packet_lengths() {
+        // CELT 20 ms, one frame; SILK 60 ms, two frames; hybrid 10 ms, three frames, stereo.
+        assert_eq!(opus_packet_samples(&[0xF8]), 960);
+        assert_eq!(opus_packet_samples(&[(3 << 3) | 1, 0]), 2 * 2880);
+        assert_eq!(opus_packet_samples(&[(12 << 3) | 4 | 3, 3]), 3 * 480);
+        assert_eq!(opus_packet_channels(&[(12 << 3) | 4 | 3, 3]), 2);
+        assert_eq!(opus_packet_samples(&[]), 0);
+        let mut units = vec![0u8; 4096];
+        units[..5].copy_from_slice(&[3, 0, 1, 2, 3]);
+        units[2048..2052].copy_from_slice(&[2, 0, 9, 9]);
+        assert_eq!(opus_packets(&units).collect::<Vec<_>>(), [&[1u8, 2, 3][..], &[9, 9]]);
     }
 
     #[test]

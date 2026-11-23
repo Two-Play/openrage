@@ -173,9 +173,8 @@ fn wire_files(ui: &AppWindow) {
             let video = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
-                item.name
-                    .to_ascii_lowercase()
-                    .ends_with(".bik")
+                let name = item.name.to_ascii_lowercase();
+                (name.ends_with(".bik") || name.ends_with(".bk2"))
                     .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = video {
@@ -687,6 +686,8 @@ fn wire_setup(ui: &AppWindow) {
     });
     let w = ui.as_weak();
     ui.on_setup_run(move || with_ui(&w, run_setup));
+    let w = ui.as_weak();
+    ui.on_setup_leave(move || with_ui(&w, leave_setup));
 }
 
 pub(crate) fn theme_name(mode: i32) -> &'static str {

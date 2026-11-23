@@ -65,6 +65,8 @@ pub(crate) enum PreviewSource {
     Entry(Arc<Rpf7>, EntryId),
     /// A file in a Red Dead Redemption 2 archive (index into its entries).
     Rpf8(Arc<rage_rpf::Rpf8>, usize),
+    /// A recovered file of a GTA VI archive (index into its entries).
+    Rpf9(Arc<rage_rpf::Rpf9>, usize),
     /// A file in a GTA IV archive.
     Gta4(Arc<rage_rpf::Gta4Archive>, rage_rpf::Gta4EntryId),
     /// A texture of an opened texture dictionary (index into its textures).
@@ -127,6 +129,10 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
             (Location::Rpf8(rpf, dir), _) if item.kind != ItemKind::Dir => {
                 rpf.find(&browser::join(dir, &item.name)).map(|i| PreviewSource::Rpf8(Arc::clone(rpf), i))
             }
+            (Location::Rpf9(rpf, dir), _) if item.kind != ItemKind::Dir => rpf
+                .loaded()
+                .and_then(|entries| rpf.find(&entries, &browser::join(dir, &item.name)))
+                .map(|i| PreviewSource::Rpf9(Arc::clone(rpf), i)),
             (Location::Gta4(a, dir), _) if item.kind != ItemKind::Dir => {
                 a.find_child(*dir, &item.name).map(|i| PreviewSource::Gta4(Arc::clone(a), i))
             }
@@ -420,6 +426,8 @@ pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys
             Ok(Node::PlainFile(p)) => load_preview_text(PreviewSource::DiskFile(p), keys),
             Ok(Node::Rpf8File(rpf, i)) => rpf8_preview(&rpf, i),
             Ok(Node::Rpf8Dir(..)) => (Meta::new(), String::new()),
+            Ok(Node::Rpf9File(rpf, i)) => rpf9_preview(&rpf, i),
+            Ok(Node::Rpf9Dir(rpf, dir)) if dir.is_empty() => (rpf9_archive_info(&rpf), String::new()),
             Ok(Node::Gta4File(a, i)) => gta4_preview(&a, i),
             Ok(Node::Gta4Dir(a, i)) if i == rage_rpf::Gta4Archive::ROOT => (gta4_archive_info(&a), String::new()),
             Ok(Node::Gta4Dir(..)) => (Meta::new(), String::new()),
@@ -427,6 +435,7 @@ pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys
             Err(e) => (vec![kv("Error", e)], String::new()),
         },
         PreviewSource::Rpf8(rpf, i) => rpf8_preview(&rpf, i),
+        PreviewSource::Rpf9(rpf, i) => rpf9_preview(&rpf, i),
         PreviewSource::Gta4(a, i) => gta4_preview(&a, i),
         PreviewSource::Texture(..) => (Meta::new(), String::new()),
         PreviewSource::DiskFile(path)
@@ -468,6 +477,31 @@ pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys
                 Err(e) => (vec![kv("Error", e)], String::new()),
             }
         }
+        // GTA VI: a texture pool.
+        PreviewSource::DiskArchive(path) if browser::is_texture_pool(&path.to_string_lossy()) => {
+            match rage_formats::ttpf::Pool::open(&path) {
+                Ok(pool) => {
+                    let plain = (0..pool.len()).filter(|i| pool.descriptor(*i).is_some_and(|d| d.is_2d())).count();
+                    let meta = vec![
+                        kv("Format", "Texture pool (GTA VI)"),
+                        kv("Textures", grouped(pool.len())),
+                        kv("Arrays, cube maps, volumes", grouped(pool.len() - plain)),
+                        note(
+                            "Opens as folders of 64 textures. Textures have no names here, only numbers. \
+                             Arrays, cube maps and volumes are not read yet; textures packed with BCPack \
+                             are shown from their largest level that is not.",
+                        ),
+                    ];
+                    (meta, String::new())
+                }
+                Err(e) => (vec![kv("Error", e)], String::new()),
+            }
+        }
+        // GTA VI: RPF9. Described from its header and a stored index: no scan here.
+        PreviewSource::DiskArchive(path) if rage_rpf::Rpf9::file_is_rpf9(&path) => match rage_rpf::Rpf9::open(&path) {
+            Ok(rpf) => (rpf9_archive_info(&rpf), String::new()),
+            Err(e) => (vec![kv("Error", e)], String::new()),
+        },
         // RDR2: RPF8, not RPF7.
         PreviewSource::DiskArchive(path) if rage_rpf::Rpf8::file_is_rpf8(&path) => {
             match rage_rpf::Rpf8::open_default(&path) {
@@ -765,6 +799,99 @@ pub(crate) fn gta4_preview(a: &rage_rpf::Gta4Archive, i: rage_rpf::Gta4EntryId) 
             }
         }
         rage_rpf::Gta4EntryKind::Dir { .. } => (meta, String::new()),
+    }
+}
+
+/// Overview of a GTA VI archive (RPF9): what was recovered, if it has been
+/// indexed already. Never starts the scan.
+pub(crate) fn rpf9_archive_info(rpf: &rage_rpf::Rpf9) -> Meta {
+    use openrage_app::extract::human_size;
+    let mut meta = vec![kv("Format", "RPF9 (GTA VI)"), kv("Data", human_size(rpf.data_len()))];
+    if rpf.has_toc() {
+        if let Some(entries) = rpf.loaded() {
+            meta.push(kv("TOC entries", grouped(entries.len())));
+        }
+        meta.push(note(
+            "Entries and sizes come from the decrypted table of contents. Unresolved names are shown as hashes.",
+        ));
+        return meta;
+    }
+    match rpf.loaded().or_else(|| openrage_app::rpf9::load_index(rpf.path()).map(Arc::new)) {
+        Some(entries) => {
+            let c = openrage_app::rpf9::coverage(rpf, &entries);
+            meta.push(kv("Recovered files", grouped(c.files as usize)));
+            meta.push(kv("Unpacked", human_size(c.unpacked)));
+            meta.push(kv("Not read", human_size(c.unread)));
+        }
+        None => meta.push(note(
+            "Not indexed yet: opening it reads the whole archive once, which takes a while for large ones.",
+        )),
+    }
+    meta.push(note(
+        "The table of contents is encrypted, so names and folders are unknown. Files are found in the data itself \
+         and named by their offset; data that is neither zlib, Bink 2 nor an audio container is not listed.",
+    ));
+    meta
+}
+
+/// Facts about a recovered file of a GTA VI archive, and the start of it as
+/// text or hex.
+pub(crate) fn rpf9_preview(rpf: &rage_rpf::Rpf9, i: usize) -> (Meta, String) {
+    let Some(entries) = rpf.loaded() else { return (Meta::new(), String::new()) };
+    let Some(e) = entries.get(i) else { return (Meta::new(), String::new()) };
+    let mut meta = vec![
+        kv("Offset", format!("0x{:x}", e.offset)),
+        kv("Stored", openrage_app::extract::human_size(e.stored)),
+        kv(
+            "Stored as",
+            match e.kind {
+                rage_rpf::rpf9::Kind::Bink2 => "Bink 2 video".to_owned(),
+                rage_rpf::rpf9::Kind::Awc => "audio container".to_owned(),
+                rage_rpf::rpf9::Kind::Zlib if e.streams > 1 => format!("{} zlib streams", e.streams),
+                rage_rpf::rpf9::Kind::Zlib => "zlib stream".to_owned(),
+                rage_rpf::rpf9::Kind::Toc { index, .. } => format!("TOC entry {index}"),
+            },
+        ),
+    ];
+    if matches!(e.kind, rage_rpf::rpf9::Kind::Bink2 | rage_rpf::rpf9::Kind::Awc) {
+        return (meta, String::new());
+    }
+    // The start is enough for a look; large files are not unpacked whole.
+    let mut start = Vec::new();
+    let mut limited = LimitedWriter { out: &mut start, left: 1 << 20 };
+    match rpf.copy_to(e, &mut limited) {
+        Ok(_) => {}
+        Err(_) if limited.left == 0 => meta.push(note("Showing the start; Extract… saves all of it.")),
+        Err(err) => {
+            meta.push(kv("Error", err));
+            return (meta, String::new());
+        }
+    }
+    // A start that was cut off ends in the middle of a string.
+    let whole = start.iter().rposition(|b| *b == 0).map_or(&start[..], |end| &start[..=end]);
+    let text = crate::docs::zero_ended_strings(whole);
+    (meta, preview::render(text.as_deref().unwrap_or(&start)))
+}
+
+/// Takes up to `left` bytes, then fails, which ends the unpacking.
+struct LimitedWriter<'a> {
+    out: &'a mut Vec<u8>,
+    left: usize,
+}
+
+impl std::io::Write for LimitedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        let n = buf.len().min(self.left);
+        self.out.extend_from_slice(&buf[..n]);
+        self.left -= n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

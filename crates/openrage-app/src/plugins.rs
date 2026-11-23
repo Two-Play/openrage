@@ -163,7 +163,8 @@ impl GameFiles for GameDir {
                 None => bail!("{vpath}: not found"),
             },
             Node::Gta4File(a, id) => a.read(id)?,
-            Node::Dir(_) | Node::ArchiveDir(..) | Node::Rpf8Dir(..) | Node::Gta4Dir(..) => {
+            Node::Rpf9File(rpf, i) => rpf.read_at(i)?,
+            Node::Dir(_) | Node::ArchiveDir(..) | Node::Rpf8Dir(..) | Node::Gta4Dir(..) | Node::Rpf9Dir(..) => {
                 bail!("{vpath} is a folder")
             }
             _ => bail!("{vpath}: not supported"),
@@ -223,7 +224,26 @@ impl GameFiles for GameDir {
                     out.push(DirEntry { name: e.name.clone(), is_dir: e.is_dir(), size: e.size() });
                 }
             }
-            Node::PlainFile(_) | Node::ArchiveFile(..) | Node::Rpf8File(..) | Node::Gta4File(..) => {
+            Node::Rpf9Dir(rpf, dir) => {
+                let entries = rpf.entries()?;
+                let (dirs, files) = rpf.list_dir(&entries, &dir);
+                for d in dirs {
+                    out.push(DirEntry { name: d, is_dir: true, size: 0 });
+                }
+                for i in files {
+                    let name = rpf.entry_name(&entries[i]);
+                    out.push(DirEntry {
+                        name: name.rsplit('/').next().unwrap_or(&name).to_owned(),
+                        is_dir: false,
+                        size: entries[i].size,
+                    });
+                }
+            }
+            Node::PlainFile(_)
+            | Node::ArchiveFile(..)
+            | Node::Rpf8File(..)
+            | Node::Gta4File(..)
+            | Node::Rpf9File(..) => {
                 bail!("{vpath} is a file")
             }
             _ => bail!("{vpath}: not supported"),

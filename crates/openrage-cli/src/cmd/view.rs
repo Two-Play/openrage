@@ -491,6 +491,49 @@ pub(crate) fn cmd_audio(game_dir: &Path, path: &str, export: Option<&Path>, keys
     Ok(())
 }
 
+/// GTA VI: what a texture pool holds, and its textures as PNG.
+pub(crate) fn cmd_ttpf(
+    path: &Path,
+    export: Option<&Path>,
+    from: usize,
+    count: Option<usize>,
+    max_side: Option<u32>,
+) -> Result<()> {
+    let pool = rage_formats::ttpf::Pool::open(path)?;
+    outln!("{}: {} textures", path.display(), pool.len());
+    if let Some(dir) = export {
+        fs::create_dir_all(dir)?;
+    }
+    let started = Instant::now();
+    let (mut read, mut full) = (0u32, 0u32);
+    let mut skipped: std::collections::BTreeMap<String, u32> = Default::default();
+    for index in (from..pool.len()).take(count.unwrap_or(usize::MAX)) {
+        let d = *pool.descriptor(index).context("texture")?;
+        let texture = match pool.texture(index, max_side) {
+            Ok(t) => t,
+            Err(e) => {
+                *skipped.entry(e.to_string()).or_default() += 1;
+                continue;
+            }
+        };
+        read += 1;
+        full += u32::from(texture.width == d.width && texture.height == d.height);
+        let Some(dir) = export else { continue };
+        match texture.to_rgba() {
+            Some(rgba) => fs::write(
+                dir.join(format!("{index:06}.png")),
+                rage_formats::png(texture.width, texture.height, &rgba)?,
+            )?,
+            None => *skipped.entry(format!("no decoder for format {}", texture.format.name())).or_default() += 1,
+        }
+    }
+    outln!("Read: {read} ({full} at full size) in {} ms", started.elapsed().as_millis());
+    for (reason, n) in skipped {
+        outln!("Not read: {n} — {reason}");
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_xml(
     game_dir: &Path,
     path: &str,

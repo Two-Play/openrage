@@ -398,3 +398,11 @@ mod tests {
         assert!(matches!(Header::parse(&bytes), Err(Rpf9Error::BadMagic(_))));
     }
 }
+
+#[path = "rpf9/recovery.rs"]
+mod recovery;
+#[path = "rpf9/toc_view.rs"]
+mod toc_view;
+pub use recovery::{
+    Entry, HEADER_LEN, Indexer, Kind, Namer, Names, Rpf9, decode_index, encode_index, set_indexer, set_namer,
+};

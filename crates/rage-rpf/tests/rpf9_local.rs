@@ -8,6 +8,31 @@ use std::{
 };
 
 #[test]
+#[ignore = "requires RPF9_ROOT pointing at the user's local files"]
+fn application_view_uses_exact_toc_named_lookup_and_nested_resources() {
+    use rage_rpf::{Rpf9, rpf9::Kind};
+    let root = PathBuf::from(std::env::var_os("RPF9_ROOT").expect("RPF9_ROOT"));
+    let common = Rpf9::open(&root.join("common.rpf")).unwrap();
+    assert!(common.has_toc());
+    let entries = common.entries().unwrap();
+    assert_eq!(entries.len(), 418);
+    let index = common.find(&entries, "DATA/AI/conversationlist.meta").unwrap();
+    assert!(matches!(entries[index].kind, Kind::Toc { index: 19, .. }));
+    assert_eq!(common.read_at(index).unwrap().len() as u64, entries[index].size);
+    assert!(common.read_start(&entries[index], 17).unwrap().len() <= 17);
+    let story = Rpf9::open(&root.join("pack/story000/story000.rpf")).unwrap();
+    let entries = story.entries().unwrap();
+    let index = entries.iter().position(|e| matches!(e.kind, Kind::Toc { index: 419, .. })).unwrap();
+    let child = story.open_child(index).unwrap();
+    assert_eq!(child.entries().unwrap().len(), 111);
+    let data = Rpf9::open(&root.join("data.rpf")).unwrap();
+    let entries = data.entries().unwrap();
+    let index = entries.iter().position(|e| matches!(e.kind, Kind::Toc { index: 476, .. })).unwrap();
+    let (sys, gfx) = data.resource_parts(index).unwrap().unwrap();
+    assert_eq!(sys.len() + gfx.len() + 16, entries[index].size as usize);
+}
+
+#[test]
 #[ignore = "requires RPF9_EXE and RPF9_ROOT pointing at the user's local files"]
 fn reads_external_corpus_and_copies_bounded_sample() {
     let root = PathBuf::from(std::env::var_os("RPF9_ROOT").expect("RPF9_ROOT"));

@@ -26,7 +26,8 @@ external metadata columns, including archives containing only resources.
 ## Candidate name resolution
 
 Like OpenRAGE's RPF8 resolver, `--names` tests an explicit list of candidate
-paths against the TOC. The list is UTF-8, one path per line, limited to 1 MiB.
+paths against the TOC. The list is UTF-8, one path per line, limited to 8 MiB
+with a 4096-byte line limit and at most 250,000 indexed keys.
 It tries normalized paths, paths without mount prefixes, basenames and stems.
 Distinct matches are preserved rather than choosing between collisions.
 
@@ -35,7 +36,8 @@ The latter remains an opaque stored identifier. Native `0x144F66DE0` uses
 MurmurHash3 x64-style mixing with seed zero, returning the low 64 bits.
 The table at `0x1465B23B0` folds ASCII case and maps backslashes to slashes.
 Its finalizer uses the low byte of the length. Some matched paths include
-extensions; others do not. The resolver does not invent missing extensions.
+extensions; others do not. The application derives known resource extensions
+from the TOC file type; unknown types retain the candidate spelling.
 
 A bounded local experiment decoded 256 small appdata/common entries, with
 6,608,262 bytes charged against the output budget. Their 18,519 candidate
@@ -132,8 +134,36 @@ validation selects bounded samples and streams decoded output to a sink.
 It is not a claim that every byte in the corpus has been decoded.
 Local nested validation covers 24 distinct metadata layouts.
 
+## GUI, VFS and previews
+
+The PR #144 interface and format readers are integrated with the exact TOC.
+Place `game_scarlett_master.exe` and optionally `rpf9-names.txt` in the game
+root (`RPF9_NAMES` overrides the dictionary path). RPF9 signature detection
+takes precedence over copied GTA V/RDR2 executables. Opening an archive with
+the reference executable uses its decrypted TOC and skips recovery scans.
+Directly stored nested archives are navigable through the normal VFS.
+
+Known paths can be opened without first adding them to the dictionary: lookup
+normalizes the path, hashes it, checks the native file type and requires a
+unique matching entry. Listing readable names still needs the dictionary.
+For example: `openrage --game /path/to/game info common.rpf/data/ai/conversationlist.meta`.
+
+Model previews use exact system/graphics partitions from resource flags.
+TOC reads and model allocations are capped at 128 MiB; extraction streams.
+Standalone `data/ttdb` TTPF pools support texture previews and PNG output;
+the decoder has an explicit byte-budget API. Local bounded validation decoded
+16 model resources and exported 16 textures, including BC1, successfully.
+These samples do not establish support for all models or texture layouts.
+
+The metadata export covers 1,255,039 entries across 4,373 archives (22 outer
+and 4,351 direct nested). A local GPU dictionary run tested 18,959,548 candidates
+and matched 80,958 distinct 64-bit hashes covering 101,484 entries. Candidate
+preimages are not proof of original spelling; 32-bit-only matches remain
+separate hypotheses. See `tools/` for reproducible dictionary tooling.
+
 ## Remaining scope
 
-Trailer decoding, missing names/extensions, GUI/VFS integration, transformed
-nested archives and codecs not yet verified remain separate work.
+Trailer decoding, missing names, transformed nested archives and codecs not
+yet verified remain separate work. Embedded texture-pool discovery, BC6H/BC7
+BCPack decoding, volume textures, skeletons and model LOD support are incomplete.
 No editing/repacking or support for other executable builds is claimed.

@@ -1,0 +1,23 @@
+#version 450
+#extension GL_ARB_gpu_shader_int64 : require
+layout(local_size_x=64) in;
+layout(binding=0,std430) readonly buffer Input { uint bytes[]; };
+layout(binding=1,std430) writeonly buffer Output { uvec4 results[]; };
+layout(binding=2,std430) readonly buffer Targets { uint64_t targets[]; };
+layout(binding=3,std430) readonly buffer Targets32 { uint targets32[]; };
+layout(push_constant) uniform Params { uint count; uint n64; uint n32; } p;
+const uint64_t C1=0x87c37b91114253d5ul, C2=0x4cf5ad432745937ful;
+uint64_t rol(uint64_t x,uint n){return (x<<n)|(x>>(64u-n));}
+uint64_t fmix(uint64_t x){x=(x^(x>>33))*0xff51afd7ed558ccdul; x=(x^(x>>33))*0xc4ceb9fe1a85ec53ul;return x^(x>>33);}
+uint getb(uint i,uint j){uint b=(bytes[i*256u+j/4u]>>((j%4u)*8u))&255u;return b>=65u&&b<=90u?b+32u:b==92u?47u:b;}
+uint64_t word(uint i,uint start,uint n){uint64_t x=0;for(uint j=0;j<n;j++)x|=uint64_t(getb(i,start+j))<<(8*j);return x;}
+void main(){uint i=gl_GlobalInvocationID.x;if(i>=p.count)return;uint n=0;while(n<1024u&&getb(i,n)!=0)n++;
+uint64_t h1=0,h2=0;uint end=n&~15u;
+for(uint j=0;j<end;j+=16){uint64_t k1=word(i,j,8),k2=word(i,j+8,8);h1^=rol(k1*C1,31)*C2;h1=(rol(h1,27)+h2)*5+0x52dce729ul;h2^=rol(k2*C2,33)*C1;h2=(rol(h2,31)+h1)*5+0x38495ab5ul;}
+uint tail=n-end;if(tail>8)h2^=rol(word(i,end+8,tail-8)*C2,33)*C1;if(tail>0)h1^=rol(word(i,end,min(tail,8u))*C1,31)*C2;
+h1^=uint64_t(n&255u);h2^=uint64_t(n&255u);h1+=h2;h2+=h1;uint64_t hash=fmix(h1)+fmix(h2);
+uint h=0,start=0,stop=n;if(n>0&&getb(i,0)==34){start=1;stop=start;while(stop<n&&getb(i,stop)!=34)stop++;}for(uint j=start;j<stop;j++){h+=getb(i,j);h+=h<<10;h^=h>>6;}h+=h<<3;h^=h>>11;h+=h<<15;
+uint lo=0,hi=p.n64;while(lo<hi){uint m=lo+(hi-lo)/2;if(targets[m]<hash)lo=m+1;else hi=m;}uint flags=(lo<p.n64&&targets[lo]==hash)?1u:0u;
+lo=0;hi=p.n32;while(lo<hi){uint m=lo+(hi-lo)/2;if(targets32[m]<h)lo=m+1;else hi=m;}if(lo<p.n32&&targets32[lo]==h)flags|=2u;
+results[i]=uvec4(uint(hash),uint(hash>>32),h,flags);
+}

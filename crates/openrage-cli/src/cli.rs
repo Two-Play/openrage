@@ -245,7 +245,7 @@ pub(crate) enum Command {
         /// Enter a directly stored nested archive by index; repeat for deeper levels.
         #[arg(long, requires = "exe")]
         nested: Vec<u32>,
-        /// Candidate paths, one per line (<=1MiB), matched against native name hashes.
+        /// Candidate paths, one per line (<=8MiB), matched against native name hashes.
         #[arg(long, requires_all = ["exe", "list"])]
         names: Option<PathBuf>,
         /// List logical entries, stored hashes and physical extents.
@@ -407,6 +407,23 @@ pub(crate) enum Command {
         /// Export every sound into this folder as .wav.
         #[arg(short = 'o', long, visible_alias = "out")]
         export: Option<PathBuf>,
+    },
+    /// GTA VI: count the textures of a texture pool (.ttpf) and optionally export them as PNG.
+    Ttpf {
+        /// The pool file.
+        path: PathBuf,
+        /// Export the textures into this folder as .png, named by their number.
+        #[arg(short = 'o', long, visible_alias = "out")]
+        export: Option<PathBuf>,
+        /// The first texture to read.
+        #[arg(long, default_value_t = 0)]
+        from: usize,
+        /// How many textures to read (default: all).
+        #[arg(long)]
+        count: Option<usize>,
+        /// Read the largest mip level that is at most this many pixels wide and high.
+        #[arg(long)]
+        max_side: Option<u32>,
     },
     /// List the textures of a texture dictionary (.ytd) and optionally export them.
     Textures {

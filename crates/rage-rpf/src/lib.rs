@@ -65,4 +65,5 @@ pub use gta4::{Gta4Archive, Gta4Entry, Gta4EntryId, Gta4EntryKind, Gta4Format};
 pub use rpf7::{Encryption, Entry, EntryId, EntryKind, Rpf7};
 #[cfg(feature = "rdr2")]
 pub use rpf8::Rpf8;
+pub use rpf9::Rpf9;
 pub use writer::{ArchiveWriter, RawEntry, entry_for, file_entry, resource_entry};

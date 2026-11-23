@@ -38,7 +38,9 @@ IVs, tables, executable bytes or archive fixtures are shipped.
 
 Use `openrage rpf9 --help` for inspection and export. See [RPF9.md](RPF9.md)
 for native evidence, validation coverage and remaining unsupported layouts.
-Name resolution, general VFS integration, editing and writing remain separate.
+The application-facing `Rpf9` adapter uses the TOC for VFS/GUI browsing,
+candidate-name lookup and directly stored nested archives. Editing and writing
+remain unsupported.
 
 ## The `rdr2` feature and its licence
 

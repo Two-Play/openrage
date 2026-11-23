@@ -2,7 +2,7 @@
 //! Native hash: 0x144F66DE0; ASCII normalization table: 0x1465B23B0.
 //! A match identifies the hashed path, not necessarily its file extension.
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
 const C1: u64 = 0x87c3_7b91_1142_53d5;
@@ -52,23 +52,47 @@ pub struct NameIndex {
 }
 
 impl NameIndex {
-    /// Import an explicit UTF-8 candidate list (one path per line), <=1MiB.
+    /// Import a UTF-8 candidate list (one path per line), <=8MiB, streaming.
     /// Only matching paths are retained. This never scans game payloads.
     pub fn load_candidates(path: &Path, wanted: &HashSet<u64>) -> io::Result<Self> {
-        let mut bytes = Vec::new();
-        std::fs::File::open(path)?.take(1_048_577).read_to_end(&mut bytes)?;
-        if bytes.len() > 1_048_576 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "name candidate list exceeds 1MiB"));
+        Self::load(path, Some(wanted))
+    }
+
+    pub(crate) fn load_all_candidates(path: &Path) -> io::Result<Self> {
+        Self::load(path, None)
+    }
+
+    fn load(path: &Path, wanted: Option<&HashSet<u64>>) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        if file.metadata()?.len() > 8 << 20 {
+            return Err(io::Error::other("name list exceeds 8MiB"));
         }
-        let text = std::str::from_utf8(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut reader = BufReader::with_capacity(4096, file);
         let mut index = Self::default();
-        for line in text.lines() {
-            index.add_candidate(line.trim(), wanted);
+        let mut total = 0;
+        loop {
+            let mut line = String::new();
+            let n = Read::by_ref(&mut reader).take(4097).read_line(&mut line)?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if n > 4096 || total > 8 << 20 {
+                return Err(io::Error::other("name list or line exceeds limit"));
+            }
+            index.add(line.trim(), wanted);
+            if index.names.len() > 250_000 {
+                return Err(io::Error::other("name index exceeds 250000 keys"));
+            }
         }
         Ok(index)
     }
 
     pub fn add_candidate(&mut self, path: &str, wanted: &HashSet<u64>) {
+        self.add(path, Some(wanted));
+    }
+
+    fn add(&mut self, path: &str, wanted: Option<&HashSet<u64>>) {
         if path.is_empty() || path.len() > 1024 || !path.is_ascii() || path.bytes().any(|b| b.is_ascii_control()) {
             return;
         }
@@ -84,7 +108,7 @@ impl NameIndex {
                 continue;
             }
             let hash = name_hash(&candidate);
-            if wanted.contains(&hash) {
+            if wanted.is_none_or(|w| w.contains(&hash)) {
                 self.names.entry(hash).or_default().insert(candidate);
             }
         }

@@ -125,7 +125,7 @@ fn known_name(ext: &str) -> &'static str {
         "awc" => "Audio container",
         "gxt2" | "gxt" => "Text table",
         "gfx" => "Scaleform movie",
-        "bik" => "Bink video",
+        "bik" | "bk2" => "Bink video",
         "nametable" => "Name table",
         "ugc" => "UGC (JSON)",
         "orp" => "OpenRAGE plugin",

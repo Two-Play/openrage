@@ -63,7 +63,7 @@ pub fn find_installs() -> Vec<PathBuf> {
 }
 
 pub fn is_gta5_dir(dir: &Path) -> bool {
-    EXECUTABLES.iter().any(|exe| dir.join(exe).is_file())
+    !is_gta6_dir(dir) && EXECUTABLES.iter().any(|exe| dir.join(exe).is_file())
 }
 
 /// The program that marks a Red Dead Redemption 2 installation.
@@ -71,11 +71,32 @@ pub const RDR2_EXE: &str = "RDR2.exe";
 
 /// Whether a folder is a Red Dead Redemption 2 installation.
 pub fn is_rdr2_dir(dir: &Path) -> bool {
-    dir.join(RDR2_EXE).is_file()
+    !is_gta6_dir(dir) && dir.join(RDR2_EXE).is_file()
+}
+
+/// Whether a folder holds RPF9 archives. Archive signatures take precedence
+/// over executable names, since a reference executable may have been copied here.
+pub fn is_gta6_dir(dir: &Path) -> bool {
+    if rage_rpf::Rpf9::file_is_rpf9(&dir.join("common.rpf")) {
+        return true;
+    }
+    let Ok(rd) = fs::read_dir(dir) else { return false };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("rpf")))
+        .any(|p| rage_rpf::Rpf9::file_is_rpf9(&p))
+}
+
+/// Whether a folder holds a game OpenRAGE can open.
+pub fn is_game_dir(dir: &Path) -> bool {
+    is_gta5_dir(dir) || is_rdr2_dir(dir) || crate::gta4::is_gta4_dir(dir) || is_gta6_dir(dir)
 }
 
 /// The icon of the game in `dir`, from its own program: (width, height, RGBA).
 pub fn game_icon(dir: &Path) -> Option<(u32, u32, Vec<u8>)> {
+    if is_gta6_dir(dir) {
+        return None;
+    }
     let programs: &[&str] = if is_rdr2_dir(dir) {
         &[RDR2_EXE]
     } else if crate::gta4::is_gta4_dir(dir) {
@@ -87,9 +108,11 @@ pub fn game_icon(dir: &Path) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 /// Short name of the game installed in `dir`: "GTA V Enhanced", "GTA V",
-/// "GTA IV", "RDR2", or `None` when no known executable is there.
+/// "GTA IV", "RDR2", "GTA VI", or `None` when the folder holds no known game.
 pub fn game_name(dir: &Path) -> Option<&'static str> {
-    if is_rdr2_dir(dir) {
+    if is_gta6_dir(dir) {
+        Some("GTA VI")
+    } else if is_rdr2_dir(dir) {
         Some("RDR2")
     } else if dir.join("GTA5_Enhanced.exe").is_file() {
         Some("GTA V Enhanced")
@@ -129,6 +152,27 @@ pub fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_signature_overrides_copied_executables() {
+        let dir = std::env::temp_dir().join(format!("openrage-detect-rpf9-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("GTA5_Enhanced.exe"), []).unwrap();
+        fs::write(dir.join("RDR2.exe"), []).unwrap();
+        fs::write(dir.join("GTAIV.exe"), []).unwrap();
+        // Detection reads only the signature, never the archive's payload.
+        fs::write(dir.join("common.rpf"), b"9FPR").unwrap();
+        assert!(is_gta6_dir(&dir));
+        assert!(!is_gta5_dir(&dir));
+        assert!(!is_rdr2_dir(&dir));
+        assert_eq!(game_name(&dir), Some("GTA VI"));
+        assert!(game_icon(&dir).is_none());
+        // Other RPF9 archives still identify the game if common is another format.
+        fs::write(dir.join("common.rpf"), b"RPF7").unwrap();
+        fs::write(dir.join("data.rpf"), b"9FPR").unwrap();
+        assert_eq!(game_name(&dir), Some("GTA VI"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn parses_library_folders() {
