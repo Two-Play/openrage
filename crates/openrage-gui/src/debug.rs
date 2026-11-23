@@ -109,6 +109,11 @@ pub(crate) fn debug_viewer(ui: &AppWindow) {
             if let Some(i) = (0..rows.row_count()).find(|&i| rows.row_data(i).is_some_and(|r| r.name == clip)) {
                 v.invoke_anim_select(i as i32);
             }
+            // `OPENRAGE_ANIM_AT=<0..1>`: pause there (a share of the clip).
+            if let Ok(at) = std::env::var("OPENRAGE_ANIM_AT") {
+                v.invoke_anim_toggle();
+                v.invoke_anim_seek(at.parse().unwrap_or(0.0));
+            }
         }
         if let Ok(hex) = std::env::var("OPENRAGE_PAINT") {
             use slint::Model;

@@ -1,4 +1,5 @@
-//! Writing changes into the OpenIV `mods` folder.
+//! Writing changes into the OpenIV `mods` folder (RDR2: LML's `lml/replace`,
+//! see [`crate::rdr2_install`]).
 //!
 //! A change to a file inside a game archive is written the OpenIV way: the
 //! top-level archive is copied once to `mods/<same path>` (or the copy already
@@ -221,6 +222,9 @@ pub fn apply_grouped(
 ) -> Result<Applied> {
     let mods = mods_dir_or_create(game_dir)?;
     let journal = Journal::new(&mods).grouped(group);
+    if rage_mods::overlay::is_rdr2(game_dir) {
+        return crate::rdr2_install::apply(game_dir, &mods, archive, ops, description, &journal);
+    }
     if archive.to_ascii_lowercase().ends_with(".img") {
         return apply_img(game_dir, &mods, archive, ops, description, &journal);
     }
@@ -521,6 +525,9 @@ pub fn apply_at(
 /// (`mods`, GTA IV: `update`) at the same path, so the game loads it instead
 /// of its own; recorded for undo. Returns the written file.
 pub fn put_loose(game_dir: &Path, vpath: &str, data: &[u8], description: &str) -> Result<PathBuf> {
+    if rage_mods::overlay::is_rdr2(game_dir) {
+        bail!("{vpath}: for RDR2 only files inside the game's archives can be replaced (through lml/replace)");
+    }
     let mods = mods_dir_or_create(game_dir)?;
     let folder = rage_mods::overlay::folder_name(game_dir);
     let rel = vpath.trim_start_matches('/');
@@ -556,6 +563,9 @@ pub fn remove_loose(game_dir: &Path, vpath: &str, description: &str) -> Result<(
 
 /// Creates a new, empty top-level archive in the mods folder (e.g. a new DLC pack).
 pub fn create_archive(game_dir: &Path, archive: &str, description: &str, group: Option<&str>) -> Result<PathBuf> {
+    if rage_mods::overlay::is_rdr2(game_dir) {
+        bail!("{archive}: new top-level archives are not loaded for RDR2");
+    }
     let mods = mods_dir_or_create(game_dir)?;
     let safe = vfs::safe_relative_path(archive).with_context(|| format!("{archive}: not a valid path"))?;
     let dest = mods.join(safe);

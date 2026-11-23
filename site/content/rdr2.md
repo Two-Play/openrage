@@ -1,10 +1,10 @@
 +++
 title = "Red Dead Redemption 2"
-description = "Red Dead Redemption 2 in OpenRAGE: setting up the keys from your own game, file names, archives, textures, models, peds, animations, metadata, audio and texts."
+description = "Red Dead Redemption 2 in OpenRAGE: setting up the keys from your own game, file names, archives, changing files through Lenny's Mod Loader, textures, models, peds, animations, metadata, audio and texts."
 
 [extra]
 docs = true
-lead = "Explore RDR2 with keys from your own game. Read-only for now."
+lead = "Explore and mod RDR2 with keys from your own game. Changes go into the replace folder of Lenny's Mod Loader, never into the game's archives."
 toc = true
 +++
 
@@ -59,16 +59,16 @@ Only the Steam version of 2 April 2024 is known so far; other versions report wh
 
 | What | Files | Status |
 |---|---|---|
-| Archives | `.rpf` (RPF8) | browse and extract |
-| Textures | `.ytd` | view, export DDS/PNG |
-| Models | `.ydr`, `.ydd`, `.yft` | view, export glTF |
+| Archives | `.rpf` (RPF8) | browse, extract, change (into `lml/replace`, with undo) |
+| Textures | `.ytd` | view, export DDS/PNG, replace (same format, size and mips) |
+| Models | `.ydr`, `.ydd`, `.yft` | view with moving parts and cloth, export glTF |
 | Peds and animals | `metapeds` outfits | put together with outfits, tints and face shapes |
 | Animations | `.ycd` | play, partly approximated |
 | Metadata | `.ymap`, `.ytyp`, `.ymt`, `.ymf`, `.meta` | view as XML |
 | Audio | `.awc` | play, save WAV |
 | Texts | `.yldb` | view |
 
-Changing RDR2 files and the search index are not available yet.
+The search index is not available for RDR2 yet.
 
 ## Archives
 
@@ -81,6 +81,66 @@ openrage --game "/path/to/Red Dead Redemption 2" ls levels_1.rpf/levels/rdr3
 ```
 
 **Checked:** all 89 archives, 4,874 nested archives and 493,592 files.
+
+## Changing files
+
+RDR2 has no OpenIV.asi. Its mods are loaded by **[Lenny's Mod Loader](https://www.rdr2mods.com/downloads/rdr2/tools/76-lennys-mod-loader-rdr/)**
+(LML), and OpenRAGE writes for it: its **replace folder** loads `lml/replace/<archive>/<path>` in place of the file
+`<path>` inside the game's `<archive>.rpf`. The game's archives are never changed. Install LML (with its
+`vfs.asi`) to see the changes in the game.
+
+| You change | OpenRAGE writes |
+|---|---|
+| a file inside a game archive, e.g. `update_4.rpf/x64/data/ui/blipdata.ymt` | that file, loose: `lml/replace/update_4/x64/data/ui/blipdata.ymt` |
+| anything inside a nested archive, e.g. `update_4.rpf/x64/data/ui/startup_data.rpf/settings/…` | the nested archive, copied there once and then edited in place: `lml/replace/update_4/x64/data/ui/startup_data.rpf` |
+
+- **Edit mode** works as for GTA V: unlock editing, then **Import…**, **Replace…**, **Rename…** and **Delete** in an
+  archive's folder, or **Replace…** on a texture. The command line has `put`, `rm`, `mv`, `history` and `undo`.
+- **Delete and Rename** work inside nested archives (and on files OpenRAGE put into `lml/replace`). LML cannot hide or
+  rename a file of the game's own archives.
+- **Undo** and **History** work as for GTA V; the journal is in `lml/replace/.openrage`.
+- **Names:** LML finds a replacement by the file's real path, so files that show only as `hash/XXXXXXXX` cannot be
+  replaced at the top of an archive (inside nested archives they can). Run `rdr2-names` first; OpenRAGE also tries the
+  `x64/…` form of every name it found, which names most files of the `update_*.rpf` archives. Names given to new or
+  renamed entries are kept in `lml/replace/.openrage/names.txt`.
+- **Resources** (textures, models and other `RSC8` files) are replaced with an RSC8 file: *Extract…* saves resources
+  in that form (header and pages, uncompressed), so an extracted file can go back after editing.
+- **Textures:** a DDS of the same format, size and mip count is written into the dictionary in place (RDR2's padded
+  layout). Adding and removing textures, or other sizes, are not supported yet.
+
+```
+openrage --game <RDR2> put blipdata.ymt update_4.rpf/x64/data/ui/blipdata.ymt
+openrage --game <RDR2> put flow.ymt update_4.rpf/x64/data/ui/startup_data.rpf/settings/flow/settings_group_flow.ymt
+openrage --game <RDR2> history
+openrage --game <RDR2> undo
+```
+
+### How nested archives are written
+
+OpenRAGE's RPF8 writer edits an archive in place, like the GTA V editor: new data is appended, the header and entry
+table at the start are rewritten, and entries in the way of a grown table move to the end unchanged. In detail:
+
+- The entry table is written **unencrypted** (the header's decryption tag says so). RDR2's cipher can only be
+  decrypted with the game's keys, not encrypted again. The game reads plain tables: a public mod (DualSense for RDR2)
+  ships a nested archive rebuilt this way through LML's replace folder.
+- Untouched entries keep their stored bytes, still encrypted, compressed and signed. New data is stored as is: not
+  encrypted, not compressed, not signed.
+- The signature block after the header is kept as it was; it no longer matches the changed table.
+- The archive's own name table is rewritten when it is readable and kept byte for byte otherwise.
+
+```
+openrage --game <RDR2> verify --rebuild            # every archive: edit a copy, read it back, undo
+```
+
+**Checked:** `verify --rebuild` over the whole game (Steam version, November 2026): 4,905 archives edited and undone
+(467,546 entries, every nested archive included) and 81,021 texture dictionaries (379,191 textures) written in place
+and read back, 0 failed. 58 archives over 512 MB were not copied whole; their nested archives were checked.
+
+**Not checked in the game:** these changes were tested in OpenRAGE only, not in RDR2 itself. In particular, whether
+LML picks up files from `lml/replace` for archives in subfolders (`x64/dlcpacks/…`, `x64/audio/sfx/…`), whether the
+game accepts unencrypted, unsigned new entries of every file type (one public mod reports that the game crashed on an
+uncompressed new UI scene and needed Oodle compression, which OpenRAGE cannot write yet), and whether the game takes
+a changed nested archive's table from the file or from its packfile cache (`pfm.dat`).
 
 ## Textures
 
@@ -95,7 +155,19 @@ Drawables, drawable dictionaries and fragments open in the viewer and export as 
 shared texture dictionaries elsewhere in the game; `rdr2-names` indexes them once (162,256 textures) so the viewer
 finds them.
 
-**Not yet:** moving parts of fragments, skeleton animations of models and cloth.
+Many vehicles, weapons and props are coloured from palettes: their colour texture holds a shade, and the palette
+colour comes from a slot per vertex. OpenRAGE bakes them into ordinary textures: vehicles in the colours of their
+first variation (`carvariations.ymt`), props and weapons in their first tint.
+
+Fragments (`.yft`) show their moving parts like GTA V's: a wagon's wheels sit on their bones, one wheel copied to the
+other side, and follow animations. The blurred wheels the game shows at speed (`wheel_lf_fast`) are listed under
+*Parts* but hidden.
+
+**Cloth** shows in its rest pose, as the game stores it before it moves it: flags, awnings and straps of fragments are
+listed as *Cloth* under *Parts*, and people's coats and skirts are part of their outfits' models (their `.yld` files
+only hold the simulation). The cloth does not sway: it moves only with the bones it hangs from.
+
+**Checked:** all 113,468 models, with 628 moving parts and 894 cloths of fragments.
 
 ## Peds and animals
 
@@ -127,13 +199,20 @@ openrage model …/metapeds.rpf/<ped>.ymt --outfit 2 --export ped.glb
 
 ## Animations
 
-Clip dictionaries (`.ycd`) open like GTA V's: select one to list its clips, or paste its path into the viewer's
-animation search to play a clip on a model.
+Clip dictionaries (`.ycd`) open like GTA V's: select one to see its clips and a list of fitting models, best first;
+click one, or double-click the dictionary, to open it in the viewer with the animation playing. In the viewer, paste a
+dictionary's path into the animation search.
+
+- **People and animals** share the main bones' names in RDR2, so every ped (`…/metapeds.rpf/<ped>.ymt`) is ranked by
+  how many of the dictionary's bones its base skeleton has: a sitting clip lists Arthur and the other people first, a
+  cow last. Most dictionaries are named only by a hash, so the bones decide.
+- **Vehicles, doors and destruction** play on their models: wheels and other parts of fragments move with their
+  bones, and a destruction clip (`des_…`) lists the models it was made for.
 
 RDR2 uses one kind of animation data whose key values are not fully understood yet. Those tracks are interpolated, so
 the timing is right to four frames but fast motion comes out softened; the viewer says so.
 
-**Checked:** 359,466 clips, every frame evaluated.
+**Checked:** 607,406 clips with 220,688 animations, every frame evaluated.
 
 ## Metadata
 

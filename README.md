@@ -4,7 +4,7 @@
 
 # OpenRAGE
 
-**The open-source successor to OpenIV — mod GTA V and explore Red Dead Redemption 2 on Linux and Windows.**
+**The open-source successor to OpenIV — mod GTA V and Red Dead Redemption 2 on Linux and Windows.**
 
 Browse and search every archive, preview textures, models, sounds and animations, read metadata as XML,<br>
 edit game text and install `.oiv` packages — compatible with OpenIV's `mods` folder, with undo.
@@ -61,11 +61,11 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 | Game | Archives | Formats |
 |---|---|---|
 | **GTA V** (Legacy & Enhanced) | ✅ read and edit (mods folder, with undo) | ✅ textures (also inside models) · models · audio · animations · metadata · text · collisions · paths · cutscenes · scripts · ASI mods (manager, Proton fix on Linux) · ◐ model import from OBJ with compressed textures and detail levels (Enhanced `.ydr` and vehicle bodies `.yft`, preview; explorer via the OBJ tools plugin) |
-| **Red Dead Redemption 2** | ✅ read, with keys from your own game | ◐ textures · models · texts · metadata · audio · animations · ped outfits (read-only) |
+| **Red Dead Redemption 2** | ✅ read, with keys from your own game · ◐ edit (Lenny's Mod Loader `lml/replace` folder, with undo; nested archives rewritten; not yet tried in the game) | ◐ textures (replace same-shape) · models with moving parts and cloth · texts · metadata · audio · animations on fitting models · ped outfits (read-only) |
 | **GTA VI** | 🔜 next: as fast as possible once it comes to PC | – |
 | **GTA IV** (Complete Edition) | ✅ read (IMG3, RPF2, RPF3), key from your own `GTAIV.exe` | ◐ textures · models · collisions · animations · text · scripts · maps in 3D · cutscenes (played with their cast, camera, subtitles and particle effects) · particle effect lists (`.wpfl`) · editing `.img`, `.rpf`, placement files, loose files and textures (`.wtd`, inside `.wdr`) (update folder, or the game files with originals kept) |
 
-**Plugins** (API 0.3, preview): sandboxed WebAssembly plugins add file types, previews (text, tree, table, image, 3D model), tool windows of their own (Tools menu), export and batch actions with access to the game's models and textures, and changes to game files through the `mods` folder (with undo), for every game. ✅ explorer (file list, preview, context menu, Settings → Plugins) and command line (`openrage plugin`), four example plugins included (OBJ export and import, a number and hash converter among them) · plugin packages (`.orp`) with install/uninstall in the explorer and the CLI · models into game formats (`build-model`) · 🔜 openFormats. [Writing plugins](https://two-play.github.io/openrage/plugins/)
+**Plugins** (API 0.3, preview): sandboxed WebAssembly plugins add file types, previews (text, tree, table, image, 3D model), tool windows of their own (Tools menu), export and batch actions with access to the game's models and textures, and changes to game files through the `mods` folder (with undo), for every game. ✅ explorer (file list, preview, context menu, Settings → Plugins) and command line (`openrage plugin`), four example plugins included (OBJ export and import, a number and hash converter among them) · plugin packages (`.orp`) with install/uninstall in the explorer and the CLI · models into game formats (`build-model`) · ✅ openFormats: OpenIV's text formats (`.odr`, `.oft`, `.odd`, `.otd` with `.mesh`, `.skel`, DDS) exported and imported back (preview). [Writing plugins](https://two-play.github.io/openrage/plugins/)
 
 ## Installation
 

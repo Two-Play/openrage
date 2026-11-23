@@ -77,6 +77,7 @@ openrage textures …/prop_x.ydr [--set name=new.dds]          # a model's own t
 openrage model …/vehicles.rpf/adder.yft                       # meshes, shaders, textures
 openrage model …/adder.yft --export adder.glb                  # glTF with embedded textures
 openrage model …/adder.yft --render adder.png [--yaw 1.2]      # software-rendered image
+openrage export-openformats …/prop_x.ydr -o out/              # OpenIV openFormats: .odr/.oft/.odd/.otd + .mesh, .skel, .dds
 openrage audio x64/audio/sfx/RADIO_02_POP.rpf/alright.awc --export out/   # sounds → .wav
 openrage clips x64c.rpf/anim/ingame/clip_move_.rpf/move_m@generic.ycd     # clips of a .ycd
 openrage model …/a_m_y_hipster_01.ydd --render pose.png --anim "…/move_m@generic.ycd:walk@0.5"
@@ -94,6 +95,7 @@ openrage rdr2-names <RDR2>                     # find RDR2 file names in the gam
 openrage rpf8 --list <RDR2>/common_0.rpf       # RDR2 archive contents
 openrage rpf8 --text <RDR2>                    # read every RDR2 text table (.yldb)
 openrage rpf8 --meta <RDR2>                    # convert all RDR2 metadata (.ymap, .ytyp, .ymt, .ymf) to XML
+openrage rpf8 --meta --rebuild <RDR2>          # every RDR2 PSO file → XML → PSO, compared
 openrage rpf8 --audio <RDR2>/x64/audio        # decode every RDR2 sound
 openrage rpf8 --anims <RDR2>/anim_0.rpf       # read every RDR2 clip dictionary
 openrage --game <RDR2> rdr2-ped                # list the RDR2 peds (people and animals) with their base skeletons
@@ -116,7 +118,12 @@ openrage mkdir x64e.rpf/my_folder
 openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --mods   # new geometry for an Enhanced .ydr (preview)
 openrage replace-model x64i.rpf/…/prop_x.ydr model.obj --out new.ydr --shader 0
 openrage replace-model x64i.rpf/…/prop_x.ydr hi.obj --lod med.obj --lod low.obj --mods   # with detail levels
-openrage replace-model x64e.rpf/levels/gta5/vehicles.rpf/adder.yft car.obj --mods   # a vehicle body: parts named like bones move with them
+openrage replace-model x64e.rpf/levels/gta5/vehicles.rpf/adder.yft car.obj --mods   # a vehicle: parts named like bones move with them, `wheel_lf` replaces the wheel
+openrage replace-model …/a_m_y_hipster_01.ydd ped.obj --mods     # a dictionary: parts named after drawables (uppr_000_u) replace them
+openrage replace-model …/a_m_y_hipster_01.ydd shirt.obj --drawable uppr_000_r --out new.ydd   # the whole OBJ on one drawable
+openrage replace-model …/prop_x.ydr model.obj --collision col.obj --mods   # with a collision built from col.obj
+openrage replace-model …/hei_ch3_12_0.ybn col.obj --out new.ybn  # a collision file from an OBJ
+openrage import-openformats x64i.rpf/…/prop_x.ydr out/prop_x.odr --mods   # edited openFormats back into the game (.odr, .oft, .otd)
 openrage oiv info mod.oiv                      # what a package would change
 openrage oiv install mod.oiv                   # install into the mods folder
 openrage oiv list / oiv uninstall "Name 1.0" [-y]   # installed packages, uninstall
@@ -171,10 +178,13 @@ openrage licenses --all                        # every license text
 openrage verify                                # decode every entry of every archive
 openrage verify --textures [--rebuild]         # decode (and rebuild) every texture dictionary
 openrage verify --models                       # parse every model of the game
-openrage verify --models --rebuild             # write every Enhanced .ydr anew with its meshes, read back identical
+openrage verify --models --rebuild             # write every Enhanced .ydr, .yft (with wheels) and .ydd anew, read back identical
+openrage verify --collisions --rebuild         # write every Enhanced collision (.ybn, in .ydr) anew from its triangles
+openrage verify --models --openformats         # every model and .ytd as openFormats and back; Enhanced models imported onto themselves
 openrage verify --audio                        # decode every sound of the game
 openrage verify --animations                   # parse every clip dictionary, evaluate all frames
 openrage verify --meta                         # convert every metadata file of the game
+openrage verify --meta --rebuild               # every PSO file → XML → PSO, same bytes or at least the same XML
 openrage verify --text                         # every .gxt2/.nametable → text → back, identical
 openrage verify --particles                    # parse every particle dictionary
 openrage verify --collisions                   # build the meshes of every collision file

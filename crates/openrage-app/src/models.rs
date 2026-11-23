@@ -272,6 +272,21 @@ impl LoadedModel {
 
 /// Ped component names (`head_000_r`, `uppr_001_u`, …) by hash: drawable
 /// dictionaries of peds only store the hashes.
+/// The names of a `.ydd`'s drawables as the viewer shows them (and OBJ
+/// export names their parts): ped components by name (`uppr_000_u`), others
+/// `<file>#<hash>`, or `<file>#<index>` without a hash.
+pub fn dictionary_names(stem: &str, hashes: &[u32]) -> Vec<String> {
+    hashes
+        .iter()
+        .enumerate()
+        .map(|(i, &hash)| match ped_component_names().get(&hash) {
+            Some(n) => n.clone(),
+            None if hash != 0 => format!("{stem}#{hash:08x}"),
+            None => format!("{stem}#{i}"),
+        })
+        .collect()
+}
+
 fn ped_component_names() -> &'static HashMap<u32, String> {
     static NAMES: OnceLock<HashMap<u32, String>> = OnceLock::new();
     NAMES.get_or_init(|| {
@@ -371,7 +386,7 @@ fn streamed_ped(rpf: &rage_rpf::Rpf7, folder: rage_rpf::EntryId) -> Result<Strea
 }
 
 fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Drawable)>, Vec<Part>) {
-    let drawable::Fragment { drawable: body, children } = fragment;
+    let drawable::Fragment { drawable: body, children, cloths } = fragment;
     let skeleton = body.skeleton.clone().unwrap_or_default();
     let world = skeleton.world_transforms();
     let mut drawables = vec![(name.to_owned(), body)];
@@ -383,6 +398,20 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
         visible: true,
         bone: None,
     }];
+    // Cloth (RDR2's flags and straps) in its rest pose: the game moves it.
+    for (k, cloth) in cloths.into_iter().enumerate() {
+        let label = if k == 0 { "cloth".to_owned() } else { format!("cloth_{k}") };
+        let index = drawables.len();
+        parts.push(Part {
+            name: label.clone(),
+            group: "Cloth".into(),
+            drawable: index,
+            transform: math::IDENTITY,
+            visible: true,
+            bone: None,
+        });
+        drawables.push((label, cloth));
+    }
     let mut wheels: Vec<(String, usize)> = Vec::new();
     for child in children {
         let bone = skeleton.find_tag(child.bone_tag);
@@ -391,11 +420,13 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
         let index = drawables.len();
         drawables.push((bone_name.clone(), child.drawable));
         let transform = bone.and_then(|b| world.get(b)).copied().unwrap_or(math::IDENTITY);
-        if bone_name.starts_with("wheel_") {
+        // RDR2's blurred wheels for high speeds (`wheel_lf_fast`) stay hidden.
+        let variant = is_wheel_variant(&bone_name);
+        if bone_name.starts_with("wheel_") && !variant {
             wheels.push((bone_name.clone(), index));
         }
         let group = if bone_name.starts_with("wheel_") { "Wheels" } else { "Parts" };
-        parts.push(Part { name: bone_name, group: group.into(), drawable: index, transform, visible: true, bone });
+        parts.push(Part { name: bone_name, group: group.into(), drawable: index, transform, visible: !variant, bone });
     }
     // Copy wheels to the wheel bones that have no drawable of their own.
     if !wheels.is_empty() {
@@ -403,7 +434,7 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
         let is_rear = |n: &str| n.ends_with('r') || n.contains("_lm") || n.contains("_rm");
         for (b, bone) in skeleton.bones.iter().enumerate() {
             let n = bone.name.to_ascii_lowercase();
-            let is_wheel_bone = n.starts_with("wheel_") && !n.contains("mesh");
+            let is_wheel_bone = n.starts_with("wheel_") && !n.contains("mesh") && !is_wheel_variant(&n);
             if !is_wheel_bone || wheels.iter().any(|(w, _)| w.eq_ignore_ascii_case(&n)) {
                 continue;
             }
@@ -430,6 +461,64 @@ fn fragment_parts(fragment: drawable::Fragment, name: &str) -> (Vec<(String, Dra
         }
     }
     (drawables, parts)
+}
+
+/// A vehicle's mod parts ([`crate::vehicle_mods`]), hidden at first, each on
+/// the bone the game puts it on, grouped by kind (`Mods: bonnet`).
+fn add_mod_parts(
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    vehicle: &str,
+    drawables: &mut Vec<(String, Drawable)>,
+    parts: &mut Vec<Part>,
+) {
+    let Some(skeleton) = drawables.first().and_then(|(_, d)| d.skeleton.clone()) else { return };
+    // Vehicles only: their skeleton has a chassis.
+    if skeleton.find_name("chassis").is_none() {
+        return;
+    }
+    let world = skeleton.world_transforms();
+    let mods = crate::vehicle_mods::mod_parts(game_dir, keys.clone(), vehicle);
+    let total = mods.len() as u64;
+    for (k, m) in mods.into_iter().enumerate() {
+        crate::progress::set("Loading the mod parts", k as u64, total);
+        let Ok((Node::ArchiveFile(rpf, id), _)) = rage_mods::resolve(game_dir, &m.vpath, keys.clone()) else {
+            continue;
+        };
+        let Some(fragment) = rpf.read_resource(id).ok().and_then(|r| drawable::parse_fragment(&r).ok()) else {
+            continue;
+        };
+        if fragment.drawable.meshes.is_empty() {
+            continue;
+        }
+        // By name, or by its hash where `carcols` keeps one.
+        let bone = m.bone.as_deref().and_then(|b| {
+            let hash = rage_formats::names::parse(&b.to_ascii_lowercase());
+            skeleton.find_name(b).or_else(|| {
+                skeleton.bones.iter().position(|x| rage_core::hash::joaat(&x.name.to_ascii_lowercase()) == hash)
+            })
+        });
+        let kind = m.kind.as_deref().map(crate::vehicle_mods::kind_label).unwrap_or_else(|| "other".into());
+        parts.push(Part {
+            name: m.name.clone(),
+            group: format!("Mods: {kind}"),
+            drawable: drawables.len(),
+            transform: bone.and_then(|b| world.get(b)).copied().unwrap_or(math::IDENTITY),
+            visible: false,
+            bone,
+        });
+        let mut d = fragment.drawable;
+        // Its own one-bone skeleton is not the vehicle's.
+        d.skeleton = None;
+        drawables.push((m.name, d));
+    }
+}
+
+/// RDR2 wheel bones besides the wheel itself: the blurred one shown at
+/// speed (`wheel_lf_fast`) and the one for upgrades (`wheel_lf_mod`).
+fn is_wheel_variant(bone: &str) -> bool {
+    let n = bone.to_ascii_lowercase();
+    n.starts_with("wheel_") && (n.ends_with("_fast") || n.ends_with("_mod"))
 }
 
 pub fn is_model(name: &str) -> bool {
@@ -506,7 +595,8 @@ fn register_gta4_materials(archive: &rage_rpf::Gta4Archive, bounds: &[(String, D
 }
 
 /// Names of the collision materials, read once from the game's `materials.dat`.
-fn collision_material_names(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> &'static [String] {
+/// The names of the game's collision materials (`materials.dat`), by type.
+pub fn collision_material_names(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> &'static [String] {
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     NAMES.get_or_init(|| {
         for path in ["update/update.rpf/common/data/materials/materials.dat", "common.rpf/data/materials/materials.dat"]
@@ -604,7 +694,7 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
     let lower = name.to_ascii_lowercase();
     let stem = name.split('.').next().unwrap_or(&name).to_owned();
     let mut external = Vec::new();
-    let (drawables, parts) = if rage_formats::paths::is_path_file(&lower) {
+    let (mut drawables, mut parts) = if rage_formats::paths::is_path_file(&lower) {
         let ext = lower.rsplit('.').next().unwrap_or_default();
         let (path, _) = rage_formats::paths::parse(&res, ext)?;
         let part = Part {
@@ -668,18 +758,10 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         }
         (drawables, parts)
     } else if lower.ends_with(".ydd") {
-        let drawables: Vec<(String, Drawable)> = drawable::parse_ydd(&res)?
-            .into_iter()
-            .enumerate()
-            .map(|(i, (hash, d))| {
-                let name = match ped_component_names().get(&hash) {
-                    Some(n) => n.clone(),
-                    None if hash != 0 => format!("{stem}#{hash:08x}"),
-                    None => format!("{stem}#{i}"),
-                };
-                (name, d)
-            })
-            .collect();
+        let parsed = drawable::parse_ydd(&res)?;
+        let hashes: Vec<u32> = parsed.iter().map(|(h, _)| *h).collect();
+        let drawables: Vec<(String, Drawable)> =
+            dictionary_names(&stem, &hashes).into_iter().zip(parsed).map(|(name, (_, d))| (name, d)).collect();
         let names: Vec<String> = drawables.iter().map(|(n, _)| n.clone()).collect();
         // Peds are assembled in place; other dictionaries are laid out in a grid.
         let layout =
@@ -738,6 +820,10 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         bail!("{name} is not a model (.ydr, .yft, .ydd, .ypt, .ybn, .ynd, .yvr, .ywr)");
     };
 
+    if lower.ends_with(".yft") {
+        add_mod_parts(game_dir, keys.clone(), &stem, &mut drawables, &mut parts);
+    }
+
     // Textures usually live next to the model: adder.yft → adder.ytd (+ vehshare.ytd for vehicles).
     let dir = rpf.entry(id).parent.unwrap_or(rage_rpf::Rpf7::ROOT);
     let mut candidates = vec![format!("{stem}.ytd"), format!("{stem}+hi.ytd")];
@@ -788,7 +874,6 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         let tid = rpf.find_child(dir, &format!("{stem}.yft"))?;
         drawable::parse_fragment(&rpf.read_resource(tid).ok()?).ok()?.drawable.skeleton
     });
-    let mut drawables = drawables;
     if let Some(sk) = &skeleton {
         fit_to_skeleton(&mut drawables, sk);
     }
@@ -1413,7 +1498,7 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
             })
             .collect()
     } else if lower.ends_with(".yft") {
-        vec![(stem.clone(), drawable::parse_fragment_rdr2(&res)?.drawable)]
+        Vec::new()
     } else {
         bail!("{name}: only .ydr, .ydd and .yft models of Red Dead Redemption 2 can be shown so far");
     };
@@ -1424,23 +1509,30 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
     if let Some(sk) = &base {
         fit_to_skeleton(&mut drawables, sk);
     }
-    let layout = if drawables.len() > 1 && base.is_none() {
-        grid_layout(&drawables)
+    let parts = if lower.ends_with(".yft") {
+        // Fragments: the body and its children (wheels) on their bones.
+        let (d, p) = fragment_parts(drawable::parse_fragment_rdr2(&res)?, &stem);
+        drawables = d;
+        p
     } else {
-        vec![math::IDENTITY; drawables.len()]
+        let layout = if drawables.len() > 1 && base.is_none() {
+            grid_layout(&drawables)
+        } else {
+            vec![math::IDENTITY; drawables.len()]
+        };
+        drawables
+            .iter()
+            .enumerate()
+            .map(|(k, (n, _))| Part {
+                name: n.clone(),
+                group: String::new(),
+                drawable: k,
+                transform: layout[k],
+                visible: true,
+                bone: None,
+            })
+            .collect()
     };
-    let parts = drawables
-        .iter()
-        .enumerate()
-        .map(|(k, (n, _))| Part {
-            name: n.clone(),
-            group: String::new(),
-            drawable: k,
-            transform: layout[k],
-            visible: true,
-            bone: None,
-        })
-        .collect();
     // Texture dictionaries in the same folder: `<stem>.ytd` first, then those
     // whose name shares the model's prefix, then the rest; at most eight.
     let dir = full.rsplit_once('/').map_or("", |(d, _)| d).to_owned();
@@ -1482,6 +1574,8 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
     // The rest from shared dictionaries elsewhere, through the texture index.
     if let Some(game) = crate::rdr2::game_folder(rpf.path()) {
         rdr2_shared_textures(&game, &drawables, &mut external, 32);
+        // Palette shaders: colours from the palettes (vehicles: their first variation).
+        crate::palette::apply(&crate::palette::carvariations(&game), &stem, &mut drawables, &mut external);
     }
     let skeleton = base.or_else(|| drawables.iter().find_map(|(_, d)| d.skeleton.clone()));
     let mut model = LoadedModel {
@@ -1608,13 +1702,8 @@ fn load_rdr2_ped_inner(game: &Path, ped: &str, outfit: usize) -> Result<LoadedMo
     }
     // The base skeleton: as the ped list names it, else guessed from the name.
     crate::progress::set("Reading the skeleton", 0, 0);
-    let fragment = metaped::peds(game)
-        .ok()
-        .and_then(|peds| peds.iter().find(|p| p.name.eq_ignore_ascii_case(ped)).map(metaped::base_fragment));
-    let base = fragment
-        .as_deref()
-        .and_then(|frag| rdr2_skeleton_named(game, frag))
-        .or_else(|| rdr2_base_skeleton_in(game, ped));
+    let fragment = rdr2_ped_base(game, ped);
+    let base = rdr2_ped_skeleton(game, ped);
     // Human heads name face bones the base skeletons lack: add them from
     // the one face rig the game has.
     let base = base.map(|mut sk| {
@@ -1876,12 +1965,34 @@ const RDR2_BASE_SKELETONS: &str = "packs_0.rpf/packs/base/models/metaped_fragmen
 /// The base skeleton of an RDR2 ped part: `a_c_cow_merge_4` → `meta_base_cow`,
 /// `a_c_bear_01_merge_2` → `meta_base_bear_01` (the longest name that exists,
 /// with or without the `a_c_`/`cs_` prefix).
-fn rdr2_base_skeleton(rpf: &rage_rpf::Rpf8, stem: &str) -> Option<drawable::Skeleton> {
+pub(crate) fn rdr2_base_skeleton(rpf: &rage_rpf::Rpf8, stem: &str) -> Option<drawable::Skeleton> {
     rdr2_base_skeleton_in(&crate::rdr2::game_folder(rpf.path())?, stem)
 }
 
+/// The file of an RDR2 ped's base skeleton, as the ped list names it (`meta_base_male.yft`).
+pub(crate) fn rdr2_ped_base(game: &Path, ped: &str) -> Option<String> {
+    let peds = crate::metaped::peds(game).ok()?;
+    peds.iter().find(|p| p.name.eq_ignore_ascii_case(ped)).map(crate::metaped::base_fragment)
+}
+
+/// The skeleton an RDR2 ped is put together on: as the ped list names it,
+/// else guessed from the ped's name.
+pub(crate) fn rdr2_ped_skeleton(game: &Path, ped: &str) -> Option<drawable::Skeleton> {
+    rdr2_ped_base(game, ped)
+        .and_then(|frag| rdr2_skeleton_named(game, &frag))
+        .or_else(|| rdr2_base_skeleton_in(game, ped))
+}
+
+/// The archive with RDR2's base skeletons (`metaped_fragments.rpf`).
+pub(crate) fn rdr2_base_skeletons(game: &Path) -> Option<Arc<rage_rpf::Rpf8>> {
+    match rage_mods::resolve(game, RDR2_BASE_SKELETONS, None).ok()?.0 {
+        Node::Rpf8Dir(frags, _) => Some(frags),
+        _ => None,
+    }
+}
+
 /// A base skeleton by its file name (`meta_base_male.yft`).
-fn rdr2_skeleton_named(game: &Path, file: &str) -> Option<drawable::Skeleton> {
+pub(crate) fn rdr2_skeleton_named(game: &Path, file: &str) -> Option<drawable::Skeleton> {
     let (Node::Rpf8Dir(frags, _), _) = rage_mods::resolve(game, RDR2_BASE_SKELETONS, None).ok()? else {
         return None;
     };
@@ -2005,6 +2116,41 @@ mod tests {
         // Head, pelvis, and the hair bone falls back to the head.
         assert_eq!(mesh.bone_indices[0], [2, 1, 2, 2]);
         assert!(mesh.bone_tags.is_empty());
+    }
+
+    #[test]
+    fn rdr2_wheels_on_their_bones() {
+        let bone = |name: &str, tag: u16, x: f32| drawable::Bone {
+            name: name.into(),
+            tag,
+            parent: if tag == 0 { -1 } else { 0 },
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            translation: [x, 0.0, 0.0],
+            scale: [1.0; 3],
+        };
+        let names = ["chassis", "wheel_lf", "wheel_lf_fast", "wheel_rf", "wheel_rf_fast", "wheel_rf_mod"];
+        let bones = names.iter().enumerate().map(|(i, n)| {
+            let x = match (i, n.contains("_r")) {
+                (0, _) => 0.0,
+                (_, true) => 1.0,
+                _ => -1.0,
+            };
+            bone(n, i as u16, x)
+        });
+        let body = Drawable { skeleton: Some(drawable::Skeleton { bones: bones.collect() }), ..Default::default() };
+        let wheel = |tag| drawable::FragmentChild { bone_tag: tag, drawable: Drawable::default() };
+        let cloth = Drawable { meshes: vec![drawable::Mesh::default()], ..Default::default() };
+        let fragment = drawable::Fragment { drawable: body, children: vec![wheel(1), wheel(2)], cloths: vec![cloth] };
+        let (drawables, parts) = fragment_parts(fragment, "cart");
+        assert_eq!(drawables.len(), 4);
+        let shown: Vec<(&str, bool)> = parts.iter().map(|p| (p.name.as_str(), p.visible)).collect();
+        // The cloth in place; the blurred wheel hidden; only the plain right wheel gets a copy.
+        let expected =
+            [("cart", true), ("cloth", true), ("wheel_lf", true), ("wheel_lf_fast", false), ("wheel_rf", true)];
+        assert_eq!(shown, expected);
+        assert_eq!((parts[1].group.as_str(), parts[1].transform), ("Cloth", math::IDENTITY));
+        assert_eq!(parts[4].drawable, 2);
+        assert_eq!(parts[4].transform[12], 1.0);
     }
 
     #[test]

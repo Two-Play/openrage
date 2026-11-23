@@ -428,6 +428,13 @@ pub fn list_changes(
     let mut out = Vec::new();
     for (i, f) in files.iter().enumerate() {
         progress(i, files.len(), &f.rel);
+        // RDR2: every file in lml/replace stands for one file inside a game
+        // archive (changed nested archives are not compared entry by entry).
+        if crate::overlay::is_rdr2(game_dir) {
+            let kind = if f.kind == ModFileKind::New { ChangeKind::NewFile } else { ChangeKind::ReplacedFile };
+            out.push(Change { vpath: f.rel.clone(), kind, is_dir: false, size: f.size });
+            continue;
+        }
         if f.kind == ModFileKind::New {
             out.push(Change { vpath: f.rel.clone(), kind: ChangeKind::NewFile, is_dir: false, size: f.size });
             continue;

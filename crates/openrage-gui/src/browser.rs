@@ -358,7 +358,13 @@ pub fn list(
             Ok((listing, None))
         }
         Node::ArchiveDir(rpf, dir) => Ok((list_archive(vpath, rpf, dir, origin), None)),
-        Node::Rpf8Dir(rpf, dir) => Ok((list_rpf8(vpath, rpf, dir, origin), None)),
+        Node::Rpf8Dir(rpf, dir) => {
+            let mut listing = list_rpf8(vpath, rpf, dir, origin);
+            if overlay {
+                merge_lml(game_dir, &mut listing);
+            }
+            Ok((listing, None))
+        }
         Node::Rpf8File(rpf, i) if is_texture_dict(&rpf.entry_name(i)) => {
             Ok((list_rpf8_textures(vpath, rpf, i, origin)?, None))
         }
@@ -377,10 +383,21 @@ pub fn list(
             Ok((audio_listing(vpath, awc, origin), None))
         }
         Node::Gta4Dir(a, dir) => Ok((list_gta4(vpath, a, dir, origin), None)),
+        // An RDR2 dictionary replaced in lml/replace: a loose RSC8 file.
+        Node::PlainFile(p) if is_texture_dict(&vpath) && rage_mods::overlay::is_rdr2(game_dir) => {
+            let res = std::fs::read(&p)
+                .ok()
+                .and_then(|b| rage_rpf::rpf8::parse_resource_file(&b))
+                .ok_or_else(|| RpfError::BadResource { path: vpath.clone(), reason: "not an RSC8 resource".into() })?;
+            let dict = rage_formats::ytd::parse_rdr2(&res)
+                .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
+            let read_only = is_particles(&vpath);
+            Ok((texture_listing(vpath, dict, origin, read_only), None))
+        }
         Node::Gta4File(a, i) if is_texture_dict(&a.entry(i).name) && a.entry(i).resource_type().is_some() => {
             let dict = rage_formats::ytd::parse_gta4(&a.read_resource(i)?)
                 .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
-            // GTA IV dictionaries can be changed (RDR2's not yet).
+            // GTA IV dictionaries can be changed (RDR2's: same-shape replacements).
             Ok((texture_listing(vpath, dict, origin, false), None))
         }
         // Files (and node kinds added later) list their folder, with the file selected.
@@ -388,6 +405,26 @@ pub fn list(
             let name = last_segment(&vpath);
             let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys, overlay)?;
             Ok((listing, Some(name)))
+        }
+    }
+}
+
+/// RDR2: marks the files of a game archive's folder that `lml/replace`
+/// replaces, and lists the ones it adds.
+fn merge_lml(game_dir: &Path, listing: &mut Listing) {
+    if listing.origin != Origin::Merged {
+        return;
+    }
+    let Some(dir) = rage_mods::overlay_path(game_dir, &listing.vpath).filter(|p| p.is_dir()) else { return };
+    let Ok(Listing { items: mod_items, .. }) = list_disk(listing.vpath.clone(), dir, Origin::Mods) else { return };
+    for m in mod_items {
+        match listing.items.iter_mut().find(|i| i.name.eq_ignore_ascii_case(&m.name)) {
+            Some(existing) if m.kind == ItemKind::Dir => existing.mark = Some(Mark::ContainsMods),
+            Some(existing) => {
+                existing.size = m.size;
+                existing.mark = Some(Mark::Replaced);
+            }
+            None => listing.items.push(Item { mark: Some(Mark::New), ..m }),
         }
     }
 }
@@ -403,6 +440,11 @@ fn merge_mods_inner(game_dir: &Path, listing: &mut Listing) {
     let Some(mods) = rage_mods::mods_dir(game_dir) else { return };
     if listing.vpath.is_empty() {
         listing.items.retain(|i| !i.name.eq_ignore_ascii_case(rage_mods::overlay::folder_name(game_dir)));
+    }
+    // RDR2's lml/replace mirrors the insides of archives, not the game
+    // folder: it is merged into archive listings instead (`merge_lml`).
+    if rage_mods::overlay::is_rdr2(game_dir) {
+        return;
     }
 
     if listing.origin == Origin::Mods {
@@ -481,13 +523,15 @@ fn texture_listing(
     Listing { vpath, origin, location: Location::Textures { dict: Arc::new(dict), read_only }, items }
 }
 
-/// The textures of a Red Dead Redemption 2 texture dictionary (read-only).
+/// The textures of a Red Dead Redemption 2 texture dictionary (textures can be
+/// replaced by ones of the same shape; particle dictionaries are read-only).
 fn list_rpf8_textures(vpath: String, rpf: Arc<rage_rpf::Rpf8>, i: usize, origin: Origin) -> Result<Listing, RpfError> {
     let entry = rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| RpfError::NotFound(vpath.clone()))?;
     let res = rpf.read_resource(entry)?;
     let dict = rage_formats::ytd::parse_rdr2(&res)
         .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
-    Ok(texture_listing(vpath, dict, origin, true))
+    let read_only = is_particles(&vpath);
+    Ok(texture_listing(vpath, dict, origin, read_only))
 }
 
 fn list_audio(

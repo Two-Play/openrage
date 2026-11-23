@@ -802,6 +802,17 @@ pub(crate) fn row_action(ui: &AppWindow, row: usize, action: &str) {
                 ui.set_status("The model is still loading.".into());
             }
         }
+        "openformats-export" => {
+            let vpath = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = listing.items.get(*a.visible.get(row)?)?;
+                Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+            });
+            if let Some(vpath) = vpath {
+                openformats_ui::export(ui, vpath);
+            }
+        }
+        "openformats-import" => openformats_ui::import(ui),
         "png" => ui.invoke_save_png(),
         "replace" if ui.get_texture_mode() => ui.invoke_texture_replace(),
         "replace" => ui.invoke_archive_replace(),

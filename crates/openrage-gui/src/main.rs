@@ -21,6 +21,7 @@ mod history;
 mod model_ui;
 mod mods_ui;
 mod navigate;
+mod openformats_ui;
 mod plugins;
 mod plugins_ui;
 mod preview;

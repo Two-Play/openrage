@@ -250,7 +250,22 @@ pub fn load_keys() -> anyhow::Result<Option<Arc<Rdr2Keys>>> {
 /// The cached file names of the game's archives, if they were collected.
 pub fn load_names(game_dir: &Path) -> Option<Arc<rage_rpf::rpf8_names::NameIndex>> {
     use rage_rpf::rpf8_names::NameIndex;
-    crate::paths::rdr2_names(game_dir).and_then(|p| NameIndex::load(&p).ok().flatten()).map(Arc::new)
+    let found = crate::paths::rdr2_names(game_dir).and_then(|p| NameIndex::load(&p).ok().flatten()).map(|mut n| {
+        n.add_x64_forms();
+        n
+    });
+    // Names OpenRAGE gave entries it created or renamed (in lml/replace).
+    let own = rage_mods::mods_dir(game_dir)
+        .and_then(|m| std::fs::read_to_string(crate::rdr2_install::names_file(&m)).ok())
+        .unwrap_or_default();
+    if own.trim().is_empty() {
+        return found.map(Arc::new);
+    }
+    let mut index = found.unwrap_or_default();
+    for name in own.lines().map(str::trim).filter(|n| !n.is_empty()) {
+        index.add_path(name, 'y');
+    }
+    Some(Arc::new(index))
 }
 
 /// Prepares archives of a game folder to be opened through the virtual file

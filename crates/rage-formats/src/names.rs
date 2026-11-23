@@ -82,6 +82,37 @@ pub fn value(hash: u32) -> String {
     lookup(hash, false).unwrap_or_else(|| format!("hash_{hash:08X}"))
 }
 
+/// Built-in names to their hashes (a name listed under several hashes keeps the first).
+fn builtin_reverse() -> &'static HashMap<&'static str, u32> {
+    static TABLE: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut by_hash: Vec<(u32, &str)> = builtin().iter().map(|(h, n)| (*h, *n)).collect();
+        by_hash.sort_unstable();
+        let mut map = HashMap::new();
+        for (h, n) in by_hash {
+            map.entry(n).or_insert(h);
+        }
+        map
+    })
+}
+
+/// The hash behind text written by [`value`]: `hash_XXXXXXXX`, a registered
+/// or built-in name, or else the lowercase joaat of the text (how the games
+/// hash asset names), so a new name typed into the XML gets its usual hash.
+pub fn parse_value(text: &str) -> u32 {
+    if let Some(h) = text.strip_prefix("hash_").and_then(|h| u32::from_str_radix(h, 16).ok()) {
+        return h;
+    }
+    if text.is_empty() {
+        return 0;
+    }
+    let lower = joaat(text);
+    if extra().read().ok().is_some_and(|m| m.get(&lower).is_some_and(|n| n == text)) {
+        return lower;
+    }
+    builtin_reverse().get(text).copied().unwrap_or(lower)
+}
+
 /// The hash a name in the XML stands for (`hash_XXXXXXXX` or a name).
 pub fn parse(text: &str) -> u32 {
     match text.strip_prefix("hash_").and_then(|h| u32::from_str_radix(h, 16).ok()) {
@@ -108,6 +139,10 @@ mod tests {
         assert_eq!(parse("hash_00000001"), 1);
         assert_eq!(parse("AABB"), jenkins_bytes(b"AABB"));
         assert_eq!(parse("adder"), 0xB779_A091);
+        for h in [jenkins_bytes(b"CMapData"), jenkins_bytes(b"aabb"), 0x1234_5678, 0] {
+            assert_eq!(parse_value(&value(h)), h);
+        }
+        assert_eq!(parse_value("adder"), 0xB779_A091);
     }
 
     #[test]

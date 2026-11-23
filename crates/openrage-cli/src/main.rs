@@ -111,12 +111,17 @@ fn run() -> Result<()> {
         return cmd_ttpf(path, export.as_deref(), *from, *count, *max_side);
     }
 
-    if let Command::Rpf8 { path, list, textures, models, text, meta, audio, anims } = &cli.command {
-        return cmd_rpf8(
-            path,
-            *list,
-            Checks { textures: *textures, models: *models, texts: *text, meta: *meta, audio: *audio, anims: *anims },
-        );
+    if let Command::Rpf8 { path, list, textures, models, text, meta, rebuild, audio, anims } = &cli.command {
+        let checks = Checks {
+            textures: *textures,
+            models: *models,
+            texts: *text,
+            meta: *meta,
+            rebuild: *rebuild,
+            audio: *audio,
+            anims: *anims,
+        };
+        return cmd_rpf8(path, *list, checks);
     }
     // Managing plugins needs no game; previews and actions use it when there is one.
     if let Command::Plugin(cmd) = &cli.command
@@ -150,7 +155,8 @@ fn run() -> Result<()> {
     if gta4 && let Err(e) = openrage_app::gta4::register(&game_dir) {
         eprintln!("warning: GTA IV archive key: {e:#}");
     }
-    if openrage_app::detect::is_rdr2_dir(&game_dir) {
+    let rdr2 = openrage_app::detect::is_rdr2_dir(&game_dir);
+    if rdr2 {
         openrage_app::rdr2::register(&game_dir)?;
     }
     let keys = openrage_app::load_keys().unwrap_or_else(|e| {
@@ -191,6 +197,7 @@ fn run() -> Result<()> {
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
         Command::Verify { path, models: true, .. } if gta4 => cmd_verify_gta4_models(&game_dir, &path),
+        Command::Verify { path, models: true, openformats: true, .. } => cmd_verify_openformats(&game_dir, &path, keys),
         Command::Verify { path, models: true, rebuild: true, .. } => cmd_verify_model_writer(&game_dir, &path, keys),
         Command::Verify { path, models: true, .. } => cmd_verify_models(&game_dir, &path, keys),
         Command::Verify { path, audio: true, .. } => cmd_verify_audio(&game_dir, &path, keys),
@@ -199,10 +206,14 @@ fn run() -> Result<()> {
         Command::Verify { path, scripts: true, .. } => cmd_verify_scripts(&game_dir, &path, keys),
         Command::Verify { path, paths: true, .. } => cmd_verify_paths(&game_dir, &path, keys),
         Command::Verify { path, collisions: true, .. } if gta4 => cmd_verify_gta4_collisions(&game_dir, &path),
+        Command::Verify { path, collisions: true, rebuild: true, .. } => {
+            cmd_verify_collision_writer(&game_dir, &path, keys)
+        }
         Command::Verify { path, collisions: true, .. } => cmd_verify_collisions(&game_dir, &path, keys),
         Command::Verify { path, particles: true, .. } => cmd_verify_particles(&game_dir, &path, keys),
         Command::Verify { path, text: true, .. } if gta4 => cmd_verify_gta4_text(&game_dir, &path),
         Command::Verify { path, text: true, .. } => cmd_verify_text(&game_dir, &path, keys),
+        Command::Verify { path, meta: true, rebuild: true, .. } => cmd_verify_pso_rebuild(&game_dir, &path, keys),
         Command::Verify { path, meta: true, .. } => cmd_verify_meta(&game_dir, &path, keys),
         Command::Verify { path, cutscenes: true, .. } if gta4 => cmd_verify_gta4_cutscenes(&game_dir, &path),
         Command::Verify { cutscenes: true, .. } => bail!("--cutscenes checks GTA IV cutscenes; this is not GTA IV"),
@@ -210,11 +221,14 @@ fn run() -> Result<()> {
         Command::Rdr2Ped { name, outfit, check, load } => cmd_rdr2_ped(&game_dir, name.as_deref(), outfit, check, load),
         Command::Verify { path, animations: true, .. } if gta4 => cmd_verify_gta4_animations(&game_dir, &path),
         Command::Verify { path, animations: true, .. } => cmd_verify_animations(&game_dir, &path, keys),
+        Command::Verify { path, textures: false, models: false, rebuild: true, .. } if rdr2 => {
+            cmd_verify_rdr2_rebuild(&game_dir, &path)
+        }
         Command::Verify { path, textures: false, rebuild: true, .. } if gta4 => {
             cmd_verify_gta4_tables(&game_dir, &path)
         }
         Command::Verify { textures: false, rebuild: true, .. } => {
-            bail!("--rebuild needs --textures or --models (or a GTA IV game)")
+            bail!("--rebuild needs --textures or --models (or a GTA IV or RDR2 game)")
         }
         Command::Verify { path, textures: false, .. } if gta4 => cmd_verify_gta4(&game_dir, &path),
         Command::Verify { path, textures: false, .. } => cmd_verify(&game_dir, &path, keys),
@@ -232,8 +246,20 @@ fn run() -> Result<()> {
             cmd_model(&game_dir, &path, outfit, view, keys)
         }
         Command::Clips { path, clip } => cmd_clips(&game_dir, &path, clip.as_deref(), keys),
-        Command::ReplaceModel { path, obj, out, mods, shader, lod, no_textures } => {
-            let options = ReplaceOptions { out: out.as_deref(), mods, shader, lods: &lod, textures: !no_textures };
+        Command::ExportOpenformats { path, out } => cmd_export_openformats(&game_dir, &path, &out, keys),
+        Command::ImportOpenformats { path, file, out, mods } => {
+            cmd_import_openformats(&game_dir, &path, &file, out.as_deref(), mods, keys)
+        }
+        Command::ReplaceModel { path, obj, out, mods, shader, lod, no_textures, drawable, collision } => {
+            let options = ReplaceOptions {
+                out: out.as_deref(),
+                mods,
+                shader,
+                lods: &lod,
+                textures: !no_textures,
+                drawable: drawable.as_deref(),
+                collision: collision.as_deref(),
+            };
             cmd_replace_model(&game_dir, &path, &obj, options, keys)
         }
         Command::World { x, y, z, radius } => {

@@ -315,7 +315,7 @@ pub fn parse_wft(res: &Resource) -> Result<Fragment, ResourceError> {
     }
     let mut drawable = read_drawable(res, main)?;
     drawable.name = fragment_name(res).unwrap_or_default();
-    let mut fragment = Fragment { drawable, children: Vec::new() };
+    let mut fragment = Fragment { drawable, ..Default::default() };
     let list = ptr(res, root + 0xD4)?;
     let count = res.u8(root + 0x1F2)? as u64;
     if !valid(res, list) {
