@@ -61,7 +61,9 @@ pub fn extract_scarlett_1_0_2_1_from_bytes(exe: &[u8]) -> Result<ExtractedMateri
     let image = PeImage::parse(exe)?;
     let registry = image.read_va(REGISTRY_VA, REGISTRY_COUNT * 24)?;
     let descriptors: Vec<_> = registry
-        .chunks_exact(24)
+        .as_chunks::<24>()
+        .0
+        .iter()
         .map(|b| KeyDescriptor {
             key_id: u64_at(b, 0).expect("descriptor chunk"),
             data_va: u64_at(b, 8).expect("descriptor chunk"),
