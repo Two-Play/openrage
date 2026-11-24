@@ -20,7 +20,7 @@ status_intro = "What OpenRAGE reads today. Scripts (`.#script`), particle effect
 image = "gta6/fly.webp"
 width = 1100
 height = 720
-alt = "OpenRAGE flying over the map of GTA VI: an elevated road junction, houses and the skyline behind"
+alt = "OpenRAGE flying over the map of GTA VI at dusk: villas on an island, towers across the water and the settings for the time of day"
 
 [[extra.features]]
 icon = "🗺️"
@@ -137,6 +137,7 @@ together with those around it. Interiors are not filled yet.
 
 **Fly (F)** flies through it: W A S D move, Q and E go down and up, Shift is faster, dragging looks around and the wheel
 sets the speed. In the whole map, details are loaded where the camera is, as the game's own levels of detail tell.
+**View** beside it sets the time of day, brightness, haze, the sea, the field of view and how far details reach.
 
 ## Names
 
