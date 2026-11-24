@@ -40,7 +40,7 @@ OpenIV's last release was in January 2022. OpenRAGE picks up where it left off a
 - **Mods, safely:** changes go to OpenIV's `mods` folder, never into your game files; every change and every `.oiv` package can be undone.
 - **Models in:** replace props and vehicle bodies of GTA V Enhanced with your own OBJ models; doors and bonnets keep moving (preview).
 - **ASI mods:** see and switch GTA V's ASI mods, and on Linux let Proton load the ASI loader with one click.
-- **Ready for GTA VI:** support follows as fast as possible once GTA VI comes to PC.
+- **GTA VI explorer (preview):** browse and extract recoverable RPF9 data; preview supported models and texture pools from the Scarlett build.
 - **Tested on the whole game:** every format is checked against every file of GTA V ([details](https://two-play.github.io/openrage/#status)).
 
 <table>
@@ -62,7 +62,7 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 |---|---|---|
 | **GTA V** (Legacy & Enhanced) | ✅ read and edit (mods folder, with undo) | ✅ textures (also inside models) · models · audio · animations · metadata · text · collisions · paths · cutscenes · scripts · ASI mods (manager, Proton fix on Linux) · ◐ model import from OBJ with compressed textures and detail levels (Enhanced `.ydr` and vehicle bodies `.yft`, preview; explorer via the OBJ tools plugin) |
 | **Red Dead Redemption 2** | ✅ read, with keys from your own game · ◐ edit (Lenny's Mod Loader `lml/replace` folder, with undo; nested archives rewritten; not yet tried in the game) | ◐ textures (replace same-shape) · models with moving parts and cloth · texts · metadata · audio · animations on fitting models · ped outfits (read-only) |
-| **GTA VI** | 🔜 next: as fast as possible once it comes to PC | – |
+| **GTA VI** (Scarlett build, preview) | ◐ read-only RPF9 recovery view: scan, browse and extract recoverable data; encrypted table of contents and original paths are not decoded | ◐ models · texture pools (`.ttpf`) · recovered text, audio containers and Bink 2 video files; recovery is incomplete |
 | **GTA IV** (Complete Edition) | ✅ read (IMG3, RPF2, RPF3), key from your own `GTAIV.exe` | ◐ textures · models · collisions · animations · text · scripts · maps in 3D · cutscenes (played with their cast, camera, subtitles and particle effects) · particle effect lists (`.wpfl`) · editing `.img`, `.rpf`, placement files, loose files and textures (`.wtd`, inside `.wdr`) (update folder, or the game files with originals kept) |
 
 **Plugins** (API 0.3, preview): sandboxed WebAssembly plugins add file types, previews (text, tree, table, image, 3D model), tool windows of their own (Tools menu), export and batch actions with access to the game's models and textures, and changes to game files through the `mods` folder (with undo), for every game. ✅ explorer (file list, preview, context menu, Settings → Plugins) and command line (`openrage plugin`), four example plugins included (OBJ export and import, a number and hash converter among them) · plugin packages (`.orp`) with install/uninstall in the explorer and the CLI · models into game formats (`build-model`) · ✅ openFormats: OpenIV's text formats (`.odr`, `.oft`, `.odd`, `.otd` with `.mesh`, `.skel`, DDS) exported and imported back (preview). [Writing plugins](https://two-play.github.io/openrage/plugins/)
@@ -70,6 +70,10 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 ## Installation
 
 Download the [latest release](https://github.com/Two-Play/openrage/releases/latest) for Linux (AppImage, Flatpak or `.tar.gz`) or Windows (`.zip`) and start `openrage-gui`. On first start it finds your game and sets up the keys. Step by step: **[Getting started](https://two-play.github.io/openrage/getting-started/)**.
+
+For the GTA VI preview, choose the folder containing `game_scarlett_master.exe` or RPF9 archives. The explorer indexes the archives in the background and caches the results; scanning large archives for the first time can take several minutes. Recovered entries are grouped by file type and offset, with model names recovered from their data where possible. The executable is recognized for game selection and its icon; its presence does not unlock encrypted archive data. Editing RPF9 archives is not supported.
+
+The CLI also supports recovery browsing, extraction and verification, for example `openrage --game <DIR> ls common.rpf` and `openrage --game <DIR> verify common.rpf` (or a recovered folder or file inside it). Running `verify` without a path checks all RPF9 archives below the game folder. Verification streams the recovered entries through zlib and size/bounds checks, reports recovery coverage, and returns an error on a failed entry; unread data and the encrypted table of contents are outside its coverage. Format-specific verification and `--rebuild` are not supported for GTA VI yet.
 
 To build from source (Rust, pinned in `rust-toolchain.toml`; on Linux also the fontconfig, xkbcommon, Wayland and ALSA development packages):
 

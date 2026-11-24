@@ -36,6 +36,10 @@ pub mod rpf8_keys;
 #[cfg(feature = "rdr2")]
 pub mod rpf8_names;
 pub mod rpf9;
+mod rpf9_cipher;
+pub mod rpf9_index;
+pub mod rpf9_names;
+mod rpf9_native;
 mod toc;
 pub mod vfs;
 pub mod writer;

@@ -806,7 +806,12 @@ pub(crate) fn gta4_preview(a: &rage_rpf::Gta4Archive, i: rage_rpf::Gta4EntryId) 
 /// indexed already. Never starts the scan.
 pub(crate) fn rpf9_archive_info(rpf: &rage_rpf::Rpf9) -> Meta {
     use openrage_app::extract::human_size;
-    let mut meta = vec![kv("Format", "RPF9 (GTA VI)"), kv("Data", human_size(rpf.data_len()))];
+    let mut meta = vec![
+        kv("Format", "RPF9 (GTA VI)"),
+        kv("Data", human_size(rpf.data_len())),
+        kv("Declared index slots", grouped(rpf.header().entry_count as usize)),
+        kv("TOC transform tag", format!("{:#04x}", rpf.header().toc_transform)),
+    ];
     match rpf.loaded().or_else(|| openrage_app::rpf9::load_index(rpf.path()).map(Arc::new)) {
         Some(entries) => {
             let c = openrage_app::rpf9::coverage(rpf, &entries);
@@ -820,7 +825,8 @@ pub(crate) fn rpf9_archive_info(rpf: &rage_rpf::Rpf9) -> Meta {
     }
     meta.push(note(
         "The table of contents is encrypted, so names and folders are unknown. Files are found in the data itself \
-         and named by their offset; data that is neither zlib, Bink 2 nor an audio container is not listed.",
+         and named by their offset; data that is neither zlib, Bink 2 nor an audio container is not listed. \
+         Recovered streams do not correspond one-to-one to the declared index slots.",
     ));
     meta
 }

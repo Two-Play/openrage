@@ -180,7 +180,9 @@ pub(crate) fn show_folder_hint(ui: &AppWindow) {
         String::new()
     } else if let Some(name) = detect::game_name(&dir) {
         if detect::is_gta6_dir(&dir) {
-            format!("Found {name}. Its archives open without keys, but without file names. Press Open to continue.")
+            format!(
+                "Found {name}. RPF9 archives open read-only in recovery view: original names and encrypted files are unavailable. The first scan can take several minutes. Press Open to continue."
+            )
         } else {
             format!("Found {name}. Press Open to continue.")
         }
@@ -203,8 +205,7 @@ pub(crate) fn pick_path(w: Weak<AppWindow>, file: bool, title: &'static str, app
 }
 
 /// What a game folder must hold.
-const NO_GAME: &str =
-    "The folder must contain GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe or RDR2.exe, or the archives of GTA VI.";
+const NO_GAME: &str = "The folder must contain GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe, RDR2.exe or game_scarlett_master.exe, or RPF9 archives of GTA VI.";
 
 /// Leaves a setup that cannot be closed: back to the list of games when there
 /// is one, otherwise out of OpenRAGE.

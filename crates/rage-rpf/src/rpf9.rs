@@ -2,7 +2,8 @@
 //!
 //! Layout (little-endian):
 //! - 64-byte header: magic `RPF9`, then the offset where the file data
-//!   starts. The other header fields are not understood yet.
+//!   starts, a declared entry count at `0x24` and transform tag at `0x2e`.
+//!   The protected index itself is not decoded.
 //! - The table of contents (names, sizes, offsets) up to the data offset. It
 //!   is encrypted with keys that only the game's executable has; OpenRAGE
 //!   does not read it.
@@ -24,7 +25,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -60,6 +61,11 @@ const MAGICS: [&[u8; 4]; 7] = [b"PSIN", b"PAMH", b"MHIU", b"RBF0", b"SPS1", b"RS
 pub struct Header {
     /// Where the file data starts; the table of contents ends here.
     pub data_offset: u32,
+    /// Native index slots declared by the clear header. Recovery streams do
+    /// not correspond one-to-one to these slots.
+    pub entry_count: u32,
+    /// Native header transform selector; this is not an archive key ID.
+    pub toc_transform: u8,
 }
 
 impl Header {
@@ -67,7 +73,7 @@ impl Header {
         if b.len() < HEADER_LEN || crate::word(b, 0) != MAGIC {
             return None;
         }
-        Some(Header { data_offset: crate::word(b, 4) })
+        Some(Header { data_offset: crate::word(b, 4), entry_count: crate::word(b, 0x24), toc_transform: b[0x2e] })
     }
 }
 
@@ -473,29 +479,47 @@ impl Rpf9 {
     pub fn copy_to(&self, entry: &Entry, out: &mut dyn Write) -> Result<u64, RpfError> {
         let name = self.entry_name(entry);
         let outside = || RpfError::OutOfBounds { archive: self.display.clone(), entry: name.clone() };
-        if entry.offset.checked_add(entry.stored).is_none_or(|end| end > self.size) {
+        if entry.offset < u64::from(self.header.data_offset)
+            || entry.stored == 0
+            || entry.size == 0
+            || entry.streams == 0
+            || entry.offset.checked_add(entry.stored).is_none_or(|end| end > self.size)
+        {
             return Err(outside());
         }
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(entry.offset))?;
         let mut reader = BufReader::with_capacity(1 << 16, file.take(entry.stored));
         if entry.kind != Kind::Zlib {
-            return Ok(std::io::copy(&mut reader, out)?);
+            if entry.size != entry.stored || entry.streams != 1 {
+                return Err(outside());
+            }
+            let written = std::io::copy(&mut reader, out)?;
+            return if written == entry.size { Ok(written) } else { Err(outside()) };
         }
         let inflate = |source| RpfError::Inflate { archive: self.display.clone(), entry: name.clone(), source };
         let (mut read, mut written) = (0u64, 0u64);
         for _ in 0..entry.streams {
             // Streams start aligned; the entry itself does too.
             let padding = read.next_multiple_of(ALIGN) - read;
-            reader.consume(padding as usize);
-            if reader.fill_buf()?.len() < padding as usize && padding > 0 {
-                return Err(outside());
+            if padding > 0 {
+                let mut bytes = [0u8; ALIGN as usize];
+                reader.read_exact(&mut bytes[..padding as usize])?;
             }
             let mut stream = flate2::bufread::ZlibDecoder::new(&mut reader);
-            written += std::io::copy(&mut stream, out).map_err(inflate)?;
+            // A stale or corrupt index must not cause unlimited output before
+            // the decoded length is checked. One extra byte detects overflow.
+            let limit = entry.size.saturating_sub(written).saturating_add(1);
+            written += std::io::copy(&mut (&mut stream).take(limit), out).map_err(inflate)?;
             read += padding + stream.total_in();
+            if written > entry.size {
+                return Err(inflate(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unpacked size exceeds the index",
+                )));
+            }
         }
-        if written != entry.size {
+        if written != entry.size || read != entry.stored {
             let short = std::io::Error::new(std::io::ErrorKind::InvalidData, "unpacked size differs from the index");
             return Err(inflate(short));
         }
@@ -647,7 +671,7 @@ impl Scanner {
                 continue;
             };
             let candidate = pos + i as u64;
-            pos = match self.stream_at(candidate)? {
+            pos = match self.stream_at(candidate, cancel)? {
                 Some(s) => {
                     let end = s.offset + s.stored;
                     found.push(s);
@@ -662,7 +686,7 @@ impl Scanner {
 
     /// The zlib stream, Bink 2 video or audio container that starts at `pos`,
     /// if one does.
-    fn stream_at(&mut self, pos: u64) -> Result<Option<Stream>, RpfError> {
+    fn stream_at(&mut self, pos: u64, cancel: &AtomicBool) -> Result<Option<Stream>, RpfError> {
         let size = self.size;
         let start = self.at(pos)?;
         if start.len() >= 28 && &start[..3] == b"KB2" && start[3].is_ascii_lowercase() {
@@ -706,6 +730,10 @@ impl Scanner {
         let mut scratch = std::mem::take(&mut self.scratch);
         let (mut head, mut head_len) = ([0u8; 16], 0usize);
         let result = loop {
+            if cancel.load(Ordering::Relaxed) {
+                self.scratch = scratch;
+                return Err(RpfError::Cancelled);
+            }
             let (read, written) = (inflater.total_in(), inflater.total_out());
             let input = match self.at(pos + read) {
                 Ok(input) if !input.is_empty() => input,
@@ -818,9 +846,20 @@ pub fn decode_index(data: &[u8]) -> Option<Vec<Entry>> {
             streams: crate::word(r, 24),
             kind,
             head: r[30..46].try_into().ok()?,
-            head_len: r[29].min(16),
+            head_len: r[29],
         };
-        if entries.last().is_some_and(|prev: &Entry| prev.offset >= entry.offset) {
+        let end = entry.offset.checked_add(entry.stored)?;
+        if entry.offset < HEADER_LEN as u64
+            || entry.stored == 0
+            || entry.size == 0
+            || entry.streams == 0
+            || entry.head_len > 16
+            || u64::from(entry.head_len) > entry.size
+            || (entry.kind != Kind::Zlib && (entry.stored != entry.size || entry.streams != 1))
+            || u64::from(entry.streams) > entry.stored
+            || end <= entry.offset
+            || entries.last().is_some_and(|prev: &Entry| prev.offset + prev.stored > entry.offset)
+        {
             return None;
         }
         entries.push(entry);
@@ -1026,6 +1065,72 @@ mod tests {
         bad[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
         std::fs::write(&path, &bad).unwrap();
         assert!(matches!(Rpf9::open(&path), Err(RpfError::CorruptToc { .. })));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clear_header_reports_native_slots_and_transform_tag() {
+        let mut bytes = [0u8; HEADER_LEN];
+        bytes[..4].copy_from_slice(&MAGIC.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x9580u32.to_le_bytes());
+        bytes[0x24..0x28].copy_from_slice(&418u32.to_le_bytes());
+        bytes[0x2e] = 9;
+        let header = Header::parse(&bytes).unwrap();
+        assert_eq!(header.data_offset, 0x9580);
+        assert_eq!(header.entry_count, 418);
+        assert_eq!(header.toc_transform, 9);
+        assert!(Header::parse(&bytes[..HEADER_LEN - 1]).is_none());
+    }
+
+    #[test]
+    fn a_stream_scan_honors_cancellation_during_inflate() {
+        let (data, _) = archive();
+        let path = write("cancel-inflate", &data);
+        let mut scanner = Scanner::new(File::open(&path).unwrap(), data.len() as u64);
+        assert!(matches!(scanner.stream_at(0x100, &AtomicBool::new(true)), Err(RpfError::Cancelled)));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn extraction_rejects_bad_lengths_and_truncated_stored_files() {
+        let (data, _) = archive();
+        let path = write("read-bounds", &data);
+        let rpf = Rpf9::open(&path).unwrap();
+        let entries = rpf.entries().unwrap();
+        let mut entry = entries[0].clone();
+        entry.size = 1;
+        let mut out = Vec::new();
+        assert!(rpf.copy_to(&entry, &mut out).is_err());
+        assert!(out.len() <= 2);
+        entry = entries[0].clone();
+        entry.offset = 0;
+        assert!(matches!(rpf.copy_to(&entry, &mut Vec::new()), Err(RpfError::OutOfBounds { .. })));
+
+        // The file can be replaced after opening an archive. Stored media
+        // must report a short read just as compressed entries do.
+        let entry = &entries[2];
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(entry.offset + 10).unwrap();
+        assert!(rpf.copy_to(entry, &mut Vec::new()).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cached_entries_reject_overflow_overlap_and_invalid_records() {
+        let (data, _) = archive();
+        let path = write("index-bounds", &data);
+        let entries = Rpf9::open(&path).unwrap().entries().unwrap();
+        let encoded = encode_index(&entries);
+        for (at, bytes) in [
+            (0, u64::MAX.to_le_bytes().to_vec()),
+            (8, 0u64.to_le_bytes().to_vec()),
+            (24, 0u32.to_le_bytes().to_vec()),
+            (29, vec![17]),
+            (INDEX_RECORD, entries[0].offset.to_le_bytes().to_vec()),
+        ] {
+            let mut bad = encoded.clone();
+            bad[at..at + bytes.len()].copy_from_slice(&bytes);
+            assert!(decode_index(&bad).is_none(), "accepted invalid field at {at}");
+        }
         std::fs::remove_file(path).unwrap();
     }
 

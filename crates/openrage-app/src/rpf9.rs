@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -48,7 +48,16 @@ pub fn load_index(archive: &Path) -> Option<Vec<Entry>> {
 fn load_index_from(index: &Path, archive: &Path) -> Option<Vec<Entry>> {
     let data = fs::read(index).ok()?;
     let rest = data.strip_prefix(INDEX_MAGIC)?.strip_prefix(&identity(archive)?)?;
-    rpf9::decode_index(rest)
+    let entries = rpf9::decode_index(rest)?;
+    let mut file = fs::File::open(archive).ok()?;
+    let size = file.metadata().ok()?.len();
+    let mut bytes = [0u8; rpf9::HEADER_LEN];
+    file.read_exact(&mut bytes).ok()?;
+    let header = rpf9::Header::parse(&bytes)?;
+    entries
+        .iter()
+        .all(|entry| entry.offset >= u64::from(header.data_offset) && entry.offset + entry.stored <= size)
+        .then_some(entries)
 }
 
 /// Stores the index of an archive.
@@ -372,6 +381,11 @@ mod tests {
         assert_eq!(load_index_from(&index, &path), None);
         store_index_to(&index, &path, &entries).unwrap();
         assert_eq!(load_index_from(&index, &path).as_deref(), Some(&entries[..]));
+        let mut outside = entries.clone();
+        outside[1].offset = fs::metadata(&path).unwrap().len();
+        store_index_to(&index, &path, &outside).unwrap();
+        assert_eq!(load_index_from(&index, &path), None);
+        store_index_to(&index, &path, &entries).unwrap();
         let c = coverage(&rpf, &entries);
         assert_eq!((c.files, c.unpacked), (2, 25 + 12));
         assert_eq!(c.stored + c.unread, rpf.data_len());

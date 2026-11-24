@@ -262,6 +262,8 @@ pub(crate) fn cmd_info(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>)
             outln!("Archive:     {}", rpf.display_name());
             outln!("Format:      RPF9 (Grand Theft Auto VI)");
             outln!("Size:        {} ({} bytes)", human(rpf.size()), rpf.size());
+            outln!("Index slots: {} (declared in header; distinct from recovered streams)", rpf.header().entry_count);
+            outln!("TOC tag:     {:#04x} (native transform selector)", rpf.header().toc_transform);
             outln!("Table:       encrypted, not read (file names and folders are unknown)");
             outln!("Data:        from offset {:#x}, {}", rpf.header().data_offset, human(rpf.data_len()));
             // The archive itself is described without reading all of it.

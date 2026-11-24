@@ -196,6 +196,44 @@ fn run() -> Result<()> {
         Command::Info { path } => cmd_info(&game_dir, &path, keys),
         Command::Extract { path, out, expand_archives } => cmd_extract(&game_dir, &path, &out, expand_archives, keys),
         Command::Find { pattern, r#in } => cmd_find(&game_dir, &r#in, &pattern, keys),
+        Command::Verify {
+            path,
+            textures,
+            models,
+            audio,
+            animations,
+            meta,
+            text,
+            particles,
+            collisions,
+            paths,
+            scripts,
+            media,
+            cutscenes,
+            rebuild,
+            openformats,
+        } if openrage_app::detect::is_gta6_dir(&game_dir) => {
+            if textures
+                || models
+                || audio
+                || animations
+                || meta
+                || text
+                || particles
+                || collisions
+                || paths
+                || scripts
+                || media
+                || cutscenes
+                || rebuild
+                || openformats
+            {
+                bail!(
+                    "GTA VI verification currently checks recovered RPF9 data only; use `verify <path>` without format or rebuild flags"
+                );
+            }
+            cmd_verify(&game_dir, &path, keys)
+        }
         Command::Verify { path, models: true, .. } if gta4 => cmd_verify_gta4_models(&game_dir, &path),
         Command::Verify { path, models: true, openformats: true, .. } => cmd_verify_openformats(&game_dir, &path, keys),
         Command::Verify { path, models: true, rebuild: true, .. } => cmd_verify_model_writer(&game_dir, &path, keys),
