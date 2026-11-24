@@ -131,7 +131,8 @@ struct App {
     suggest_awc: String,
     /// Models for `suggest_ycd` are still being looked for.
     suggest_pending: bool,
-    index_running: bool,
+    /// The game whose index is being updated, and how to stop that.
+    index_running: Option<(PathBuf, Arc<AtomicBool>)>,
     /// Plugin package shown in the install dialog.
     plugin_package: Option<Arc<openrage_plugins::package::Package>>,
 }
@@ -227,7 +228,7 @@ fn main() -> anyhow::Result<()> {
             suggest_ycd: String::new(),
             suggest_awc: String::new(),
             suggest_pending: false,
-            index_running: false,
+            index_running: None,
             plugin_package: None,
         })
     });

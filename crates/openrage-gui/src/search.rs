@@ -3,29 +3,44 @@
 use crate::*;
 
 pub(crate) fn start_index_update(ui: &AppWindow) {
-    let Some((game_dir, keys)) = with_app(|a| {
-        if a.index_running {
-            return None;
+    let Some((game_dir, keys, cancel)) = with_app(|a| {
+        let dir = a.game_dir.clone()?;
+        if let Some((running, cancel)) = &a.index_running {
+            if *running == dir {
+                return None;
+            }
+            // Another game was opened meanwhile: its index comes first.
+            cancel.store(true, Ordering::Relaxed);
         }
-        a.index_running = true;
-        a.game_dir.clone().map(|d| (d, a.keys.clone()))
+        let cancel = Arc::new(AtomicBool::new(false));
+        a.index_running = Some((dir.clone(), Arc::clone(&cancel)));
+        Some((dir, a.keys.clone(), cancel))
     }) else {
         return;
     };
     let weak = ui.as_weak();
     ui.set_index_status("Index: checking…".into());
     std::thread::spawn(move || {
+        let current = Arc::clone(&cancel);
         let status = |text: String| {
-            let _ = weak.upgrade_in_event_loop(move |ui| ui.set_index_status(text.into()));
+            if !cancel.load(Ordering::Relaxed) {
+                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_index_status(text.into()));
+            }
         };
         let result = (|| -> Result<rage_index::IndexStats, rage_index::IndexError> {
+            // One update at a time: a stopped one still writes what it has.
+            static UPDATING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _updating = UPDATING.lock().unwrap_or_else(|e| e.into_inner());
             let path = index_path(&game_dir).ok_or_else(|| std::io::Error::other("no cache directory"))?;
             let mut index = Index::open(&path)?;
             let mut last = Instant::now();
-            index.update(&game_dir, keys, &AtomicBool::new(false), &mut |p| {
+            index.update(&game_dir, keys, &cancel, &mut |p| {
                 if last.elapsed() > Duration::from_millis(200) {
                     last = Instant::now();
-                    status(format!("Indexing {}/{} archives…", p.archives_done, p.archives_total));
+                    status(format!(
+                        "Indexing {}/{} archives ({} entries)…",
+                        p.archives_done, p.archives_total, p.entries
+                    ));
                 }
             })?;
             // Names of models, textures, … so hashes in metadata read as names.
@@ -39,8 +54,17 @@ pub(crate) fn start_index_update(ui: &AppWindow) {
             Err(e) => format!("Index error: {e}"),
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            with_app(|a| a.index_running = false);
-            ui.set_index_status(text.into());
+            // The status belongs to the newest run.
+            let newest = with_app(|a| {
+                let newest = a.index_running.as_ref().is_some_and(|(_, c)| Arc::ptr_eq(c, &current));
+                if newest {
+                    a.index_running = None;
+                }
+                newest
+            });
+            if newest {
+                ui.set_index_status(text.into());
+            }
         });
     });
 }
@@ -59,18 +83,21 @@ pub(crate) fn start_search(ui: &AppWindow, query: String, record: bool) {
         let result = index_path(&game_dir)
             .ok_or_else(|| "no cache directory".to_owned())
             .and_then(|p| Index::open(&p).map_err(|e| e.to_string()))
-            .and_then(|idx| match idx.stats() {
-                Ok(s) if s.updated_at.is_none() => {
-                    Err("the search index is still being built — please try again in a moment".to_owned())
+            .and_then(|idx| {
+                let results = idx.search(&query, 1000, language.as_deref()).map_err(|e| e.to_string())?;
+                // What is indexed already can be searched meanwhile.
+                let complete = idx.is_complete().unwrap_or(true);
+                if !complete && results.hits.is_empty() {
+                    return Err("the search index is still being built — please try again in a moment".to_owned());
                 }
-                _ => idx.search(&query, 1000, language.as_deref()).map_err(|e| e.to_string()),
+                Ok((results, complete))
             });
         let ms = started.elapsed().as_millis();
         if counter.load(Ordering::SeqCst) != generation {
             return;
         }
         let _ = weak.upgrade_in_event_loop(move |ui| match result {
-            Ok(results) => show_search_results(&ui, query, results, ms, record),
+            Ok((results, complete)) => show_search_results(&ui, query, results, complete, ms, record),
             Err(e) => show_error(&ui, format!("Search failed: {e}")),
         });
     });
@@ -80,6 +107,7 @@ pub(crate) fn show_search_results(
     ui: &AppWindow,
     query: String,
     results: rage_index::SearchResults,
+    complete: bool,
     ms: u128,
     record: bool,
 ) {
@@ -123,6 +151,9 @@ pub(crate) fn show_search_results(
         items.len(),
         if results.limited { " (first 1000)" } else { "" }
     ));
+    if !complete {
+        summary.push_str(" · the index is still being built, there may be more");
+    }
     let vpath = format!("?{query}");
     with_app(|a| {
         if record {

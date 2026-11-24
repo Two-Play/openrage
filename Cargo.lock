@@ -4572,6 +4572,8 @@ dependencies = [
  "flate2",
  "rage-core",
  "rage-crypto",
+ "rage-formats",
+ "rage-resource",
  "rage-rpf",
  "rayon",
  "rusqlite",
