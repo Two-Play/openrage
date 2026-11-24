@@ -22,7 +22,7 @@ It contains **no game files and no encryption keys**: keys are taken from your o
 features_title = "Highlights"
 features_intro = "What OpenRAGE can open, show and change today."
 screenshots_title = "Screenshots"
-screenshots_intro = "Click a picture to enlarge it, arrow keys browse. The screenshots show files from the author's own copy of the game."
+screenshots_intro = "Click a picture to enlarge it, arrow keys browse."
 games_title = "Supported games"
 games_intro = "GTA V comes first and Red Dead Redemption 2 can be explored. GTA VI can be explored (read-only preview). GTA IV can be explored and modded too: archives, textures, models, collisions, animations, texts, maps in 3D and whole cutscenes."
 details_summary = "Checked against the whole game"
