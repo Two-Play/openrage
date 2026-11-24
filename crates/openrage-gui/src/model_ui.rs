@@ -354,11 +354,17 @@ pub(crate) fn axis_view(axis: i32, current: openrage_app::render::View) -> openr
     v
 }
 
+/// The size of pictures made for the preview area, in the screen's pixels.
+pub(crate) fn preview_pixels(ui: &AppWindow) -> (usize, usize) {
+    let scale = ui.window().scale_factor().clamp(0.5, 4.0);
+    let pixels = |length: f32| ((length - 16.0).max(64.0) * scale).round() as usize;
+    (pixels(ui.get_preview_area_width()), pixels(ui.get_preview_area_height()))
+}
+
 /// Renders the current model at the size of the preview area.
 pub(crate) fn render_model(ui: &AppWindow) {
     let Some((model, view)) = with_app(|a| a.model.clone().map(|m| (m, a.model_view))) else { return };
-    let w = (ui.get_preview_area_width() - 16.0).max(64.0) as usize;
-    let h = (ui.get_preview_area_height() - 16.0).max(64.0) as usize;
+    let (w, h) = preview_pixels(ui);
     if let Some((img, gizmo)) =
         render_image(&model, |lo, hi| openrage_app::render::orbit_camera(lo, hi, view), None, w, h)
     {

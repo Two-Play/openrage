@@ -327,6 +327,12 @@ pub(crate) fn texture_image(t: &rage_formats::texture::Texture) -> Option<Rgba> 
 /// Preview with an optional image: textures and texture dictionaries show a picture.
 pub(crate) fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, String, Option<Rgba>) {
     match source {
+        PreviewSource::Rpf9(rpf, i) if rpf9_texture_dict(&rpf, i) => {
+            match openrage_app::textures::gta6_dictionary(&rpf, i) {
+                Ok(dict) => texture_dict_preview(&dict),
+                Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new(), None),
+            }
+        }
         PreviewSource::Texture(dict, idx) => match dict.textures.get(idx) {
             Some(t) => {
                 let image = texture_image(t);
@@ -836,6 +842,12 @@ pub(crate) fn rpf9_archive_info(rpf: &rage_rpf::Rpf9) -> Meta {
          Recovered streams do not correspond one-to-one to the declared index slots.",
     ));
     meta
+}
+
+/// Whether an entry of a GTA VI archive is a texture dictionary.
+fn rpf9_texture_dict(rpf: &rage_rpf::Rpf9, i: usize) -> bool {
+    let name = rpf.loaded().and_then(|entries| Some(rpf.entry_name(entries.get(i)?)));
+    name.is_some_and(|name| browser::is_texture_dict(&name))
 }
 
 /// Facts about a recovered file of a GTA VI archive, and the start of it as

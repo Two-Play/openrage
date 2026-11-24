@@ -60,10 +60,7 @@ pub(crate) fn start_sound_preview(
 ) {
     let counter = with_app(|a| Arc::clone(&a.preview_generation));
     ui.set_preview_loading(true);
-    let (w, h) = (
-        (ui.get_preview_area_width() - 16.0).max(64.0) as usize,
-        (ui.get_preview_area_height() - 16.0).max(64.0) as usize,
-    );
+    let (w, h) = preview_pixels(ui);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let sound = awc.sounds.get(index).cloned();

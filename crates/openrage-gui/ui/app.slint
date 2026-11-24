@@ -2683,7 +2683,8 @@ export component AppWindow inherits Window {
                         width: parent.width - 16px;
                         height: parent.height - 16px;
                         source: root.preview-image;
-                        image-fit: contain;
+                        // A waveform spans the area, as its position line does.
+                        image-fit: root.audio-mode ? fill : contain;
                         image-rendering: smooth;
                         accessible-role: image;
                         accessible-label: @tr("Preview of {}", root.info-title);
@@ -2700,6 +2701,8 @@ export component AppWindow inherits Window {
                     if root.audio-mode: Text {
                         x: Theme.space-s;
                         y: parent.height - self.height - Theme.space-s;
+                        width: parent.width - 2 * Theme.space-s;
+                        overflow: elide;
                         text: @tr("Click the waveform to jump · Space plays and pauses");
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
@@ -2718,6 +2721,9 @@ export component AppWindow inherits Window {
                     if root.model-mode: Text {
                         x: Theme.space-s;
                         y: parent.height - self.height - Theme.space-s;
+                        // Beside the axes in the corner.
+                        width: max(0px, parent.width - 110px);
+                        overflow: elide;
                         text: @tr("Drag to rotate · scroll to zoom");
                         font-size: Theme.font-small;
                         color: Theme.text-faint;

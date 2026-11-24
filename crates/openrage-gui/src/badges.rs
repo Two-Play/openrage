@@ -12,7 +12,12 @@ const fn rgb(hex: u32) -> Color {
 pub const NEUTRAL: Color = rgb(0x7C8592);
 
 fn extension(name: &str) -> String {
-    name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default()
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    // GTA VI's `#dr` is what GTA V's `ydr` was, and so on.
+    match ext.strip_prefix('#') {
+        Some(rest) => format!("y{rest}"),
+        None => ext,
+    }
 }
 
 /// Icon (a name known to the UI's `Icons.get`) and tint for a file, so
@@ -42,15 +47,15 @@ fn core_icon(ext: &str) -> Option<(&'static str, Color)> {
         "ydr" | "ydd" | "yft" | "yld" | "wdr" | "wdd" | "wft" => ("model", rgb(0x3B82F6)),
         "ypt" => ("particles", rgb(0xE0679B)),
         "ybn" | "wbn" | "wbd" => ("collision", rgb(0x14A08F)),
-        "ynv" | "ynd" | "yvr" | "ywr" | "nod" => ("path", rgb(0x14A08F)),
+        "ynv" | "ynvs" | "ycov" | "ynd" | "yvr" | "ywr" | "nod" => ("path", rgb(0x14A08F)),
         "ymap" | "wpl" | "ytyp" | "ipl" | "ide" => ("map", rgb(0x2FA866)),
-        "ymt" | "ymf" | "meta" | "xml" | "dat" | "json" | "pso" => ("data", rgb(0x2FA866)),
+        "ymt" | "ymf" | "yhdat" | "ymsk" | "ykit" | "meta" | "xml" | "dat" | "json" | "pso" => ("data", rgb(0x2FA866)),
         "cut" => ("anim", rgb(0xDB4F8A)),
         "txt" | "log" | "ini" | "cfg" => ("text", rgb(0x7C8592)),
-        "ycd" | "yed" => ("anim", rgb(0xDB4F8A)),
+        "ycd" | "yed" | "yas" | "yascd" | "ysmm" => ("anim", rgb(0xDB4F8A)),
         "awc" | "rel" | "dat151" | "dat54" | "dat4" | "dat10" | "dat15" | "dat16" | "dat22" => ("audio", rgb(0xDB4F8A)),
-        "ysc" | "sco" | "asi" | "dll" | "lua" | "cs" => ("script", rgb(0xE05252)),
-        "gxt2" | "gxt" => ("lang", rgb(0x5B76DE)),
+        "ysc" | "yscript" | "sco" | "asi" | "dll" | "lua" | "cs" => ("script", rgb(0xE05252)),
+        "gxt2" | "gxt" | "yldb" | "yldbmt" => ("lang", rgb(0x5B76DE)),
         "oiv" | "orp" | "zip" | "7z" | "rar" => ("package", rgb(0xD9822B)),
         _ => return None,
     })
@@ -96,6 +101,7 @@ pub fn type_name(name: &str, kind: ItemKind) -> String {
     } else if ext.is_empty() {
         "File".into()
     } else {
+        let ext = name.rsplit_once('.').map_or(ext.as_str(), |(_, e)| e);
         format!("{} file", ext.to_ascii_uppercase())
     }
 }
@@ -110,7 +116,11 @@ fn known_name(ext: &str) -> &'static str {
         "ypt" => "Particles",
         "ybn" | "wbn" => "Bounds",
         "wbd" => "Bounds dict",
-        "ynv" => "Nav mesh",
+        "ynv" | "ynvs" => "Nav mesh",
+        "ycov" => "Cover",
+        "yscript" => "Script",
+        "yldb" | "yldbmt" => "Text table",
+        "yhdat" => "Height data",
         "ynd" => "Path nodes",
         "ymap" | "wpl" => "Map placement",
         "ytyp" => "Archetypes",

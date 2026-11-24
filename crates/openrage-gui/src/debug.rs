@@ -13,7 +13,9 @@ pub(crate) fn debug_snapshot(ui: &AppWindow) {
     }
     let Ok(path) = std::env::var("OPENRAGE_SNAPSHOT") else { return };
     let weak = ui.as_weak();
-    slint::Timer::single_shot(Duration::from_secs(5), move || {
+    // `OPENRAGE_SNAPSHOT_DELAY=<seconds>`: for folders that open slowly.
+    let delay = std::env::var("OPENRAGE_SNAPSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    slint::Timer::single_shot(Duration::from_secs(delay), move || {
         let Some(ui) = weak.upgrade() else { return };
         debug_viewer(&ui);
         if std::env::var("OPENRAGE_FLY").is_ok()
