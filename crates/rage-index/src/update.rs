@@ -544,18 +544,27 @@ impl Index {
         let conn = &mut self.conn;
         let result: Result<(), IndexError> = std::thread::scope(|scope| {
             scope.spawn(move || {
-                todo.par_iter().for_each_with(sender, |s, archive| {
-                    if cancel.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let s = &*s;
-                    let part = |batch| {
-                        let _ = s.send(batch);
-                    };
-                    if let Some(batch) = read_archive(archive, keys.clone(), cancel, &part) {
-                        part(batch);
-                    }
-                });
+                let read = move || {
+                    todo.par_iter().for_each_with(sender, |s, archive| {
+                        if cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let s = &*s;
+                        let part = |batch| {
+                            let _ = s.send(batch);
+                        };
+                        if let Some(batch) = read_archive(archive, keys.clone(), cancel, &part) {
+                            part(batch);
+                        }
+                    });
+                };
+                // Threads of its own: what is opened meanwhile does not wait
+                // behind the archives, and keeps some processors.
+                let threads = std::thread::available_parallelism().map_or(4, |n| (n.get() * 3 / 4).max(1));
+                match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+                    Ok(pool) => pool.install(read),
+                    Err(_) => read(),
+                }
             });
             for batch in receiver {
                 let tx = conn.transaction()?;

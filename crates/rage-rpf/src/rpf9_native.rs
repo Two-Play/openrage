@@ -43,8 +43,15 @@ pub(crate) fn materials(path: &Path) -> Option<Arc<Materials>> {
     drop(bytes);
     let nameless = Arc::new(Materials { cipher, names: Default::default() });
     let mut strings = Vec::new();
-    for archive in ["common.rpf", "data.rpf"].map(|name| executable.with_file_name(name)) {
-        strings.extend(NativeArchive::strings(&archive, &nameless).unwrap_or_default());
+    let mut read = || {
+        for archive in ["common.rpf", "data.rpf"].map(|name| executable.with_file_name(name)) {
+            strings.extend(NativeArchive::strings(&archive, &nameless).unwrap_or_default());
+        }
+    };
+    // Threads of its own: the shared ones may all be waiting for this.
+    match rayon::ThreadPoolBuilder::new().build() {
+        Ok(pool) => pool.install(read),
+        Err(_) => read(),
     }
     strings.iter().for_each(|text| names.add(text));
     let cipher = Arc::into_inner(nameless)?.cipher;
