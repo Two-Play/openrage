@@ -8,7 +8,7 @@ lead = "Format by format: what you see, what you can export, and what is not the
 toc = true
 +++
 
-This page describes GTA V. [GTA IV](@/gta-iv.md) and [Red Dead Redemption 2](@/rdr2.md) have their own pages.
+This page describes GTA V. [GTA VI](@/gta-vi.md), [GTA IV](@/gta-iv.md) and [Red Dead Redemption 2](@/rdr2.md) have their own pages.
 Changing files is described in [Modding](@/modding.md).
 
 ## Textures

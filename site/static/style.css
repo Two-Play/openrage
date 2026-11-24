@@ -733,3 +733,16 @@ table.compare td.edge::after {
 
 /* Shorter sections: more air between them, compact tables in prose */
 .prose h3 { margin-top: 1.8rem; }
+
+/* Announcement above the hero headline */
+.hero .announcement { margin: 0 0 1.25rem; }
+.hero .announcement a {
+  display: inline-block;
+  padding: 0.55rem 1.1rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-text, #fff);
+  text-decoration: none;
+  line-height: 1.35;
+}
+.hero .announcement a:hover, .hero .announcement a:focus-visible { text-decoration: underline; }

@@ -2,7 +2,7 @@
 # Content lives in content/ (Markdown), layout in templates/, CSS/JS in static/.
 base_url = "https://two-play.github.io/openrage"
 title = "OpenRAGE"
-description = "The free, open-source successor to OpenIV: mod GTA V and explore Red Dead Redemption 2 on Linux and Windows."
+description = "The free, open-source successor to OpenIV: mod GTA V and explore GTA VI and Red Dead Redemption 2 on Linux and Windows."
 default_language = "en"
 compile_sass = false
 build_search_index = false
@@ -40,7 +40,7 @@ pages = [
 
 [[extra.docs]]
 title = "Games"
-pages = [["gta-iv.md", "GTA IV"], ["rdr2.md", "Red Dead Redemption 2"]]
+pages = [["gta-vi.md", "GTA VI"], ["gta-iv.md", "GTA IV"], ["rdr2.md", "Red Dead Redemption 2"]]
 
 [[extra.docs]]
 title = "Develop"
