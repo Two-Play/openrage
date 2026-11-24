@@ -7,21 +7,19 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use openrage_app::gta4_effects::{Image, Sprite};
-use openrage_app::models::{LoadedModel, Look};
-use openrage_app::render::{Camera, Materials};
+use openrage_app::models::Look;
+use openrage_app::render::Camera;
 use rage_formats::math;
 use wgpu::util::DeviceExt;
 
 const SAMPLES: u32 = 4;
-/// Bones the skinning matrices cover (16 KiB of uniforms, the downlevel limit).
+/// The most bones the skinning matrices cover.
 const MAX_BONES: usize = 1024;
 /// Bytes of a bone's matrix.
 const BONE: u32 = 64;
-/// Bytes of per-draw data: colour (vec4) and model matrix (mat4).
-const DRAW_DATA: usize = 16 + 64;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -39,6 +37,12 @@ struct Globals {
     // xyz: viewing direction (headlight), w: number of lights
     forward: vec4<f32>,
     lights: array<Light, 16>,
+    // Outdoors. xyz: where the camera is, w: how fast things fade into the
+    // distance (per metre).
+    eye: vec4<f32>,
+    // The directions to the right and upper edge of the picture, w: there is a sky.
+    right: vec4<f32>,
+    up: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var tex: texture_2d<f32>;
@@ -49,15 +53,43 @@ struct Globals {
 // Flat and black when there is none.
 @group(1) @binding(3) var normal_map: texture_2d<f32>;
 @group(1) @binding(4) var specular_map: texture_2d<f32>;
-// Per draw: material colour (multiplied with the texture) and the model's
-// placement in the scene.
-struct DrawData {
-    tint: vec4<f32>,
-    model: mat4x4<f32>,
-};
-@group(2) @binding(0) var<uniform> draw: DrawData;
 // Skinning matrices per skeleton bone (identity when not animated).
-@group(3) @binding(0) var<uniform> skin: array<mat4x4<f32>, {BONES}>;
+@group(2) @binding(0) var<uniform> skin: array<mat4x4<f32>, {BONES}>;
+
+// Where the sun is, and the colours of the sky.
+const SUN: vec3<f32> = vec3<f32>(0.48, -0.42, 0.77);
+const ZENITH: vec3<f32> = vec3<f32>(0.22, 0.45, 0.78);
+const HORIZON: vec3<f32> = vec3<f32>(0.74, 0.82, 0.89);
+const BELOW: vec3<f32> = vec3<f32>(0.40, 0.48, 0.55);
+
+fn sky_colour(dir: vec3<f32>) -> vec3<f32> {
+    let sun = normalize(SUN);
+    var c = mix(HORIZON, ZENITH, pow(clamp(dir.z, 0.0, 1.0), 0.55));
+    c = mix(c, BELOW, smoothstep(0.0, 0.25, -dir.z));
+    let near = max(dot(dir, sun), 0.0);
+    return c + vec3<f32>(1.0, 0.92, 0.75) * (pow(near, 900.0) + 0.12 * pow(near, 12.0));
+}
+
+struct SkyOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) dir: vec3<f32>,
+};
+
+// A triangle over the whole picture, behind everything.
+@vertex
+fn vs_sky(@builtin(vertex_index) i: u32) -> SkyOut {
+    var o: SkyOut;
+    let x = f32(i32(i & 1u) * 4 - 1);
+    let y = f32(i32(i >> 1u) * 4 - 1);
+    o.clip = vec4<f32>(x, y, 0.0, 1.0);
+    o.dir = globals.forward.xyz + globals.right.xyz * x + globals.up.xyz * y;
+    return o;
+}
+
+@fragment
+fn fs_sky(i: SkyOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(sky_colour(normalize(i.dir)), 1.0);
+}
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -66,6 +98,13 @@ struct VsIn {
     @location(3) weights: vec4<f32>,
     @location(4) joints: vec4<u32>,
     @location(5) uv1: vec2<f32>,
+    // Per placement: where it is, and the material's colour (multiplied with
+    // the texture).
+    @location(6) model_0: vec4<f32>,
+    @location(7) model_1: vec4<f32>,
+    @location(8) model_2: vec4<f32>,
+    @location(9) model_3: vec4<f32>,
+    @location(10) tint: vec4<f32>,
 };
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -73,6 +112,7 @@ struct VsOut {
     @location(1) uv: vec2<f32>,
     @location(2) uv1: vec2<f32>,
     @location(3) world: vec3<f32>,
+    @location(4) tint: vec3<f32>,
 };
 
 @vertex
@@ -87,10 +127,12 @@ fn vs_main(v: VsIn) -> VsOut {
         pos = m * pos;
         normal = (m * vec4<f32>(normal, 0.0)).xyz;
     }
-    let world = draw.model * pos;
+    let model = mat4x4<f32>(v.model_0, v.model_1, v.model_2, v.model_3);
+    let world = model * pos;
     o.clip = globals.view_proj * world;
     o.world = world.xyz;
-    o.normal = (draw.model * vec4<f32>(normal, 0.0)).xyz;
+    o.normal = (model * vec4<f32>(normal, 0.0)).xyz;
+    o.tint = v.tint.rgb;
     o.uv = v.uv;
     o.uv1 = v.uv1;
     return o;
@@ -128,6 +170,13 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
     }
     // Headlight plus a little sky light; double-sided.
     var light = vec3<f32>(0.25 + 0.65 * abs(dot(n, globals.forward.xyz)) + 0.1 * max(n.z, 0.0));
+    if (globals.right.w > 0.5) {
+        // Outdoors: the sun, and the sky from above.
+        let to_eye = globals.eye.xyz - i.world;
+        let m = select(-n, n, dot(n, to_eye) >= 0.0);
+        light = vec3<f32>(1.0, 0.95, 0.86) * 0.75 * max(dot(m, normalize(SUN)), 0.0)
+            + vec3<f32>(0.48, 0.53, 0.60) * (0.85 + 0.35 * m.z);
+    }
     let count = u32(globals.forward.w);
     if (count > 0u) {
         // With scene lights the headlight is dimmer and the lights add up.
@@ -149,10 +198,18 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
             light = light + l.color.rgb * amount;
         }
     }
-    let colour = mix(base.rgb * draw.tint.rgb, layer.rgb, layer.a);
+    let colour = mix(base.rgb * i.tint, layer.rgb, layer.a);
     // What shines towards the viewer.
     let glint = pow(abs(dot(n, globals.forward.xyz)), 24.0) * max(max(shine.r, shine.g), shine.b) * 0.25;
-    return vec4<f32>(colour * light + vec3<f32>(glint), 1.0);
+    var lit = colour * light + vec3<f32>(glint);
+    if (globals.right.w > 0.5) {
+        let ray = i.world - globals.eye.xyz;
+        let far = length(ray);
+        let dir = ray / max(far, 0.001);
+        let haze = sky_colour(normalize(vec3<f32>(dir.xy, max(dir.z, 0.0))));
+        lit = mix(haze, colour * light, exp(-far * globals.eye.w));
+    }
+    return vec4<f32>(lit, 1.0);
 }
 
 // Particles: camera-facing squares, built on the CPU in world space.
@@ -220,6 +277,9 @@ struct Globals {
     view_proj: [f32; 16],
     forward: [f32; 4],
     lights: [GpuLight; MAX_LIGHTS],
+    eye: [f32; 4],
+    right: [f32; 4],
+    up: [f32; 4],
 }
 
 /// A light of a scene: position, colour × strength, reach, and for spot
@@ -232,6 +292,24 @@ pub struct SceneLight {
     pub spot: Option<([f32; 3], f32)>,
 }
 
+/// A placement of a draw.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Instance {
+    model: math::Mat4,
+    tint: [f32; 4],
+}
+
+/// How a scene outdoors looks.
+#[derive(Debug, Clone, Copy)]
+pub struct Outdoors {
+    /// How fast things fade into the distance, per metre.
+    pub haze: f32,
+}
+
+/// Outdoors, models smaller than this in the picture are left out (pixels).
+const SMALLEST: f32 = 1.2;
+
 struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -239,12 +317,10 @@ struct Gpu {
     /// Particles blended over the scene, and particles that add light.
     sprite_blend: wgpu::RenderPipeline,
     sprite_add: wgpu::RenderPipeline,
+    sky: wgpu::RenderPipeline,
     globals_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
-    tint_layout: wgpu::BindGroupLayout,
     skin_layout: wgpu::BindGroupLayout,
-    /// Stride of the per-draw colours in the tint buffer.
-    tint_stride: u64,
     sampler: wgpu::Sampler,
     /// White 1×1 texture for untextured meshes (their colour is the tint).
     white: wgpu::TextureView,
@@ -260,9 +336,9 @@ struct Draw {
     part: usize,
     drawable: usize,
     shader: u16,
-    vertices: wgpu::Buffer,
-    indices: wgpu::Buffer,
-    count: u32,
+    /// In the model's buffers.
+    base_vertex: i32,
+    indices: std::ops::Range<u32>,
     texture: usize,
     /// Bounding sphere (centre, radius) in the model's space, for culling.
     sphere: ([f32; 3], f32),
@@ -272,6 +348,8 @@ struct Draw {
 struct GpuModel {
     owner: Weak<crate::ModelPreview>,
     draws: Vec<Draw>,
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
     /// Bind groups: 0 is the plain texture, then one per combination of
     /// decoded images.
     textures: Vec<wgpu::BindGroup>,
@@ -290,7 +368,6 @@ struct Targets {
 
 #[derive(Default)]
 struct State {
-    gpu: Option<Option<Gpu>>,
     models: Vec<GpuModel>,
     targets: Option<Targets>,
     /// Bone palette of items without a skin (all identity), shared by them.
@@ -298,6 +375,12 @@ struct State {
     /// Particle textures, uploaded once each.
     sprite_textures: Vec<(Weak<Image>, wgpu::BindGroup)>,
 }
+
+/// The graphics device; `None` if there is no usable one.
+static GPU: LazyLock<Option<Gpu>> = LazyLock::new(init);
+
+/// Models uploaded by other threads.
+static READY: Mutex<Vec<GpuModel>> = Mutex::new(Vec::new());
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
@@ -393,21 +476,6 @@ fn init() -> Option<Gpu> {
             },
         ],
     });
-    let tint_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("tint"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: true,
-                min_binding_size: wgpu::BufferSize::new(DRAW_DATA as u64),
-            },
-            count: None,
-        }],
-    });
-    let align = (device.limits().min_uniform_buffer_offset_alignment as u64).max(16);
-    let tint_stride = (DRAW_DATA as u64).div_ceil(align) * align;
     let skin_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("skin"),
         entries: &[wgpu::BindGroupLayoutEntry {
@@ -423,7 +491,7 @@ fn init() -> Option<Gpu> {
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("model"),
-        bind_group_layouts: &[Some(&globals_layout), Some(&texture_layout), Some(&tint_layout), Some(&skin_layout)],
+        bind_group_layouts: &[Some(&globals_layout), Some(&texture_layout), Some(&skin_layout)],
         immediate_size: 0,
     });
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -433,11 +501,18 @@ fn init() -> Option<Gpu> {
             module: &module,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<Vertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Uint32x4, 5 => Float32x2],
-            })],
+            buffers: &[
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4, 4 => Uint32x4, 5 => Float32x2],
+                }),
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Instance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![6 => Float32x4, 7 => Float32x4, 8 => Float32x4, 9 => Float32x4, 10 => Float32x4],
+                }),
+            ],
         },
         primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
         depth_stencil: Some(wgpu::DepthStencilState {
@@ -451,6 +526,42 @@ fn init() -> Option<Gpu> {
         fragment: Some(wgpu::FragmentState {
             module: &module,
             entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: COLOR_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("sky"),
+        bind_group_layouts: &[Some(&globals_layout)],
+        immediate_size: 0,
+    });
+    let sky = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("sky"),
+        layout: Some(&sky_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs_sky"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: SAMPLES, ..Default::default() },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs_sky"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: COLOR_FORMAT,
@@ -522,6 +633,8 @@ fn init() -> Option<Gpu> {
         address_mode_v: wgpu::AddressMode::Repeat,
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        anisotropy_clamp: 8,
         ..Default::default()
     });
     let white = upload_texture(&device, &queue, 1, 1, &[255, 255, 255, 255]);
@@ -530,14 +643,13 @@ fn init() -> Option<Gpu> {
     Some(Gpu {
         sprite_blend,
         sprite_add,
+        sky,
         device,
         queue,
         pipeline,
         globals_layout,
         texture_layout,
-        tint_layout,
         skin_layout,
-        tint_stride,
         sampler,
         white,
         clear,
@@ -546,13 +658,33 @@ fn init() -> Option<Gpu> {
     })
 }
 
-/// Uploads RGBA pixels as a texture.
+/// Half of a picture in each direction.
+fn halved(w: u32, h: u32, rgba: &[u8]) -> (u32, u32, Vec<u8>) {
+    let (hw, hh) = ((w / 2).max(1), (h / 2).max(1));
+    let mut out = Vec::with_capacity((hw * hh * 4) as usize);
+    for y in 0..hh {
+        let rows = [(y * 2).min(h - 1), (y * 2 + 1).min(h - 1)];
+        for x in 0..hw {
+            let columns = [(x * 2).min(w - 1), (x * 2 + 1).min(w - 1)];
+            let at = |x: u32, y: u32| ((y * w + x) * 4) as usize;
+            let from =
+                [at(columns[0], rows[0]), at(columns[1], rows[0]), at(columns[0], rows[1]), at(columns[1], rows[1])];
+            for c in 0..4 {
+                let sum: u32 = from.iter().map(|i| u32::from(rgba[i + c])).sum();
+                out.push(((sum + 2) / 4) as u8);
+            }
+        }
+    }
+    (hw, hh, out)
+}
+
+/// Uploads RGBA pixels as a texture, with smaller copies for the distance.
 fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, rgba: &[u8]) -> wgpu::TextureView {
-    let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+    let levels = w.max(h).max(1).ilog2() + 1;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size,
-        mip_level_count: 1,
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: levels,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         // Colors are passed through unchanged, like the software renderer.
@@ -560,17 +692,29 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, rg
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        rgba,
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
-        size,
-    );
+    let write = |level: u32, w: u32, h: u32, rgba: &[u8]| {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: level,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+    };
+    write(0, w, h, rgba);
+    let mut smaller: Option<(u32, u32, Vec<u8>)> = None;
+    for level in 1..levels {
+        let next = match &smaller {
+            None => halved(w, h, rgba),
+            Some((w, h, rgba)) => halved(*w, *h, rgba),
+        };
+        write(level, next.0, next.1, &next.2);
+        smaller = Some(next);
+    }
     texture.create_view(&Default::default())
 }
 
@@ -606,7 +750,9 @@ fn texture_bind_group(
 }
 
 /// Uploads every part of the model (placements baked into the vertices).
-fn upload(gpu: &Gpu, model: &LoadedModel, materials: &Materials) -> (Vec<Draw>, Vec<wgpu::BindGroup>) {
+fn upload(gpu: &Gpu, preview: &Arc<crate::ModelPreview>) -> GpuModel {
+    let (model, materials) = (&preview.loaded, &preview.materials);
+    let (mut all_vertices, mut all_indices): (Vec<Vertex>, Vec<u32>) = (Vec::new(), Vec::new());
     let mut textures = vec![plain_bind_group(gpu, &gpu.white)];
     // Material image index → uploaded texture; image indices → bind group.
     let mut views: HashMap<usize, wgpu::TextureView> = HashMap::new();
@@ -680,22 +826,37 @@ fn upload(gpu: &Gpu, model: &LoadedModel, materials: &Materials) -> (Vec<Draw>, 
                 part: part_index,
                 drawable: part.drawable,
                 shader: mesh.shader,
-                vertices: gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                indices: gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: None,
-                    contents: bytemuck::cast_slice(&mesh.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-                count: mesh.indices.len() as u32,
+                base_vertex: all_vertices.len() as i32,
+                indices: all_indices.len() as u32..(all_indices.len() + mesh.indices.len()) as u32,
                 texture,
             });
+            all_vertices.extend_from_slice(&vertices);
+            all_indices.extend_from_slice(&mesh.indices);
         }
     }
-    (draws, textures)
+    // An empty buffer cannot be used.
+    if all_indices.is_empty() {
+        all_vertices.push(bytemuck::Zeroable::zeroed());
+        all_indices.push(0);
+    }
+    let buffer = |contents: &[u8], usage| {
+        gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents, usage })
+    };
+    GpuModel {
+        owner: Arc::downgrade(preview),
+        draws,
+        vertices: buffer(bytemuck::cast_slice(&all_vertices), wgpu::BufferUsages::VERTEX),
+        indices: buffer(bytemuck::cast_slice(&all_indices), wgpu::BufferUsages::INDEX),
+        textures,
+    }
+}
+
+/// Uploads a model ahead of its first picture; from any thread.
+pub fn prepare(preview: &Arc<crate::ModelPreview>) {
+    if let Some(gpu) = &*GPU {
+        let model = upload(gpu, preview);
+        READY.lock().unwrap_or_else(|e| e.into_inner()).push(model);
+    }
 }
 
 fn targets(gpu: &Gpu, w: u32, h: u32) -> Targets {
@@ -748,13 +909,17 @@ fn frustum_planes(m: &[f32; 16]) -> [[f32; 4]; 6] {
     planes
 }
 
+/// The largest factor a placement scales by.
+fn scale_of(model: &math::Mat4) -> f32 {
+    (0..3)
+        .map(|k| (model[k * 4].powi(2) + model[k * 4 + 1].powi(2) + model[k * 4 + 2].powi(2)).sqrt())
+        .fold(0.0f32, f32::max)
+}
+
 /// Whether a bounding sphere in model space, placed by `model`, touches the view.
 fn sphere_visible(planes: &[[f32; 4]; 6], model: &math::Mat4, (centre, radius): ([f32; 3], f32)) -> bool {
     let c = math::transform_point(model, centre);
-    let scale = (0..3)
-        .map(|k| (model[k * 4].powi(2) + model[k * 4 + 1].powi(2) + model[k * 4 + 2].powi(2)).sqrt())
-        .fold(0.0f32, f32::max);
-    let r = radius * scale;
+    let r = radius * scale_of(model);
     planes.iter().all(|p| p[0] * c[0] + p[1] * c[1] + p[2] * c[2] + p[3] >= -r)
 }
 
@@ -801,7 +966,7 @@ pub fn render(
     w: u32,
     h: u32,
 ) -> Option<slint::Image> {
-    render_scene(&[SceneItem { preview, look, model: math::IDENTITY, skin }], &[], &[], camera, w, h)
+    render_scene(&[SceneItem { preview, look, model: math::IDENTITY, skin }], &[], &[], None, camera, w, h)
 }
 
 /// One model of a scene: what is shown, where it stands and its pose.
@@ -864,6 +1029,7 @@ pub fn render_scene(
     items: &[SceneItem],
     lights: &[SceneLight],
     sprites: &[Sprite],
+    outdoors: Option<Outdoors>,
     camera: &Camera,
     w: u32,
     h: u32,
@@ -871,22 +1037,19 @@ pub fn render_scene(
     STATE.with(|state| {
         let mut st = state.borrow_mut();
         let st = &mut *st;
-        if st.gpu.is_none() {
-            st.gpu = Some(init());
-        }
-        let gpu = st.gpu.as_ref()?.as_ref()?;
+        let gpu = GPU.as_ref()?;
         let (w, h) = (w.clamp(1, 8192), h.clamp(1, 8192));
 
         // Upload once per model; forget models that are gone. A scene places
         // the same model many times: look models up by pointer, not by a scan
         // of every uploaded model for every placement.
+        st.models.append(&mut READY.lock().unwrap_or_else(|e| e.into_inner()));
         st.models.retain(|m| m.owner.strong_count() > 0);
         let mut uploaded: std::collections::HashSet<*const crate::ModelPreview> =
             st.models.iter().map(|m| m.owner.as_ptr()).collect();
         for item in items {
             if uploaded.insert(Arc::as_ptr(item.preview)) {
-                let (draws, textures) = upload(gpu, &item.preview.loaded, &item.preview.materials);
-                st.models.push(GpuModel { owner: Arc::downgrade(item.preview), draws, textures });
+                st.models.push(upload(gpu, item.preview));
             }
         }
 
@@ -918,10 +1081,20 @@ pub fn render_scene(
                 direction: [dir[0], dir[1], dir[2], cos],
             };
         }
+        // How long the sides of the picture are, one away from the camera.
+        let tan = (camera.fov / 2.0).tan();
+        let short = w.min(h) as f32;
+        let edge = |axis: [f32; 3], side: u32, last: f32| {
+            let reach = tan * side as f32 / short;
+            [axis[0] * reach, axis[1] * reach, axis[2] * reach, last]
+        };
         let globals = Globals {
             view_proj: view_projection(camera, w, h, near, far),
             forward: [camera.forward[0], camera.forward[1], camera.forward[2], lights.len().min(MAX_LIGHTS) as f32],
             lights: gpu_lights,
+            eye: [camera.eye[0], camera.eye[1], camera.eye[2], outdoors.map_or(0.0, |o| o.haze)],
+            right: edge(camera.right, w, if outdoors.is_some() { 1.0 } else { 0.0 }),
+            up: edge(camera.up, h, 0.0),
         };
         let globals_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("globals"),
@@ -939,43 +1112,43 @@ pub fn render_scene(
         let model_of: HashMap<*const crate::ModelPreview, usize> =
             st.models.iter().enumerate().map(|(i, m)| (m.owner.as_ptr(), i)).collect();
         let planes = frustum_planes(&globals.view_proj);
-        let mut shown: Vec<(usize, &GpuModel, &Draw, [f32; 4])> = Vec::new();
+        // Pixels of something as large as it is far.
+        let pixels = short / 2.0 / tan;
+        let too_small = |model: &math::Mat4, (centre, radius): ([f32; 3], f32)| {
+            let c = math::transform_point(model, centre);
+            let far = (0..3).map(|k| (c[k] - camera.eye[k]).powi(2)).sum::<f32>().sqrt();
+            radius * scale_of(model) * pixels < SMALLEST * (far - radius).max(0.0)
+        };
+        // The skinned item it is (or none), the model, the draw; the same
+        // ones are drawn together.
+        const NO_SKIN: usize = usize::MAX;
+        let mut shown: Vec<((usize, usize, usize), Instance)> = Vec::new();
         for (index, item) in items.iter().enumerate() {
-            let model = &st.models[*model_of.get(&Arc::as_ptr(item.preview))?];
-            for d in &model.draws {
+            let number = *model_of.get(&Arc::as_ptr(item.preview))?;
+            for (k, d) in st.models[number].draws.iter().enumerate() {
                 if !item.look.parts.get(d.part).copied().unwrap_or(false) {
                     continue;
                 }
-                if item.skin.is_none() && !sphere_visible(&planes, &item.model, d.sphere) {
+                if item.skin.is_none()
+                    && (!sphere_visible(&planes, &item.model, d.sphere)
+                        || (outdoors.is_some() && too_small(&item.model, d.sphere)))
+                {
                     continue;
                 }
                 if let Some(tint) = item.preview.loaded.tint(item.look, d.drawable, d.shader) {
-                    shown.push((index, model, d, tint));
+                    let skin = if item.skin.is_some() { index } else { NO_SKIN };
+                    shown.push(((skin, number, k), Instance { model: item.model, tint }));
                 }
             }
         }
-        let stride = gpu.tint_stride as usize;
-        let mut tints = vec![0u8; stride * shown.len().max(1)];
-        for (i, (index, _, _, tint)) in shown.iter().enumerate() {
-            tints[i * stride..i * stride + 16].copy_from_slice(bytemuck::cast_slice(tint));
-            tints[i * stride + 16..i * stride + DRAW_DATA].copy_from_slice(bytemuck::cast_slice(&items[*index].model));
-        }
-        let tint_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("draws"),
-            contents: &tints,
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let tint_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &gpu.tint_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &tint_buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(DRAW_DATA as u64),
-                }),
-            }],
+        shown.sort_by_key(|(key, _)| *key);
+        let instances: Vec<Instance> = shown.iter().map(|(_, i)| *i).collect();
+        let instance_buffer = (!instances.is_empty()).then(|| {
+            gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("instances"),
+                contents: bytemuck::cast_slice(&instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
         });
 
         // A bone palette per skinned item; the others share the rest pose.
@@ -1029,15 +1202,37 @@ pub fn render_scene(
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&gpu.pipeline);
             pass.set_bind_group(0, &globals_group, &[]);
-            for (i, (index, model, d, _)) in shown.iter().enumerate() {
-                pass.set_bind_group(3, skin_groups[*index].as_ref().unwrap_or(rest_pose), &[]);
-                pass.set_bind_group(1, &model.textures[d.texture], &[]);
-                pass.set_bind_group(2, &tint_group, &[(i * stride) as u32]);
-                pass.set_vertex_buffer(0, d.vertices.slice(..));
-                pass.set_index_buffer(d.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..d.count, 0, 0..1);
+            if let Some(buffer) = &instance_buffer {
+                pass.set_pipeline(&gpu.pipeline);
+                pass.set_vertex_buffer(1, buffer.slice(..));
+                let mut last = (None, None, None);
+                let mut first = 0;
+                for run in shown.chunk_by(|a, b| a.0 == b.0) {
+                    let (skin, number, k) = run[0].0;
+                    let model = &st.models[number];
+                    let d = &model.draws[k];
+                    // Only what changes is set.
+                    if last.0 != Some(skin) {
+                        let group = skin_groups.get(skin).and_then(Option::as_ref).unwrap_or(rest_pose);
+                        pass.set_bind_group(2, group, &[]);
+                    }
+                    if last.1 != Some(number) {
+                        pass.set_vertex_buffer(0, model.vertices.slice(..));
+                        pass.set_index_buffer(model.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    }
+                    if last.2 != Some((number, d.texture)) {
+                        pass.set_bind_group(1, &model.textures[d.texture], &[]);
+                    }
+                    last = (Some(skin), Some(number), Some((number, d.texture)));
+                    let count = run.len() as u32;
+                    pass.draw_indexed(d.indices.clone(), d.base_vertex, first..first + count);
+                    first += count;
+                }
+            }
+            if outdoors.is_some() {
+                pass.set_pipeline(&gpu.sky);
+                pass.draw(0..3, 0..1);
             }
             // Particles last, over what they are in front of.
             if let Some(buffer) = &sprite_buffer {
@@ -1047,7 +1242,6 @@ pub fn render_scene(
                         continue;
                     };
                     pass.set_pipeline(if additive { &gpu.sprite_add } else { &gpu.sprite_blend });
-                    pass.set_bind_group(0, &globals_group, &[]);
                     pass.set_bind_group(1, group, &[]);
                     let range = (first * 6) as u32..((first + count) * 6) as u32;
                     pass.draw(range, 0..1);

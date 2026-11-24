@@ -5536,15 +5536,23 @@ export component SceneWindow inherits Window {
                         return EventResult.accept;
                     }
                 }
-                if root.can-fly && !root.loading && root.load-text == "": Text {
+                if root.can-fly && !root.loading && root.load-text == "": Rectangle {
                     x: Theme.space-m;
                     y: parent.height - self.height - Theme.space-s;
-                    width: parent.width - 2 * Theme.space-m;
+                    width: min(hint.preferred-width + 2 * Theme.space-s, parent.width - 2 * Theme.space-m);
+                    height: hint.preferred-height + 2 * Theme.space-xs;
+                    border-radius: 6px;
+                    background: #000000a0;
+                    hint := Text {
+                    x: Theme.space-s;
+                    y: Theme.space-xs;
+                    width: parent.width - 2 * Theme.space-s;
                     text: root.fly-mode ? @tr("{} · wheel changes the speed · W A S D move · Q E down/up · Shift faster · drag to look · F orbits", root.fly-speed)
                         : @tr("Drag to turn · scroll to zoom · F flies");
                     font-size: Theme.font-small;
                     overflow: elide;
-                    color: #b0b0b0;
+                    color: #e0e0e0;
+                }
                 }
             }
             if root.objects.length > 0: Rectangle {

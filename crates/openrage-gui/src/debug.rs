@@ -239,6 +239,10 @@ pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
                 wait += std::env::var("OPENRAGE_FLY_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(20) * 1000;
             }
             slint::Timer::single_shot(Duration::from_millis(wait), move || {
+                // `OPENRAGE_BENCH=<pictures>`: how long they take.
+                if let Some(n) = std::env::var("OPENRAGE_BENCH").ok().and_then(|n| n.parse().ok()) {
+                    scene::bench(n);
+                }
                 if let Some(Ok(img)) = scene::newest().map(|w| w.window().take_snapshot()) {
                     let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
                         .map(|png| std::fs::write(&path, png));

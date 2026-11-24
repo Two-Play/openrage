@@ -77,12 +77,17 @@ struct Kept {
     far: bool,
 }
 
-/// How a model looks in a scene: without decals, which need blending it does not do.
+/// How a model looks in a scene: without decals, which need blending it does not do, and with blue water.
 pub fn scene_look(preview: &ModelPreview) -> Look {
     let mut look = preview.loaded.default_look();
     for (slot, l) in preview.loaded.materials.iter().zip(look.materials.iter_mut()) {
         if rage_formats::shaders::name(slot.name_hash).is_some_and(|n| n.contains("decal")) {
             l.visible = false;
+        }
+        // Its colour is computed in the game.
+        let shader = rage_formats::names::value(slot.name_hash);
+        if shader.starts_with("water") || (!slot.textured && preview.name.to_ascii_lowercase().contains("water")) {
+            l.tint = if slot.textured { [0.25, 0.4, 0.46, 1.0] } else { [0.16, 0.3, 0.36, 1.0] };
         }
     }
     look
@@ -161,7 +166,10 @@ fn work(
             .map(|(m, name, loaded)| {
                 let materials = render::Materials::new(&loaded);
                 let look = std::sync::RwLock::new(loaded.default_look());
-                (m, Arc::new(ModelPreview { loaded, look, materials, name }))
+                let preview = Arc::new(ModelPreview { loaded, look, materials, name });
+                // Not while a picture is drawn.
+                crate::gpu::prepare(&preview);
+                (m, preview)
             })
             .collect();
         failed.extend(wanted.iter().copied());

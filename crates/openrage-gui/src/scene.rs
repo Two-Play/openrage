@@ -90,6 +90,8 @@ struct State {
     /// The flying camera, when it flies, and what moves it.
     fly: Option<Fly>,
     fly_timer: slint::Timer,
+    /// Under a sky: a map.
+    outdoors: bool,
     /// Loads the details of GTA VI's whole map around the camera.
     stream: Option<Stream>,
 }
@@ -129,6 +131,9 @@ impl State {
         }
     }
 }
+
+/// The most pixels a scene is drawn with (Full HD).
+const MOST_PIXELS: f32 = 1920.0 * 1080.0;
 
 type Shared = Rc<RefCell<Option<State>>>;
 
@@ -624,6 +629,7 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
         timer: slint::Timer::default(),
         fly: None,
         fly_timer: slint::Timer::default(),
+        outdoors: false,
         stream: None,
     });
     if let Some(st) = state.borrow_mut().as_mut() {
@@ -929,8 +935,11 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
     }
     let st = state.borrow();
     let Some(st) = st.as_ref() else { return };
-    let width = win.get_area_width().max(64.0) as u32;
-    let height = win.get_area_height().max(64.0) as u32;
+    let (width, height) = (win.get_area_width().max(64.0), win.get_area_height().max(64.0));
+    // Pictures come back from the graphics card: not more of them than needed
+    // for a smooth flight.
+    let scale = (MOST_PIXELS / (width * height)).sqrt().min(1.0);
+    let (width, height) = ((width * scale) as u32, (height * scale) as u32);
     let mut poses: Vec<(Mat4, Option<Vec<Mat4>>)> = Vec::with_capacity(st.actors.len());
     // Actors the current section does not have stay out of the picture.
     let shown: Vec<&SceneActor> =
@@ -993,7 +1002,10 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
             &animated
         };
         let sprites = gta4_effects::sprites_at(&st.effect_library, &st.effects, st.time);
-        crate::gpu::render_scene(&items, lights, &sprites, &camera, width, height)
+        // Seen from above, haze would hide a whole map.
+        let outdoors =
+            st.outdoors.then(|| crate::gpu::Outdoors { haze: if st.fly.is_some() { 1.0 / 9000.0 } else { 0.0 } });
+        crate::gpu::render_scene(&items, lights, &sprites, outdoors, &camera, width, height)
     } else {
         None
     };
@@ -1231,6 +1243,7 @@ fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
         timer: slint::Timer::default(),
         fly: None,
         fly_timer: slint::Timer::default(),
+        outdoors: true,
         stream: None,
     });
     if let (Some((lod, _)), Some(far)) = (scene.lod, far) {
@@ -1492,6 +1505,25 @@ pub fn fly_to(place: [f32; 5]) {
         win.set_fly_mode(true);
     }
     render_frame(&win, &state);
+}
+
+/// Draws the newest scene so many times while turning, and prints how long a picture takes (milliseconds).
+#[cfg(debug_assertions)]
+pub fn bench(pictures: u32) {
+    let Some((win, state)) = OPEN.with(|o| o.borrow().last().map(|(_, w, s)| (w.clone_strong(), Rc::clone(s)))) else {
+        return;
+    };
+    let started = Instant::now();
+    for _ in 0..pictures {
+        if let Some(st) = state.borrow_mut().as_mut() {
+            match &mut st.fly {
+                Some(f) => f.look(5.0, 0.0),
+                None => st.view.yaw += 0.02,
+            }
+        }
+        render_frame(&win, &state);
+    }
+    eprintln!("bench: {:.2} ms a picture", started.elapsed().as_secs_f32() * 1000.0 / pictures as f32);
 }
 
 /// Whether the newest scene has loaded (for debug snapshots).
