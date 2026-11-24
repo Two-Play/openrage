@@ -182,6 +182,27 @@ fn wire_files(ui: &AppWindow) {
                 open_with_system(ui, vpath);
                 return;
             }
+            // An audio container with one sound: the row plays it (it is
+            // selected, so the sound is loaded or about to be).
+            let is_container = with_app(|a| {
+                let listing = a.listing.as_ref()?;
+                let item = &listing.items[*a.visible.get(i as usize)?];
+                Some(item.kind == ItemKind::File && item.vpath.is_none() && browser::is_audio(&item.name))
+            });
+            if is_container == Some(true) {
+                if ui.get_file_selected() != i {
+                    select_row(ui, i as usize);
+                }
+                if ui.get_audio_mode() {
+                    toggle_sound(ui);
+                    return;
+                }
+                // Still decoding; a container with several has its list by now.
+                if ui.get_preview_loading() {
+                    with_app(|a| a.play_when_ready = true);
+                    return;
+                }
+            }
             let is_ycd = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 Some(is_clip_dictionary(&listing.items[*a.visible.get(i as usize)?]))

@@ -183,7 +183,7 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
         return;
     }
     if browser::is_audio(&item.name) && item.kind == ItemKind::File && item.mark != Some(Mark::Removed) {
-        show_audio_container(ui, vpath.clone(), info);
+        show_audio_container(ui, vpath.clone(), info, generation);
         return;
     }
     if item.kind == ItemKind::Sound {
@@ -860,6 +860,14 @@ pub(crate) fn rpf9_preview(rpf: &rage_rpf::Rpf9, i: usize) -> (Meta, String) {
     if let Some((system, graphics)) = rpf.resource_parts(e) {
         meta.push(kv("System part", openrage_app::extract::human_size(system)));
         meta.push(kv("Graphics part", openrage_app::extract::human_size(graphics)));
+    }
+    if openrage_app::metadata::is_metadata(&rpf.entry_name(e))
+        && e.size <= 64 << 20
+        && let Ok(xml) = openrage_app::metadata::from_rpf9(rpf, i)
+    {
+        let (more, text) = metadata_lines(xml);
+        meta.extend(more);
+        return (meta, text);
     }
     if matches!(e.kind, rage_rpf::rpf9::Kind::Bink2 | rage_rpf::rpf9::Kind::Awc) || rpf.is_archive(e) {
         return (meta, String::new());

@@ -118,7 +118,7 @@ pub fn is_audio(name: &str) -> bool {
 /// Whether a file name is a texture dictionary that can be opened like a folder.
 pub fn is_texture_dict(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".ytd") || lower.ends_with(".ypt") || lower.ends_with(".wtd")
+    lower.ends_with(".ytd") || lower.ends_with(".ypt") || lower.ends_with(".wtd") || lower.ends_with(".#td")
 }
 
 /// GTA VI texture pools (`.ttpf`): they open as folders of [`POOL_PAGE`]
@@ -377,6 +377,11 @@ pub fn list(
         }
         Node::PlainFile(file) if is_texture_pool(&vpath) => Ok((list_pool(vpath, &file, origin)?, None)),
         Node::Rpf9Dir(rpf, dir) => Ok((list_rpf9(vpath, rpf, dir, origin)?, None)),
+        Node::Rpf9File(rpf, i) if is_texture_dict(&vpath) => {
+            let dict = openrage_app::textures::gta6_dictionary(&rpf, i)
+                .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
+            Ok((texture_listing(vpath, dict, origin, true), None))
+        }
         Node::Rpf9File(rpf, i) if is_audio(&vpath) => {
             let awc = rage_formats::awc::Awc::parse(rpf.read_at(i)?, None)
                 .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;

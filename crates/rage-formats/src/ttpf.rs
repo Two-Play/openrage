@@ -131,7 +131,7 @@ impl Descriptor {
 }
 
 /// Bytes of one pixel, or of one 4×4 block of a compressed format.
-fn element_bytes(format: u32) -> Option<usize> {
+pub(crate) fn element_bytes(format: u32) -> Option<usize> {
     Some(match format {
         2..=4 => 16,
         6..=8 => 12,
@@ -296,6 +296,28 @@ impl Layout {
             }
         }
         Some(out)
+    }
+}
+
+/// How the data of a texture outside the pools is tiled.
+pub(crate) struct Tiling(Layout);
+
+impl Tiling {
+    /// The layout that makes `slices` slices take `size` bytes.
+    pub(crate) fn by_size(width: u32, height: u32, mips: u32, format: u32, slices: u32, size: usize) -> Option<Tiling> {
+        let element = element_bytes(format)?;
+        let block = if is_block_format(format) { 4 } else { 1 };
+        [4096, 65536].into_iter().find_map(|tile| {
+            let layout = Layout::new(width, height, mips, element, block, tile)?;
+            (layout.size.checked_mul(slices as usize)? == size).then_some(Tiling(layout))
+        })
+    }
+
+    /// The largest level of a slice, in rows.
+    pub(crate) fn largest(&self, data: &[u8], slice: usize) -> Option<Vec<u8>> {
+        let level = self.0.levels.first()?;
+        let start = slice * self.0.size + level.offset;
+        self.0.untile(level, data.get(start..start + level.region)?)
     }
 }
 

@@ -299,6 +299,19 @@ pub fn coverage(rpf: &Rpf9, entries: &[Entry]) -> Coverage {
     }
 }
 
+/// The system and graphics parts of a resource.
+pub fn resource(rpf: &Rpf9, index: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+    let entries = rpf.entries()?;
+    let entry = entries.get(index).context("no such entry")?;
+    let (system, _) = rpf.resource_parts(entry).context("not a resource")?;
+    let mut data = rpf.read(entry)?;
+    if system as usize > data.len() {
+        anyhow::bail!("the resource is cut off");
+    }
+    let graphics = data.split_off(system as usize);
+    Ok((data, graphics))
+}
+
 /// Extracts from a GTA VI archive into `out`: one file (`file`), or
 /// everything below folder `dir`. Files are written unpacked, straight to
 /// disk; with `expand`, archives inside become folders. Unreadable files are

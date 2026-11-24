@@ -61,6 +61,17 @@ mod ty {
     pub const OPAQUE32: u8 = 0x53;
     /// RDR2: a map; the entry's key holds the key and value type indices.
     pub const MAP: u8 = 0x71;
+    /// GTA VI: 2D vector, 3D vector without padding, 3×4 matrix.
+    pub const VEC2: u8 = 0x30;
+    pub const VEC3: u8 = 0x32;
+    pub const MATRIX34: u8 = 0x35;
+    /// GTA VI: another 32-bit name hash, a 64-bit one, a 16-bit enum.
+    pub const HASH2: u8 = 0x4D;
+    pub const HASH64: u8 = 0x4F;
+    pub const SHORT_ENUM: u8 = 0x61;
+    /// GTA VI: 16-byte values of unknown layout (shown as bytes).
+    pub const OPAQUE16: u8 = 0x5C;
+    pub const OPAQUE16B: u8 = 0x67;
     pub const STRUCTURE: u8 = 0x05;
     pub const STRUCTURE_POINTER: u8 = 0x07;
     pub const SBYTE: u8 = 0x10;
@@ -123,6 +134,12 @@ pub fn is_meta(version: u32) -> bool {
     version == VERSION || version == VERSION_RDR2
 }
 
+/// Whether this is the system part of a GTA VI meta file. They are laid out
+/// like Red Dead Redemption 2's ([`VERSION_RDR2`]).
+pub fn is_gta6(system: &[u8]) -> bool {
+    system.get(0x10..0x18) == Some(b"0DRP\x7a\0\0\0")
+}
+
 pub fn parse(res: &Resource) -> Result<Meta, MetaError> {
     let root = Resource::ROOT;
     let i16_at = |off: u64| -> Result<usize, MetaError> { Ok((res.u16(root + off)? as i16).max(0) as usize) };
@@ -133,7 +150,9 @@ pub fn parse(res: &Resource) -> Result<Meta, MetaError> {
     let shift = if res.version == VERSION_RDR2 { 8 } else { 0 };
     let root_block = res.u32(root + if res.version == VERSION_RDR2 { 0x20 } else { 0x1C })? as usize;
     let name_ptr = res.u64(root + 0x38 + shift)?;
-    let name = if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() };
+    // GTA VI has a list in place of the name.
+    let name =
+        if name_ptr != 0 && !is_gta6(&res.system) { res.string(name_ptr).unwrap_or_default() } else { String::new() };
 
     let mut structs = HashMap::new();
     let infos = res.u64(root + 0x20 + shift)?;
@@ -230,6 +249,11 @@ fn vector_attrs(name: &str, v: &[f32]) -> String {
         s.push_str(&format!(" {axis}=\"{}\"", xml::float(*value)));
     }
     s
+}
+
+/// A 64-bit name hash; nothing for 0.
+fn hash64_text(hash: u64) -> String {
+    if hash == 0 { String::new() } else { format!("hash_{hash:016X}") }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -424,7 +448,7 @@ impl Meta {
             ty::FLOAT => w.value(level, ename, &xml::float(f32_at(data, at)?)),
             ty::FLOAT_XYZ => w.empty(level, &vector_attrs(ename, &vector(data, at, 3)?)),
             ty::FLOAT_XYZW => w.empty(level, &vector_attrs(ename, &vector(data, at, 4)?)),
-            ty::HASH => w.string(level, ename, &names::value(u32_at(data, at)?)),
+            ty::HASH | ty::HASH2 => w.string(level, ename, &names::value(u32_at(data, at)?)),
             // RDR2's 0x63 flags are a single byte.
             ty::INT_FLAGS1 if self.offset_shift == 20 => {
                 w.string(level, ename, &self.enum_string(entry, i32::from(byte(at)?)));
@@ -446,9 +470,18 @@ impl Meta {
                     m.chunks(4).map(|r| r.iter().map(|v| xml::float(*v)).collect::<Vec<_>>().join(" ")).collect();
                 w.raw_array(level, ename, &rows, 1);
             }
-            ty::OPAQUE32 => {
+            ty::VEC2 => w.empty(level, &vector_attrs(ename, &vector(data, at, 2)?)),
+            ty::VEC3 => w.empty(level, &vector_attrs(ename, &vector(data, at, 3)?)),
+            ty::MATRIX34 => {
+                let v: Vec<String> = vector(data, at, 12)?.into_iter().map(xml::float).collect();
+                w.raw_array(level, ename, &v, 4);
+            }
+            ty::HASH64 => w.text(level, ename, &hash64_text(u64_at(data, at)?)),
+            ty::SHORT_ENUM => w.value(level, ename, &u16_at(data, at)?.to_string()),
+            ty::OPAQUE32 | ty::OPAQUE16 | ty::OPAQUE16B => {
+                let size = if entry.kind == ty::OPAQUE32 { 32 } else { 16 };
                 let b: Vec<String> =
-                    (0..32).map(|i| byte(at + i).map(|v| format!("{v:02X}"))).collect::<Result<_, _>>()?;
+                    (0..size).map(|i| byte(at + i).map(|v| format!("{v:02X}"))).collect::<Result<_, _>>()?;
                 w.raw_array(level, ename, &b, 16);
             }
             ty::SINT => w.value(level, ename, &(u32_at(data, at)? as i32).to_string()),
@@ -519,7 +552,9 @@ impl Meta {
             ty::ARRAY => 16,
             ty::STRUCTURE => self.structs.get(&value_entry.key).map_or(8, |s| s.size),
             ty::INT_FLAGS1 if self.offset_shift == 20 => 1,
-            ty::HASH | ty::UINT | ty::SINT | ty::FLOAT | ty::INT_ENUM | ty::INT_FLAGS1 | ty::INT_FLAGS2 => 4,
+            ty::HASH | ty::HASH2 | ty::UINT | ty::SINT | ty::FLOAT | ty::INT_ENUM | ty::INT_FLAGS1 | ty::INT_FLAGS2 => {
+                4
+            }
             ty::BOOLEAN | ty::UBYTE | ty::SBYTE | ty::BYTE_ENUM => 1,
             ty::USHORT | ty::SSHORT | ty::SHORT_FLAGS => 2,
             ty::FLOAT_XYZ | ty::FLOAT_XYZW => 16,
@@ -637,7 +672,34 @@ impl Meta {
                 })?;
                 w.item_array(level, ename, &v);
             }
-            ty::HASH => {
+            ty::HASH64 => {
+                let v = numbers(8, &|b| hash64_text(u64::from_le_bytes(b.try_into().unwrap_or_default())))?;
+                w.item_array(level, ename, &v);
+            }
+            ty::ULONG | ty::ULONG2 => {
+                let v = numbers(8, &|b| u64::from_le_bytes(b.try_into().unwrap_or_default()).to_string())?;
+                w.raw_array(level, ename, &v, 10);
+            }
+            ty::SINT => {
+                let v = numbers(4, &|b| i32::from_le_bytes(b.try_into().unwrap_or_default()).to_string())?;
+                w.raw_array(level, ename, &v, 10);
+            }
+            ty::SSHORT => {
+                let v = numbers(2, &|b| i16::from_le_bytes(b.try_into().unwrap_or_default()).to_string())?;
+                w.raw_array(level, ename, &v, 10);
+            }
+            ty::FLOAT_XYZW => {
+                let v = numbers(16, &|b| {
+                    b.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| xml::float(f32::from_le_bytes(*c)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })?;
+                w.item_array(level, ename, &v);
+            }
+            ty::HASH | ty::HASH2 => {
                 let v = numbers(4, &|b| names::value(u32::from_le_bytes(b.try_into().unwrap_or_default())))?;
                 w.item_array(level, ename, &v);
             }

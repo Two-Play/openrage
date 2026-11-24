@@ -3,41 +3,34 @@
 use crate::*;
 
 /// Selecting an `.awc`: its sounds as a list (click one to play it).
-pub(crate) fn show_audio_container(ui: &AppWindow, vpath: String, mut info: Meta) {
+/// A container with only one sound is played like a sound.
+pub(crate) fn show_audio_container(ui: &AppWindow, vpath: String, mut info: Meta, generation: u64) {
     let (keys, rdr2) = with_app(|a| (a.keys.clone(), a.game_dir.as_deref().is_some_and(is_rdr2_dir)));
     let parse = |d: Vec<u8>| -> anyhow::Result<rage_formats::awc::Awc> {
         if rdr2 { Ok(rage_formats::awc::Awc::parse_rdr2(d)?) } else { openrage_app::audio::parse(d, keys.as_deref()) }
     };
     match read_file(ui, &vpath).and_then(parse) {
+        Ok(awc) if awc.stream_format.is_some() || awc.sounds.len() == 1 => {
+            start_sound_preview(ui, Arc::new(awc), 0, info, generation);
+        }
         Ok(awc) => {
-            let (names, rows): (Vec<String>, Vec<ClipRow>) = match &awc.stream_format {
-                Some(f) => {
-                    let stem = vpath.rsplit('/').next().unwrap_or(&vpath).trim_end_matches(".awc").to_owned();
-                    let secs = awc.sounds.first().map_or(0.0, |s| s.duration_secs());
-                    let name = format!("{stem} (stream)");
-                    let info = format!("{} · {} channels · music/stream", browser::seconds(secs), f.channels);
-                    (vec![name.clone()], vec![ClipRow { name: name.into(), info: info.into() }])
-                }
-                None => awc
-                    .sounds
-                    .iter()
-                    .map(|s| {
-                        let name = format!("{:08x}", s.id);
-                        let info = format!(
-                            "{} · {} Hz · {}",
-                            browser::seconds(s.duration_secs()),
-                            s.sample_rate,
-                            s.codec.name().replace("codec 7", "MPEG")
-                        );
-                        (name.clone(), ClipRow { name: name.into(), info: info.into() })
-                    })
-                    .unzip(),
-            };
+            let (names, rows): (Vec<String>, Vec<ClipRow>) = awc
+                .sounds
+                .iter()
+                .map(|s| {
+                    let name = format!("{:08x}", s.id);
+                    let info = format!(
+                        "{} · {} Hz · {}",
+                        browser::seconds(s.duration_secs()),
+                        s.sample_rate,
+                        s.codec.name().replace("codec 7", "MPEG")
+                    );
+                    (name.clone(), ClipRow { name: name.into(), info: info.into() })
+                })
+                .unzip();
             let total: f32 = awc.sounds.iter().map(|s| s.duration_secs()).sum();
             info.push(kv("Contains", format!("{} sound(s)", rows.len())));
-            if awc.stream_format.is_none() {
-                info.push(kv("Total length", browser::seconds(total)));
-            }
+            info.push(kv("Total length", browser::seconds(total)));
             if awc.encrypted || awc.flags & 0xA != 0 {
                 info.push(kv("Encrypted", "yes"));
             }

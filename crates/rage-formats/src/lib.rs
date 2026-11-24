@@ -32,6 +32,7 @@ pub mod pso;
 pub mod rbf;
 pub mod sco;
 pub mod shaders;
+pub mod td6;
 pub mod texture;
 pub mod ttpf;
 pub mod wad;
