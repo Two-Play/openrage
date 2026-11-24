@@ -37,9 +37,9 @@ pub enum Node {
     Gta4Dir(Arc<Gta4Archive>, Gta4EntryId),
     /// A file inside a GTA IV archive.
     Gta4File(Arc<Gta4Archive>, Gta4EntryId),
-    /// A folder of the recovery view of a GTA VI archive ("" for its top).
+    /// A folder of a GTA VI archive ("" for its top).
     Rpf9Dir(Arc<Rpf9>, String),
-    /// A recovered file of a GTA VI archive (index into its entries).
+    /// A file of a GTA VI archive (index into its entries).
     Rpf9File(Arc<Rpf9>, usize),
 }
 
@@ -137,20 +137,37 @@ fn resolve_rpf8(mut archive: Arc<Rpf8>, rest: &[String], vpath: &str) -> Result<
     Ok(Node::Rpf8Dir(archive, dir))
 }
 
-/// Walks the rest of a path inside a GTA VI archive. The archive itself
-/// resolves without its entries; anything below needs them, which scans the
-/// archive unless an index is at hand.
-fn resolve_rpf9(archive: Arc<Rpf9>, rest: &[String], vpath: &str) -> Result<Node, RpfError> {
+/// Walks the rest of a path inside a GTA VI archive; nested archives are
+/// entered. The archive itself resolves without its entries; anything below
+/// needs them, which scans the archive if its own table cannot be read and no
+/// index is at hand.
+fn resolve_rpf9(mut archive: Arc<Rpf9>, rest: &[String], vpath: &str) -> Result<Node, RpfError> {
     if rest.is_empty() {
         return Ok(Node::Rpf9Dir(archive, String::new()));
     }
-    let path = rest.join("/");
-    let entries = archive.entries()?;
-    if let Some(i) = archive.find(&entries, &path) {
-        return Ok(Node::Rpf9File(archive, i));
+    let mut dir = String::new();
+    for (n, comp) in rest.iter().enumerate() {
+        if !dir.is_empty() {
+            dir.push('/');
+        }
+        dir.push_str(comp);
+        // Only the last component and archives on the way are entries.
+        if n + 1 < rest.len() && !is_rpf(comp) {
+            continue;
+        }
+        let entries = archive.entries()?;
+        let Some(i) = archive.find(&entries, &dir) else { continue };
+        if archive.is_archive(&entries[i]) {
+            archive = Arc::new(archive.open_child(&entries[i])?);
+            dir.clear();
+        } else if n + 1 == rest.len() {
+            return Ok(Node::Rpf9File(archive, i));
+        } else {
+            return Err(RpfError::NotFound(vpath.to_owned()));
+        }
     }
-    if archive.is_dir(&entries, &path) {
-        return Ok(Node::Rpf9Dir(archive, path.to_ascii_lowercase()));
+    if archive.is_dir(&archive.entries()?, &dir) {
+        return Ok(Node::Rpf9Dir(archive, dir.to_ascii_lowercase()));
     }
     Err(RpfError::NotFound(vpath.to_owned()))
 }

@@ -1471,8 +1471,8 @@ pub(crate) fn cmd_verify(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKey
     Ok(())
 }
 
-/// Checks bytes recovered from RPF9, without claiming to verify its unread
-/// table of contents or the files the recovery scan cannot discover.
+/// Checks that the files of RPF9 archives can be read. Where the archive's
+/// own table is not read, only what the recovery scan finds is checked.
 fn verify_rpf9(node: Node, within: &str) -> Result<()> {
     let started = Instant::now();
     let mut total = VerifyStats::default();
@@ -1501,7 +1501,7 @@ fn verify_rpf9(node: Node, within: &str) -> Result<()> {
         outln!("FAIL {error}");
     }
     outln!(
-        "{} RPF9 archives, {} recovered files checked, {} decoded, {} errors ({:.1}s)",
+        "{} RPF9 archives, {} files checked, {} decoded, {} errors ({:.1}s)",
         total.archives,
         total.files,
         human(total.bytes),
@@ -1509,7 +1509,7 @@ fn verify_rpf9(node: Node, within: &str) -> Result<()> {
         started.elapsed().as_secs_f32()
     );
     outln!(
-        "Recovery verification only: zlib decoding, entry bounds and unpacked sizes. Original names, encrypted table of contents and undiscovered data are not verified; raw audio/video checks do not validate their media contents."
+        "For archives whose own table is not read, this checks zlib decoding, entry bounds and unpacked sizes. Original names, encrypted table of contents and undiscovered data are not verified; raw audio/video checks do not validate their media contents."
     );
     if !total.errors.is_empty() {
         bail!("verification found {} errors", total.errors.len());
@@ -1522,8 +1522,9 @@ fn verify_rpf9_archive(rpf: &rage_rpf::Rpf9, dir: &str, file: Option<usize>, tot
     total.archives += 1;
     let coverage = openrage_app::rpf9::coverage(rpf, &entries);
     outln!(
-        "{}: recovery coverage: {} files, {} stored of {} data, {} unread (includes padding)",
+        "{}: {}: {} files, {} stored of {} data, {} unread (includes padding)",
         rpf.display_name(),
+        if rpf.is_native() { "archive table" } else { "recovery coverage" },
         coverage.files,
         human(coverage.stored),
         human(rpf.data_len()),

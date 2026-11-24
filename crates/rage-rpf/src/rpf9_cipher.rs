@@ -4,9 +4,6 @@
 //! identified below. Tables and key schedules are read from the user's file;
 //! none are bundled. This module supports only that exact executable build.
 
-// Not yet wired into the archive reader; integration follows.
-#![allow(dead_code, clippy::items_after_test_module)]
-
 use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
@@ -227,6 +224,39 @@ impl Cipher {
     }
 }
 
+/// Converts an original-file PE address to a bounded source range. No
+/// executable code is loaded or run by the parser.
+fn pe_bytes(exe: &[u8], address: u64, len: usize) -> Option<&[u8]> {
+    if exe.get(..2)? != b"MZ" {
+        return None;
+    }
+    let pe = u32::from_le_bytes(exe.get(0x3c..0x40)?.try_into().ok()?) as usize;
+    if exe.get(pe..pe.checked_add(4)?)? != b"PE\0\0" {
+        return None;
+    }
+    let count = u16::from_le_bytes(exe.get(pe + 6..pe + 8)?.try_into().ok()?) as usize;
+    let opt_len = u16::from_le_bytes(exe.get(pe + 20..pe + 22)?.try_into().ok()?) as usize;
+    if count > 96 || opt_len < 32 || exe.get(pe + 24..pe + 26)? != [0x0b, 0x02] {
+        return None;
+    }
+    let base = u64::from_le_bytes(exe.get(pe + 48..pe + 56)?.try_into().ok()?);
+    let rva = address.checked_sub(base)?;
+    let start = pe.checked_add(24)?.checked_add(opt_len)?;
+    let sections = exe.get(start..start.checked_add(count.checked_mul(40)?)?)?;
+    for section in sections.as_chunks::<40>().0 {
+        let virtual_start = u32::from_le_bytes(section[12..16].try_into().ok()?) as u64;
+        let stored_len = u32::from_le_bytes(section[16..20].try_into().ok()?) as u64;
+        let stored_start = u32::from_le_bytes(section[20..24].try_into().ok()?) as u64;
+        let Some(relative) = rva.checked_sub(virtual_start) else { continue };
+        if relative.checked_add(len as u64)? > stored_len {
+            continue;
+        }
+        let offset = usize::try_from(stored_start.checked_add(relative)?).ok()?;
+        return exe.get(offset..offset.checked_add(len)?);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,37 +354,4 @@ mod tests {
         assert!(cipher.crypt_ctr(10, &mut whole, &iv, 0).is_none());
         assert_eq!(whole, plain);
     }
-}
-
-/// Converts an original-file PE address to a bounded source range. No
-/// executable code is loaded or run by the parser.
-fn pe_bytes(exe: &[u8], address: u64, len: usize) -> Option<&[u8]> {
-    if exe.get(..2)? != b"MZ" {
-        return None;
-    }
-    let pe = u32::from_le_bytes(exe.get(0x3c..0x40)?.try_into().ok()?) as usize;
-    if exe.get(pe..pe.checked_add(4)?)? != b"PE\0\0" {
-        return None;
-    }
-    let count = u16::from_le_bytes(exe.get(pe + 6..pe + 8)?.try_into().ok()?) as usize;
-    let opt_len = u16::from_le_bytes(exe.get(pe + 20..pe + 22)?.try_into().ok()?) as usize;
-    if count > 96 || opt_len < 32 || exe.get(pe + 24..pe + 26)? != [0x0b, 0x02] {
-        return None;
-    }
-    let base = u64::from_le_bytes(exe.get(pe + 48..pe + 56)?.try_into().ok()?);
-    let rva = address.checked_sub(base)?;
-    let start = pe.checked_add(24)?.checked_add(opt_len)?;
-    let sections = exe.get(start..start.checked_add(count.checked_mul(40)?)?)?;
-    for section in sections.as_chunks::<40>().0 {
-        let virtual_start = u32::from_le_bytes(section[12..16].try_into().ok()?) as u64;
-        let stored_len = u32::from_le_bytes(section[16..20].try_into().ok()?) as u64;
-        let stored_start = u32::from_le_bytes(section[20..24].try_into().ok()?) as u64;
-        let Some(relative) = rva.checked_sub(virtual_start) else { continue };
-        if relative.checked_add(len as u64)? > stored_len {
-            continue;
-        }
-        let offset = usize::try_from(stored_start.checked_add(relative)?).ok()?;
-        return exe.get(offset..offset.checked_add(len)?);
-    }
-    None
 }

@@ -73,20 +73,53 @@ archive or its payload. All twelve root archives were sampled.
 | `shaders.rpf` | 411695600 | 34368 | 34336 | 3 | 9 | `15f896951d3608eb45ca446c9d8198513076c0c9f2c3dd79981af8eb083a9af1` |
 | `textures.rpf` | 192585024 | 1936 | 1728 | 22 | 9 | `d730f6a42de5474a7d9d490c672d4a2c0e35409a238508caf0943fdc660052e9` |
 
-## Remaining decoder work
+## Members
 
-OpenRAGE's recovery scanner does not yet decode the protected native table.
-The executable being present is not itself a verified decryption algorithm.
-Further work must reconstruct the transform family and descriptor handling,
-validate table bounds and member layouts, and compare decoded lengths and
-checksums against representative local archives before enabling native index
-browsing. Original path recovery, nested index navigation, signature checks,
-and archive writing are separate work.
+With the header decoded, a member is described by one payload record (raw,
+chunked or resource) and optional encryption and chunk records.
 
-Concrete static entry points for that work are the transform span builder
-`0x1428ceb20`, descriptor setup `0x140a349a0`, transform dispatch
-`0x1406bd160` / `0x140536a70`, and later header processing
-`0x1408ec210`. These are leads, not proof of a complete decoder.
+An encryption record is 64 bytes: u32 key, u16 algorithm (17: counter mode
+with a big-endian 16-byte counter), the initial counter at `+6`, and a
+pattern of byte counts: `+24` head, `+32` run, `+40` gap, `+48` tail. The
+head is encrypted, then `run` bytes of every `run + gap`, then the tail. The
+counter follows the position in the member, encrypted or not. The usual
+pattern (`0x400`, `0x400`, `0x1c00`) encrypts the first 2 KiB and 1 KiB of
+every 8 KiB after. The tail field was seen in one resource only.
+
+A resource starts with a clear 16-byte prefix. The encryption pattern and the
+chunks count from its end. Decoded, the system part is followed by the
+graphics part.
+
+A chunk record is 8 bytes: u32 start of the list *counted from the record*,
+u16 number of chunks, u8 item size (8), u8 format. Members with lists at the
+same distance share records. Items, with codec 0 (stored) or 3 (zlib):
+
+| Format | Decoded size | Stored size | Offset | Codec |
+| ---: | --- | --- | --- | --- |
+| 2 | u32 × 16 | bits 32–57 × 16, less padding in bits 58–61 | follows | bits 62–63 |
+| 3 | 65536 − bits 0–15 | 65536 − bits 16–31 | bits 32–59 × 16 | bits 60–63 |
+| 4 | bits 0–23 | bits 24–47, less padding in bits 52–55 | follows | bits 56–63 |
+
+A chunk that follows another starts on the next multiple of 16. Members
+without a chunk record are stored as they are (layout 0) or as one raw
+DEFLATE stream (layout 1).
+
+All members of the archives above up to 256 MiB, and all members of the
+archives inside them, were decoded with this: 790,347 members, with the zlib
+checksums and every decoded length matching.
+
+## Names
+
+The table holds only hashes, of paths relative to the archive without the
+extensions that have a type number. Names come from path strings in the
+executable and in the files of `common.rpf` and `data.rpf`, checked against
+the hashes. They cover most top-level files; those without are listed as
+`entries/<slot>_<hash>`.
+
+## Remaining work
+
+Names inside nested archives, the extensions of types the game registers at
+run time (shown as `type<number>`), signature checks and archive writing.
 
 ## Local recovery validation
 

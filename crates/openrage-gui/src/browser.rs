@@ -82,7 +82,7 @@ pub enum Location {
     Archive(Arc<Rpf7>, EntryId),
     /// A folder inside a Red Dead Redemption 2 archive (read-only).
     Rpf8(Arc<rage_rpf::Rpf8>, String),
-    /// A folder of the recovery view of a GTA VI archive (read-only).
+    /// A folder of a GTA VI archive (read-only).
     Rpf9(Arc<rage_rpf::Rpf9>, String),
     /// A folder inside a GTA IV archive (`.img`, RPF2/RPF3; read-only).
     Gta4(Arc<rage_rpf::Gta4Archive>, rage_rpf::Gta4EntryId),
@@ -667,7 +667,7 @@ fn list_rpf8(vpath: String, rpf: Arc<rage_rpf::Rpf8>, dir: String, origin: Origi
     Listing { vpath, origin, location: Location::Rpf8(rpf, dir), items }
 }
 
-/// A folder of the recovery view of a GTA VI archive: files named by their
+/// A folder of a GTA VI archive. In the recovery view files are named by their
 /// offset, in folders by what they look like.
 fn list_rpf9(vpath: String, rpf: Arc<rage_rpf::Rpf9>, dir: String, origin: Origin) -> Result<Listing, RpfError> {
     let entries = rpf.entries()?;
@@ -690,10 +690,16 @@ fn list_rpf9(vpath: String, rpf: Arc<rage_rpf::Rpf9>, dir: String, origin: Origi
             rage_rpf::rpf9::Kind::Bink2 => "video".to_owned(),
             rage_rpf::rpf9::Kind::Awc => "sounds".to_owned(),
             rage_rpf::rpf9::Kind::Zlib if e.streams > 1 => format!("{} chunks", e.streams),
-            rage_rpf::rpf9::Kind::Zlib => String::new(),
+            _ => String::new(),
         };
         // The entries known to be models open in the viewer.
-        let kind = if openrage_app::models::is_model(&full) { ItemKind::Resource } else { ItemKind::File };
+        let kind = if rpf.is_archive(e) {
+            ItemKind::Archive
+        } else if openrage_app::models::is_model(&full) || rpf.resource_parts(e).is_some() {
+            ItemKind::Resource
+        } else {
+            ItemKind::File
+        };
         items.push(item(full.rsplit('/').next().unwrap_or(&full).to_owned(), kind, e.size, info));
     }
     Ok(Listing { vpath, origin, location: Location::Rpf9(rpf, dir), items })

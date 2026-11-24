@@ -1,7 +1,7 @@
-//! GTA VI models from the recovery view of an archive.
+//! GTA VI models.
 //!
-//! A model is stored as its system part and then its graphics part, each
-//! cut into zlib streams of 64 KiB. Without the table of contents nothing
+//! A model is stored as its system part and then its graphics part. The
+//! archive's table says how long they are. In the recovery view both are cut into zlib streams of 64 KiB. Without the table of contents nothing
 //! says where one part ends: the recovery view lists a resource as its first
 //! entry (which starts the system part) and what follows it. So the parts
 //! are found by trying: every cut between two streams is a possible end of
@@ -28,6 +28,10 @@ pub fn load(rpf: &Rpf9, index: usize) -> Result<Vec<(String, Drawable)>> {
     let mut data = rpf.read(first)?;
     if drawable6::root(&data).is_none() {
         bail!("this resource is not a model");
+    }
+    if let Some((system, _)) = rpf.resource_parts(first) {
+        let (system, graphics) = data.split_at_checked(system as usize).context("the resource is cut off")?;
+        return Ok(named(drawable6::parse(system, graphics)?));
     }
     // Where streams end: the possible ends of the system part.
     let mut cuts: Vec<usize> = (1..=data.len().div_ceil(STREAM)).map(|i| (i * STREAM).min(data.len())).collect();

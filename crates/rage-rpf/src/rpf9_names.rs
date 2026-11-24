@@ -11,6 +11,8 @@
 //! leaf does not have that quote rule. See `docs/rpf9-name-hashes.md` for the
 //! observation and isolated native comparison boundaries.
 
+use std::collections::HashMap;
+
 /// ASCII path normalization shared by the observed native hash leaves.
 pub fn normalize_byte(byte: u8) -> u8 {
     match byte {
@@ -154,6 +156,93 @@ pub fn extension_for_type(type_id: u8) -> Option<&'static str> {
     })
 }
 
+/// The extension an entry of this type is shown with when its own is not
+/// known: the canonical one, or `type<number>` for types the game registers.
+pub fn type_extension(type_id: u8) -> String {
+    match extension_for_type(type_id) {
+        Some(ext) => ext.to_owned(),
+        None if type_id == u8::MAX => "bin".to_owned(),
+        None => format!("type{type_id}"),
+    }
+}
+
+/// Texts that may be paths, found by the hashes of the names they could be.
+#[derive(Debug, Default)]
+pub struct Dictionary {
+    texts: Vec<Box<str>>,
+    /// Hash to the text and the part of it that has the hash.
+    by_hash: HashMap<u64, (u32, u16, u16)>,
+}
+
+impl Dictionary {
+    /// Adds a path, `mount:/path` or plain name. The mount is dropped, and
+    /// what follows each slash is a name as well: files name others from
+    /// different folders up. Names count with and without their extension,
+    /// as the index leaves out those it has a type for.
+    pub fn add(&mut self, text: &str) {
+        if text.len() > 1024 {
+            return;
+        }
+        let Ok(number) = u32::try_from(self.texts.len()) else { return };
+        let from = text.find(":/").map_or(0, |at| at + 2);
+        let starts = std::iter::once(from).chain(text[from..].match_indices('/').map(|(at, _)| from + at + 1));
+        let mut used = false;
+        for start in starts {
+            let name = &text[start..];
+            let stem = name.rsplit_once('.').filter(|(_, ext)| !ext.contains('/')).map(|(stem, _)| stem);
+            for part in std::iter::once(name).chain(stem).filter(|part| is_relative(part)) {
+                self.by_hash.entry(hash64(part.as_bytes())).or_insert_with(|| {
+                    used = true;
+                    (number, start as u16, (start + part.len()) as u16)
+                });
+            }
+        }
+        if used {
+            self.texts.push(text.into());
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_hash.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_hash.is_empty()
+    }
+
+    /// The path of an entry with these hashes and this type.
+    pub fn find(&self, hash64: u64, hash32: Option<u32>, type_id: u8) -> Option<String> {
+        let &(number, start, end) = self.by_hash.get(&hash64)?;
+        let name = &self.texts[number as usize][usize::from(start)..usize::from(end)];
+        if hash32.is_some_and(|expected| expected != self::hash32(name.as_bytes())) {
+            return None;
+        }
+        // Texts differ in how they write folders; hashes ignore case.
+        let folder = name.rfind('/').map_or(0, |at| at + 1);
+        let name = name[..folder].to_ascii_lowercase() + &name[folder..];
+        Some(if type_id == u8::MAX { name } else { format!("{name}.{}", type_extension(type_id)) })
+    }
+}
+
+fn is_relative(path: &str) -> bool {
+    path.len() >= 2
+        && !path.contains([':', '%'])
+        && path.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+/// The texts in a file's data that may be paths or names of files.
+pub fn tokens(data: &[u8]) -> Vec<String> {
+    let belongs = |b: &u8| b.is_ascii_alphanumeric() || b"_/\\.-#@+$:".contains(b);
+    let mut found: Vec<String> = data
+        .split(|b| !belongs(b))
+        .filter(|t| (3..=255).contains(&t.len()) && t.iter().any(u8::is_ascii_alphabetic))
+        .map(|t| String::from_utf8_lossy(t).replace('\\', "/"))
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
 /// Candidate path hashes and the recognized static extension type, if any.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathHashes {
@@ -289,6 +378,23 @@ mod tests {
         assert_eq!(unknown.file_type, None);
         assert_eq!(unknown.hash32, hash32(b"data/example.xml"));
         assert_eq!(unknown.hash64, hash64(b"data/example.xml"));
+    }
+
+    #[test]
+    fn dictionary_finds_names_below_mounts_and_folders() {
+        let mut names = Dictionary::default();
+        names.add("platform:/levels/Props/barrel.rpf");
+        names.add("/movies/Intro.bk2");
+        names.add("../secret/file.xml");
+        let find = |name: &str, ty| names.find(hash64(name.as_bytes()), Some(hash32(name.as_bytes())), ty);
+        assert_eq!(find("levels/props/barrel", 0).as_deref(), Some("levels/props/barrel.rpf"));
+        assert_eq!(find("props/barrel", 2).as_deref(), Some("props/barrel.#dr"));
+        assert_eq!(find("barrel", 74).as_deref(), Some("barrel.type74"));
+        assert_eq!(find("movies/intro.bk2", 255).as_deref(), Some("movies/Intro.bk2"));
+        assert_eq!(find("secret/file.xml", 255).as_deref(), Some("secret/file.xml"));
+        assert!(find("../secret/file.xml", 255).is_none());
+        assert!(names.find(hash64(b"barrel"), Some(1), 0).is_none());
+        assert_eq!(tokens(b"\x01ab\0data\\x.xml\xff123 name"), ["data/x.xml", "name"]);
     }
 
     #[test]

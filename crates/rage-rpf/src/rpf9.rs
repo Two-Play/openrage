@@ -1,12 +1,18 @@
-//! RPF9 archives (GTA VI), read without their table of contents.
+//! RPF9 archives (GTA VI).
+//!
+//! With the game's executable (`game_scarlett_master.exe`, the supported
+//! build) in the archive's folder or one above, the archive's own table of
+//! contents is read: all its files, their folders and — as far as they can be
+//! matched to the hashes in the table — names, and the archives inside it
+//! ([`Rpf9::open_child`]). Nothing from the executable is stored.
+//!
+//! Without it, an archive is read without its table of contents, as below.
 //!
 //! Layout (little-endian):
 //! - 64-byte header: magic `RPF9`, then the offset where the file data
 //!   starts, a declared entry count at `0x24` and transform tag at `0x2e`.
-//!   The protected index itself is not decoded.
 //! - The table of contents (names, sizes, offsets) up to the data offset. It
-//!   is encrypted with keys that only the game's executable has; OpenRAGE
-//!   does not read it.
+//!   is encrypted with keys that only the game's executable has.
 //! - The file data. Most of it is not encrypted: zlib streams laid end to
 //!   end, each starting on a 16-byte boundary, Bink 2 videos and audio
 //!   containers (`ADAT`).
@@ -33,6 +39,8 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use rayon::prelude::*;
 
 use crate::RpfError;
+use crate::rpf9_index::{NativeEntry, Storage};
+use crate::rpf9_native::{self, NativeArchive};
 
 const MAGIC: u32 = 0x5250_4639;
 /// Length of the header in front of the table of contents.
@@ -86,6 +94,8 @@ pub enum Kind {
     Bink2,
     /// An audio container (`ADAT`), stored as is.
     Awc,
+    /// A file of the archive's own table, at this slot.
+    Native { slot: u32 },
 }
 
 /// One recovered file.
@@ -106,6 +116,11 @@ pub struct Entry {
 }
 
 impl Entry {
+    fn native(e: &NativeEntry) -> Entry {
+        let kind = Kind::Native { slot: e.slot as u32 };
+        Entry { offset: e.offset, stored: e.stored, size: e.size, streams: 1, kind, head: [0; 16], head_len: 0 }
+    }
+
     /// The first unpacked bytes.
     pub fn head(&self) -> &[u8] {
         &self.head[..usize::from(self.head_len).min(16)]
@@ -129,7 +144,7 @@ impl Entry {
         match self.kind {
             Kind::Bink2 => return "bk2".into(),
             Kind::Awc => return "awc".into(),
-            Kind::Zlib => {}
+            Kind::Zlib | Kind::Native { .. } => {}
         }
         if self.is_resource() {
             return "res".into();
@@ -274,6 +289,10 @@ pub struct Rpf9 {
     display: String,
     header: Header,
     size: u64,
+    /// Where the archive starts in the file: a nested one, inside its parent.
+    base: u64,
+    /// The archive's own table, read on first use.
+    native: OnceLock<Option<NativeArchive>>,
     /// Filled on first use: finding the entries means reading the archive.
     entries: Mutex<Option<Arc<Vec<Entry>>>>,
     /// Filled on first use.
@@ -307,7 +326,92 @@ impl Rpf9 {
         if u64::from(header.data_offset) < HEADER_LEN as u64 || u64::from(header.data_offset) > size {
             return Err(RpfError::CorruptToc { archive: display, reason: "the data starts outside the file".into() });
         }
-        Ok(Rpf9 { path: path.to_path_buf(), display, header, size, entries: Mutex::new(None), names: Mutex::new(None) })
+        Ok(Rpf9 {
+            path: path.to_path_buf(),
+            display,
+            header,
+            size,
+            base: 0,
+            native: OnceLock::new(),
+            entries: Mutex::new(None),
+            names: Mutex::new(None),
+        })
+    }
+
+    /// The archive's own table; `None` without the game's executable (or
+    /// with another build's) and for damaged tables.
+    fn native(&self) -> Option<&NativeArchive> {
+        self.native
+            .get_or_init(|| {
+                let materials = rpf9_native::materials(&self.path)?;
+                NativeArchive::open(&self.path, self.base, self.size, materials).ok()
+            })
+            .as_ref()
+    }
+
+    /// Whether the archive's own table is read, rather than a recovery view
+    /// made by scanning. Decides it on first use, without a scan.
+    pub fn is_native(&self) -> bool {
+        self.native().is_some()
+    }
+
+    /// Whether the archive lies inside another one.
+    pub fn is_nested(&self) -> bool {
+        self.base != 0
+    }
+
+    /// The record of an entry in the archive's own table.
+    fn native_entry(&self, entry: &Entry) -> Option<(&NativeArchive, &NativeEntry)> {
+        let Kind::Native { slot } = entry.kind else { return None };
+        let native = self.native()?;
+        Some((native, native.catalog.entries.get(slot as usize)?))
+    }
+
+    /// Whether an entry is an archive that [`Rpf9::open_child`] opens.
+    pub fn is_archive(&self, entry: &Entry) -> bool {
+        self.native_entry(entry).is_some_and(|(_, e)| e.type_id == 0)
+    }
+
+    /// The sizes of a resource's system and graphics parts, which follow
+    /// each other in its data. `None` for other files.
+    pub fn resource_parts(&self, entry: &Entry) -> Option<(u64, u64)> {
+        match self.native_entry(entry)?.1.storage {
+            Storage::Resource { system_flags, graphics_flags } => {
+                Some((u64::from(system_flags & 0x7fff_fff0), u64::from(graphics_flags & 0xffff_fff0)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Opens an archive inside this one.
+    pub fn open_child(&self, entry: &Entry) -> Result<Rpf9, RpfError> {
+        let display = format!("{}/{}", self.display, self.entry_name(entry));
+        // Archives are stored as they are, so they can be read in place.
+        if !self.is_archive(entry) || entry.stored != entry.size {
+            return Err(RpfError::NotAnArchive(display));
+        }
+        let base = self.base + entry.offset;
+        let mut file = File::open(&self.path)?;
+        file.seek(SeekFrom::Start(base))?;
+        let mut head = [0u8; HEADER_LEN];
+        file.read_exact(&mut head)?;
+        let Some(header) = Header::parse(&head) else {
+            return Err(RpfError::BadMagic(display, crate::word(&head, 0)));
+        };
+        let child = Rpf9 {
+            path: self.path.clone(),
+            display,
+            header,
+            size: entry.size,
+            base,
+            native: OnceLock::new(),
+            entries: Mutex::new(None),
+            names: Mutex::new(None),
+        };
+        if child.native().is_none() {
+            return Err(RpfError::CorruptToc { archive: child.display, reason: "its table cannot be read".into() });
+        }
+        Ok(child)
     }
 
     pub fn header(&self) -> Header {
@@ -345,7 +449,8 @@ impl Rpf9 {
         }
     }
 
-    /// The entries, sorted by offset. The first call loads them with the
+    /// The entries: in the order of the archive's own table if that is read,
+    /// else sorted by offset. Then the first call loads them with the
     /// registered [`set_indexer`] loader, or scans the archive, which reads
     /// all of it. A failure is not remembered: the next call tries again.
     pub fn entries(&self) -> Result<Arc<Vec<Entry>>, RpfError> {
@@ -354,9 +459,10 @@ impl Rpf9 {
             return Ok(Arc::clone(entries));
         }
         let load = indexer().read().ok().and_then(|l| l.clone());
-        let entries = Arc::new(match load {
-            Some(load) => load(self)?,
-            None => self.scan(&AtomicBool::new(false), &|_, _| {})?,
+        let entries = Arc::new(match (self.native(), load) {
+            (Some(native), _) => native.catalog.entries.iter().map(Entry::native).collect(),
+            (None, Some(load)) => load(self)?,
+            (None, None) => self.scan(&AtomicBool::new(false), &|_, _| {})?,
         });
         *slot = Some(Arc::clone(&entries));
         Ok(entries)
@@ -392,7 +498,8 @@ impl Rpf9 {
         if let Some(names) = slot.as_ref() {
             return Arc::clone(names);
         }
-        let load = namer().read().ok().and_then(|l| l.clone());
+        // The names of models in the recovery view; the table has its own.
+        let load = if self.is_native() { None } else { namer().read().ok().and_then(|l| l.clone()) };
         let names = Arc::new(load.and_then(|load| load(self)).unwrap_or_default());
         *slot = Some(Arc::clone(&names));
         names
@@ -414,6 +521,9 @@ impl Rpf9 {
     }
 
     fn entry_name_with(&self, names: &Names, entry: &Entry) -> String {
+        if let Some((native, e)) = self.native_entry(entry) {
+            return native.paths[e.slot].clone();
+        }
         if let Some(name) = names.get(entry.offset) {
             return format!("{NAMED}/{}/{name}", Names::group(name));
         }
@@ -430,6 +540,10 @@ impl Rpf9 {
 
     /// The entry with this name (case-insensitive).
     pub fn find(&self, entries: &[Entry], path: &str) -> Option<usize> {
+        if let Some(native) = self.native() {
+            // Entries are in the order of the slots.
+            return native.find(path).filter(|slot| *slot < entries.len());
+        }
         let names = self.names();
         let file = path.rsplit('/').next()?;
         let by_offset = file.split('.').next().and_then(|stem| u64::from_str_radix(stem, 16).ok());
@@ -478,6 +592,13 @@ impl Rpf9 {
     /// Writes an entry unpacked to `out` and returns the bytes written.
     pub fn copy_to(&self, entry: &Entry, out: &mut dyn Write) -> Result<u64, RpfError> {
         let name = self.entry_name(entry);
+        if let Some((native, e)) = self.native_entry(entry) {
+            return native.copy_to(&self.path, self.base, e, out).map_err(|reason| RpfError::Inflate {
+                archive: self.display.clone(),
+                entry: name,
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, reason),
+            });
+        }
         let outside = || RpfError::OutOfBounds { archive: self.display.clone(), entry: name.clone() };
         if entry.offset < u64::from(self.header.data_offset)
             || entry.stored == 0
@@ -816,6 +937,8 @@ pub fn encode_index(entries: &[Entry]) -> Vec<u8> {
             Kind::Zlib => 0,
             Kind::Bink2 => 1,
             Kind::Awc => 2,
+            // Read from the archive, never stored.
+            Kind::Native { .. } => u8::MAX,
         });
         out.push(e.head_len.min(16));
         out.extend_from_slice(&e.head);

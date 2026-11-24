@@ -38,6 +38,19 @@ pub struct NativeEntry {
     records: Vec<Option<usize>>,
 }
 
+/// One chunk of a member's data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chunk {
+    /// From the start of the member's data, after a resource's prefix.
+    pub offset: u64,
+    /// Stored bytes, without padding.
+    pub stored: u64,
+    /// Decoded bytes.
+    pub size: u64,
+    /// A zlib stream; otherwise the bytes as they are.
+    pub zlib: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Table {
     pub type_hash: u64,
@@ -229,6 +242,48 @@ impl Catalog {
         Ok(Self { entries, tables, header, split })
     }
 
+    /// The chunks a member is stored in, or `None` if it is stored whole. A
+    /// chunk record holds where its list starts, counted from the record
+    /// itself, the number of chunks, the size of a list item and its format.
+    pub fn chunks(&self, slot: usize) -> Result<Option<Vec<Chunk>>, String> {
+        let Some(column) = self.tables.iter().position(|t| t.type_hash == CHUNKS) else { return Ok(None) };
+        let at = self.entries.get(slot).and_then(|e| e.records.get(column).copied().flatten());
+        let Some(at) = at else { return Ok(None) };
+        if self.tables[column].stride != 8 || self.header[at + 6] != 8 {
+            return Err("unsupported chunk record".into());
+        }
+        let list = sum(at, u32_at(&self.header, at) as usize)?;
+        let count = usize::from(u16_at(&self.header, at + 4));
+        let items = self.header.get(list..sum(list, count * 8)?).ok_or("chunk list lies outside the header")?;
+        let mut chunks = Vec::with_capacity(count);
+        // Formats 2 and 4 have no offsets: chunks follow each other, padded.
+        let mut next = 0u64;
+        for item in items.as_chunks::<8>().0 {
+            let value = u64::from_le_bytes(*item);
+            let (low, high) = (value as u32, (value >> 32) as u32);
+            let wrapped = |v: u32| 0x10000 - u64::from(v & 0xffff);
+            let (offset, stored, size, codec) = match self.header[at + 7] {
+                2 => {
+                    let padded = u64::from(high & 0x03ff_ffff) << 4;
+                    (next, padded.checked_sub(u64::from(high >> 26 & 15)), u64::from(low) << 4, high >> 30)
+                }
+                3 => (u64::from(high & 0x0fff_ffff) << 4, Some(wrapped(low >> 16)), wrapped(low), high >> 28),
+                4 => {
+                    let padded = value >> 24 & 0xff_ffff;
+                    (next, padded.checked_sub(u64::from(high >> 20 & 15)), value & 0xff_ffff, high >> 24)
+                }
+                format => return Err(format!("chunk format {format} is not supported")),
+            };
+            let stored = stored.ok_or("a chunk is shorter than its padding")?;
+            if !matches!(codec, 0 | 3) {
+                return Err(format!("chunk codec {codec} is not supported"));
+            }
+            next = (offset + stored).next_multiple_of(16);
+            chunks.push(Chunk { offset, stored, size, zlib: codec == 3 });
+        }
+        Ok(Some(chunks))
+    }
+
     /// A selected row's native table record, including optional tables whose
     /// interpretation is handled by the payload decoder.
     pub fn record(&self, slot: usize, table_type: u64) -> Option<&[u8]> {
@@ -302,6 +357,44 @@ mod tests {
         assert!(Catalog::parse(b, 320).is_err());
         assert!(Catalog::parse(fixture()[..223].to_vec(), 320).is_err());
         assert!(Catalog::parse(fixture(), 200).is_err());
+    }
+
+    #[test]
+    fn reads_the_three_chunk_formats() {
+        let chunks = |format: u8, items: &[[u8; 8]]| {
+            // The second table (hashes, 8-byte records here) becomes chunks;
+            // the list follows the header's other data.
+            let mut b = fixture();
+            b[112..120].copy_from_slice(&CHUNKS.to_le_bytes());
+            let record = 200;
+            let list = b.len();
+            b[record..record + 4].copy_from_slice(&((list - record) as u32).to_le_bytes());
+            b[record + 4..record + 8].copy_from_slice(&[items.len() as u8, 0, 8, format]);
+            items.iter().for_each(|item| b.extend_from_slice(item));
+            let len = b.len() as u32;
+            b[4..8].copy_from_slice(&len.to_le_bytes());
+            for slot in 0..2 {
+                b[148 + slot * 16..152 + slot * 16].copy_from_slice(&32u32.to_le_bytes());
+            }
+            Catalog::parse(b, 1024).unwrap().chunks(0)
+        };
+        let chunk = |offset, stored, size, zlib| Chunk { offset, stored, size, zlib };
+        // 2: sizes in units of 16, padding in the last one.
+        let items = [[0, 0x40, 1, 0, 0xfd, 0x50, 0, 0xd4], [2, 0, 0, 0, 2, 0, 0, 0]];
+        let expected = vec![chunk(0, 0x50fd0 - 5, 0x14_0000, true), chunk(0x50fd0, 32, 32, false)];
+        assert_eq!(chunks(2, &items), Ok(Some(expected)));
+        // 3: sizes counted down from 64 KiB, with the chunk's offset.
+        let items = [[0, 0, 0x41, 0xb8, 0, 0, 0, 0x30], [0xf1, 0xff, 0xf1, 0xff, 0x7c, 4, 0, 0]];
+        let expected = vec![chunk(0, 0x47bf, 0x10000, true), chunk(0x47c0, 15, 15, false)];
+        assert_eq!(chunks(3, &items), Ok(Some(expected)));
+        // 4: 24-bit sizes, padding, codec.
+        let items = [[0, 0, 0x13, 0x70, 0xaa, 4, 0x70, 3], [0x0f, 0, 0, 0x10, 0, 0, 0x10, 0]];
+        let expected = vec![chunk(0, 0x4aa70 - 7, 0x13_0000, true), chunk(0x4aa70, 15, 15, false)];
+        assert_eq!(chunks(4, &items), Ok(Some(expected)));
+        assert!(chunks(5, &items).is_err());
+        assert!(chunks(4, &[[0, 0, 0, 0, 0, 0, 0, 9]]).is_err());
+        // Less stored than padding.
+        assert!(chunks(4, &[[1, 0, 0, 0, 0, 0, 0x10, 0]]).is_err());
     }
 
     #[test]

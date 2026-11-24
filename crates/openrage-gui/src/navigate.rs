@@ -622,7 +622,10 @@ pub(crate) fn show_folder_info(ui: &AppWindow) {
             }
             Location::Rpf9(rpf, _) => {
                 let mut meta = vec![
-                    kv("Type", "Recovered from a GTA VI archive"),
+                    kv(
+                        "Type",
+                        if rpf.is_native() { "Inside a GTA VI archive" } else { "Recovered from a GTA VI archive" },
+                    ),
                     kv("Archive", rpf.display_name().rsplit('/').next().unwrap_or_default()),
                 ];
                 meta.extend(crate::preview::rpf9_archive_info(rpf));

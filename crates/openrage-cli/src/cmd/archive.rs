@@ -163,7 +163,7 @@ pub(crate) fn cmd_ls(game_dir: &Path, path: &str, recursive: bool, keys: Option<
         }
         Node::Rpf9File(rpf, i) => {
             let entries = rpf.entries()?;
-            print_rpf9_entry(&mut out, &entries[i], &rpf.entry_name(&entries[i]));
+            print_rpf9_entry(&mut out, &rpf, &entries[i], &rpf.entry_name(&entries[i]));
         }
         Node::Rpf9Dir(rpf, dir) => {
             let entries = rpf.entries()?;
@@ -172,8 +172,9 @@ pub(crate) fn cmd_ls(game_dir: &Path, path: &str, recursive: bool, keys: Option<
                 let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
                 for e in entries.iter() {
                     let name = rpf.entry_name(e);
-                    if let Some(rel) = name.strip_prefix(&prefix) {
-                        print_rpf9_entry(&mut out, e, rel);
+                    let below = name.get(..prefix.len()).is_some_and(|s| s.eq_ignore_ascii_case(&prefix));
+                    if let Some(rel) = name.get(prefix.len()..).filter(|_| below) {
+                        print_rpf9_entry(&mut out, &rpf, e, rel);
                     }
                 }
             } else {
@@ -183,7 +184,7 @@ pub(crate) fn cmd_ls(game_dir: &Path, path: &str, recursive: bool, keys: Option<
                 }
                 for i in files {
                     let name = rpf.entry_name(&entries[i]);
-                    print_rpf9_entry(&mut out, &entries[i], name.rsplit('/').next().unwrap_or(&name));
+                    print_rpf9_entry(&mut out, &rpf, &entries[i], name.rsplit('/').next().unwrap_or(&name));
                 }
             }
         }
@@ -264,24 +265,31 @@ pub(crate) fn cmd_info(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>)
             outln!("Size:        {} ({} bytes)", human(rpf.size()), rpf.size());
             outln!("Index slots: {} (declared in header; distinct from recovered streams)", rpf.header().entry_count);
             outln!("TOC tag:     {:#04x} (native transform selector)", rpf.header().toc_transform);
-            outln!("Table:       encrypted, not read (file names and folders are unknown)");
+            if rpf.is_native() {
+                outln!("Table:       read with the game's executable");
+            } else {
+                outln!("Table:       encrypted, not read (file names and folders are unknown)");
+            }
             outln!("Data:        from offset {:#x}, {}", rpf.header().data_offset, human(rpf.data_len()));
             // The archive itself is described without reading all of it.
-            let known = rpf.loaded().or_else(|| openrage_app::rpf9::load_index(rpf.path()).map(Arc::new));
+            let known = openrage_app::rpf9::known_entries(&rpf);
             let entries = if dir.is_empty() { known } else { Some(rpf.entries()?) };
             match entries {
                 Some(entries) => {
                     let c = openrage_app::rpf9::coverage(&rpf, &entries);
                     outln!(
-                        "Recovered:   {} files, {} in the archive, {} unpacked",
+                        "{}   {} files, {} in the archive, {} unpacked",
+                        if rpf.is_native() { "Contents: " } else { "Recovered:" },
                         c.files,
                         human(c.stored),
                         human(c.unpacked)
                     );
-                    outln!(
-                        "Not read:    {} (padding, and data that is neither zlib, Bink 2 nor an audio container)",
-                        human(c.unread)
-                    );
+                    if !rpf.is_native() {
+                        outln!(
+                            "Not read:    {} (padding, and data that is neither zlib, Bink 2 nor an audio container)",
+                            human(c.unread)
+                        );
+                    }
                 }
                 None => outln!("Recovered:   not indexed yet; `openrage ls` on the archive reads all of it once"),
             }
@@ -293,13 +301,23 @@ pub(crate) fn cmd_info(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>)
             let entries = rpf.entries()?;
             let e = &entries[i];
             outln!("Path:        {}/{}", rpf.display_name(), rpf.entry_name(e));
-            outln!("Kind:        recovered file (its name is its offset; the real name is unknown)");
+            if rpf.is_native() {
+                outln!("Kind:        {}", if rpf.resource_parts(e).is_some() { "resource" } else { "file" });
+            } else {
+                outln!("Kind:        recovered file (its name is its offset; the real name is unknown)");
+            }
             outln!("Offset:      {:#x}", e.offset);
             outln!("Size:        {} ({} on disk)", human(e.size), human(e.stored));
             match e.kind {
                 rage_rpf::rpf9::Kind::Zlib => outln!("Stored as:   {} zlib stream(s)", e.streams),
                 rage_rpf::rpf9::Kind::Bink2 => outln!("Stored as:   Bink 2 video"),
                 rage_rpf::rpf9::Kind::Awc => outln!("Stored as:   audio container"),
+                rage_rpf::rpf9::Kind::Native { slot } => {
+                    outln!("Slot:        {slot}");
+                    if let Some((system, graphics)) = rpf.resource_parts(e) {
+                        outln!("Parts:       {} system, {} graphics", human(system), human(graphics));
+                    }
+                }
             }
         }
         Node::Rpf8File(rpf, i) => {
@@ -382,9 +400,17 @@ pub(crate) fn report_rpf9_extract(rpf: &rage_rpf::Rpf9, dir: &str, file: Option<
     extraction_result(s.failures.len())
 }
 
-/// One recovered file of a GTA VI archive.
-pub(crate) fn print_rpf9_entry(out: &mut Rows, e: &rage_rpf::rpf9::Entry, name: &str) {
-    ls_row(out, "file", Some(e.size), "", name, false);
+/// One file of a GTA VI archive.
+pub(crate) fn print_rpf9_entry(out: &mut Rows, rpf: &rage_rpf::Rpf9, e: &rage_rpf::rpf9::Entry, name: &str) {
+    let archive = rpf.is_archive(e);
+    let kind = if archive {
+        "rpf"
+    } else if rpf.resource_parts(e).is_some() {
+        "resource"
+    } else {
+        "file"
+    };
+    ls_row(out, kind, Some(e.size), "", name, archive);
 }
 
 /// Extraction goes on past single failures, but the command still fails then,

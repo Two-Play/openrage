@@ -1,7 +1,7 @@
 //! GTA VI archives (RPF9): the stored index of their recovery view, and
 //! extraction.
 //!
-//! Finding the files of an RPF9 archive means reading all of it (see
+//! The recovery view is for archives whose own table cannot be read. Finding the files of an RPF9 archive means reading all of it (see
 //! [`rage_rpf::rpf9`]), which takes minutes for the large ones. The result
 //! is kept in the cache directory, one file per archive, and used as long as
 //! the archive's size and modification time stay the same.
@@ -201,6 +201,9 @@ fn index(rpf: &Rpf9, cancel: &AtomicBool, report: &Report) -> Result<Vec<Entry>,
 /// Finds and stores the names of an archive's models, unless they are
 /// stored already, and gives them to `rpf`.
 pub fn ensure_names(rpf: &Rpf9, entries: &[Entry], cancel: &AtomicBool, report: &Report) {
+    if rpf.is_native() {
+        return;
+    }
     let lock = scan_lock(rpf.path());
     let _scanning = lock.lock().unwrap_or_else(|e| e.into_inner());
     if load_names(rpf.path()).is_some() {
@@ -259,13 +262,21 @@ pub fn index_in_background(game_dir: &Path) {
                 break;
             }
             let Ok(rpf) = Rpf9::open(&archive) else { continue };
+            if rpf.is_native() {
+                continue;
+            }
             let Ok(entries) = index(&rpf, &stop, report) else { continue };
             ensure_names(&rpf, &entries, &stop, report);
         }
     });
 }
 
-/// Totals of a recovery view.
+/// The entries of an archive if they are at hand without scanning it.
+pub fn known_entries(rpf: &Rpf9) -> Option<Arc<Vec<Entry>>> {
+    rpf.loaded().or_else(|| if rpf.is_native() { rpf.entries().ok() } else { load_index(rpf.path()).map(Arc::new) })
+}
+
+/// Totals of an archive's entries.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Coverage {
     pub files: u64,
@@ -288,7 +299,7 @@ pub fn coverage(rpf: &Rpf9, entries: &[Entry]) -> Coverage {
     }
 }
 
-/// Extracts from the recovery view into `out`: one file (`file`), or
+/// Extracts from a GTA VI archive into `out`: one file (`file`), or
 /// everything below folder `dir`. Files are written unpacked, straight to
 /// disk. Unreadable files are listed in `failures` and skipped.
 pub fn extract(
@@ -332,7 +343,10 @@ pub fn extract(
     let prefix = if dir.is_empty() { String::new() } else { format!("{}/", dir.to_ascii_lowercase()) };
     for (i, e) in entries.iter().enumerate() {
         let name = rpf.entry_name(e);
-        let Some(rel) = name.strip_prefix(&prefix) else { continue };
+        let Some(rel) = name.get(..prefix.len()).filter(|s| s.eq_ignore_ascii_case(&prefix)).map(|s| &name[s.len()..])
+        else {
+            continue;
+        };
         if cancel.load(Ordering::Relaxed) {
             summary.cancelled = true;
             break;

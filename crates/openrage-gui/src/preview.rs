@@ -812,11 +812,18 @@ pub(crate) fn rpf9_archive_info(rpf: &rage_rpf::Rpf9) -> Meta {
         kv("Declared index slots", grouped(rpf.header().entry_count as usize)),
         kv("TOC transform tag", format!("{:#04x}", rpf.header().toc_transform)),
     ];
-    match rpf.loaded().or_else(|| openrage_app::rpf9::load_index(rpf.path()).map(Arc::new)) {
+    match openrage_app::rpf9::known_entries(rpf) {
         Some(entries) => {
             let c = openrage_app::rpf9::coverage(rpf, &entries);
-            meta.push(kv("Recovered files", grouped(c.files as usize)));
+            meta.push(kv(if rpf.is_native() { "Files" } else { "Recovered files" }, grouped(c.files as usize)));
             meta.push(kv("Unpacked", human_size(c.unpacked)));
+            if rpf.is_native() {
+                meta.push(note(
+                    "Read with the game's executable. The table holds only hashes of names: files whose name is \
+                     not known are under entries/.",
+                ));
+                return meta;
+            }
             meta.push(kv("Not read", human_size(c.unread)));
         }
         None => meta.push(note(
@@ -846,10 +853,15 @@ pub(crate) fn rpf9_preview(rpf: &rage_rpf::Rpf9, i: usize) -> (Meta, String) {
                 rage_rpf::rpf9::Kind::Awc => "audio container".to_owned(),
                 rage_rpf::rpf9::Kind::Zlib if e.streams > 1 => format!("{} zlib streams", e.streams),
                 rage_rpf::rpf9::Kind::Zlib => "zlib stream".to_owned(),
+                rage_rpf::rpf9::Kind::Native { slot } => format!("slot {slot}"),
             },
         ),
     ];
-    if e.kind != rage_rpf::rpf9::Kind::Zlib {
+    if let Some((system, graphics)) = rpf.resource_parts(e) {
+        meta.push(kv("System part", openrage_app::extract::human_size(system)));
+        meta.push(kv("Graphics part", openrage_app::extract::human_size(graphics)));
+    }
+    if matches!(e.kind, rage_rpf::rpf9::Kind::Bink2 | rage_rpf::rpf9::Kind::Awc) || rpf.is_archive(e) {
         return (meta, String::new());
     }
     // The start is enough for a look; large files are not unpacked whole.
