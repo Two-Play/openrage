@@ -537,6 +537,7 @@ pub fn is_model(name: &str) -> bool {
         || n.ends_with(".#dr")
         || n.ends_with(".#ft")
         || n.ends_with(".#dd")
+        || n.ends_with(".#bn")
         || rage_formats::paths::is_path_file(&n)
 }
 
@@ -680,6 +681,17 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         return load_gta4(&archive, id);
     }
     if let Node::Rpf9File(rpf, i) = node {
+        if vpath.to_ascii_lowercase().ends_with(".#bn") {
+            let (system, _) = crate::rpf9::resource(&rpf, i)?;
+            let (collision, stats) = rage_formats::bn6::parse(&system)?;
+            for material in stats.materials {
+                let label = format!("Material {material:04x}");
+                let color = material_color(&label, material as u8);
+                let id = rage_formats::ybn::MATERIAL_BASE + u32::from(material);
+                rage_formats::shaders::register(id, label, color);
+            }
+            return Ok(LoadedModel::from_drawables(vec![("collision".to_owned(), collision)]));
+        }
         let drawables = crate::gta6_models::load(&rpf, i)?;
         let textures = crate::gta6_textures::for_drawables(game_dir, &drawables);
         let mut model = LoadedModel::from_drawables(drawables);
