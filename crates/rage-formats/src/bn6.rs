@@ -23,6 +23,7 @@ use crate::ybn::MATERIAL_BASE;
 
 const SYSTEM: u64 = 0x5000_0000;
 const MAX_BOUNDS: usize = 100_000;
+const MAX_POLYGONS: usize = 10_000_000;
 
 #[derive(Debug, thiserror::Error)]
 #[error("damaged or unknown collision data: {0}")]
@@ -45,6 +46,8 @@ struct Reader<'a> {
     sys: &'a [u8],
     builder: Builder,
     stats: Stats,
+    /// Read so far: bounds can name the same geometry.
+    polygons: usize,
 }
 
 impl Reader<'_> {
@@ -114,6 +117,10 @@ impl Reader<'_> {
         if vertex_count == 0 || polygon_count == 0 {
             return Ok(());
         }
+        self.polygons += polygon_count;
+        if self.polygons > MAX_POLYGONS {
+            return Err(BnError("too many polygons"));
+        }
         let (quantum, centre) = (self.vec3(at + 0x90)?, self.vec3(at + 0xA0)?);
         let vertices_at = self.pointer(at + 0xB0, vertex_count * 6)?;
         let polygons = self.pointer(at + 0x88, polygon_count * 16)?;
@@ -177,7 +184,7 @@ pub fn parse(system: &[u8]) -> Result<(Drawable, Stats), BnError> {
     if system.u64_at(0) != Some(0) || !matches!(system.get(16), Some(5 | 6)) {
         return Err(BnError("no collision"));
     }
-    let mut r = Reader { sys: system, builder: Builder::default(), stats: Stats::default() };
+    let mut r = Reader { sys: system, builder: Builder::default(), stats: Stats::default(), polygons: 0 };
     r.bound(0, &math::IDENTITY, 0)?;
     let mut d = Drawable { name: "collision".into(), ..Default::default() };
     let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);

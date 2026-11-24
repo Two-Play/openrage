@@ -58,6 +58,10 @@ const PART_SIZE: u64 = 0x18;
 const LAYER_SIZE: u64 = 0x38;
 /// Longest clip that is put together, in frames.
 const MAX_FRAMES: f32 = 1_000_000.0;
+/// Where a block says how many frames it holds.
+const BLOCK_FRAMES: u64 = 0x16;
+/// Frames times tracks of a clip.
+const MAX_VALUES: usize = 1 << 24;
 
 /// What a track animates, by its name's hash (`None` when the name is not known).
 pub fn kind_name(hash: u32) -> Option<&'static str> {
@@ -82,7 +86,7 @@ fn read_animation(res: &Resource, ptr: u64) -> Result<Animation, ResourceError> 
     let duration = float(res, ptr + 0x28)?;
     let (blocks_at, block_count) = (res.u64(ptr + 0x50)?, u64::from(res.u16(ptr + 0x58)?));
     let (tracks_at, track_count) = (res.u64(ptr + 0x60)?, u64::from(res.u16(ptr + 0x68)?));
-    if frames == 0 || !(0.0..1e5).contains(&duration) || block_count == 0 || block_count > 4096 {
+    if frames == 0 || !(0.0..1e5).contains(&duration) || block_count == 0 || block_count > 4096 || track_count > 4096 {
         return Err(bad("implausible animation"));
     }
     let tracks: Vec<BoneTrack> = (0..track_count)
@@ -103,6 +107,15 @@ fn read_animation(res: &Resource, ptr: u64) -> Result<Animation, ResourceError> 
             Ok(BoneTrack { bone: 0, format, track, bone_hash: res.u32(at)?, kind_hash })
         })
         .collect::<Result<_, ResourceError>>()?;
+    // The frames a block holds are in its header; what they add up to is
+    // checked before any is decoded.
+    let mut stored = 0;
+    for i in 0..block_count {
+        stored += usize::from(res.u16(res.u64(blocks_at + i * 8)? + BLOCK_FRAMES)?);
+    }
+    if stored != frames + block_count as usize - 1 {
+        return Err(bad("an animation whose blocks have another number of frames"));
+    }
     let blocks = (0..block_count)
         .map(|i| read_block(res, res.u64(blocks_at + i * 8)?, tracks.len(), Layout::GtaVi))
         .collect::<Result<Vec<_>, _>>()?;
@@ -143,6 +156,10 @@ fn join_layers(layers: &[ClipPart], animations: &[Animation], duration: f32) -> 
         return Err(bad("implausible clip"));
     }
     let frames = frames as usize + 1;
+    let count: usize = layers.iter().map(|l| animations[l.animation].tracks.len()).sum();
+    if frames.saturating_mul(count) > MAX_VALUES {
+        return Err(bad("implausible clip"));
+    }
     let mut seen = HashSet::new();
     let (mut tracks, mut values) = (Vec::new(), Vec::new());
     for layer in layers {

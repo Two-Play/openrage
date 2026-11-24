@@ -2686,7 +2686,7 @@ export component AppWindow inherits Window {
                         height: parent.height - 16px - (root.video-mode ? 24px : 0px);
                         source: root.preview-image;
                         // A waveform spans the area, as its position line does.
-                        image-fit: root.audio-mode ? fill : contain;
+                        image-fit: root.audio-mode && !root.video-mode ? fill : contain;
                         image-rendering: smooth;
                         accessible-role: image;
                         accessible-label: @tr("Preview of {}", root.info-title);

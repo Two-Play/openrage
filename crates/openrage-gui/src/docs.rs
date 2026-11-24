@@ -169,10 +169,10 @@ pub(crate) fn open_script_view(ui: &AppWindow, vpath: String) {
 
 /// Reads a metadata file and converts it to XML.
 pub(crate) fn read_xml(ui: &AppWindow, vpath: &str) -> anyhow::Result<openrage_app::metadata::Xml> {
-    // RDR2 keeps much of its metadata as resources, which the game's own
+    // RDR2 and GTA VI keep much of their metadata as resources, which the game's own
     // resolution reads; GTA V files are read like any other file.
     if let Some((dir, keys)) = with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone())))
-        && is_rdr2_dir(&dir)
+        && (is_rdr2_dir(&dir) || detect::is_gta6_dir(&dir))
     {
         return openrage_app::metadata::load(&dir, keys, vpath);
     }

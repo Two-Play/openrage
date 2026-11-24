@@ -91,7 +91,9 @@ pub fn read(data: &[u8]) -> Result<Bink2, Bink2Error> {
     let revision = u32_at(0)?.to_le_bytes()[3];
     let frames = u32_at(0x08)? as usize;
     let (width, height) = (u32_at(0x14)?, u32_at(0x18)?);
-    if width == 0 || height == 0 || width > MAX_WIDTH || u64::from(width) * u64::from(height) > MAX_PIXELS {
+    let coded = |side: u32| u64::from(side).next_multiple_of(32);
+    if width == 0 || height == 0 || width > MAX_WIDTH || height > MAX_WIDTH || coded(width) * coded(height) > MAX_PIXELS
+    {
         return bad(format!("{width} × {height} pixels"));
     }
     let fps = (u32_at(0x1C)?, u32_at(0x20)?);

@@ -375,7 +375,11 @@ fn extract_entry(
     progress: &mut dyn FnMut(&ExtractSummary, &str),
     summary: &mut ExtractSummary,
 ) -> Result<()> {
-    let target = out.join(vfs::safe_relative_path(rel).with_context(|| format!("unsafe path {rel}"))?);
+    let Some(path) = vfs::safe_relative_path(rel) else {
+        summary.failures.push(format!("unsafe path {rel}"));
+        return Ok(());
+    };
+    let target = out.join(path);
     if expand && rpf.is_archive(entry) {
         match rpf.open_child(entry) {
             Ok(child) => return extract_dir(&child, "", &target, expand, cancel, progress, summary),
@@ -383,10 +387,16 @@ fn extract_entry(
         }
         return Ok(());
     }
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut writer = BufWriter::new(fs::File::create(&target)?);
+    let parent = target.parent().map_or(Ok(()), fs::create_dir_all);
+    let mut writer = match parent.and_then(|()| fs::File::create(&target)) {
+        Ok(file) => BufWriter::new(file),
+        // A full disk stops everything, another bad file only itself.
+        Err(e) if e.kind() == std::io::ErrorKind::StorageFull => return Err(e.into()),
+        Err(e) => {
+            summary.failures.push(format!("{}: {e}", target.display()));
+            return Ok(());
+        }
+    };
     match rpf.copy_to(entry, &mut writer).and_then(|n| Ok(writer.flush().map(|()| n)?)) {
         Ok(bytes) => {
             summary.files += 1;

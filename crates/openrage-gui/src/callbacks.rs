@@ -95,6 +95,7 @@ fn wire_files(ui: &AppWindow) {
             if ui.get_file_selected() == i && with_app(|a| a.selected.is_some()) {
                 return;
             }
+            with_app(|a| a.play_when_ready = false);
             select_row(ui, i as usize)
         })
     });
@@ -201,6 +202,17 @@ fn wire_files(ui: &AppWindow) {
                 // Still decoding; a container with several has its list by now.
                 if ui.get_preview_loading() {
                     with_app(|a| a.play_when_ready = true);
+                    return;
+                }
+                // A video that cannot be shown here: perhaps elsewhere.
+                let video = with_app(|a| {
+                    let listing = a.listing.as_ref()?;
+                    let item = &listing.items[*a.visible.get(i as usize)?];
+                    browser::is_video(&item.name)
+                        .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+                });
+                if let Some(vpath) = video {
+                    open_with_system(ui, vpath);
                     return;
                 }
             }

@@ -54,11 +54,16 @@ pub fn parse(system: &[u8], graphics: &[u8]) -> Result<TextureDictionary, TdErro
         root: Vec::new(),
         stored: Vec::new(),
     };
+    // Entries can name the same data; not without limit.
+    let mut left = graphics.len().saturating_mul(4).max(1 << 28);
     for i in 0..count {
         let at = system_pointer(system, list + i * 8);
         let name = at.and_then(|at| name(system, at)).unwrap_or_else(|| format!("texture_{i}"));
         match at.map(|at| texture(system, graphics, at, name.clone())) {
-            Some(Ok(texture)) => dict.textures.push(texture),
+            Some(Ok(texture)) => {
+                left = left.checked_sub(texture.data.len()).ok_or(TdError("more textures than data"))?;
+                dict.textures.push(texture);
+            }
             Some(Err(reason)) => dict.errors.push(format!("{name}: {reason}")),
             None => dict.errors.push(format!("{name}: no such texture")),
         }

@@ -585,13 +585,14 @@ fn render(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>) {
 
 fn anim_search(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>, text: &str) {
     let Some(win) = w.upgrade() else { return };
-    // A full path (from "Copy path") opens directly: RDR2 and GTA VI have no search index.
+    // A full path (from "Copy path") opens directly: RDR2 has no search index.
     let text = text.trim();
     let lower = text.to_ascii_lowercase();
     let found = if text.contains('/') && (lower.ends_with(".ycd") || lower.ends_with(".#cd")) {
         vec![text.to_owned()]
     } else {
-        crate::find_files(text, ".ycd", 200)
+        let gta6 = crate::with_app(|a| a.game_dir.as_deref().is_some_and(openrage_app::detect::is_gta6_dir));
+        crate::find_files(text, if gta6 { ".#cd" } else { ".ycd" }, 200)
     };
     let rows: Vec<ClipRow> = found
         .iter()

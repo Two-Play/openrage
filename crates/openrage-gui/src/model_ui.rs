@@ -490,8 +490,7 @@ pub(crate) fn is_clip_dictionary(item: &Item) -> bool {
 pub(crate) fn show_clip_dictionary(ui: &AppWindow, vpath: String, mut info: Meta) {
     match load_clip_dictionary(&vpath) {
         Ok(dict) if vpath.to_ascii_lowercase().ends_with(".#cd") => {
-            // Bones are named by hash there and there is no search index, so
-            // no models are looked for.
+            // Bones are named by hash there, so no models are looked for.
             info.push(kv("Clips", dict.clips.len()));
             for c in dict.clips.iter().take(40) {
                 let animation = c.parts.first().and_then(|p| dict.animations.get(p.animation));
@@ -502,9 +501,7 @@ pub(crate) fn show_clip_dictionary(ui: &AppWindow, vpath: String, mut info: Meta
             if dict.clips.len() > 40 {
                 info.push(note(format!("… and {} more", dict.clips.len() - 40)));
             }
-            info.push(note(
-                "To play it on a model with a skeleton, open the model and enter this file's path in its animation search.",
-            ));
+            info.push(note("To play it on a model with a skeleton, open the model and search for this file there."));
             set_meta(ui, &info);
         }
         Ok(dict) => {

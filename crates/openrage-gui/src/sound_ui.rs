@@ -45,6 +45,7 @@ pub(crate) fn show_audio_container(ui: &AppWindow, vpath: String, mut info: Meta
             });
         }
         Err(e) => {
+            with_app(|a| a.play_when_ready = false);
             info.push(kv("Error", format!("{e:#}")));
             set_meta(ui, &info);
         }
@@ -106,6 +107,7 @@ pub(crate) fn start_sound_preview(
                     }
                 }
                 Err(e) => {
+                    with_app(|a| a.play_when_ready = false);
                     meta.push(kv("Error", e));
                     set_meta(&ui, &meta);
                 }
@@ -126,7 +128,7 @@ pub(crate) fn step_sound(ui: &AppWindow, delta: i32, play: bool) -> bool {
         return false;
     }
     with_app(|a| a.play_when_ready = play);
-    ui.invoke_select_row(target);
+    select_row(ui, target as usize);
     true
 }
 

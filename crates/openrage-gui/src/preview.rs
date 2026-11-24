@@ -161,6 +161,8 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
         info.push(kv(if is_version { "Version" } else { "Details" }, &item.info));
     }
     set_info(ui, &item.name, &vpath, &info, badges::icon(&item.name, item.kind));
+    // What was loading belongs to the row before.
+    ui.set_preview_loading(false);
     ui.set_preview_text(SharedString::new());
     ui.set_has_image(false);
     ui.set_model_mode(false);

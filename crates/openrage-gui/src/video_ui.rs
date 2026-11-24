@@ -53,6 +53,9 @@ fn picture(player: &Player<Vec<u8>>) -> slint::SharedPixelBuffer<slint::Rgba8Pix
     slint::SharedPixelBuffer::clone_from_slice(&f.rgba(), f.width, f.height)
 }
 
+/// Sound is filled up with silence to this many samples (46 minutes of stereo at 48 kHz).
+const MAX_SILENCE: usize = 1 << 28;
+
 /// The sound of a video, as long as the video. Silence if there is none.
 fn sound(video: &bink2::Bink2, data: &[u8]) -> (Pcm, Option<String>) {
     let (mut pcm, error) = match video.sound(data, 0) {
@@ -60,10 +63,10 @@ fn sound(video: &bink2::Bink2, data: &[u8]) -> (Pcm, Option<String>) {
         Some(Err(e)) => (Pcm { sample_rate: 8000, channels: 1, samples: Vec::new() }, Some(e.to_string())),
         None => (Pcm { sample_rate: 8000, channels: 1, samples: Vec::new() }, None),
     };
-    // At most a day of silence, should the frame rate be damaged.
-    let secs = video.duration().min(86400.0);
-    let samples = (secs * f64::from(pcm.sample_rate)) as usize * pcm.channels.max(1) as usize;
-    pcm.samples.resize(samples.max(1), 0);
+    // Silence up to the end; not without limit, should the frame rate be damaged.
+    let samples = (video.duration() * f64::from(pcm.sample_rate)) as usize;
+    let samples = samples.saturating_mul(pcm.channels.max(1) as usize).min(MAX_SILENCE);
+    pcm.samples.resize(samples.max(pcm.samples.len()).max(1), 0);
     (pcm, error)
 }
 
@@ -100,6 +103,7 @@ pub(crate) fn start_video_preview(ui: &AppWindow, vpath: String, info: Meta, gen
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     if counter.load(Ordering::SeqCst) == generation {
                         ui.set_preview_loading(false);
+                        with_app(|a| a.play_when_ready = false);
                         set_meta(&ui, &meta);
                     }
                 });

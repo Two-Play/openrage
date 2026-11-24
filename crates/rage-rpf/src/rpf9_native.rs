@@ -25,14 +25,24 @@ impl std::fmt::Debug for Materials {
 
 /// Reuses runtime tables, never a checked-in or on-disk key cache.
 pub(crate) fn materials(path: &Path) -> Option<Arc<Materials>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Materials>>>> = OnceLock::new();
+    type Key = (PathBuf, u64, Option<std::time::SystemTime>);
+    // `None`: not a supported build, which is not read again and again.
+    static CACHE: OnceLock<Mutex<HashMap<Key, Option<Arc<Materials>>>>> = OnceLock::new();
     let executable =
         path.ancestors().skip(1).take(5).map(|p| p.join("game_scarlett_master.exe")).find(|p| p.is_file())?;
+    let meta = std::fs::metadata(&executable).ok()?;
+    let key = (executable, meta.len(), meta.modified().ok());
     let mut cache = CACHE.get_or_init(Default::default).lock().ok()?;
-    if let Some(materials) = cache.get(&executable) {
-        return Some(Arc::clone(materials));
+    if let Some(materials) = cache.get(&key) {
+        return materials.clone();
     }
-    let bytes = std::fs::read(&executable).ok()?;
+    let materials = load_materials(&key.0).map(Arc::new);
+    cache.insert(key, materials.clone());
+    materials
+}
+
+fn load_materials(executable: &Path) -> Option<Materials> {
+    let bytes = std::fs::read(executable).ok()?;
     let cipher = Cipher::from_exe(&bytes)?;
     // Names: path strings of the executable and of the metadata in the two
     // archives that list most of the game's files.
@@ -55,9 +65,7 @@ pub(crate) fn materials(path: &Path) -> Option<Arc<Materials>> {
     }
     strings.iter().for_each(|text| names.add(text));
     let cipher = Arc::into_inner(nameless)?.cipher;
-    let materials = Arc::new(Materials { cipher, names });
-    cache.insert(executable, Arc::clone(&materials));
-    Some(materials)
+    Some(Materials { cipher, names })
 }
 
 #[derive(Debug)]

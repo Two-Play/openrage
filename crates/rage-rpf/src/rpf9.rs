@@ -297,6 +297,8 @@ pub struct Rpf9 {
     size: u64,
     /// Where the archive starts in the file: a nested one, inside its parent.
     base: u64,
+    /// How many archives it lies in.
+    depth: u8,
     /// The archive's own table, read on first use.
     native: OnceLock<Option<Arc<NativeArchive>>>,
     /// Filled on first use: finding the entries means reading the archive.
@@ -338,6 +340,7 @@ impl Rpf9 {
             header,
             size,
             base: 0,
+            depth: 0,
             native: OnceLock::new(),
             entries: Mutex::new(None),
             names: Mutex::new(None),
@@ -398,6 +401,9 @@ impl Rpf9 {
         if !self.is_archive(entry) || entry.stored != entry.size {
             return Err(RpfError::NotAnArchive(display));
         }
+        if self.depth >= crate::MAX_NESTING {
+            return Err(RpfError::TooDeep(display));
+        }
         let base = self.base + entry.offset;
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(base))?;
@@ -412,6 +418,7 @@ impl Rpf9 {
             header,
             size: entry.size,
             base,
+            depth: self.depth + 1,
             native: OnceLock::new(),
             entries: Mutex::new(None),
             names: Mutex::new(None),

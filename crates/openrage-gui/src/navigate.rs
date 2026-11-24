@@ -522,6 +522,18 @@ pub(crate) fn set_meta(ui: &AppWindow, meta: &Meta) {
 pub(crate) fn show_folder_info(ui: &AppWindow) {
     // Read before `with_app` below: it would borrow the app state twice.
     let overlay = overlay_name();
+    // A video does not go on without its picture.
+    if ui.get_preview_loading() || with_app(|a| a.video.is_some()) {
+        with_app(|a| a.preview_generation.fetch_add(1, Ordering::SeqCst));
+        ui.set_preview_loading(false);
+        stop_sound(ui);
+        ui.set_audio_mode(false);
+        ui.set_video_mode(false);
+        with_app(|a| {
+            a.sound = None;
+            a.video = None;
+        });
+    }
     let info = with_app(|a| {
         let l = a.listing.as_ref()?;
         let name = location_title(l);
