@@ -7,7 +7,12 @@ pub(crate) fn read_file(ui: &AppWindow, vpath: &str) -> anyhow::Result<Vec<u8>> 
     let _ = ui;
     let (game_dir, keys) = with_app(|a| (a.game_dir.clone(), a.keys.clone()));
     let game_dir = game_dir.ok_or_else(|| anyhow::anyhow!("no game folder"))?;
-    match rage_mods::resolve(&game_dir, vpath, keys)?.0 {
+    read_vpath(&game_dir, vpath, keys)
+}
+
+/// Reads a file off the UI thread.
+pub(crate) fn read_vpath(game_dir: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> anyhow::Result<Vec<u8>> {
+    match rage_mods::resolve(game_dir, vpath, keys)?.0 {
         Node::ArchiveFile(rpf, id) => Ok(rpf.read(id)?),
         Node::PlainFile(p) => Ok(std::fs::read(p)?),
         Node::Rpf8File(rpf, i) => {

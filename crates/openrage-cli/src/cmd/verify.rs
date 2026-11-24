@@ -183,7 +183,15 @@ pub(crate) fn cmd_verify_media(game_dir: &Path, within: &str, keys: Option<Arc<G
                 return;
             }
             let result = a.read(id).map_err(anyhow::Error::from).and_then(|d| {
-                if name.ends_with(".bik") {
+                if name.ends_with(".bk2") {
+                    let mut player = rage_formats::bink2::Player::new(&d)?;
+                    let first_second = player.video.frames_per_second().ceil() as usize;
+                    for _ in 0..player.video.frames().min(first_second) {
+                        player.advance()?;
+                    }
+                    c.1 += 1;
+                    c.2 += player.video.duration() as f32;
+                } else if name.ends_with(".bik") {
                     let b = media::bink(&d)?;
                     c.1 += 1;
                     c.2 += b.duration();

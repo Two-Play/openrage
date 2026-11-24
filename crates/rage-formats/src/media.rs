@@ -1,6 +1,7 @@
 //! Facts about media files the game plays: Scaleform movies (`.gfx`) and
-//! Bink videos (`.bik`). Neither is played back; this reads their headers
-//! (and, for `.gfx`, the names it exports and the images it loads).
+//! Bink videos (`.bik`). Neither is played back (Bink 2 is, see
+//! [`crate::bink2`]); this reads their headers (and, for `.gfx`, the names it
+//! exports and the images it loads).
 
 use rage_core::bytes::LeRead;
 use std::io::Read;
@@ -202,7 +203,7 @@ pub fn gfx_to_swf(data: &[u8]) -> Result<Vec<u8>, MediaError> {
 
 pub fn is_media(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".gfx") || lower.ends_with(".bik")
+    [".gfx", ".bik", ".bk2"].iter().any(|e| lower.ends_with(e))
 }
 
 #[cfg(test)]

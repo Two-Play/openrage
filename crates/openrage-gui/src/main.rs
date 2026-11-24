@@ -31,6 +31,7 @@ mod setup_ui;
 mod sound_ui;
 mod tools_ui;
 mod util;
+mod video_ui;
 mod viewer;
 mod xmlview;
 
@@ -75,6 +76,7 @@ use setup_ui::*;
 use sound_ui::*;
 use tools_ui::*;
 use util::*;
+use video_ui::start_video_preview;
 
 slint::include_modules!();
 
@@ -124,6 +126,8 @@ struct App {
     /// Play the selected sound as soon as it is decoded (double-click).
     play_when_ready: bool,
     audio_timer: slint::Timer,
+    /// The selected video; `sound` holds its sound.
+    video: Option<video_ui::Video>,
     /// The list in the preview area: models suggested for a clip dictionary
     /// (`suggest_ycd` set), or the sounds of an audio container (`suggest_awc`).
     suggestions: Vec<String>,
@@ -223,6 +227,7 @@ fn main() -> anyhow::Result<()> {
             sound_start: 0.0,
             play_when_ready: false,
             audio_timer: slint::Timer::default(),
+            video: None,
             suggestions: Vec::new(),
             suggest_ycd: String::new(),
             suggest_awc: String::new(),

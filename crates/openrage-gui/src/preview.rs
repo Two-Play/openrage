@@ -168,7 +168,11 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
     with_app(|a| a.model = None);
     stop_sound(ui);
     ui.set_audio_mode(false);
-    with_app(|a| a.sound = None);
+    ui.set_video_mode(false);
+    with_app(|a| {
+        a.sound = None;
+        a.video = None;
+    });
     ui.set_suggestions(ModelRc::default());
     ui.set_suggest_title(SharedString::new());
     ui.set_suggest_pending(false);
@@ -195,6 +199,10 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
             let index = with_app(|a| a.selected).unwrap_or(0);
             start_sound_preview(ui, awc, index, info, generation);
         }
+        return;
+    }
+    if browser::is_video(&item.name) && item.kind == ItemKind::File && item.mark != Some(Mark::Removed) {
+        start_video_preview(ui, vpath.clone(), info, generation);
         return;
     }
     if is_model_item(&item) {
@@ -372,7 +380,7 @@ pub(crate) fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -
 }
 
 /// A frame from the middle of a Bink video, if FFmpeg is installed (it
-/// decodes Bink; OpenRAGE has no decoder of its own).
+/// decodes Bink 1; OpenRAGE only decodes Bink 2 itself).
 pub(crate) fn video_frame(name: &str, data: &[u8]) -> Option<Rgba> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
@@ -532,7 +540,7 @@ pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys
                 return match openrage_app::media::rows(&entry.name, &data) {
                     Ok(rows) => {
                         let mut meta: Meta = rows.into_iter().filter(|(_, v)| !v.is_empty()).collect();
-                        meta.push(note(if entry.name.to_ascii_lowercase().ends_with(".bik") {
+                        meta.push(note(if !entry.name.to_ascii_lowercase().ends_with(".gfx") {
                             "Double-click plays it in your video player (VLC, mpv and other FFmpeg-based players play Bink)."
                         } else {
                             "Right-click → Export as SWF… opens it in Flash tools such as JPEXS or Ruffle."

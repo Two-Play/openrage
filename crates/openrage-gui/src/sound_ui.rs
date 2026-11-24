@@ -225,7 +225,7 @@ pub(crate) fn update_sound_ui(ui: &AppWindow) {
             a.audio_timer.stop();
         });
         // "Play all": continue with the next sound (outside this timer tick).
-        if ui.get_audio_play_all() {
+        if ui.get_audio_play_all() && !ui.get_video_mode() {
             let weak = ui.as_weak();
             slint::Timer::single_shot(Duration::ZERO, move || {
                 if let Some(ui) = weak.upgrade() {
@@ -234,6 +234,11 @@ pub(crate) fn update_sound_ui(ui: &AppWindow) {
             });
         }
     }
+    with_app(|a| {
+        if let Some(video) = &a.video {
+            video.show_at(pos);
+        }
+    });
     ui.set_audio_position(pos / total);
     ui.set_audio_playing(playing && !finished);
     ui.set_audio_time(format!("{} / {}", browser::seconds(pos), browser::seconds(total)).into());

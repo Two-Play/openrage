@@ -331,7 +331,9 @@ fn run() -> Result<()> {
             outln!("Imported {n} native names; script disassemblies now show them.");
             Ok(())
         }
-        Command::Media { path, swf } => cmd_media(&game_dir, &path, swf.as_deref(), keys),
+        Command::Media { path, frames, every, wav, swf } => {
+            cmd_media(&game_dir, &path, frames.as_deref(), every, wav.as_deref(), swf.as_deref(), keys)
+        }
         Command::Script { path, out, strings } => cmd_script(&game_dir, &path, out.as_deref(), strings, keys),
         Command::Particles { path } => cmd_particles(&game_dir, &path, keys),
         Command::Text { path, out, import: None } => cmd_text(&game_dir, &path, out.as_deref(), keys),

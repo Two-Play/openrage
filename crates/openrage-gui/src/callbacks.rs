@@ -174,7 +174,7 @@ fn wire_files(ui: &AppWindow) {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
                 let name = item.name.to_ascii_lowercase();
-                (name.ends_with(".bik") || name.ends_with(".bk2"))
+                name.ends_with(".bik")
                     .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
             });
             if let Some(vpath) = video {
@@ -182,12 +182,13 @@ fn wire_files(ui: &AppWindow) {
                 open_with_system(ui, vpath);
                 return;
             }
-            // An audio container with one sound: the row plays it (it is
+            // A Bink 2 video or an audio container with one sound: the row plays it (it is
             // selected, so the sound is loaded or about to be).
             let is_container = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
-                Some(item.kind == ItemKind::File && item.vpath.is_none() && browser::is_audio(&item.name))
+                let playable = (item.vpath.is_none() && browser::is_audio(&item.name)) || browser::is_video(&item.name);
+                Some(item.kind == ItemKind::File && playable)
             });
             if is_container == Some(true) {
                 if ui.get_file_selected() != i {

@@ -586,15 +586,53 @@ pub(crate) fn cmd_xml(
     Ok(())
 }
 
-pub(crate) fn cmd_media(game_dir: &Path, path: &str, swf: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+pub(crate) fn cmd_media(
+    game_dir: &Path,
+    path: &str,
+    frames: Option<&Path>,
+    every: usize,
+    wav: Option<&Path>,
+    swf: Option<&Path>,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
     let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
     let data = match node {
         Node::ArchiveFile(rpf, id) => rpf.read(id)?,
         Node::PlainFile(p) => fs::read(p)?,
+        Node::Rpf8File(rpf, i) => {
+            rpf.read(rpf.entries().and_then(|e| e.get(i)).context("archive table not readable")?)?
+        }
+        Node::Rpf9File(rpf, i) => rpf.read_at(i)?,
+        Node::Gta4File(a, id) => a.read(id)?,
         _ => bail!("{path} is not a file"),
     };
     for (k, v) in openrage_app::media::rows(path, &data)? {
         outln!("{k:<14}{v}");
+    }
+    if let Some(dir) = frames {
+        let mut player = rage_formats::bink2::Player::new(&data)?;
+        fs::create_dir_all(dir)?;
+        let total = player.video.frames();
+        for i in 0..total {
+            player.advance().with_context(|| format!("frame {i}"))?;
+            if i % every.max(1) == 0 {
+                let f = player.frame();
+                fs::write(dir.join(format!("{i:05}.png")), rage_formats::png(f.width, f.height, &f.rgba())?)?;
+            }
+        }
+        outln!("Wrote {} of {total} frames to {}", total.div_ceil(every.max(1)), dir.display());
+    }
+    if let Some(out) = wav {
+        let video = rage_formats::bink2::read(&data)?;
+        if video.tracks.is_empty() {
+            bail!("{path} has no sound");
+        }
+        for i in 0..video.tracks.len() {
+            let Some(pcm) = video.sound(&data, i) else { continue };
+            let file = if i == 0 { out.to_path_buf() } else { out.with_extension(format!("{}.wav", i + 1)) };
+            fs::write(&file, pcm?.to_wav())?;
+            outln!("Wrote {}", file.display());
+        }
     }
     if let Some(out) = swf {
         fs::write(out, rage_formats::media::gfx_to_swf(&data)?)?;
