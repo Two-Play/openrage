@@ -15,6 +15,11 @@
   --ok: #15803d;
   --planned: #6b7280;
   --shadow: 0 1px 2px rgb(0 0 0 / 0.06), 0 8px 24px rgb(0 0 0 / 0.08);
+  /* GTA VI: the teaser and its page only */
+  --vice-1: #d6247f;
+  --vice-2: #e8622a;
+  --vice-3: #b87a00;
+  --vice-glow: 12%;
   --radius: 10px;
   --max: 1120px;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", Ubuntu, sans-serif;
@@ -33,6 +38,10 @@
     --accent: #fb923c;
     --accent-hover: #fdba74;
     --accent-text: #1a1206;
+    --vice-1: #ff4fa3;
+    --vice-2: #ff8a4c;
+    --vice-3: #ffd166;
+    --vice-glow: 22%;
     --code-bg: #262628;
     --ok: #4ade80;
     --planned: #9ca3af;
@@ -51,6 +60,10 @@
   --accent: #fb923c;
   --accent-hover: #fdba74;
   --accent-text: #1a1206;
+  --vice-1: #ff4fa3;
+  --vice-2: #ff8a4c;
+  --vice-3: #ffd166;
+  --vice-glow: 22%;
   --code-bg: #262628;
   --ok: #4ade80;
   --planned: #9ca3af;
@@ -750,3 +763,43 @@ table.compare td.edge::after {
 
 /* Landing pages: the text below the sections */
 .landing-text { max-width: 75ch; }
+
+/* GTA VI accent: a pink to yellow gradient (tokens --vice-* at the top) */
+.vice {
+  --vice: linear-gradient(100deg, var(--vice-1), var(--vice-2) 55%, var(--vice-3));
+  --vice-shadow: 0 0 28px color-mix(in srgb, var(--vice-1) var(--vice-glow), transparent);
+}
+.vice.teaser .card {
+  border: 2px solid transparent;
+  background: linear-gradient(var(--surface), var(--surface)) padding-box, var(--vice) border-box;
+  box-shadow: var(--vice-shadow);
+}
+.vice.teaser .card:hover { border-color: transparent; }
+.vice.teaser h2, .vice .hero h1 strong {
+  width: fit-content;
+  background: var(--vice);
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+.vice .hero .eyebrow {
+  border-color: color-mix(in srgb, var(--vice-1) 45%, var(--border));
+  background: color-mix(in srgb, var(--vice-1) 10%, transparent);
+  color: var(--vice-1);
+}
+.vice .hero {
+  background: radial-gradient(60% 90% at 50% 0%, color-mix(in srgb, var(--vice-1) var(--vice-glow), transparent), transparent 70%);
+}
+.vice .hero::after {
+  content: "";
+  display: block;
+  width: min(320px, 60%);
+  height: 3px;
+  margin: 2.25rem auto 0;
+  border-radius: 999px;
+  background: var(--vice);
+}
+.vice .hero-shot { box-shadow: var(--shadow), var(--vice-shadow); }
+@media (forced-colors: active) {
+  .vice.teaser h2, .vice .hero h1 strong { background: none; color: CanvasText; }
+}

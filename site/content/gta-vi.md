@@ -10,8 +10,17 @@ headline = "Explore **GTA VI**"
 lead = "Open RPF9 archives like folders, search the whole game and look at what is inside, on Linux and Windows."
 features_title = "What you can do"
 features_intro = "Everything is read from your own copy of the game. Nothing in it is changed."
+screenshots_title = "Screenshots"
+screenshots_intro = "OpenRAGE showing files of GTA VI. Click a picture to enlarge it, arrow keys browse."
 status_title = "At a glance"
 status_intro = "What OpenRAGE reads today. Scripts (`.#script`), particle effects (`.#pt`) and texture volumes are not read yet."
+
+# Pictures are files in static/.
+[extra.hero]
+image = "gta6/fly.webp"
+width = 1100
+height = 720
+alt = "OpenRAGE flying over the map of GTA VI: an elevated road junction, houses and the skyline behind"
 
 [[extra.features]]
 icon = "🗺️"
@@ -42,6 +51,30 @@ text = "Sounds with WAV export; videos in a player of their own."
 icon = "🔎"
 title = "Search"
 text = "Names, hashes and full text of the whole game."
+
+[[extra.screenshots]]
+image = "gta6/map.webp"
+width = 1100
+height = 720
+alt = "The whole map of GTA VI from afar in OpenRAGE's map window"
+title = "The whole map"
+caption = "every distant model in one scene"
+
+[[extra.screenshots]]
+image = "gta6/model.webp"
+width = 1100
+height = 760
+alt = "A deer trophy prop with textures in OpenRAGE's model viewer"
+title = "Model viewer"
+caption = "textures, normal and specular maps"
+
+[[extra.screenshots]]
+image = "gta6/video.webp"
+width = 960
+height = 600
+alt = "OpenRAGE's video player showing an abstract neon animation"
+title = "Video player"
+caption = "volume, repeat and full screen"
 
 [[extra.formats]]
 what = "Archives"
