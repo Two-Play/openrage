@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{#- A game's landing page. All text comes from content/gta-vi.md. -#}
+
+{% block main %}
+{%- set x = page.extra %}
+<main id="main">
+  <div class="hero">
+    <div class="wrap">
+      <p class="eyebrow">{{ x.eyebrow }}</p>
+      <h1>{{ x.headline | markdown(inline=true) | safe }}</h1>
+      <p class="lead">{{ x.lead | markdown(inline=true) | safe }}</p>
+      <div class="actions">
+        <a class="btn btn-primary" href="{{ config.extra.releases }}/latest">Download the latest release</a>
+        <a class="btn btn-secondary" href="{{ get_url(path='@/getting-started.md') }}">Getting started</a>
+      </div>
+    </div>
+  </div>
+
+  <section id="features" aria-labelledby="features-title">
+    <div class="wrap">
+      <h2 id="features-title">{{ x.features_title }}</h2>
+      <div class="section-intro">{{ x.features_intro | markdown | safe }}</div>
+      <ul class="features">
+        {%- for f in x.features %}
+        <li class="reveal"><h3><span class="icon" aria-hidden="true">{{ f.icon }}</span>{{ f.title }}</h3><p>{{ f.text | markdown(inline=true) | safe }}</p></li>
+        {%- endfor %}
+      </ul>
+    </div>
+  </section>
+
+  <section id="status" class="alt" aria-labelledby="status-title">
+    <div class="wrap">
+      <h2 id="status-title">{{ x.status_title }}</h2>
+      <div class="section-intro">{{ x.status_intro | markdown | safe }}</div>
+      <div class="table-scroll">
+        <table class="stack">
+          <thead>
+            <tr><th scope="col">What</th><th scope="col">Files</th><th scope="col">Status</th></tr>
+          </thead>
+          <tbody>
+            {%- for f in x.formats %}
+            <tr>
+              <th scope="row">{{ f.what }}</th>
+              <td data-label="Files">{{ f.files | markdown(inline=true) | safe }}</td>
+              <td data-label="Status">{{ f.status | markdown(inline=true) | safe }}</td>
+            </tr>
+            {%- endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="guide" aria-label="Guide">
+    <div class="wrap">
+      <article class="prose landing-text">
+        {{ page.content | safe }}
+      </article>
+    </div>
+  </section>
+</main>
+{% endblock main %}

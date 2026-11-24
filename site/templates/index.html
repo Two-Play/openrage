@@ -6,7 +6,6 @@
 <main id="main">
   <div class="hero">
     <div class="wrap">
-      {%- if x?.announcement %}<p class="announcement"><a href="{{ get_url(path='@/' ~ x.announcement_link) }}">{{ x.announcement | markdown(inline=true) | safe }} <span aria-hidden="true">→</span></a></p>{% endif %}
       {%- if x?.eyebrow %}<p class="eyebrow">{{ x.eyebrow }}</p>{% endif %}
       <h1>{{ x.headline | markdown(inline=true) | safe }}</h1>
       <p class="lead">{{ x.lead | markdown(inline=true) | safe }}</p>
@@ -20,7 +19,8 @@
       <ul class="facts" aria-label="At a glance">
         <li><span data-release="version">Latest release</span></li>
         <li>Linux &amp; Windows</li>
-        <li>GTA VI · GTA V · RDR2 · GTA IV</li>
+        <li>GTA V · RDR2 archives</li>
+        <li>GTA VI preview</li>
         <li>GPL-3.0</li>
       </ul>
 
@@ -34,6 +34,21 @@
   <div class="wrap">
     <div class="notice">{{ x.notice | markdown | safe }}</div>
   </div>
+
+  {%- if x?.gta6 %}
+
+  <section id="gta-vi" class="teaser" aria-labelledby="gta-vi-title">
+    <div class="wrap">
+      <div class="card">
+        <div>
+          <h2 id="gta-vi-title">{{ x.gta6.title }}</h2>
+          <p>{{ x.gta6.text | markdown(inline=true) | safe }}</p>
+        </div>
+        <a class="btn btn-secondary" href="{{ get_url(path='@/gta-vi.md') }}">{{ x.gta6.link_text }}</a>
+      </div>
+    </div>
+  </section>
+  {%- endif %}
 
   <section id="features" aria-labelledby="features-title">
     <div class="wrap">

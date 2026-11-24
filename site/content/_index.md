@@ -3,18 +3,15 @@
 # TOML note: plain keys must stay above the first [table] / [[list]] entry.
 # Strings are Markdown (links, `code`, **bold**). Images are file names in docs/images/.
 title = "OpenRAGE – the open-source OpenIV successor"
-description = "OpenRAGE is the free, open-source successor to OpenIV: mod GTA V (Legacy and Enhanced) and explore GTA VI and Red Dead Redemption 2 on Linux and Windows, with OpenIV's mods folder and .oiv packages, plus undo."
+description = "OpenRAGE is the free, open-source successor to OpenIV: mod GTA V (Legacy and Enhanced) and explore Red Dead Redemption 2 on Linux and Windows, with OpenIV's mods folder and .oiv packages, plus undo."
 
 [extra]
-# Announcement at the top of the page, with a link to a page.
-announcement = "**New: GTA VI works.** Browse and search its archives, see the whole map in 3D, view models, textures and animations, play sounds and videos."
-announcement_link = "gta-vi.md"
 # Small line above the headline.
 eyebrow = "The open-source OpenIV successor"
 # **bold** parts are shown in the accent colour.
 headline = "The open modding toolkit for **RAGE engine** games"
 # One short line under the headline; the longer description belongs in features_intro.
-lead = "OpenIV's last release was in 2022. OpenRAGE picks up where it left off: same `mods` folder and `.oiv` packages, now open source, on Linux and Windows, ready for **GTA VI**, GTA V Enhanced and RDR2."
+lead = "OpenIV's last release was in 2022. OpenRAGE picks up where it left off: same `mods` folder and `.oiv` packages, now open source, on Linux and Windows, ready for GTA V Enhanced and RDR2."
 notice = """
 OpenRAGE is an independent community project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive.
 It is not made by or affiliated with the OpenIV team either.
@@ -27,7 +24,7 @@ features_intro = "What OpenRAGE can open, show and change today."
 screenshots_title = "Screenshots"
 screenshots_intro = "Click a picture to enlarge it, arrow keys browse. The screenshots show files from the author's own copy of the game."
 games_title = "Supported games"
-games_intro = "GTA V comes first. **GTA VI can be explored already** (read-only preview), and so can Red Dead Redemption 2. GTA IV can be explored and modded too: archives, textures, models, collisions, animations, texts, maps in 3D and whole cutscenes."
+games_intro = "GTA V comes first and Red Dead Redemption 2 can be explored. GTA VI can be explored (read-only preview). GTA IV can be explored and modded too: archives, textures, models, collisions, animations, texts, maps in 3D and whole cutscenes."
 details_summary = "Checked against the whole game"
 download_intro = "Unpack the archive and run `openrage-gui` (or `openrage` for the command line). On first start the GUI detects your game and sets up the keys."
 why_title = "Why switch from OpenIV"
@@ -39,6 +36,12 @@ Out of date? [Open an issue](https://github.com/Two-Play/openrage/issues).
 """
 
 
+# A short section that points to the GTA VI page (content/gta-vi.md).
+[extra.gta6]
+title = "GTA VI"
+text = "OpenRAGE opens GTA VI's archives: the map in 3D, models, textures, animations, sounds and videos. A read-only preview, with your own copy of the game."
+link_text = "What works in GTA VI"
+
 [extra.hero]
 light = "overview-light.png"
 dark = "overview-dark.png"
@@ -47,11 +50,6 @@ height = 945
 alt = "OpenRAGE explorer showing a vehicles archive of GTA V with a 3D preview of a car"
 
 # ---------------------------------------------------------------- Highlights
-
-[[extra.features]]
-icon = "🌴"
-title = "GTA VI"
-text = "The whole map in 3D, models, textures, animations, sounds, videos, metadata. [What works](https://two-play.github.io/openrage/gta-vi/)."
 
 [[extra.features]]
 icon = "🗂️"
@@ -167,19 +165,19 @@ formats_status = "ok"
 formats = "textures · models · audio · animations · metadata · text tables · cutscenes · scripts · collisions · paths"
 
 [[extra.games]]
-name = "GTA VI"
-variant = "preview"
-archives_status = "partial"
-archives = "RPF9 read, incl. nested archives, with your own copy of the game (Xbox Series build); browsing, searching and extracting ([details](https://two-play.github.io/openrage/gta-vi/))"
-formats_status = "partial"
-formats = "models with skeletons (glTF export), animations, textures, collisions, navigation meshes, metadata and maps as XML, game text, audio and videos (read-only)"
-
-[[extra.games]]
 name = "Red Dead Redemption 2"
 archives_status = "ok"
 archives = "RPF8 read: decryption with keys from your own game, Oodle decompression, browsing and extracting in the GUI"
 formats_status = "partial"
 formats = "textures, models (viewer, glTF export), texts, metadata, audio and animations (read-only)"
+
+[[extra.games]]
+name = "GTA VI"
+variant = "preview"
+archives_status = "partial"
+archives = "RPF9 read, incl. nested archives, with your own copy of the game (Xbox Series build)"
+formats_status = "partial"
+formats = "models, animations, textures, maps in 3D, collisions, navigation meshes, metadata, game text, audio and videos (read-only)"
 
 [[extra.games]]
 name = "GTA IV"
@@ -204,7 +202,7 @@ text = "Native on both, Steam and Proton installs included."
 [[extra.reasons]]
 icon = "🛠️"
 title = "Actively developed"
-text = "Supports GTA V Enhanced and, as a preview, GTA VI. OpenIV's last release, 4.1, is from January 2022."
+text = "Supports GTA V Enhanced, GTA VI can be explored. OpenIV's last release, 4.1, is from January 2022."
 
 [[extra.reasons]]
 icon = "↩️"
@@ -255,7 +253,7 @@ edge = "openrage"
 [[extra.compare]]
 feature = "Other games"
 openiv = "GTA IV, EFLC, Max Payne 3"
-openrage = "RDR2 archives, textures, models, texts, metadata, audio and animations; GTA IV archives, textures, models, texts, placements and cutscenes; GTA VI archives, models, textures, animations, audio, videos and metadata (preview)"
+openrage = "RDR2 archives, textures, models, texts, metadata, audio and animations; GTA IV archives, textures, models, texts, placements and cutscenes; GTA VI read-only (preview)"
 edge = "openiv"
 
 [[extra.compare]]

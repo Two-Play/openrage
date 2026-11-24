@@ -734,15 +734,19 @@ table.compare td.edge::after {
 /* Shorter sections: more air between them, compact tables in prose */
 .prose h3 { margin-top: 1.8rem; }
 
-/* Announcement above the hero headline */
-.hero .announcement { margin: 0 0 1.25rem; }
-.hero .announcement a {
-  display: inline-block;
-  padding: 0.55rem 1.1rem;
-  border-radius: 999px;
-  background: var(--accent);
-  color: var(--accent-text, #fff);
-  text-decoration: none;
-  line-height: 1.35;
+/* Short section that points to another page */
+.teaser { padding: 1.75rem 0 0; }
+.teaser .card {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 1.5rem;
 }
-.hero .announcement a:hover, .hero .announcement a:focus-visible { text-decoration: underline; }
+.teaser .card > div { flex: 1 1 26rem; }
+.teaser h2 { font-size: 1.15rem; margin: 0 0 0.25rem; }
+.teaser p { margin: 0; color: var(--text-muted); font-size: 0.97rem; }
+.teaser .card .btn { flex: none; align-self: center; margin: 0; }
+
+/* Landing pages: the text below the sections */
+.landing-text { max-width: 75ch; }
