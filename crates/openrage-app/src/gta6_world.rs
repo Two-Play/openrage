@@ -31,9 +31,25 @@ const CLOSE: [u8; 2] = [0, 5];
 const FAR: u8 = 3;
 /// The levels between, up to the far one.
 const LEVELS: std::ops::RangeInclusive<u8> = 1..=FAR;
-/// The sides of textures in views of many models.
-const SIDE_NEAR: u32 = 256;
-const SIDE_FAR: u32 = 128;
+/// How well textures are read in views of many models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quality {
+    /// Seen from kilometres away.
+    Far,
+    Near,
+    /// From up close: normal and specular maps too.
+    Close,
+}
+
+impl Quality {
+    fn side(self) -> u32 {
+        match self {
+            Self::Far => 256,
+            Self::Near => 512,
+            Self::Close => 1024,
+        }
+    }
+}
 
 /// Something a map file places.
 #[derive(Debug, Clone, PartialEq)]
@@ -459,7 +475,7 @@ impl Models<'_> {
     }
 
     /// Loads models; those that cannot be read are left out.
-    fn load(&self, wanted: &[u32], side: u32, progress: &(dyn Fn(usize, usize) + Sync)) -> Vec<Loaded> {
+    fn load(&self, wanted: &[u32], quality: Quality, progress: &(dyn Fn(usize, usize) + Sync)) -> Vec<Loaded> {
         // Archives are opened once: that takes longer than reading a model.
         let mut archives: BTreeMap<String, Vec<(String, u32, Source)>> = BTreeMap::new();
         for &model in wanted {
@@ -482,7 +498,7 @@ impl Models<'_> {
                 files.into_par_iter().filter_map(move |(file, model, source)| {
                     let loaded = opened.as_ref().and_then(|(rpf, entries)| {
                         let i = rpf.find(entries, &file)?;
-                        crate::progress::quietly(|| load_model(self.game, rpf, i, &source, side)).ok()
+                        crate::progress::quietly(|| load_model(self.game, rpf, i, &source, quality)).ok()
                     });
                     progress(count.fetch_add(1, Ordering::Relaxed) + 1, total);
                     loaded.map(|(name, loaded)| (model, name, loaded))
@@ -497,7 +513,7 @@ fn scene(
     game: &Path,
     map: &Map,
     objects: &[Object],
-    side: u32,
+    quality: Quality,
     progress: &(dyn Fn(usize, usize) + Sync),
 ) -> Result<MapScene> {
     let files = model_files(game)?;
@@ -510,7 +526,7 @@ fn scene(
     let mut missing: Vec<(String, usize)> =
         unknown.into_iter().map(|m| (rage_formats::names::value(m), places[&m].len())).collect();
     missing.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    let loaded = models.load(&wanted, side, progress);
+    let loaded = models.load(&wanted, quality, progress);
     let models = loaded
         .into_iter()
         .map(|(model, name, loaded)| (name, loaded, places.remove(&model).unwrap_or_default()))
@@ -518,7 +534,7 @@ fn scene(
     Ok(MapScene { models, objects: objects.len(), missing })
 }
 
-fn load_model(game: &Path, rpf: &Rpf9, i: usize, source: &Source, side: u32) -> Result<(String, LoadedModel)> {
+fn load_model(game: &Path, rpf: &Rpf9, i: usize, source: &Source, quality: Quality) -> Result<(String, LoadedModel)> {
     let (Source::File(vpath) | Source::Child(vpath, _)) = source;
     let mut drawables: Vec<(String, Drawable)> = crate::gta6_models::load(rpf, i)?;
     if let Source::Child(_, k) = source {
@@ -530,11 +546,9 @@ fn load_model(game: &Path, rpf: &Rpf9, i: usize, source: &Source, side: u32) -> 
         Source::File(_) => vpath.rsplit('/').next().unwrap_or(vpath).to_owned(),
         Source::Child(..) => drawables[0].0.clone(),
     };
-    let textures = crate::gta6_textures::for_drawables_up_to(game, &drawables, side);
+    let textures = crate::gta6_textures::shared_for(game, &drawables, quality.side(), quality == Quality::Close);
     let mut model = LoadedModel::from_drawables(drawables);
-    if let Some(textures) = textures {
-        model.add_textures("texture pools".to_owned(), textures);
-    }
+    model.set_shared(textures);
     Ok((name.trim_end_matches(".#dr").trim_end_matches(".#ft").to_owned(), model))
 }
 
@@ -543,7 +557,7 @@ pub fn overview(game: &Path, progress: &Progress) -> Result<MapScene> {
     let map = load(game, &|done, total| progress("Reading the game's map files", done, total))?;
     let far: Vec<Object> = map.nodes.iter().filter(|n| n.level == FAR).map(|n| n.object.clone()).collect();
     anyhow::ensure!(!far.is_empty(), "the map files of this game have no distant view");
-    scene(game, &map, &far, SIDE_FAR, &|done, total| progress("Loading the map's models", done, total))
+    scene(game, &map, &far, Quality::Far, &|done, total| progress("Loading the map's models", done, total))
 }
 
 /// Gets what is being done, how much of it is done, and how much there is.
@@ -579,7 +593,7 @@ pub fn place(game: &Path, vpath: &str, around: f32, progress: &Progress) -> Resu
         );
         objects.extend(found.into_inner().unwrap_or_else(|e| e.into_inner()));
     }
-    scene(game, &map, &objects, SIDE_NEAR, &|done, total| progress("Loading the map's models", done, total))
+    scene(game, &map, &objects, Quality::Near, &|done, total| progress("Loading the map's models", done, total))
 }
 
 /// How near the camera a map file has to be for its close objects (metres).
@@ -654,15 +668,15 @@ impl Lod {
         self.files.contains_key(&model) || self.map.children.contains_key(&model)
     }
 
-    /// Loads models; `far` ones with small textures.
-    pub fn load(&self, models: &[u32], far: bool, progress: &(dyn Fn(usize, usize) + Sync)) -> Vec<Loaded> {
+    /// Loads models.
+    pub fn load(&self, models: &[u32], quality: Quality, progress: &(dyn Fn(usize, usize) + Sync)) -> Vec<Loaded> {
         let of = Models { game: &self.game, files: &self.files, map: &self.map };
-        of.load(models, if far { SIDE_FAR } else { SIDE_NEAR }, progress)
+        of.load(models, quality, progress)
     }
 
     /// The map files with close objects near a place.
-    pub fn near(&self, eye: &[f32; 3]) -> HashSet<u32> {
-        let near = |(_, lo, hi): &&(String, [f32; 3], [f32; 3])| distance_to_box(eye, lo, hi) < NEAR;
+    pub fn near(&self, eye: &[f32; 3], range: f32) -> HashSet<u32> {
+        let near = |(_, lo, hi): &&(String, [f32; 3], [f32; 3])| distance_to_box(eye, lo, hi) < NEAR * range;
         (0..).zip(&self.map.files).filter(|(_, f)| near(f)).map(|(i, _)| i).collect()
     }
 
@@ -687,12 +701,14 @@ impl Lod {
         found.into_inner().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// What to draw from a place, of the models there are, with the close
+    /// What to draw from a place, `range` times as far in detail as the game
+    /// does, of the models there are, with the close
     /// objects read so far. An object gives way to those it stands for when
     /// all of them are there.
     pub fn cut<'a>(
         &self,
         eye: &[f32; 3],
+        range: f32,
         loaded: &dyn Fn(u32) -> bool,
         unreadable: &dyn Fn(u32) -> bool,
         close: impl Iterator<Item = &'a Close>,
@@ -701,6 +717,7 @@ impl Lod {
         let mut cut = Choice {
             lod: self,
             eye,
+            range,
             loaded,
             unreadable,
             close: HashMap::new(),
@@ -710,7 +727,7 @@ impl Lod {
         for (node, object) in close.flat_map(|c| &c.objects) {
             match node {
                 Some(node) => of_node.entry(*node).or_default().push(object),
-                None if distance(eye, &object.position) < NEAR && cut.take(object) => cut.draw.push(object),
+                None if distance(eye, &object.position) < NEAR * range && cut.take(object) => cut.draw.push(object),
                 None => {}
             }
         }
@@ -735,6 +752,7 @@ impl Lod {
 struct Choice<'a> {
     lod: &'a Lod,
     eye: &'a [f32; 3],
+    range: f32,
     loaded: &'a dyn Fn(u32) -> bool,
     unreadable: &'a dyn Fn(u32) -> bool,
     close: HashMap<u32, Vec<&'a Object>>,
@@ -767,7 +785,7 @@ impl<'a> Choice<'a> {
     fn visit(&mut self, node: u32) -> bool {
         let lod = self.lod;
         let (n, children) = (&lod.map.nodes[node as usize], &lod.children[node as usize]);
-        if distance(self.eye, &n.object.position) < n.reach {
+        if distance(self.eye, &n.object.position) < n.reach * self.range {
             let before = self.draw.len();
             let mut all = true;
             let mut any = false;
@@ -881,7 +899,7 @@ mod tests {
         let object = Object { model: 30, position: [0.0; 3], rotation: [0.0, 0.0, 0.0, 1.0], scale: [1.0; 2] };
         let close = Close { objects: vec![(Some(1), object)] };
         let cut = |at: f32, loaded: &[u32]| {
-            let cut = lod.cut(&[at, 0.0, 0.0], &|m| loaded.contains(&m), &|_| false, std::iter::once(&close));
+            let cut = lod.cut(&[at, 0.0, 0.0], 1.0, &|m| loaded.contains(&m), &|_| false, std::iter::once(&close));
             let mut draw: Vec<u32> = cut.draw.into_keys().collect();
             draw.sort_unstable();
             (draw, cut.wanted.len())

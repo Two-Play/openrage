@@ -6,8 +6,10 @@
 
 use rage_formats::drawable::param;
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 
 use rage_formats::math;
+use rage_formats::texture::Texture;
 
 use crate::models::{LoadedModel, Look};
 
@@ -25,24 +27,78 @@ impl Default for View {
     }
 }
 
-struct Image {
+/// A picture on a model, shared by those with the same one.
+pub struct Image {
     w: usize,
     h: usize,
-    rgba: Vec<u8>,
+    /// Decoded on first use.
+    rgba: OnceLock<Option<Vec<u8>>>,
+    /// As the game has it; let go once it is on the graphics card.
+    source: Mutex<Option<Arc<Texture>>>,
 }
 
 impl Image {
-    fn sample(&self, u: f32, v: f32) -> [u8; 4] {
+    fn decoded(w: usize, h: usize, rgba: Vec<u8>) -> Self {
+        Self { w, h, rgba: OnceLock::from(Some(rgba)), source: Mutex::new(None) }
+    }
+
+    /// Width and height.
+    pub fn size(&self) -> (usize, usize) {
+        (self.w, self.h)
+    }
+
+    /// RGBA pixels.
+    pub fn rgba(&self) -> Option<&[u8]> {
+        let decode = || self.source().and_then(|t| t.to_rgba());
+        self.rgba.get_or_init(decode).as_deref()
+    }
+
+    /// The texture as the game has it, if it is kept.
+    pub fn source(&self) -> Option<Arc<Texture>> {
+        self.source.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Lets go of it: it is elsewhere now.
+    pub fn release(&self) {
+        *self.source.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The picture of a texture that several models share.
+    fn shared(texture: &Arc<Texture>) -> Arc<Image> {
+        type Known = HashMap<usize, (Weak<Texture>, Weak<Image>)>;
+        static KNOWN: LazyLock<Mutex<Known>> = LazyLock::new(Default::default);
+        let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        let key = Arc::as_ptr(texture) as usize;
+        if let Some((of, image)) = known.get(&key)
+            && of.upgrade().is_some_and(|of| Arc::ptr_eq(&of, texture))
+            && let Some(image) = image.upgrade()
+        {
+            return image;
+        }
+        let image = Arc::new(Image {
+            w: texture.width.max(1) as usize,
+            h: texture.height.max(1) as usize,
+            rgba: OnceLock::new(),
+            source: Mutex::new(Some(Arc::clone(texture))),
+        });
+        if known.len().is_power_of_two() {
+            known.retain(|_, (_, image)| image.strong_count() > 0);
+        }
+        known.insert(key, (Arc::downgrade(texture), Arc::downgrade(&image)));
+        image
+    }
+
+    fn sample(&self, rgba: &[u8], u: f32, v: f32) -> [u8; 4] {
         let x = ((u - u.floor()) * self.w as f32) as usize % self.w;
         let y = ((v - v.floor()) * self.h as f32) as usize % self.h;
         let i = (y * self.w + x) * 4;
-        [self.rgba[i], self.rgba[i + 1], self.rgba[i + 2], self.rgba[i + 3]]
+        [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
     }
 }
 
-/// Decoded textures, shared between frames.
+/// The textures of a model, ready to be drawn.
 pub struct Materials {
-    images: Vec<Image>,
+    images: Vec<Arc<Image>>,
     /// Indices into `images` per drawable and shader.
     per_shader: Vec<Vec<Slots>>,
 }
@@ -61,18 +117,22 @@ impl Materials {
     /// Decodes the textures of every shader of every drawable.
     pub fn new(model: &LoadedModel) -> Self {
         let mut by_name: HashMap<String, Option<usize>> = HashMap::new();
-        let mut images: Vec<Image> = Vec::new();
+        let mut images: Vec<Arc<Image>> = Vec::new();
         // `opaque`: the shader's alpha channel holds other data (skin shaders).
         let mut decode = |d: &rage_formats::drawable::Drawable, name: Option<&str>, opaque: bool| {
             let name = name?;
             let key = format!("{}{}", name.to_ascii_lowercase(), if opaque { "#opaque" } else { "" });
             *by_name.entry(key).or_insert_with(|| {
                 let t = model.texture(d, name)?;
+                if let Some(shared) = model.shared_texture(name).filter(|s| !opaque && std::ptr::eq(&***s, t)) {
+                    images.push(Image::shared(shared));
+                    return Some(images.len() - 1);
+                }
                 let mut rgba = t.to_rgba()?;
                 if opaque {
                     rgba.iter_mut().skip(3).step_by(4).for_each(|a| *a = 255);
                 }
-                images.push(Image { w: t.width.max(1) as usize, h: t.height.max(1) as usize, rgba });
+                images.push(Arc::new(Image::decoded(t.width.max(1) as usize, t.height.max(1) as usize, rgba)));
                 Some(images.len() - 1)
             })
         };
@@ -101,39 +161,26 @@ impl Materials {
         self.per_shader.get(drawable).and_then(|s| s.get(shader as usize)).copied().unwrap_or_default()
     }
 
-    fn image(&self, drawable: usize, shader: u16) -> Option<&Image> {
-        self.slot(drawable, shader).base.map(|i| &self.images[i])
+    fn image(&self, drawable: usize, shader: u16) -> Option<(&Image, &[u8])> {
+        let image = &*self.images[self.slot(drawable, shader).base?];
+        Some((image, image.rgba()?))
     }
 
-    fn overlay_image(&self, drawable: usize, shader: u16) -> Option<&Image> {
-        self.slot(drawable, shader).overlay.map(|i| &self.images[i])
+    fn overlay_image(&self, drawable: usize, shader: u16) -> Option<(&Image, &[u8])> {
+        let image = &*self.images[self.slot(drawable, shader).overlay?];
+        Some((image, image.rgba()?))
     }
 
-    /// RGBA pixels of the base texture of a drawable's shader (for GPU upload).
-    pub fn texture(&self, drawable: usize, shader: u16) -> Option<(usize, usize, usize, &[u8])> {
-        self.pixels(self.slot(drawable, shader).base)
+    /// The base texture of a drawable's shader, the overlay drawn over it with
+    /// its alpha on the second UV set, the normal and the specular map.
+    pub fn pictures(&self, drawable: usize, shader: u16) -> [Option<&Arc<Image>>; 4] {
+        let Slots { base, overlay, normal, specular } = self.slot(drawable, shader);
+        [base, overlay, normal, specular].map(|i| i.map(|i| &self.images[i]))
     }
 
-    /// RGBA pixels of the overlay texture of a drawable's shader, drawn over
-    /// the base colour with its alpha on the second UV set (for GPU upload).
-    pub fn overlay(&self, drawable: usize, shader: u16) -> Option<(usize, usize, usize, &[u8])> {
-        self.pixels(self.slot(drawable, shader).overlay)
-    }
-
-    /// The same of its normal map.
-    pub fn normal(&self, drawable: usize, shader: u16) -> Option<(usize, usize, usize, &[u8])> {
-        self.pixels(self.slot(drawable, shader).normal)
-    }
-
-    /// The same of its specular map.
-    pub fn specular(&self, drawable: usize, shader: u16) -> Option<(usize, usize, usize, &[u8])> {
-        self.pixels(self.slot(drawable, shader).specular)
-    }
-
-    fn pixels(&self, image: Option<usize>) -> Option<(usize, usize, usize, &[u8])> {
-        let i = image?;
-        let img = &self.images[i];
-        Some((i, img.w, img.h, &img.rgba))
+    /// Lets go of what is on the graphics card now.
+    pub fn release(&self) {
+        self.images.iter().for_each(|i| i.release());
     }
 }
 
@@ -350,7 +397,7 @@ pub fn render_scene(items: &[SceneItem], camera: &Camera, width: usize, height: 
                             if let (Some(img), true) = (img, has_uv) {
                                 let u = q0 * mesh.uvs[a][0] + q1 * mesh.uvs[b][0] + q2 * mesh.uvs[c][0];
                                 let v = q0 * mesh.uvs[a][1] + q1 * mesh.uvs[b][1] + q2 * mesh.uvs[c][1];
-                                let t = img.sample(u, v);
+                                let t = img.0.sample(img.1, u, v);
                                 if t[3] < 77 {
                                     continue; // alpha cut-out
                                 }
@@ -363,7 +410,7 @@ pub fn render_scene(items: &[SceneItem], camera: &Camera, width: usize, height: 
                                 let uv = &mesh.uvs1;
                                 let u = q0 * uv[a][0] + q1 * uv[b][0] + q2 * uv[c][0];
                                 let v = q0 * uv[a][1] + q1 * uv[b][1] + q2 * uv[c][1];
-                                let t = img.sample(u, v);
+                                let t = img.0.sample(img.1, u, v);
                                 let alpha = t[3] as f32 / 255.0;
                                 for k in 0..3 {
                                     base[k] += (t[k] as f32 / 255.0 - base[k]) * alpha;

@@ -522,6 +522,16 @@ impl Pool {
     /// has that one level, of every slice of an array and every face of a
     /// cube map; its name is the texture's number. Volumes are not read.
     pub fn texture(&self, index: usize, max_side: Option<u32>) -> Result<Texture, TtpfError> {
+        self.read(index, max_side, false)
+    }
+
+    /// The same with the smaller mip levels that follow, down to four pixels,
+    /// if it is neither an array nor a cube map.
+    pub fn texture_with_mips(&self, index: usize, max_side: Option<u32>) -> Result<Texture, TtpfError> {
+        self.read(index, max_side, true)
+    }
+
+    fn read(&self, index: usize, max_side: Option<u32>, mips: bool) -> Result<Texture, TtpfError> {
         let d = *self.descriptor(index).ok_or_else(|| invalid("no such texture"))?;
         if d.dimension == 3 {
             return Err(unsupported("a volume, which is not read yet"));
@@ -554,12 +564,25 @@ impl Pool {
             let stored = self.read_range(slice_at(chosen, s), level.region)?;
             data.extend(layout.untile(level, &stored).ok_or_else(|| invalid("a mip level outside its allocation"))?);
         }
+        let mut levels = 1;
+        if mips && d.depth == 1 {
+            for i in chosen + 1..layout.levels.len() {
+                let next = &layout.levels[i];
+                if next.pixels.0.min(next.pixels.1) < 4 || !readable(&i) {
+                    break;
+                }
+                let stored = self.read_range(slice_at(i, 0), next.region)?;
+                let Some(rows) = layout.untile(next, &stored) else { break };
+                data.extend(rows);
+                levels += 1;
+            }
+        }
         Ok(Texture {
             name: format!("{index:06}"),
             width: level.pixels.0,
             height: level.pixels.1,
             depth: d.depth,
-            levels: 1,
+            levels,
             format: Format(d.format),
             dimension: if d.dimension == 2 { Dimension::Cube } else { Dimension::Texture2D },
             usage: 0,

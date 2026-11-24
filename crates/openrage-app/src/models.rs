@@ -38,6 +38,8 @@ pub struct LoadedModel {
     pub parts: Vec<Part>,
     /// Texture dictionaries found next to the model (`<name>.ytd`, `vehshare.ytd`).
     pub external: Vec<(String, TextureDictionary)>,
+    /// Textures shared with other models (GTA VI).
+    shared: Vec<Arc<Texture>>,
     /// Materials: shaders with the same name across all drawables.
     pub materials: Vec<MaterialSlot>,
     /// The skeleton skinned meshes are bound to (for peds: from the `.yft`
@@ -111,6 +113,7 @@ impl LoadedModel {
             parts,
             external: Vec::new(),
             materials: Vec::new(),
+            shared: Vec::new(),
             shader_material: Vec::new(),
             skeleton: None,
             expressions: Vec::new(),
@@ -123,7 +126,24 @@ impl LoadedModel {
     /// Finds a texture by name: embedded in the drawable first, then next to the model.
     pub fn texture<'a>(&'a self, drawable: &'a Drawable, name: &str) -> Option<&'a Texture> {
         let find = |d: &'a TextureDictionary| d.textures.iter().find(|t| t.name.eq_ignore_ascii_case(name));
-        drawable.textures.as_ref().and_then(find).or_else(|| self.external.iter().find_map(|(_, d)| find(d)))
+        let own = drawable.textures.as_ref().and_then(find).or_else(|| self.external.iter().find_map(|(_, d)| find(d)));
+        own.or_else(|| self.shared_texture(name).map(|t| &**t))
+    }
+
+    /// The texture of this name that is shared with other models.
+    pub(crate) fn shared_texture(&self, name: &str) -> Option<&Arc<Texture>> {
+        self.shared.iter().find(|t| t.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Gives the model textures it shares with others.
+    pub fn set_shared(&mut self, textures: Vec<Arc<Texture>>) {
+        self.shared = textures;
+        self.collect_materials();
+    }
+
+    /// Lets go of the shared textures: what shows the model has them.
+    pub fn forget_shared(&mut self) {
+        self.shared = Vec::new();
     }
 
     /// Dresses a GTA IV ped: for each (component, drawable, texture) — a
@@ -822,6 +842,7 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
             parts,
             external,
             materials: Vec::new(),
+            shared: Vec::new(),
             shader_material: Vec::new(),
             skeleton,
             expressions: Vec::new(),
@@ -907,6 +928,7 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         parts,
         external,
         materials: Vec::new(),
+        shared: Vec::new(),
         shader_material: Vec::new(),
         skeleton,
         expressions: Vec::new(),
@@ -1383,6 +1405,7 @@ fn load_gta4(archive: &Arc<rage_rpf::Gta4Archive>, id: rage_rpf::Gta4EntryId) ->
         parts,
         external,
         materials: Vec::new(),
+        shared: Vec::new(),
         shader_material: Vec::new(),
         skeleton,
         expressions: Vec::new(),
@@ -1446,6 +1469,7 @@ fn gta4_player(archive: &rage_rpf::Gta4Archive, skeleton: drawable::Skeleton) ->
         parts,
         external,
         materials: Vec::new(),
+        shared: Vec::new(),
         shader_material: Vec::new(),
         skeleton: Some(skeleton),
         expressions: Vec::new(),
@@ -1486,6 +1510,7 @@ pub fn load_gta4_members(game: &Path, vpath: &str, wanted: &[(String, u32)]) -> 
             parts: vec![part],
             external,
             materials: Vec::new(),
+            shared: Vec::new(),
             shader_material: Vec::new(),
             skeleton: d.skeleton.clone(),
             expressions: Vec::new(),
@@ -1608,6 +1633,7 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
         parts,
         external,
         materials: Vec::new(),
+        shared: Vec::new(),
         shader_material: Vec::new(),
         skeleton,
         expressions: Vec::new(),
@@ -1770,6 +1796,7 @@ fn load_rdr2_ped_inner(game: &Path, ped: &str, outfit: usize) -> Result<LoadedMo
         parts,
         external,
         materials: Vec::new(),
+        shared: Vec::new(),
         shader_material: Vec::new(),
         skeleton,
         expressions: Vec::new(),

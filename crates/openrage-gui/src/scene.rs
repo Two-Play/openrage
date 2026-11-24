@@ -90,8 +90,12 @@ struct State {
     /// The flying camera, when it flies, and what moves it.
     fly: Option<Fly>,
     fly_timer: slint::Timer,
-    /// Under a sky: a map.
-    outdoors: bool,
+    /// Under a sky: a map, with how it is shown.
+    outdoors: Option<Weather>,
+    /// Tells it from other scenes.
+    number: u64,
+    /// Moves the water.
+    water_timer: slint::Timer,
     /// Loads the details of GTA VI's whole map around the camera.
     stream: Option<Stream>,
 }
@@ -105,6 +109,9 @@ impl State {
                 let mut camera = f.camera((0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f32>().sqrt() / 2.0);
                 // It can be close to things however large the scene is.
                 camera.distance = camera.distance.min(50.0);
+                if let Some(w) = &self.outdoors {
+                    camera.fov = w.fov.to_radians();
+                }
                 camera
             }
             None => render::orbit_camera(lo, hi, self.view),
@@ -132,8 +139,50 @@ impl State {
     }
 }
 
+/// How often moving water is drawn.
+const WATER_STEP: Duration = Duration::from_millis(50);
+
+/// Another number for each scene.
+fn scene_number() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// The most pixels a scene is drawn with (Full HD).
 const MOST_PIXELS: f32 = 1920.0 * 1080.0;
+
+/// How a map is shown (the settings beside it).
+#[derive(Clone, Copy)]
+struct Weather {
+    hour: f32,
+    /// 0 to 1.
+    haze: f32,
+    brightness: f32,
+    /// The flying camera's angle, in degrees.
+    fov: f32,
+    /// How far things are in detail, 1 as in the game.
+    range: f32,
+    /// The water moves.
+    moving: bool,
+    /// There is a sea at height 0.
+    sea: bool,
+    since: Instant,
+}
+
+impl Default for Weather {
+    fn default() -> Self {
+        Self {
+            hour: 13.0,
+            haze: 0.3,
+            brightness: 1.0,
+            fov: 60.0,
+            range: 1.0,
+            moving: true,
+            sea: false,
+            since: Instant::now(),
+        }
+    }
+}
 
 type Shared = Rc<RefCell<Option<State>>>;
 
@@ -629,7 +678,9 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
         timer: slint::Timer::default(),
         fly: None,
         fly_timer: slint::Timer::default(),
-        outdoors: false,
+        number: scene_number(),
+        outdoors: None,
+        water_timer: slint::Timer::default(),
         stream: None,
     });
     if let Some(st) = state.borrow_mut().as_mut() {
@@ -927,10 +978,15 @@ fn cut_camera(st: &State) -> Option<Camera> {
 }
 
 fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
+    draw(win, state, false);
+}
+
+/// The same; `moving` if it is drawn again soon.
+fn draw(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, moving: bool) {
     if let Some(st) = state.borrow_mut().as_mut() {
         let eye = st.free_camera().eye;
         if let Some(stream) = &mut st.stream {
-            stream.look_from(eye);
+            stream.look_from(eye, st.outdoors.map_or(1.0, |w| w.range));
         }
     }
     let st = state.borrow();
@@ -1003,9 +1059,16 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         };
         let sprites = gta4_effects::sprites_at(&st.effect_library, &st.effects, st.time);
         // Seen from above, haze would hide a whole map.
-        let outdoors =
-            st.outdoors.then(|| crate::gpu::Outdoors { haze: if st.fly.is_some() { 1.0 / 9000.0 } else { 0.0 } });
-        crate::gpu::render_scene(&items, lights, &sprites, outdoors, &camera, width, height)
+        let outdoors = st.outdoors.map(|w| crate::gpu::Outdoors {
+            haze: if st.fly.is_some() { w.haze * w.haze / 1000.0 } else { 0.0 },
+            hour: w.hour,
+            brightness: w.brightness,
+            seconds: w.since.elapsed().as_secs_f32(),
+            sea: w.sea,
+        });
+        let live = moving.then_some(st.number);
+        let around = crate::gpu::Around { lights, sprites: &sprites, outdoors, live };
+        crate::gpu::render_scene(&items, &around, &camera, width, height)
     } else {
         None
     };
@@ -1124,7 +1187,7 @@ pub fn open_map(ui: &AppWindow, vpath: String) {
                 .map(|(name, loaded, transforms)| {
                     let materials = render::Materials::new(&loaded);
                     let look = std::sync::RwLock::new(loaded.default_look());
-                    (ModelPreview { loaded, look, materials, name }, transforms)
+                    (Arc::new(ModelPreview { loaded, look, materials, name }), transforms)
                 })
                 .collect();
             let missing = scene.missing.iter().map(|(_, n)| n).sum();
@@ -1147,7 +1210,7 @@ pub fn open_map(ui: &AppWindow, vpath: String) {
 
 /// A map file's models with their placements, loaded in the background.
 struct MapLoaded {
-    models: Vec<(ModelPreview, Vec<Mat4>)>,
+    models: Vec<(Arc<ModelPreview>, Vec<Mat4>)>,
     objects: usize,
     /// Objects whose model was not found.
     missing: usize,
@@ -1159,31 +1222,27 @@ struct MapLoaded {
 /// GTA VI's whole map from afar.
 fn load_whole_map(game: &Path, show: &gta6_world::Progress) -> anyhow::Result<MapLoaded> {
     let lod = Arc::new(Lod::open(game, show)?);
-    let loaded = lod.load(&lod.far(), true, &|done, total| show("Loading the map's models", done, total));
-    let mut places = lod.cut(&[0.0, 0.0, 1e6], &|_| true, &|_| false, std::iter::empty()).draw;
+    let loaded =
+        lod.load(&lod.far(), gta6_world::Quality::Far, &|done, total| show("Loading the map's models", done, total));
+    let mut places = lod.cut(&[0.0, 0.0, 1e6], 1.0, &|_| true, &|_| false, std::iter::empty()).draw;
     let objects = places.values().map(Vec::len).sum();
-    let (keys, models): (Vec<u32>, Vec<_>) = loaded
-        .into_par_iter()
-        .map(|(key, name, loaded)| {
-            let materials = render::Materials::new(&loaded);
-            let look = std::sync::RwLock::new(loaded.default_look());
-            (key, ModelPreview { loaded, look, materials, name })
-        })
-        .unzip();
+    let (keys, models): (Vec<u32>, Vec<Arc<ModelPreview>>) = crate::stream::ready(loaded).into_iter().unzip();
     anyhow::ensure!(!models.is_empty(), "the map files of this game have no distant view");
-    let models: Vec<(ModelPreview, Vec<Mat4>)> =
+    let models: Vec<(Arc<ModelPreview>, Vec<Mat4>)> =
         models.into_iter().zip(&keys).map(|(p, key)| (p, places.remove(key).unwrap_or_default())).collect();
     let missing = places.values().map(Vec::len).sum();
     Ok(MapLoaded { models, objects, missing, lod: Some((lod, keys)) })
 }
 
 fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
+    let whole_map = scene.lod.is_some();
+    win.set_view_sea(whole_map);
     let mut surroundings: Vec<(Arc<ModelPreview>, Look, Vec<Mat4>)> = scene
         .models
         .into_iter()
         .map(|(p, transforms)| {
             let look = scene_look(&p);
-            (Arc::new(p), look, transforms)
+            (p, look, transforms)
         })
         .collect();
     let far: Option<HashMap<u32, Arc<ModelPreview>>> = scene
@@ -1202,6 +1261,7 @@ fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
     win.set_objects(slint::ModelRc::new(slint::VecModel::from(if far.is_some() { Vec::new() } else { rows })));
     win.set_can_export(!surroundings.is_empty());
     win.set_can_fly(true);
+    win.set_show_panel(true);
     let (lo, hi) = bounds;
     let mut status = format!(
         "{} objects · {} models · {:.0} × {:.0} m",
@@ -1243,7 +1303,9 @@ fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
         timer: slint::Timer::default(),
         fly: None,
         fly_timer: slint::Timer::default(),
-        outdoors: true,
+        number: scene_number(),
+        outdoors: Some(Weather { sea: whole_map, ..Weather::default() }),
+        water_timer: slint::Timer::default(),
         stream: None,
     });
     if let (Some((lod, _)), Some(far)) = (scene.lod, far) {
@@ -1256,6 +1318,7 @@ fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
             st.stream = Some(stream);
         }
     }
+    move_water(win, state);
     render_frame(win, state);
 }
 
@@ -1326,6 +1389,21 @@ fn wire_map(win: &SceneWindow, state: &Shared, main: slint::Weak<AppWindow>, nam
 
 fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
+    win.on_view_changed(move || {
+        let Some(win) = w.upgrade() else { return };
+        if let Some(weather) = s.borrow_mut().as_mut().and_then(|st| st.outdoors.as_mut()) {
+            weather.hour = win.get_view_hour();
+            weather.haze = win.get_view_haze();
+            weather.brightness = win.get_view_brightness();
+            weather.fov = win.get_view_fov();
+            weather.range = win.get_view_range();
+            weather.moving = win.get_view_water();
+            weather.sea = win.get_view_sea();
+        }
+        move_water(&win, &s);
+        render_frame(&win, &s);
+    });
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_fly(move || toggle_fly(&w, &s));
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_key_down(move |text, shift| {
@@ -1343,16 +1421,22 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
                 if let Some(f) = s.borrow_mut().as_mut().and_then(|st| st.fly.as_mut()) {
                     f.tick();
                 }
-                render_frame(&win, &s);
+                draw(&win, &s, true);
             });
         }
     });
-    let s = Rc::clone(state);
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_key_up(move |text, shift| {
+        let mut stopped = false;
         if let Some(st) = s.borrow_mut().as_mut()
             && !st.fly.as_mut().is_some_and(|f| f.key_up(&text.to_lowercase(), shift))
         {
+            stopped = st.fly_timer.running();
             st.fly_timer.stop();
+        }
+        // Where it stopped.
+        if let Some(win) = w.upgrade().filter(|_| stopped) {
+            render_frame(&win, &s);
         }
     });
     let s = Rc::clone(state);
@@ -1463,6 +1547,26 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
     });
 }
 
+/// Keeps drawing while water moves.
+fn move_water(win: &SceneWindow, state: &Shared) {
+    let st = state.borrow();
+    let Some(st) = st.as_ref() else { return };
+    if !st.outdoors.is_some_and(|w| w.moving) {
+        st.water_timer.stop();
+    } else if !st.water_timer.running() {
+        let (w, s) = (win.as_weak(), Rc::downgrade(state));
+        st.water_timer.start(slint::TimerMode::Repeated, WATER_STEP, move || {
+            if let (Some(win), Some(s)) = (w.upgrade(), s.upgrade())
+                && win.window().is_visible()
+                // Flying draws anyway.
+                && !s.borrow().as_ref().is_some_and(|st| st.fly_timer.running())
+            {
+                draw(&win, &s, true);
+            }
+        });
+    }
+}
+
 /// Switches between orbiting and flying, starting where the camera is.
 fn toggle_fly(w: &slint::Weak<SceneWindow>, state: &Shared) {
     let Some(win) = w.upgrade() else { return };
@@ -1503,6 +1607,13 @@ pub fn fly_to(place: [f32; 5]) {
         let [x, y, z, yaw, pitch] = place;
         st.fly = Some(Fly::new(&render::fly_camera([x, y, z], yaw, pitch, 1.0), 100.0));
         win.set_fly_mode(true);
+        // `OPENRAGE_HOUR=<hour>`: the time of day.
+        if let (Some(w), Some(hour)) =
+            (&mut st.outdoors, std::env::var("OPENRAGE_HOUR").ok().and_then(|h| h.parse().ok()))
+        {
+            w.hour = hour;
+            win.set_view_hour(hour);
+        }
     }
     render_frame(&win, &state);
 }
@@ -1521,7 +1632,7 @@ pub fn bench(pictures: u32) {
                 None => st.view.yaw += 0.02,
             }
         }
-        render_frame(&win, &state);
+        draw(&win, &state, true);
     }
     eprintln!("bench: {:.2} ms a picture", started.elapsed().as_secs_f32() * 1000.0 / pictures as f32);
 }

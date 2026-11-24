@@ -34,8 +34,10 @@
 //!   lower 12 are the number), or one bone without a weight. Of the weights
 //!   the four largest are kept. A bone's number is its place in the model's
 //!   list of the hashes of its bones' names (40).
-//! - Texture coordinates (part 28): two floats, or two 16-bit numbers with a
-//!   scale.
+//! - Texture coordinates (parts 28 and 29): two floats, or two 16-bit numbers
+//!   with a scale.
+//! - What shades a vertex (part 24): how much of the sky it sees (red) and how
+//!   much of what is put on the base shows (alpha).
 //!
 //! The index buffer is cut into *clusters* of up to 128 vertices and 256
 //! triangles: a list of the vertices each cluster uses, and triangles as
@@ -91,6 +93,7 @@ const POSITION: usize = 0;
 const WEIGHTS: [usize; 2] = [16, 17];
 const BONES: [usize; 2] = [20, 21];
 const TEXCOORD: usize = 28;
+const COLOUR: usize = 24;
 /// Most bones a skeleton has.
 const MAX_BONES: usize = 4096;
 
@@ -428,26 +431,31 @@ impl<'a> Reader<'a> {
         }
         .ok_or_else(|| bad("positions that are no numbers"))?;
 
-        let (offset, size, encoding) = part(TEXCOORD);
-        let uvs: Vec<[f32; 2]> = match (size, encoding, within(offset, usize::from(size))) {
-            (8, 16, Some(at)) => data[at..at + vertices * 8]
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|c| [f32::from_le_bytes([c[0], c[1], c[2], c[3]]), f32::from_le_bytes([c[4], c[5], c[6], c[7]])])
-                .collect(),
-            (4, 38, Some(at)) => {
-                let scale = data.u32_at(124).map(f32::from_bits).filter(|s| s.is_finite()).unwrap_or(1.0);
-                let number = |a: u8, b: u8| (f32::from(i16::from_le_bytes([a, b])) / 32767.0).max(-1.0) * scale;
-                data[at..at + vertices * 4]
-                    .as_chunks::<4>()
+        let coordinates = |slot: usize| -> Vec<[f32; 2]> {
+            let (offset, size, encoding) = part(slot);
+            match (size, encoding, within(offset, usize::from(size))) {
+                (8, 16, Some(at)) => data[at..at + vertices * 8]
+                    .as_chunks::<8>()
                     .0
                     .iter()
-                    .map(|c| [number(c[0], c[1]), number(c[2], c[3])])
-                    .collect()
+                    .map(|c| {
+                        [f32::from_le_bytes([c[0], c[1], c[2], c[3]]), f32::from_le_bytes([c[4], c[5], c[6], c[7]])]
+                    })
+                    .collect(),
+                (4, 38, Some(at)) => {
+                    let scale = data.u32_at(124).map(f32::from_bits).filter(|s| s.is_finite()).unwrap_or(1.0);
+                    let number = |a: u8, b: u8| (f32::from(i16::from_le_bytes([a, b])) / 32767.0).max(-1.0) * scale;
+                    data[at..at + vertices * 4]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| [number(c[0], c[1]), number(c[2], c[3])])
+                        .collect()
+                }
+                _ => Vec::new(),
             }
-            _ => Vec::new(),
         };
+        let (uvs, uvs1) = (coordinates(TEXCOORD), coordinates(TEXCOORD + 1));
 
         let bytes = |slot: usize, size: usize, encoding: u8| -> Option<&[u8]> {
             let (offset, own_size, own_encoding) = part(slot);
@@ -486,6 +494,8 @@ impl<'a> Reader<'a> {
             .into_iter()
             .unzip();
 
+        let shading = bytes(COLOUR, 4, 28).map(|all| all.as_chunks::<4>().0.to_vec()).unwrap_or_default();
+
         let descriptor = self.s(geometry + 64, 16)?;
         let (index, stride) = self.buffer(self.s(descriptor, 64)?)?;
         if stride != 4 {
@@ -493,7 +503,7 @@ impl<'a> Reader<'a> {
         }
         let indices = clusters(index, vertices)?;
         let normals = smooth_normals(&positions, &indices);
-        Ok(Mesh { positions, normals, uvs, indices, bone_indices, bone_weights, ..Default::default() })
+        Ok(Mesh { positions, normals, uvs, uvs1, shading, indices, bone_indices, bone_weights, ..Default::default() })
     }
 }
 

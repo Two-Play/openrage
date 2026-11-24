@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 
-use openrage_app::gta6_world::{Close, Lod};
+use openrage_app::gta6_world::{Close, Loaded, Lod, Quality};
 use openrage_app::models::Look;
 use openrage_app::render;
 use rage_formats::math::Mat4;
@@ -21,16 +21,22 @@ const KEPT: usize = 1500;
 /// Models with their places, as a scene draws them.
 pub type Drawn = Vec<(Arc<ModelPreview>, Look, Vec<Mat4>)>;
 
+/// Nearer than this, models get their best textures (metres).
+const UP_CLOSE: f32 = 70.0;
+
+/// Where the camera is, and how far things are in detail.
+type From = ([f32; 3], f32);
+
 #[derive(Default)]
 struct Wish {
-    eye: Option<[f32; 3]>,
+    from: Option<From>,
     stop: bool,
 }
 
 /// The thread that loads; ends when this is dropped.
 pub struct Stream {
     wish: Arc<(Mutex<Wish>, Condvar)>,
-    last: Option<[f32; 3]>,
+    last: Option<From>,
 }
 
 impl Stream {
@@ -47,14 +53,15 @@ impl Stream {
         Self { wish, last: None }
     }
 
-    /// The camera is here now.
-    pub fn look_from(&mut self, eye: [f32; 3]) {
+    /// The camera is here now; things are in detail `range` times as far as
+    /// in the game.
+    pub fn look_from(&mut self, eye: [f32; 3], range: f32) {
         // Small steps change nothing.
-        let moved = |from: &[f32; 3]| (0..3).map(|k| (from[k] - eye[k]).powi(2)).sum::<f32>() > 4.0;
+        let moved = |(from, r): &From| *r != range || (0..3).map(|k| (from[k] - eye[k]).powi(2)).sum::<f32>() > 4.0;
         if self.last.as_ref().is_none_or(moved) {
-            self.last = Some(eye);
+            self.last = Some((eye, range));
             let (lock, changed) = &*self.wish;
-            lock.lock().unwrap_or_else(|e| e.into_inner()).eye = Some(eye);
+            lock.lock().unwrap_or_else(|e| e.into_inner()).from = Some((eye, range));
             changed.notify_one();
         }
     }
@@ -75,22 +82,46 @@ struct Kept {
     drawn: u64,
     /// Always kept.
     far: bool,
+    /// With its best textures.
+    best: bool,
 }
 
-/// How a model looks in a scene: without decals, which need blending it does not do, and with blue water.
+/// How a model looks in a scene: with water and lamps told from the rest.
 pub fn scene_look(preview: &ModelPreview) -> Look {
     let mut look = preview.loaded.default_look();
+    let is_water = preview.name.to_ascii_lowercase().contains("water");
     for (slot, l) in preview.loaded.materials.iter().zip(look.materials.iter_mut()) {
-        if rage_formats::shaders::name(slot.name_hash).is_some_and(|n| n.contains("decal")) {
-            l.visible = false;
-        }
-        // Its colour is computed in the game.
         let shader = rage_formats::names::value(slot.name_hash);
-        if shader.starts_with("water") || (!slot.textured && preview.name.to_ascii_lowercase().contains("water")) {
-            l.tint = if slot.textured { [0.25, 0.4, 0.46, 1.0] } else { [0.16, 0.3, 0.36, 1.0] };
+        if shader.starts_with("water") || (!slot.textured && is_water) {
+            l.tint = [0.16, 0.3, 0.36, crate::gpu::WATER];
+        } else if !slot.textured {
+            // A colour the game computes; what lies on others would hide them.
+            l.visible = !shader.contains("decal");
+            l.tint = [0.45, 0.45, 0.44, 1.0];
+        } else if shader.contains("emissive") {
+            l.tint[3] = crate::gpu::LAMP;
         }
     }
     look
+}
+
+/// Whether a placement is near the camera.
+fn near_to(eye: &[f32; 3], place: &Mat4) -> bool {
+    (0..3).map(|k| (place[12 + k] - eye[k]).powi(2)).sum::<f32>() < UP_CLOSE * UP_CLOSE
+}
+
+/// Models ready to be drawn. What can be done here is not done while a
+/// picture is drawn.
+pub fn ready(loaded: Vec<Loaded>) -> Vec<(u32, Arc<ModelPreview>)> {
+    let prepare = |(m, name, mut loaded): Loaded| {
+        let materials = render::Materials::new(&loaded);
+        let look = std::sync::RwLock::new(loaded.default_look());
+        loaded.forget_shared();
+        (m, Arc::new(ModelPreview { loaded, look, materials, name }))
+    };
+    let (keys, previews): (Vec<u32>, Vec<Arc<ModelPreview>>) = loaded.into_par_iter().map(prepare).unzip();
+    crate::gpu::prepare(&previews);
+    keys.into_iter().zip(previews).collect()
 }
 
 fn work(
@@ -99,12 +130,13 @@ fn work(
     wish: &(Mutex<Wish>, Condvar),
     show: &dyn Fn(Drawn, bool) -> bool,
 ) {
-    let keep = |preview: Arc<ModelPreview>, far| Kept { look: scene_look(&preview), preview, drawn: 0, far };
+    let keep =
+        |preview: Arc<ModelPreview>, far| Kept { look: scene_look(&preview), preview, drawn: 0, far, best: false };
     let mut models: HashMap<u32, Kept> = far.into_iter().map(|(m, p)| (m, keep(p, true))).collect();
     // Models that cannot be read are not tried again.
     let mut failed: HashSet<u32> = HashSet::new();
     let mut close: HashMap<u32, Close> = HashMap::new();
-    let mut eye = None;
+    let mut from = None;
     let mut turn = 0u64;
     let mut more = false;
     loop {
@@ -115,8 +147,8 @@ fn work(
                 if now.stop {
                     return;
                 }
-                if let Some(wanted) = now.eye.take() {
-                    eye = Some(wanted);
+                if let Some(wanted) = now.from.take() {
+                    from = Some(wanted);
                     break;
                 }
                 if more {
@@ -125,9 +157,9 @@ fn work(
                 now = changed.wait(now).unwrap_or_else(|e| e.into_inner());
             }
         }
-        let Some(eye) = eye else { continue };
+        let Some((eye, range)) = from else { continue };
         turn += 1;
-        let near = lod.near(&eye);
+        let near = lod.near(&eye, range);
         close.retain(|file, _| near.contains(file));
         let unread: Vec<u32> = near.iter().filter(|f| !close.contains_key(f)).copied().take(FILES_AT_ONCE).collect();
         let files_left = !unread.is_empty();
@@ -136,18 +168,23 @@ fn work(
         for file in unread {
             close.entry(file).or_default();
         }
-        let cut = lod.cut(&eye, &|m| models.contains_key(&m), &|m| failed.contains(&m), close.values());
+        let cut = lod.cut(&eye, range, &|m| models.contains_key(&m), &|m| failed.contains(&m), close.values());
+        let mut better: Vec<u32> = Vec::new();
         let drawn: Drawn = cut
             .draw
             .into_iter()
             .filter_map(|(m, places)| {
                 let kept = models.get_mut(&m)?;
                 kept.drawn = turn;
+                if !kept.best && places.iter().any(|t| near_to(&eye, t)) {
+                    better.push(m);
+                }
                 Some((Arc::clone(&kept.preview), kept.look.clone(), places))
             })
             .collect();
         let wanted: Vec<u32> = cut.wanted.into_iter().take(AT_ONCE).collect();
-        more = files_left || !wanted.is_empty();
+        better.truncate(if wanted.is_empty() { AT_ONCE } else { 8 });
+        more = files_left || !wanted.is_empty() || !better.is_empty();
         if !show(drawn, more) {
             return;
         }
@@ -160,18 +197,19 @@ fn work(
                 models.remove(m);
             }
         }
-        let loaded: Vec<(u32, Arc<ModelPreview>)> = lod
-            .load(&wanted, false, &|_, _| {})
-            .into_par_iter()
-            .map(|(m, name, loaded)| {
-                let materials = render::Materials::new(&loaded);
-                let look = std::sync::RwLock::new(loaded.default_look());
-                let preview = Arc::new(ModelPreview { loaded, look, materials, name });
-                // Not while a picture is drawn.
-                crate::gpu::prepare(&preview);
-                (m, preview)
-            })
-            .collect();
+        let quiet = &|_, _| {};
+        let loaded = ready(lod.load(&wanted, Quality::Near, quiet));
+        for (m, preview) in ready(lod.load(&better, Quality::Close, quiet)) {
+            if let Some(kept) = models.get_mut(&m) {
+                (kept.look, kept.preview, kept.best) = (scene_look(&preview), preview, true);
+            }
+        }
+        // Those that could not be read again are not tried for ever.
+        for m in &better {
+            if let Some(kept) = models.get_mut(m) {
+                kept.best = true;
+            }
+        }
         failed.extend(wanted.iter().copied());
         for (m, preview) in loaded {
             failed.remove(&m);

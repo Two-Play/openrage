@@ -6,10 +6,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use rage_formats::drawable::Drawable;
+use rage_formats::drawable::param::{BUMP_TEX, DIFFUSE_TEX, DIFFUSE_TEX2, LAYER_1_TEX, SPECULAR_TEX};
 use rage_formats::drawable6::texture_name;
+use rage_formats::texture::Texture;
 use rage_formats::ttpf::Pool;
 use rage_formats::ytd::{Layout, TextureDictionary};
 
@@ -57,10 +59,35 @@ impl Catalog {
         self.by_key.is_empty()
     }
 
-    /// The texture with this key, named by the key.
-    pub fn texture(&self, key: u64, side: u32) -> Option<rage_formats::texture::Texture> {
+    /// The texture with this key, with mip levels, the same for all that use
+    /// it at the time.
+    pub fn shared(&self, key: u64, side: u32) -> Option<Arc<Texture>> {
+        type Known = HashMap<(u64, u32), Weak<Texture>>;
+        static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
+        let lock = || KNOWN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(known) = lock().get(&(key, side)).and_then(Weak::upgrade) {
+            return Some(known);
+        }
         let (pool, number) = *self.by_key.get(&key)?;
-        let mut texture = self.pools[pool].1.texture(number, Some(side)).ok()?;
+        let mut texture = self.pools[pool].1.texture_with_mips(number, Some(side)).ok()?;
+        texture.name = texture_name(key);
+        let mut known = lock();
+        // Another thread may have been quicker.
+        if let Some(theirs) = known.get(&(key, side)).and_then(Weak::upgrade) {
+            return Some(theirs);
+        }
+        let texture = Arc::new(texture);
+        if known.len().is_power_of_two() {
+            known.retain(|_, t| t.strong_count() > 0);
+        }
+        known.insert((key, side), Arc::downgrade(&texture));
+        Some(texture)
+    }
+
+    /// The texture with this key, named by the key.
+    pub fn texture(&self, key: u64) -> Option<rage_formats::texture::Texture> {
+        let (pool, number) = *self.by_key.get(&key)?;
+        let mut texture = self.pools[pool].1.texture(number, Some(MAX_SIDE)).ok()?;
         texture.name = texture_name(key);
         Some(texture)
     }
@@ -77,18 +104,8 @@ pub fn catalog(game_dir: &Path) -> Arc<Catalog> {
     )
 }
 
-/// The textures the shaders of these drawables name, from the pools of the
-/// game: a dictionary of them, `None` if none was found.
-pub fn for_drawables(game_dir: &Path, drawables: &[(String, Drawable)]) -> Option<TextureDictionary> {
-    for_drawables_up_to(game_dir, drawables, MAX_SIDE)
-}
-
-/// The same with textures of at most this size.
-pub fn for_drawables_up_to(game_dir: &Path, drawables: &[(String, Drawable)], side: u32) -> Option<TextureDictionary> {
-    use rage_formats::drawable::param::{BUMP_TEX, DIFFUSE_TEX, DIFFUSE_TEX2, SPECULAR_TEX};
-    // Small ones are for views of many models, where only the colours show.
-    let wanted: &[u32] =
-        if side < MAX_SIDE { &[DIFFUSE_TEX] } else { &[DIFFUSE_TEX, DIFFUSE_TEX2, BUMP_TEX, SPECULAR_TEX] };
+/// The names of the textures of shaders, of these kinds.
+fn names<'a>(drawables: &'a [(String, Drawable)], wanted: &[u32]) -> Vec<&'a str> {
     let mut names: Vec<&str> = drawables
         .iter()
         .flat_map(|(_, d)| &d.shaders)
@@ -98,15 +115,47 @@ pub fn for_drawables_up_to(game_dir: &Path, drawables: &[(String, Drawable)], si
         .collect();
     names.sort_unstable();
     names.dedup();
+    names.truncate(MAX_TEXTURES);
+    names
+}
+
+/// The textures of drawables, shared with other models: their colours, with
+/// `all` normal and specular maps too.
+pub fn shared_for(game_dir: &Path, drawables: &[(String, Drawable)], side: u32, all: bool) -> Vec<Arc<Texture>> {
+    let wanted: &[u32] = if all {
+        &[DIFFUSE_TEX, DIFFUSE_TEX2, LAYER_1_TEX, BUMP_TEX, SPECULAR_TEX]
+    } else if side > 256 {
+        &[DIFFUSE_TEX, DIFFUSE_TEX2, LAYER_1_TEX]
+    } else {
+        &[DIFFUSE_TEX]
+    };
+    let names = names(drawables, wanted);
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let catalog = catalog(game_dir);
+    let found = names.iter().filter_map(|n| catalog.shared(u64::from_str_radix(n, 16).ok()?, side));
+    // Not the white stand-ins for a colour the game computes.
+    let stands_in = |t: &Texture| {
+        t.width <= 8
+            && t.to_rgba().is_some_and(|rgba| rgba.as_chunks::<4>().0.iter().all(|p| p[..3].iter().all(|c| *c > 225)))
+    };
+    found.filter(|t| !stands_in(t)).collect()
+}
+
+/// The textures the shaders of these drawables name, from the pools of the
+/// game: a dictionary of them, `None` if none was found.
+pub fn for_drawables(game_dir: &Path, drawables: &[(String, Drawable)]) -> Option<TextureDictionary> {
+    let names = names(drawables, &[DIFFUSE_TEX, DIFFUSE_TEX2, LAYER_1_TEX, BUMP_TEX, SPECULAR_TEX]);
     if names.is_empty() {
         return None;
     }
     let catalog = catalog(game_dir);
-    let total = names.len().min(MAX_TEXTURES);
+    let total = names.len();
     let mut textures = Vec::new();
-    for (i, name) in names.into_iter().take(MAX_TEXTURES).enumerate() {
+    for (i, name) in names.into_iter().enumerate() {
         crate::progress::set("Loading textures", i as u64, total as u64);
-        if let Some(texture) = u64::from_str_radix(name, 16).ok().and_then(|key| catalog.texture(key, side)) {
+        if let Some(texture) = u64::from_str_radix(name, 16).ok().and_then(|key| catalog.texture(key)) {
             textures.push(texture);
         }
     }
