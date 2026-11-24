@@ -443,7 +443,7 @@ fn init() -> Option<Gpu> {
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
             depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Less),
+            depth_compare: Some(wgpu::CompareFunction::Greater),
             stencil: Default::default(),
             bias: Default::default(),
         }),
@@ -485,7 +485,7 @@ fn init() -> Option<Gpu> {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -784,9 +784,10 @@ fn view_projection(cam: &Camera, w: u32, h: u32, near: f32, far: f32) -> [f32; 1
     let short = w.min(h) as f32;
     let t = (cam.fov / 2.0).tan();
     let (sx, sy) = (short / w as f32 / t, short / h as f32 / t);
-    // Perspective with depth 0..1 (wgpu).
-    let a = far / (near - far);
-    let proj = [sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 0.0, a, -1.0, 0.0, 0.0, a * near, 0.0];
+    // Perspective with depth 1 (near) to 0: floats are finest at 0, which
+    // makes up for the far being so dense. Maps are kilometres wide.
+    let a = near / (far - near);
+    let proj = [sx, 0.0, 0.0, 0.0, 0.0, sy, 0.0, 0.0, 0.0, 0.0, a, -1.0, 0.0, 0.0, a * far, 0.0];
     math::mul(&proj, &view)
 }
 
@@ -1021,7 +1022,7 @@ pub fn render_scene(
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &t.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,

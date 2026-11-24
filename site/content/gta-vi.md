@@ -52,7 +52,11 @@ Not read yet: scripts (`.#script`), particle effects (`.#pt`) and texture volume
 
 **Tools → Map of the game (3D)…** shows the whole world from afar. The search index must be complete; the first time,
 all map files are read, which takes a minute or two. A single `.#map` opens as XML; **Show in 3D** there puts its objects
-together with those around it. Interiors are not filled yet.
+together with those around it.
+
+**Fly (F)** flies through it: W A S D move, Q and E go down and up, Shift is faster, dragging looks around and the wheel
+sets the speed. In the whole map, details are loaded where the camera is, as the game's own levels of detail tell.
+ Interiors are not filled yet.
 
 On the command line: `openrage map --render map.png`, or `openrage map <path of a .#map>`.
 

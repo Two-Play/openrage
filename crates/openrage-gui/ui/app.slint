@@ -3911,6 +3911,8 @@ export component ViewerWindow inherits Window {
     in-out property <bool> show-info: true;
     // First-person camera (WASD + mouse) instead of orbiting.
     in property <bool> fly-mode;
+    // How fast the camera flies.
+    in property <string> fly-speed;
     in property <[PartRow]> parts;
     in property <[MaterialRow]> materials;
     // RDR2 peds: the outfits to choose from (empty for other models).
@@ -4101,7 +4103,7 @@ export component ViewerWindow inherits Window {
                         x: Theme.space-m;
                         y: parent.height - self.height - Theme.space-s;
                         text: !root.model-mode ? @tr("Esc closes")
-                            : root.fly-mode ? @tr("W A S D move · Q E down/up · Shift faster · drag to look · F orbits · Esc closes")
+                            : root.fly-mode ? @tr("{} · wheel changes the speed · W A S D move · Q E down/up · Shift faster · drag to look · F orbits · Esc closes", root.fly-speed)
                             : @tr("Drag to rotate · scroll to zoom · F flies · R or double-click resets · Esc closes");
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
@@ -5345,6 +5347,14 @@ export component SceneWindow inherits Window {
     out property <length> area-width: area.width;
     out property <length> area-height: area.height;
 
+    // Map scenes: a flying camera, and how fast it is.
+    in property <bool> can-fly;
+    in property <bool> fly-mode;
+    in property <string> fly-speed;
+    callback toggle-fly();
+    callback key-down(string, bool);
+    callback key-up(string, bool);
+    callback focus-lost();
     callback toggle-play();
     callback seek(float);
     callback toggle-camera();
@@ -5355,7 +5365,10 @@ export component SceneWindow inherits Window {
     changed theme-mode => { root.apply-theme(); }
     changed area-width => { root.resized(); }
     changed area-height => { root.resized(); }
-    init => { root.apply-theme(); }
+    init => {
+        root.apply-theme();
+        scope.focus();
+    }
 
     function apply-theme() {
         Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
@@ -5407,6 +5420,16 @@ export component SceneWindow inherits Window {
                 if root.has-camera: Button {
                     text: root.cut-camera ? @tr("Free camera") : @tr("Cutscene camera");
                     clicked => { root.toggle-camera(); }
+                }
+                if root.can-fly: Button {
+                    text: @tr("Fly (F)");
+                    checkable: true;
+                    checked: root.fly-mode;
+                    clicked => {
+                        self.checked = root.fly-mode;
+                        root.toggle-fly();
+                        scope.focus();
+                    }
                 }
                 if root.can-export: Button {
                     text: @tr("Export glTF…");
@@ -5498,6 +5521,7 @@ export component SceneWindow inherits Window {
                         if (e.kind == PointerEventKind.down) {
                             self.last-x = self.mouse-x;
                             self.last-y = self.mouse-y;
+                            scope.focus();
                         }
                     }
                     moved => {
@@ -5511,6 +5535,16 @@ export component SceneWindow inherits Window {
                         root.zoom(e.delta-y / 1px);
                         return EventResult.accept;
                     }
+                }
+                if root.can-fly && !root.loading && root.load-text == "": Text {
+                    x: Theme.space-m;
+                    y: parent.height - self.height - Theme.space-s;
+                    width: parent.width - 2 * Theme.space-m;
+                    text: root.fly-mode ? @tr("{} · wheel changes the speed · W A S D move · Q E down/up · Shift faster · drag to look · F orbits", root.fly-speed)
+                        : @tr("Drag to turn · scroll to zoom · F flies");
+                    font-size: Theme.font-small;
+                    overflow: elide;
+                    color: #b0b0b0;
                 }
             }
             if root.objects.length > 0: Rectangle {
@@ -5626,13 +5660,26 @@ export component SceneWindow inherits Window {
             }
         }
     }
-    FocusScope {
+    scope := FocusScope {
         key-pressed(e) => {
-            if (e.text == " ") {
+            if (e.text == " " && root.timeline) {
                 root.toggle-play();
                 return EventResult.accept;
             }
+            if (root.can-fly) {
+                root.key-down(e.text, e.modifiers.shift);
+                return EventResult.accept;
+            }
             return EventResult.reject;
+        }
+        key-released(e) => {
+            root.key-up(e.text, e.modifiers.shift);
+            return EventResult.accept;
+        }
+        changed has-focus => {
+            if (!self.has-focus) {
+                root.focus-lost();
+            }
         }
     }
 }

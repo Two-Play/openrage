@@ -224,12 +224,21 @@ pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
         let waiting = std::rc::Rc::new(slint::Timer::default());
         let (started, timer) = (Instant::now(), std::rc::Rc::clone(&waiting));
         waiting.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
-            if !scene::ready() && started.elapsed() < Duration::from_secs(180) {
+            if !scene::ready() && started.elapsed() < Duration::from_secs(600) {
                 return;
             }
             timer.stop();
             let path = path.clone();
-            slint::Timer::single_shot(Duration::from_millis(800), move || {
+            // `OPENRAGE_FLY_TO=x,y,z,yaw,pitch`, and `OPENRAGE_FLY_WAIT=<s>` for the details to load.
+            let to: Vec<f32> = std::env::var("OPENRAGE_FLY_TO")
+                .map(|t| t.split(',').filter_map(|v| v.parse().ok()).collect())
+                .unwrap_or_default();
+            let mut wait = 800;
+            if let Ok(to) = <[f32; 5]>::try_from(to) {
+                scene::fly_to(to);
+                wait += std::env::var("OPENRAGE_FLY_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(20) * 1000;
+            }
+            slint::Timer::single_shot(Duration::from_millis(wait), move || {
                 if let Some(Ok(img)) = scene::newest().map(|w| w.window().take_snapshot()) {
                     let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
                         .map(|png| std::fs::write(&path, png));

@@ -3,7 +3,8 @@
 
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use openrage_app::anim::Binding;
 use openrage_app::cutscene::{self, Actor, Cutscene};
+use openrage_app::gta6_world::{self, Lod};
 use openrage_app::models::Look;
 use openrage_app::render::{self, Camera, View};
 use openrage_app::{gta4_cutscene, gta4_effects};
@@ -20,6 +22,8 @@ use rage_formats::math::{self, Mat4};
 use rage_rpf::vfs::Node;
 use slint::ComponentHandle;
 
+use crate::fly::Fly;
+use crate::stream::{Drawn, Stream, scene_look};
 use crate::{AppWindow, ModelPreview, SceneWindow};
 
 struct SceneActor {
@@ -83,9 +87,28 @@ struct State {
     effects: Vec<gta4_effects::Instance>,
     effect_library: Arc<gta4_effects::Library>,
     timer: slint::Timer,
+    /// The flying camera, when it flies, and what moves it.
+    fly: Option<Fly>,
+    fly_timer: slint::Timer,
+    /// Loads the details of GTA VI's whole map around the camera.
+    stream: Option<Stream>,
 }
 
 impl State {
+    /// The camera when no cutscene's is used.
+    fn free_camera(&self) -> render::Camera {
+        let (lo, hi) = self.bounds;
+        match &self.fly {
+            Some(f) => {
+                let mut camera = f.camera((0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f32>().sqrt() / 2.0);
+                // It can be close to things however large the scene is.
+                camera.distance = camera.distance.min(50.0);
+                camera
+            }
+            None => render::orbit_camera(lo, hi, self.view),
+        }
+    }
+
     /// Makes the sound follow the scene: playing from the scene's time while
     /// it plays and the sound is on, stopped otherwise.
     fn sync_sound(&mut self) {
@@ -599,6 +622,9 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
         effects: instances,
         effect_library: effects.library,
         timer: slint::Timer::default(),
+        fly: None,
+        fly_timer: slint::Timer::default(),
+        stream: None,
     });
     if let Some(st) = state.borrow_mut().as_mut() {
         st.sync_sound();
@@ -895,6 +921,12 @@ fn cut_camera(st: &State) -> Option<Camera> {
 }
 
 fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
+    if let Some(st) = state.borrow_mut().as_mut() {
+        let eye = st.free_camera().eye;
+        if let Some(stream) = &mut st.stream {
+            stream.look_from(eye);
+        }
+    }
     let st = state.borrow();
     let Some(st) = st.as_ref() else { return };
     let width = win.get_area_width().max(64.0) as u32;
@@ -943,8 +975,7 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
             }
         }
     }
-    let camera = if st.cut_camera { cut_camera(st) } else { None }
-        .unwrap_or_else(|| render::orbit_camera(st.bounds.0, st.bounds.1, st.view));
+    let camera = if st.cut_camera { cut_camera(st) } else { None }.unwrap_or_else(|| st.free_camera());
     let gpu = if std::env::var_os("OPENRAGE_SOFTWARE_RENDERER").is_none() {
         // Animated lights (GTA IV) where they are now.
         let animated: Vec<crate::gpu::SceneLight>;
@@ -1061,10 +1092,9 @@ pub fn open_map(ui: &AppWindow, vpath: String) {
                 // GTA IV: a placement file (.wpl) or a map archive (.img).
                 openrage_app::gta4::load_map(&game_dir, &vpath, &|done, total| progress.step(done, total))?
             } else if openrage_app::detect::is_gta6_dir(&game_dir) {
-                use openrage_app::gta6_world;
                 let show = |what: &str, done, total| progress.set(what, done, total);
                 if vpath.is_empty() {
-                    gta6_world::overview(&game_dir, &show)?
+                    return load_whole_map(&game_dir, &show);
                 } else {
                     gta6_world::place(&game_dir, &vpath, gta6_world::AROUND, &show)?
                 }
@@ -1085,7 +1115,8 @@ pub fn open_map(ui: &AppWindow, vpath: String) {
                     (ModelPreview { loaded, look, materials, name }, transforms)
                 })
                 .collect();
-            Ok(MapLoaded { models, objects: scene.objects, missing: scene.missing.iter().map(|(_, n)| n).sum() })
+            let missing = scene.missing.iter().map(|(_, n)| n).sum();
+            Ok(MapLoaded { models, objects: scene.objects, missing, lod: None })
         })();
         progress.set("", 0, 0);
         let _ = weak.upgrade_in_event_loop(move |win| {
@@ -1108,6 +1139,30 @@ struct MapLoaded {
     objects: usize,
     /// Objects whose model was not found.
     missing: usize,
+    /// The whole map of GTA VI, whose details are loaded around the camera,
+    /// and the hashes of the models' names.
+    lod: Option<(Arc<Lod>, Vec<u32>)>,
+}
+
+/// GTA VI's whole map from afar.
+fn load_whole_map(game: &Path, show: &gta6_world::Progress) -> anyhow::Result<MapLoaded> {
+    let lod = Arc::new(Lod::open(game, show)?);
+    let loaded = lod.load(&lod.far(), true, &|done, total| show("Loading the map's models", done, total));
+    let mut places = lod.cut(&[0.0, 0.0, 1e6], &|_| true, &|_| false, std::iter::empty()).draw;
+    let objects = places.values().map(Vec::len).sum();
+    let (keys, models): (Vec<u32>, Vec<_>) = loaded
+        .into_par_iter()
+        .map(|(key, name, loaded)| {
+            let materials = render::Materials::new(&loaded);
+            let look = std::sync::RwLock::new(loaded.default_look());
+            (key, ModelPreview { loaded, look, materials, name })
+        })
+        .unzip();
+    anyhow::ensure!(!models.is_empty(), "the map files of this game have no distant view");
+    let models: Vec<(ModelPreview, Vec<Mat4>)> =
+        models.into_iter().zip(&keys).map(|(p, key)| (p, places.remove(key).unwrap_or_default())).collect();
+    let missing = places.values().map(Vec::len).sum();
+    Ok(MapLoaded { models, objects, missing, lod: Some((lod, keys)) })
 }
 
 fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
@@ -1115,16 +1170,14 @@ fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
         .models
         .into_iter()
         .map(|(p, transforms)| {
-            let mut look = p.loaded.default_look();
-            // Decals need blending the scene does not do (see load_surroundings).
-            for (slot, l) in p.loaded.materials.iter().zip(look.materials.iter_mut()) {
-                if rage_formats::shaders::name(slot.name_hash).is_some_and(|n| n.contains("decal")) {
-                    l.visible = false;
-                }
-            }
+            let look = scene_look(&p);
             (Arc::new(p), look, transforms)
         })
         .collect();
+    let far: Option<HashMap<u32, Arc<ModelPreview>>> = scene
+        .lod
+        .as_ref()
+        .map(|(_, keys)| keys.iter().copied().zip(surroundings.iter().map(|(p, ..)| Arc::clone(p))).collect());
     surroundings.sort_by(|a, b| a.0.name.cmp(&b.0.name));
     let items: Vec<(&openrage_app::models::LoadedModel, &Look, &[Mat4])> =
         surroundings.iter().map(|(p, l, t)| (&p.loaded, l, t.as_slice())).collect();
@@ -1133,8 +1186,10 @@ fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
         .iter()
         .map(|(p, _, t)| crate::PartRow { name: p.name.clone().into(), visible: true, level: 0, count: t.len() as i32 })
         .collect();
-    win.set_objects(slint::ModelRc::new(slint::VecModel::from(rows)));
+    // What is there changes with the camera in a whole map.
+    win.set_objects(slint::ModelRc::new(slint::VecModel::from(if far.is_some() { Vec::new() } else { rows })));
     win.set_can_export(!surroundings.is_empty());
+    win.set_can_fly(true);
     let (lo, hi) = bounds;
     let mut status = format!(
         "{} objects · {} models · {:.0} × {:.0} m",
@@ -1146,7 +1201,6 @@ fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
     if scene.missing > 0 {
         status.push_str(&format!(" · {} without a model", scene.missing));
     }
-    status.push_str(" · drag to turn, scroll to zoom");
     win.set_status(status.into());
     let object_shown = vec![true; surroundings.len()];
     *state.borrow_mut() = Some(State {
@@ -1175,8 +1229,39 @@ fn start_map(win: &SceneWindow, state: &Shared, scene: MapLoaded) {
         effects: Vec::new(),
         effect_library: Arc::default(),
         timer: slint::Timer::default(),
+        fly: None,
+        fly_timer: slint::Timer::default(),
+        stream: None,
     });
+    if let (Some((lod, _)), Some(far)) = (scene.lod, far) {
+        let weak = win.as_weak();
+        let stream = Stream::start(lod, far, move |drawn, more| {
+            let weak = weak.clone();
+            weak.upgrade_in_event_loop(move |win| show_stream(&win, drawn, more)).is_ok()
+        });
+        if let Some(st) = state.borrow_mut().as_mut() {
+            st.stream = Some(stream);
+        }
+    }
     render_frame(win, state);
+}
+
+/// The whole map in the detail loaded by now.
+fn show_stream(win: &SceneWindow, drawn: Drawn, more: bool) {
+    let state = OPEN.with(|o| {
+        let open = o.borrow();
+        let window = |w: &SceneWindow| std::ptr::eq(w.window(), win.window());
+        open.iter().find(|(_, w, _)| window(w)).map(|(.., s)| Rc::clone(s))
+    });
+    let Some(state) = state else { return };
+    if let Some(st) = state.borrow_mut().as_mut() {
+        let objects: usize = drawn.iter().map(|(.., places)| places.len()).sum();
+        let loading = if more { " · loading details …" } else { "" };
+        win.set_status(format!("{objects} objects · {} models{loading}", drawn.len()).into());
+        st.object_shown = vec![true; drawn.len()];
+        st.surroundings = drawn;
+    }
+    render_frame(win, &state);
 }
 
 /// The object list and the export of a map scene.
@@ -1228,6 +1313,45 @@ fn wire_map(win: &SceneWindow, state: &Shared, main: slint::Weak<AppWindow>, nam
 
 fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
+    win.on_toggle_fly(move || toggle_fly(&w, &s));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
+    win.on_key_down(move |text, shift| {
+        let key = text.to_lowercase();
+        if key == "f" {
+            toggle_fly(&w, &s);
+            return;
+        }
+        let mut st = s.borrow_mut();
+        let Some(st) = st.as_mut() else { return };
+        if st.fly.as_mut().is_some_and(|f| f.key_down(&key, shift)) && !st.fly_timer.running() {
+            let (w, s) = (w.clone(), Rc::clone(&s));
+            st.fly_timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || {
+                let Some(win) = w.upgrade() else { return };
+                if let Some(f) = s.borrow_mut().as_mut().and_then(|st| st.fly.as_mut()) {
+                    f.tick();
+                }
+                render_frame(&win, &s);
+            });
+        }
+    });
+    let s = Rc::clone(state);
+    win.on_key_up(move |text, shift| {
+        if let Some(st) = s.borrow_mut().as_mut()
+            && !st.fly.as_mut().is_some_and(|f| f.key_up(&text.to_lowercase(), shift))
+        {
+            st.fly_timer.stop();
+        }
+    });
+    let s = Rc::clone(state);
+    win.on_focus_lost(move || {
+        if let Some(st) = s.borrow_mut().as_mut() {
+            if let Some(f) = &mut st.fly {
+                f.release();
+            }
+            st.fly_timer.stop();
+        }
+    });
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_play(move || {
         let Some(win) = w.upgrade() else { return };
         if let Some(st) = s.borrow_mut().as_mut() {
@@ -1271,8 +1395,13 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         if let Some(st) = s.borrow_mut().as_mut() {
             st.cut_camera = false;
             win.set_cut_camera(false);
-            st.view.yaw -= dx * 0.01;
-            st.view.pitch = (st.view.pitch + dy * 0.01).clamp(-1.4, 1.4);
+            match &mut st.fly {
+                Some(f) => f.look(dx, dy),
+                None => {
+                    st.view.yaw -= dx * 0.01;
+                    st.view.pitch = (st.view.pitch + dy * 0.01).clamp(-1.5, 1.5);
+                }
+            }
         }
         render_frame(&win, &s);
     });
@@ -1282,7 +1411,14 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         if let Some(st) = s.borrow_mut().as_mut() {
             st.cut_camera = false;
             win.set_cut_camera(false);
-            st.view.zoom = (st.view.zoom * (1.0 + delta * 0.001)).clamp(0.1, 20.0);
+            match &mut st.fly {
+                Some(f) => {
+                    f.wheel(delta);
+                    win.set_fly_speed(f.speed_text().into());
+                }
+                // Far enough in to see a street of a whole map.
+                None => st.view.zoom = (st.view.zoom * 1.1f32.powf(delta / 120.0)).clamp(0.1, 200.0),
+            }
         }
         render_frame(&win, &s);
     });
@@ -1314,11 +1450,48 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
     });
 }
 
+/// Switches between orbiting and flying, starting where the camera is.
+fn toggle_fly(w: &slint::Weak<SceneWindow>, state: &Shared) {
+    let Some(win) = w.upgrade() else { return };
+    if let Some(st) = state.borrow_mut().as_mut() {
+        st.fly_timer.stop();
+        st.fly = match st.fly.take() {
+            Some(_) => None,
+            None => {
+                let from = if st.cut_camera { cut_camera(st) } else { None }.unwrap_or_else(|| st.free_camera());
+                let mut fly = Fly::new(&from, 0.0);
+                // A large scene is not crossed in seconds, a small one not in minutes.
+                fly.set_speed((from.distance * 0.1).clamp(3.0, 400.0));
+                Some(fly)
+            }
+        };
+        st.cut_camera = false;
+        win.set_cut_camera(false);
+        win.set_fly_mode(st.fly.is_some());
+        win.set_fly_speed(st.fly.as_ref().map(Fly::speed_text).unwrap_or_default().into());
+    }
+    render_frame(&win, state);
+}
+
 /// Forgets a closed window (after the close event has been handled).
 fn forget_closed() {
     slint::Timer::single_shot(Duration::ZERO, || {
         OPEN.with(|o| o.borrow_mut().retain(|(_, w, _)| w.window().is_visible()));
     });
+}
+
+/// Flies the newest scene's camera to a place (for debug snapshots): x, y, z, yaw, pitch.
+#[cfg(debug_assertions)]
+pub fn fly_to(place: [f32; 5]) {
+    let Some((win, state)) = OPEN.with(|o| o.borrow().last().map(|(_, w, s)| (w.clone_strong(), Rc::clone(s)))) else {
+        return;
+    };
+    if let Some(st) = state.borrow_mut().as_mut() {
+        let [x, y, z, yaw, pitch] = place;
+        st.fly = Some(Fly::new(&render::fly_camera([x, y, z], yaw, pitch, 1.0), 100.0));
+        win.set_fly_mode(true);
+    }
+    render_frame(&win, &state);
 }
 
 /// Whether the newest scene has loaded (for debug snapshots).

@@ -4,7 +4,6 @@
 //! several models can be compared side by side while browsing on.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +11,7 @@ use std::time::{Duration, Instant};
 use openrage_app::render::{self, Camera, View};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 
+use crate::fly::Fly;
 use crate::{AppWindow, ClipRow, MaterialRow, ModelPreview, PartRow, ViewerWindow};
 use openrage_app::anim::Binding;
 use rage_formats::clip::ClipDictionary;
@@ -51,14 +51,6 @@ pub enum Content {
     Image(slint::Image),
 }
 
-/// First-person camera.
-#[derive(Clone, Copy)]
-struct Fly {
-    eye: [f32; 3],
-    yaw: f32,
-    pitch: f32,
-}
-
 /// What a row of the parts list stands for.
 #[derive(Clone)]
 enum PartEntry {
@@ -76,11 +68,7 @@ struct State {
     entries: Vec<(String, i32, PartEntry)>,
     view: View,
     fly: Option<Fly>,
-    /// Movement keys held down (lower-case), and whether Shift is held.
-    keys: HashSet<String>,
-    fast: bool,
     timer: slint::Timer,
-    last_tick: Instant,
     /// Waits for an outfit loading in the background.
     outfit_timer: slint::Timer,
 }
@@ -101,17 +89,15 @@ impl State {
     }
 
     fn camera(&self, lo: [f32; 3], hi: [f32; 3]) -> Camera {
-        match self.fly {
+        match &self.fly {
             Some(f) => {
                 let radius = (0..3).map(|i| (hi[i] - lo[i]).powi(2)).sum::<f32>().sqrt() / 2.0;
-                render::fly_camera(f.eye, f.yaw, f.pitch, radius)
+                f.camera(radius)
             }
             None => render::orbit_camera(lo, hi, self.view),
         }
     }
 }
-
-const MOVE_KEYS: [&str; 6] = ["w", "a", "s", "d", "q", "e"];
 
 thread_local! {
     static OPEN: RefCell<Vec<(u64, ViewerWindow)>> = const { RefCell::new(Vec::new()) };
@@ -181,10 +167,7 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         entries,
         view: View::default(),
         fly: None,
-        keys: HashSet::new(),
-        fast: false,
         timer: slint::Timer::default(),
-        last_tick: Instant::now(),
         outfit_timer: slint::Timer::default(),
     }));
 
@@ -193,10 +176,7 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         let mut st = s.borrow_mut();
         match &mut st.fly {
             // Dragging looks around.
-            Some(f) => {
-                f.yaw -= dx * 0.005;
-                f.pitch = (f.pitch - dy * 0.005).clamp(-1.55, 1.55);
-            }
+            Some(f) => f.look(dx, dy),
             None => {
                 st.view.yaw -= dx * 0.01;
                 st.view.pitch = (st.view.pitch + dy * 0.01).clamp(-1.5, 1.5);
@@ -208,13 +188,10 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
     let (w, s) = (win.as_weak(), Rc::clone(&state));
     win.on_zoom(move |delta| {
         let mut st = s.borrow_mut();
-        if st.fly.is_some() {
-            // The wheel moves forward and back.
-            let step = st.bounds().map_or(1.0, |(lo, hi)| (0..3).map(|i| hi[i] - lo[i]).fold(0.0, f32::max) * 0.05);
-            if let Some(f) = &mut st.fly {
-                let cam = render::fly_camera(f.eye, f.yaw, f.pitch, 1.0);
-                let d = step * delta.signum();
-                f.eye = [f.eye[0] + cam.forward[0] * d, f.eye[1] + cam.forward[1] * d, f.eye[2] + cam.forward[2] * d];
+        if let Some(f) = &mut st.fly {
+            f.wheel(delta);
+            if let Some(win) = w.upgrade() {
+                win.set_fly_speed(f.speed_text().into());
             }
         } else {
             st.view.zoom = (st.view.zoom * 1.1f32.powf(delta / 120.0)).clamp(0.2, 20.0);
@@ -250,13 +227,10 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
             return;
         }
         let mut st = s.borrow_mut();
-        st.fast = shift;
-        if st.fly.is_none() || !MOVE_KEYS.contains(&key.as_str()) {
+        if !st.fly.as_mut().is_some_and(|f| f.key_down(&key, shift)) {
             return;
         }
-        st.keys.insert(key);
         if !st.timer.running() {
-            st.last_tick = Instant::now();
             let (w2, s2) = (w.clone(), Rc::clone(&s));
             st.timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || tick(&w2, &s2));
         }
@@ -264,16 +238,16 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
     let s = Rc::clone(&state);
     win.on_key_up(move |text, shift| {
         let mut st = s.borrow_mut();
-        st.fast = shift;
-        st.keys.remove(&text.to_lowercase());
-        if st.keys.is_empty() {
+        if !st.fly.as_mut().is_some_and(|f| f.key_up(&text.to_lowercase(), shift)) {
             st.timer.stop();
         }
     });
     let s = Rc::clone(&state);
     win.on_focus_lost(move || {
         let mut st = s.borrow_mut();
-        st.keys.clear();
+        if let Some(f) = &mut st.fly {
+            f.release();
+        }
         st.timer.stop();
     });
     let (w, s) = (win.as_weak(), Rc::clone(&state));
@@ -333,7 +307,6 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         let mut st = s.borrow_mut();
         st.view = View::default();
         st.fly = None;
-        st.keys.clear();
         st.timer.stop();
         drop(st);
         if let Some(win) = w.upgrade() {
@@ -659,39 +632,24 @@ fn toggle_fly(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>) {
     if st.fly.take().is_none() {
         let Some((lo, hi)) = st.bounds() else { return };
         let cam = render::orbit_camera(lo, hi, st.view);
-        let f = cam.forward;
-        st.fly = Some(Fly { eye: cam.eye, yaw: f[1].atan2(f[0]), pitch: f[2].clamp(-1.0, 1.0).asin() });
+        st.fly = Some(Fly::new(&cam, 2.0 * cam.radius));
     }
-    st.keys.clear();
     st.timer.stop();
     let flying = st.fly.is_some();
+    let speed = st.fly.as_ref().map(Fly::speed_text).unwrap_or_default();
     drop(st);
     if let Some(win) = w.upgrade() {
         win.set_fly_mode(flying);
+        win.set_fly_speed(speed.into());
     }
     render(w, state);
 }
 
 /// Moves the flying camera while movement keys are held.
 fn tick(w: &slint::Weak<ViewerWindow>, state: &Rc<RefCell<State>>) {
-    let mut st = state.borrow_mut();
-    let dt = st.last_tick.elapsed().as_secs_f32().min(0.1);
-    st.last_tick = Instant::now();
-    let size = st.bounds().map_or(2.0, |(lo, hi)| (0..3).map(|i| (hi[i] - lo[i]).powi(2)).sum::<f32>().sqrt());
-    let speed = size * 0.35 * if st.fast { 4.0 } else { 1.0 } * dt;
-    let held = |k: &str| st.keys.contains(k);
-    let (fwd, side, vert) = (
-        (held("w") as i32 - held("s") as i32) as f32,
-        (held("d") as i32 - held("a") as i32) as f32,
-        (held("e") as i32 - held("q") as i32) as f32,
-    );
-    let Some(f) = &mut st.fly else { return };
-    let cam = render::fly_camera(f.eye, f.yaw, f.pitch, 1.0);
-    for i in 0..3 {
-        let up = if i == 2 { 1.0 } else { 0.0 };
-        f.eye[i] += (cam.forward[i] * fwd + cam.right[i] * side + up * vert) * speed;
+    if let Some(f) = &mut state.borrow_mut().fly {
+        f.tick();
     }
-    drop(st);
     render(w, state);
 }
 

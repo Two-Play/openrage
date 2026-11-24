@@ -195,21 +195,8 @@ pub fn orbit_camera(lo: [f32; 3], hi: [f32; 3], view: View) -> Camera {
     let forward = norm([-towards[0], -towards[1], -towards[2]]);
     let right = norm(cross(forward, [0.0, 0.0, 1.0]));
     let up = cross(right, forward);
-    // What is near looks larger, so the middle of the picture is not that of
-    // the model. The camera moves sideways by the difference (the same at
-    // every zoom).
-    let half = [(hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0, (hi[2] - lo[2]) / 2.0];
-    let shift = |axis: V3| {
-        let (mut min, mut max) = (f32::MAX, f32::MIN);
-        for corner in 0..8 {
-            let p: V3 = std::array::from_fn(|k| if corner >> k & 1 == 0 { -half[k] } else { half[k] });
-            let seen = dot(p, axis) / (whole + dot(p, forward));
-            (min, max) = (min.min(seen), max.max(seen));
-        }
-        (min + max) / 2.0 * whole
-    };
-    let (sx, sy) = (shift(right), shift(up));
-    let eye = std::array::from_fn(|k| center[k] + distance * towards[k] + sx * right[k] + sy * up[k]);
+    // Nothing but the angles moves the camera: around the middle, on a circle.
+    let eye = std::array::from_fn(|k| center[k] + distance * towards[k]);
     Camera { eye, forward, right, up, distance, radius, fov }
 }
 

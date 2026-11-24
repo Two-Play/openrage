@@ -311,7 +311,14 @@ impl NativeArchive {
 
     /// The slot with this path (case-insensitive).
     pub fn find(&self, path: &str) -> Option<usize> {
-        self.by_path.get(&path.to_ascii_lowercase()).copied()
+        let path = path.to_ascii_lowercase();
+        self.by_path.get(&path).copied().or_else(|| {
+            // Its name was learned since: the stand-in has the slot and the hash.
+            let (slot, rest) = path.strip_prefix(UNNAMED)?.strip_prefix('/')?.split_once('_')?;
+            let hash = u64::from_str_radix(rest.get(..16)?, 16).ok()?;
+            let slot: usize = slot.parse().ok()?;
+            self.catalog.entries.get(slot).filter(|e| e.slot == slot && e.name_hash64 == Some(hash)).map(|e| e.slot)
+        })
     }
 
     /// The path-like strings in an archive's own files.
@@ -380,7 +387,7 @@ const SELF_NAMED: [u8; 10] = [2, 3, 4, 66, 67, 69, 70, 72, 102, 109];
 /// Larger members are not searched for their own name.
 const LEARN_MAX: u64 = 8 << 20;
 /// Opened archives to keep.
-const KEPT: usize = 16;
+const KEPT: usize = 192;
 /// Larger members are not searched for names of others.
 const STRINGS_MAX: u64 = 64 << 20;
 
