@@ -1451,7 +1451,7 @@ FX_CS_spit:effect1_0 0 1205 500 500 0 0 0 0 0 0 0\n[/EFFECTS]\n[DURATION]\n2000\
     #[test]
     fn props_move_by_their_root() {
         use rage_formats::clip::BoneTrack;
-        let track = |bone, track, format| BoneTrack { bone, format, track };
+        let track = |bone, track, format| BoneTrack { bone, format, track, ..Default::default() };
         let body = Animation::from_frames(
             2,
             1.0,

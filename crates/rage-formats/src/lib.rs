@@ -10,6 +10,7 @@
 pub mod awc;
 pub mod bcpack;
 pub mod clip;
+pub mod clip6;
 pub mod dds;
 pub mod drawable;
 pub mod drawable6;

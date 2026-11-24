@@ -80,6 +80,7 @@ openrage model …/adder.yft --render adder.png [--yaw 1.2]      # software-rend
 openrage export-openformats …/prop_x.ydr -o out/              # OpenIV openFormats: .odr/.oft/.odd/.otd + .mesh, .skel, .dds
 openrage audio x64/audio/sfx/RADIO_02_POP.rpf/alright.awc --export out/   # sounds → .wav
 openrage clips x64c.rpf/anim/ingame/clip_move_.rpf/move_m@generic.ycd     # clips of a .ycd
+openrage clips …/clip_car.rpf/gameplay@vehicles@….#cd      # clips of a GTA VI .#cd
 openrage model …/a_m_y_hipster_01.ydd --render pose.png --anim "…/move_m@generic.ycd:walk@0.5"
 openrage model …/csb_bogdan.ydd --render pose.png --anim "…/cuts_sil.rpf/sil_int.cut:csb_bogdan_dual@75"   # cutscene pose
 openrage xml …/ufo.ymap [-o ufo.ymap.xml]      # metadata (.ymap/.ytyp/.ymt/.ymf/.cut/.pso) → XML

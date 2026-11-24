@@ -98,6 +98,11 @@ impl Skeleton {
         self.bones.iter().position(|b| b.tag == tag)
     }
 
+    /// The bone whose name has this hash (GTA VI's animations name bones so).
+    pub fn find_hash(&self, hash: u32) -> Option<usize> {
+        self.bones.iter().position(|b| rage_core::hash::joaat(&b.name) == hash)
+    }
+
     pub fn find_name(&self, name: &str) -> Option<usize> {
         self.bones.iter().position(|b| b.name.eq_ignore_ascii_case(name))
     }

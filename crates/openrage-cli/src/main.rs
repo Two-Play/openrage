@@ -216,7 +216,6 @@ fn run() -> Result<()> {
             if textures
                 || models
                 || audio
-                || animations
                 || meta
                 || text
                 || particles
@@ -229,8 +228,11 @@ fn run() -> Result<()> {
                 || openformats
             {
                 bail!(
-                    "GTA VI verification currently checks recovered RPF9 data only; use `verify <path>` without format or rebuild flags"
+                    "GTA VI verification checks archive data, or clip dictionaries with --animations; use `verify <path>` without other format or rebuild flags"
                 );
+            }
+            if animations {
+                return cmd_verify_animations(&game_dir, &path, keys);
             }
             cmd_verify(&game_dir, &path, keys)
         }
