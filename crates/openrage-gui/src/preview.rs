@@ -401,26 +401,23 @@ pub(crate) fn video_frame(name: &str, data: &[u8]) -> Option<Rgba> {
 /// Returns (metadata, preview body).
 pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, String) {
     match source {
-        PreviewSource::Virtual { game_dir, vpath, query, overlay } => match if overlay {
+        PreviewSource::Virtual { game_dir, vpath, query: Some(query), overlay } => {
+            let matching = vfs::resolve(&game_dir, &vpath, keys.clone())
+                .ok()
+                .and_then(|node| rage_index::snippet(&rage_index::node_text(&node)?, &query));
+            let (mut meta, body) =
+                load_preview_text(PreviewSource::Virtual { game_dir, vpath, query: None, overlay }, keys);
+            if let Some(line) = matching {
+                meta.insert(0, kv("Match", line));
+            }
+            (meta, body)
+        }
+        PreviewSource::Virtual { game_dir, vpath, query: None, overlay } => match if overlay {
             rage_mods::resolve(&game_dir, &vpath, keys.clone()).map(|(n, _)| n)
         } else {
             vfs::resolve(&game_dir, &vpath, keys.clone())
         } {
-            Ok(Node::ArchiveFile(rpf, id)) => {
-                let (mut meta, body) = load_preview_text(PreviewSource::Entry(Arc::clone(&rpf), id), keys);
-                if let Some(q) = query {
-                    let name = rpf.entry(id).name.clone();
-                    let line = rpf
-                        .read(id)
-                        .ok()
-                        .and_then(|d| rage_index::content_for(&name, &d))
-                        .and_then(|(text, _)| rage_index::snippet(&text, &q));
-                    if let Some(line) = line {
-                        meta.insert(0, kv("Match", line));
-                    }
-                }
-                (meta, body)
-            }
+            Ok(Node::ArchiveFile(rpf, id)) => load_preview_text(PreviewSource::Entry(rpf, id), keys),
             Ok(Node::ArchiveDir(rpf, id)) if id == Rpf7::ROOT => (archive_info(&rpf), String::new()),
             Ok(Node::ArchiveDir(..)) | Ok(Node::Dir(_)) => (Meta::new(), String::new()),
             Ok(Node::PlainFile(p)) => load_preview_text(PreviewSource::DiskFile(p), keys),

@@ -384,6 +384,13 @@ impl Rpf9 {
         }
     }
 
+    /// The 32-bit name hash of an entry whose name is not known, if the
+    /// archive's own table has one: of its path without a known extension.
+    pub fn unnamed_hash(&self, entry: &Entry) -> Option<u32> {
+        let (native, e) = self.native_entry(entry)?;
+        e.name_hash32.filter(|_| native.is_unnamed(e))
+    }
+
     /// Opens an archive inside this one.
     pub fn open_child(&self, entry: &Entry) -> Result<Rpf9, RpfError> {
         let display = format!("{}/{}", self.display, self.entry_name(entry));

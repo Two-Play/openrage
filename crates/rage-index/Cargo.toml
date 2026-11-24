@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 rage-core.workspace = true
 rage-crypto.workspace = true
+rage-formats.workspace = true
+rage-resource.workspace = true
 rage-rpf.workspace = true
 rayon.workspace = true
 rusqlite.workspace = true

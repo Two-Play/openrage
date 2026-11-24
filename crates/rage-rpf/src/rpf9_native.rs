@@ -185,10 +185,12 @@ impl NativeArchive {
     }
 
     fn unnamed(&self) -> impl Iterator<Item = &NativeEntry> {
-        self.catalog
-            .entries
-            .iter()
-            .filter(|e| self.paths[e.slot].strip_prefix(UNNAMED).is_some_and(|rest| rest.starts_with('/')))
+        self.catalog.entries.iter().filter(|e| self.is_unnamed(e))
+    }
+
+    /// Whether an entry is listed by its slot, as its name is not known.
+    pub fn is_unnamed(&self, entry: &NativeEntry) -> bool {
+        self.paths[entry.slot].strip_prefix(UNNAMED).is_some_and(|rest| rest.starts_with('/'))
     }
 
     /// Names of unnamed entries that follow from a pattern or from the names

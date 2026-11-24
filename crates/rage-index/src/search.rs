@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use rage_core::hash::joaat;
 use rusqlite::params;
 
+use crate::content::hashed_names;
 use crate::{EntryTag, Index, IndexError};
 
 /// Why an entry matched.
@@ -60,11 +61,14 @@ pub fn parse_hash(query: &str) -> Option<u32> {
     None
 }
 
-/// Text languages of GTA V, as used in the names of its `*.rpf` language archives.
-pub const LANGUAGES: [&str; 13] = [
+/// Text languages of the games, as used in the names of its `*.rpf` language archives.
+/// `brazilian` and `chinesetrad` are GTA VI's.
+pub const LANGUAGES: [&str; 15] = [
     "american",
+    "brazilian",
     "chinese",
     "chinesesimp",
+    "chinesetrad",
     "french",
     "german",
     "italian",
@@ -77,26 +81,33 @@ pub const LANGUAGES: [&str; 13] = [
     "spanish",
 ];
 
-/// Language of a localized file, derived from its path (`…/germandlc.rpf/…`, `…/german_rel.rpf/…`, `…/lang/german/…`).
+/// Language of a localized file, derived from its path (`…/germandlc.rpf/…`, `…/german_rel.rpf/…`,
+/// `…/german_final.rpf/…`, `…/lang/german/…`).
 pub fn language_of(vpath: &str) -> Option<&'static str> {
     vpath.split('/').find_map(|seg| {
         let seg = seg.to_ascii_lowercase();
         // GTA IV keeps its text tables loose: `common/text/german.gxt`.
         let base = seg.strip_suffix(".rpf").or_else(|| seg.strip_suffix(".gxt")).unwrap_or(&seg);
-        let base = base.strip_suffix("dlc").or_else(|| base.strip_suffix("_rel")).unwrap_or(base);
+        let base = ["dlc", "_rel", "_final"].iter().find_map(|end| base.strip_suffix(end)).unwrap_or(base);
         LANGUAGES.iter().find(|&&l| l == base).copied()
     })
 }
 
 /// FTS5 query: every whitespace-separated term must appear (prefix match).
+/// Other characters end a word in the text too, so `vehicles.meta` means its
+/// words next to each other. A single name may also appear as its hash.
 fn fts_query(query: &str) -> Option<String> {
     let terms: Vec<String> = query
         .split_whitespace()
-        .map(|t| t.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect::<String>())
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{t}\"*"))
+        .map(|t| t.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| !w.is_empty()).collect::<Vec<_>>())
+        .filter(|words| !words.is_empty())
+        .map(|words| format!("\"{}\"*", words.join(" ")))
         .collect();
-    (!terms.is_empty()).then(|| terms.join(" "))
+    let terms = (!terms.is_empty()).then(|| terms.join(" "))?;
+    Some(match hashed_names(query.trim()) {
+        Some([exact, lower]) => format!("{terms} OR \"{exact}\" OR \"{lower}\""),
+        None => terms,
+    })
 }
 
 fn like_pattern(query: &str) -> String {
@@ -155,20 +166,26 @@ impl Index {
                 .query_map(params![hash as i64, fetch], row_to_hit(HitReason::NameHash))?
                 .collect::<Result<_, _>>()?;
             push(hits, &mut results);
-            // GXT2 labels are indexed as `0xHASH text` lines.
+            // GXT2 labels are indexed as `0xHASH text` lines, unknown names in
+            // metadata as `hash_HASH`.
             let mut stmt = self.conn.prepare_cached(
                 "SELECT e.vpath, e.name, e.kind, e.size FROM content JOIN entries e ON e.id = content.rowid
                  WHERE content MATCH ?1 ORDER BY rank LIMIT ?2",
             )?;
             let hits: Vec<Hit> = stmt
-                .query_map(params![format!("\"0x{hash:08x}\""), fetch * 20], row_to_hit(HitReason::Content))?
+                .query_map(
+                    params![format!("\"0x{hash:08x}\" OR \"hash_{hash:08x}\""), fetch * 20],
+                    row_to_hit(HitReason::Content),
+                )?
                 .collect::<Result<_, _>>()?;
             push(hits.into_iter().filter(|h| wanted_language(&h.vpath)).collect(), &mut results);
             return Ok(results);
         }
 
         let mut stmt = self.conn.prepare_cached(
-            "SELECT vpath, name, kind, size FROM entries WHERE name LIKE ?1 ESCAPE '\\'
+            "SELECT vpath, name, kind, size FROM entries
+             WHERE name LIKE ?1 ESCAPE '\\' OR ?5 AND vpath LIKE ?1 ESCAPE '\\'
+                 OR name_hash = ?3 OR stem_hash = ?3         -- also where only the hash is known
              ORDER BY CASE
                  WHEN name_hash = ?3 OR stem_hash = ?3 THEN 0   -- exact name or stem
                  WHEN name LIKE ?4 ESCAPE '\\' THEN 1          -- prefix
@@ -176,20 +193,31 @@ impl Index {
              length(name), vpath LIMIT ?2",
         )?;
         let prefix = format!("{}%", like_pattern(query).trim_start_matches('%'));
-        let hits = stmt
-            .query_map(params![like_pattern(query), fetch, joaat(query) as i64, prefix], row_to_hit(HitReason::Name))?
+        let path = query.contains(['/', '\\']);
+        let pattern = like_pattern(&query.replace('\\', "/"));
+        let mut names: Vec<Hit> = stmt
+            .query_map(params![pattern, fetch, joaat(query) as i64, prefix, path], row_to_hit(HitReason::Name))?
             .collect::<Result<_, _>>()?;
-        push(hits, &mut results);
-
+        let mut texts: Vec<Hit> = Vec::new();
         if let Some(fts) = fts_query(query) {
             let mut stmt = self.conn.prepare_cached(
                 "SELECT e.vpath, e.name, e.kind, e.size FROM content JOIN entries e ON e.id = content.rowid
                  WHERE content MATCH ?1 ORDER BY rank LIMIT ?2",
             )?;
-            let hits: Vec<Hit> =
+            texts =
                 stmt.query_map(params![fts, fetch * 20], row_to_hit(HitReason::Content))?.collect::<Result<_, _>>()?;
-            push(hits.into_iter().filter(|h| wanted_language(&h.vpath)).collect(), &mut results);
+            texts.retain(|h| wanted_language(&h.vpath));
         }
+        // Names come first, but leave room for some text hits: a common word
+        // is in more names than are shown.
+        let named: HashSet<&str> = names.iter().map(|h| h.vpath.as_str()).collect();
+        let room = texts.iter().filter(|h| !named.contains(h.vpath.as_str())).take(limit / 4).count();
+        if names.len() > limit - room {
+            names.truncate(limit - room);
+            results.limited = true;
+        }
+        push(names, &mut results);
+        push(texts, &mut results);
         Ok(results)
     }
 }
@@ -213,12 +241,63 @@ mod tests {
     fn detects_languages() {
         assert_eq!(language_of("x64b.rpf/data/lang/chinese_rel.rpf/global.gxt2"), Some("chinese"));
         assert_eq!(language_of("update/x/dlc.rpf/x64/data/lang/germandlc.rpf/a.gxt2"), Some("german"));
+        assert_eq!(language_of("data.rpf/data/lang/chinesetrad_final.rpf/a.#ldbmt"), Some("chinesetrad"));
         assert_eq!(language_of("x64e.rpf/levels/gta5/vehicles.rpf/adder.yft"), None);
     }
 
     #[test]
+    fn finds_paths_and_unnamed_entries_by_the_hash_of_their_name() {
+        let dir = std::env::temp_dir().join(format!("openrage-index-search-{}", std::process::id()));
+        let index = Index::open(&dir.join("index.sqlite")).unwrap();
+        for (vpath, hash) in [("a.rpf/cars/adder.#ft", None), ("a.rpf/entries/000001_00ff.#mt", Some(joaat("adder")))] {
+            let name = vpath.rsplit('/').next().unwrap();
+            index
+                .conn
+                .execute(
+                    "INSERT INTO entries(source, vpath, name, kind, size, name_hash, stem_hash)
+                     VALUES(1, ?1, ?2, 2, 0, ?3, ?3)",
+                    params![vpath, name, hash.unwrap_or_else(|| joaat(name)) as i64],
+                )
+                .unwrap();
+        }
+        let hits =
+            |q: &str| -> Vec<String> { index.search(q, 20, None).unwrap().hits.into_iter().map(|h| h.vpath).collect() };
+        assert_eq!(hits("Adder").len(), 2);
+        assert_eq!(hits("0xB779A091"), ["a.rpf/entries/000001_00ff.#mt"]);
+        assert_eq!(hits("cars/add"), ["a.rpf/cars/adder.#ft"]);
+        assert_eq!(hits("cars\\add"), ["a.rpf/cars/adder.#ft"]);
+        assert!(hits("cars").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_hits_have_room_beside_names() {
+        let dir = std::env::temp_dir().join(format!("openrage-index-room-{}", std::process::id()));
+        let index = Index::open(&dir.join("index.sqlite")).unwrap();
+        for i in 0..30 {
+            let name = if i < 20 { format!("motel_{i}.#dr") } else { format!("{i}.xml") };
+            let insert = "INSERT INTO entries(id, source, vpath, name, kind, size, name_hash, stem_hash)
+                          VALUES(?1, 1, ?2, ?2, 2, 0, 0, 0)";
+            index.conn.execute(insert, params![i, name]).unwrap();
+            if i >= 20 {
+                index.conn.execute("INSERT INTO content(rowid, body) VALUES(?1, 'a motel')", [i]).unwrap();
+            }
+        }
+        let results = index.search("motel", 12, None).unwrap();
+        let texts = results.hits.iter().filter(|h| h.reason == HitReason::Content).count();
+        assert_eq!((results.hits.len(), texts, results.limited), (12, 3, true));
+        let results = index.search("motel", 30, None).unwrap();
+        assert_eq!((results.hits.len(), results.limited), (30, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn builds_fts_queries() {
-        assert_eq!(fts_query("weapon_pistol").as_deref(), Some("\"weapon_pistol\"*"));
+        let hash = joaat("weapon_pistol");
+        let expected = format!("\"weapon_pistol\"* OR \"hash_{hash:08x}\" OR \"hash_{hash:08x}\"");
+        assert_eq!(fts_query("weapon_pistol"), Some(expected));
+        // The text is split at the dot, too.
+        assert_eq!(fts_query("vehicles.meta").as_deref(), Some("\"vehicles meta\"*"));
         assert_eq!(fts_query("a \"b\" -c").as_deref(), Some("\"a\"* \"b\"* \"c\"*"));
         assert_eq!(fts_query("  ").as_deref(), None);
     }

@@ -129,6 +129,9 @@ pub struct Meta {
     offset_shift: u32,
 }
 
+/// The name of a block that holds the items of a map.
+const MAP_BLOCK: u32 = 0x101;
+
 /// Whether a resource with this version is a meta file.
 pub fn is_meta(version: u32) -> bool {
     version == VERSION || version == VERSION_RDR2
@@ -276,6 +279,33 @@ impl Meta {
     /// Names of the structures used, the root first; e.g. `CMapData`.
     pub fn root_type(&self) -> Option<String> {
         self.block(self.root_block).map(|b| names::field(b.name))
+    }
+
+    /// The texts of a GTA VI language file (`#ldbmt`), by the hash of their
+    /// label. They are in a map: groups of 16 control bytes (above `0x7f`: no
+    /// item) and as many items of 16 bytes, the label's hash and a pointer to
+    /// a struct with the text's pointer at 8.
+    pub fn label_texts(&self) -> Vec<(u32, String)> {
+        const GROUP: usize = 16 + 16 * 16;
+        let text = |item: &[u8]| -> Option<String> {
+            let (id, off) = self.unpack(item.u64_at(8)?);
+            let (id, off) = self.unpack(self.block(id)?.data.as_slice().u64_at(off + 8)?);
+            let start = self.block(id)?.data.get(off..)?;
+            let end = start.iter().position(|b| *b == 0)?;
+            Some(String::from_utf8_lossy(&start[..end]).into_owned())
+        };
+        let mut out = Vec::new();
+        for block in self.blocks.iter().filter(|b| b.name == MAP_BLOCK) {
+            for group in block.data.as_chunks::<GROUP>().0 {
+                let (control, items) = group.split_at(16);
+                for (item, _) in items.as_chunks::<16>().0.iter().zip(control).filter(|(_, c)| **c < 0x80) {
+                    if let (Some(label), Some(text)) = (item.u32_at(0), text(item)) {
+                        out.push((label, text));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Reads `count` items of `size` bytes starting at a packed pointer; long
@@ -706,5 +736,33 @@ impl Meta {
             other => return Err(format!("unexpected array item type {other:#04x}")),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gta6_label_texts() {
+        let block = |name, data: Vec<u8>| Block { name, data };
+        let mut map = vec![0x80u8; 16];
+        map[2] = 0x2a;
+        map.resize(16 + 16 * 16, 0);
+        map[16 + 32..16 + 36].copy_from_slice(&7u32.to_le_bytes());
+        // Block 1, 16 bytes in; there the text is in block 3, 4 bytes in.
+        map[16 + 40..16 + 48].copy_from_slice(&(1u64 | 16 << 20).to_le_bytes());
+        let mut items = vec![0u8; 32];
+        items[24..].copy_from_slice(&(3u64 | 4 << 20).to_le_bytes());
+        let blocks = vec![block(9, items), block(MAP_BLOCK, map), block(0x10, b"abc\0Motel\0".to_vec())];
+        let meta = Meta {
+            name: String::new(),
+            root_block: 1,
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+            blocks,
+            offset_shift: 20,
+        };
+        assert_eq!(meta.label_texts(), [(7, "Motel".to_owned())]);
     }
 }
