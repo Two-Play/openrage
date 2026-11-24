@@ -95,6 +95,41 @@ impl NameIndex {
         self.names.len() - before
     }
 
+    /// Adds the path of an entry that OpenRAGE created or renamed: trusted,
+    /// stored under the hash [`crate::rpf8::path_hash`] gives it.
+    pub fn add_path(&mut self, path: &str, platform: char) {
+        let path = path.to_ascii_lowercase().replace('\\', "/");
+        let (hash, ext) = crate::rpf8::path_hash(&path, platform);
+        let name =
+            if ext == 0xFF { path } else { path.rsplit_once('.').map_or(path.clone(), |(stem, _)| stem.to_owned()) };
+        self.names.insert(hash, name);
+        self.files.insert(hash, IMPORTED);
+        self.untrusted.remove(&hash);
+    }
+
+    /// Adds the `x64/…` form of every trusted path. The game's files mostly
+    /// name paths without it (`data/ui/startup_data`), while the update
+    /// archives hash the full path (`x64/data/ui/startup_data`). Returns how
+    /// many were added.
+    pub fn add_x64_forms(&mut self) -> usize {
+        let derived: Vec<(u32, String, u32)> = self
+            .names
+            .iter()
+            .filter(|(h, n)| self.trusted(**h) && n.contains('/') && !n.contains(':') && !n.starts_with("x64/"))
+            .map(|(h, n)| {
+                let full = format!("x64/{n}");
+                (joaat(&full), full, self.files.get(h).copied().unwrap_or(1))
+            })
+            .filter(|(h, _, _)| !self.names.contains_key(h))
+            .collect();
+        let added = derived.len();
+        for (h, n, files) in derived {
+            self.names.insert(h, n);
+            self.files.insert(h, files);
+        }
+        added
+    }
+
     /// Whether the name for a hash is trusted (see [`NameIndex::judge`]).
     pub fn trusted(&self, hash: u32) -> bool {
         self.names.contains_key(&hash) && !self.untrusted.contains(&hash)
@@ -380,19 +415,19 @@ mod tests {
         assert_eq!(idx.add_list("P_Chair01x.ydr\ncommon:/data/x.meta\nnope\n", &wanted), 2);
         let back = NameIndex::from_text(&idx.to_text()).unwrap();
         assert_eq!(back, idx);
-        let e = Entry {
-            hash: joaat("p_chair01x"),
-            ext_id: 2,
-            key_id: 0xFF,
-            encryption_config: 0,
-            is_resource: true,
-            signed: false,
-            offset: 0,
-            size_on_disk: 0,
-            compression: crate::rpf8::Compression::None,
-            size_or_flags: 0,
-            path: None,
-        };
+        let e = Entry::new_plain(joaat("p_chair01x"), 2, true, 0);
         assert_eq!(idx.name_for(&e, 'y').as_deref(), Some("p_chair01x.ydr"));
+    }
+
+    #[test]
+    fn x64_forms_and_own_paths() {
+        let mut idx = NameIndex::default();
+        idx.add_path("data/ui/startup_data.rpf", 'y');
+        idx.add_path("pack:/x.clip", 'y');
+        assert_eq!(idx.add_x64_forms(), 1, "paths only, without mount prefixes");
+        let e = Entry::new_plain(joaat("x64/data/ui/startup_data"), 0, false, 0);
+        assert_eq!(idx.name_for(&e, 'y').as_deref(), Some("x64/data/ui/startup_data.rpf"));
+        let plain = Entry::new_plain(joaat("data/ui/startup_data"), 0, false, 0);
+        assert_eq!(idx.name_for(&plain, 'y').as_deref(), Some("data/ui/startup_data.rpf"));
     }
 }

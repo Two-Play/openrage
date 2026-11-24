@@ -205,7 +205,21 @@ pub(crate) fn suggest_models(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, profi
     }
     let mut candidates: Vec<suggest::Candidate> = Vec::new();
     let mut load: Vec<String> = named.clone();
-    if let Some(animal) = &profile.animal {
+    if is_rdr2_dir(game_dir) {
+        // RDR2's people and animals share bone names: rank them all by their
+        // base skeletons (vehicles and objects follow below as for GTA V).
+        if profile.kinds.contains(&suggest::Kind::Ped) || profile.rdr2_peds {
+            // The game has some 90,000 `.ymt` files; the outfit files are among them.
+            let outfits: Vec<String> = search(".ymt", 200_000)
+                .into_iter()
+                .filter(|v| {
+                    let (dir, name) = v.rsplit_once('/').unwrap_or(("", v));
+                    openrage_app::models::is_rdr2_ped_file(name, dir)
+                })
+                .collect();
+            candidates.extend(suggest::rdr2_ped_candidates(game_dir, outfits));
+        }
+    } else if let Some(animal) = &profile.animal {
         load.extend(search(&format!("a_c_{animal}"), 160).into_iter().filter(|v| v.ends_with(".ydd")));
     } else if profile.kinds.contains(&suggest::Kind::Ped) {
         // All peds share one skeleton: no need to load each.
@@ -243,9 +257,17 @@ pub(crate) fn suggest_models(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, profi
         load.extend(vehicles);
     }
     if profile.kinds.contains(&suggest::Kind::Prop) && named.is_empty() {
-        // Objects sharing a word of the dictionary name.
-        if let Some(word) = profile.hints.iter().filter(|h| !h.contains('@')).max_by_key(|h| h.len()) {
-            load.extend(search(word, 400).into_iter().filter(|v| is_model(v)).take(80));
+        // Objects sharing a word of the dictionary or clip names: the
+        // longest that names any model (RDR2's prop clips name models whose
+        // file names are not known).
+        let mut words: Vec<&String> = profile.hints.iter().filter(|h| !h.contains('@')).collect();
+        words.sort_by_key(|h| std::cmp::Reverse(h.len()));
+        for word in words.into_iter().take(6) {
+            let models: Vec<String> = search(word, 400).into_iter().filter(|v| is_model(v)).take(80).collect();
+            if !models.is_empty() {
+                load.extend(models);
+                break;
+            }
         }
     }
     load.sort();
@@ -332,11 +354,17 @@ pub(crate) fn axis_view(axis: i32, current: openrage_app::render::View) -> openr
     v
 }
 
+/// The size of pictures made for the preview area, in the screen's pixels.
+pub(crate) fn preview_pixels(ui: &AppWindow) -> (usize, usize) {
+    let scale = ui.window().scale_factor().clamp(0.5, 4.0);
+    let pixels = |length: f32| ((length - 16.0).max(64.0) * scale).round() as usize;
+    (pixels(ui.get_preview_area_width()), pixels(ui.get_preview_area_height()))
+}
+
 /// Renders the current model at the size of the preview area.
 pub(crate) fn render_model(ui: &AppWindow) {
     let Some((model, view)) = with_app(|a| a.model.clone().map(|m| (m, a.model_view))) else { return };
-    let w = (ui.get_preview_area_width() - 16.0).max(64.0) as usize;
-    let h = (ui.get_preview_area_height() - 16.0).max(64.0) as usize;
+    let (w, h) = preview_pixels(ui);
     if let Some((img, gizmo)) =
         render_image(&model, |lo, hi| openrage_app::render::orbit_camera(lo, hi, view), None, w, h)
     {
@@ -452,15 +480,30 @@ pub(crate) fn save_png_image(img: &slint::Image, name: String, main: Weak<AppWin
 // ---------------------------------------------------------------------------
 // Animations
 
-/// Whether an item is a clip dictionary (`.ycd`; GTA IV `.wad`).
+/// Whether an item is a clip dictionary (`.ycd`; GTA IV `.wad`; GTA VI `.#cd`).
 pub(crate) fn is_clip_dictionary(item: &Item) -> bool {
     let n = item.name.to_ascii_lowercase();
-    n.ends_with(".ycd") || (n.ends_with(".wad") && item.kind == ItemKind::Resource)
+    n.ends_with(".ycd") || n.ends_with(".#cd") || (n.ends_with(".wad") && item.kind == ItemKind::Resource)
 }
 
 /// Selecting a `.ycd` (or `.wad`): its clips and (found in the background) the models it fits.
 pub(crate) fn show_clip_dictionary(ui: &AppWindow, vpath: String, mut info: Meta) {
     match load_clip_dictionary(&vpath) {
+        Ok(dict) if vpath.to_ascii_lowercase().ends_with(".#cd") => {
+            // Bones are named by hash there, so no models are looked for.
+            info.push(kv("Clips", dict.clips.len()));
+            for c in dict.clips.iter().take(40) {
+                let animation = c.parts.first().and_then(|p| dict.animations.get(p.animation));
+                let size = animation
+                    .map_or_else(String::new, |a| format!(" · {} frames · {} tracks", a.frames, a.tracks.len()));
+                info.push(kv(&c.name, format!("{:.2} s{size}", c.duration())));
+            }
+            if dict.clips.len() > 40 {
+                info.push(note(format!("… and {} more", dict.clips.len() - 40)));
+            }
+            info.push(note("To play it on a model with a skeleton, open the model and search for this file there."));
+            set_meta(ui, &info);
+        }
         Ok(dict) => {
             let profile = suggest::Profile::new(&vpath, &dict);
             info.push(kv("Clips", dict.clips.len()));

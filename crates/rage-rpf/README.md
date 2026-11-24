@@ -8,6 +8,13 @@ Read and write RAGE archives, part of
 | RPF7 (incl. nested archives, AES and NG encryption) | GTA V Legacy and Enhanced | yes | yes |
 | IMG3, RPF2, RPF3 | GTA IV | yes | yes |
 | RPF8 | Red Dead Redemption 2 | with the `rdr2` feature | no |
+| RPF9 | GTA VI | what is not encrypted (zlib data, videos, audio containers), without names (`rpf9`) | no |
+
+RPF9 exposes the clear header's declared slot count and transform selector.
+Recovered streams can split one native resource or combine its chunks, so
+their count is not a measure of native index coverage. Scarlett executable
+observations and the remaining native decoder work are recorded in
+[`docs/rpf9-scarlett.md`](../../docs/rpf9-scarlett.md).
 
 `vfs` resolves paths that cross archive boundaries
 (`update/update.rpf/x64/data/lang/americandlc.rpf/global.gxt2`).

@@ -24,4 +24,5 @@ png = "0.18"
 zip.workspace = true
 
 [dev-dependencies]
+flate2.workspace = true
 zip = { version = "9", default-features = false, features = ["deflate-flate2"] }

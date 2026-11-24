@@ -5,23 +5,25 @@
 //! including all archives nested inside it. Loose files are re-listed on
 //! every update (cheap). Archives are read in parallel; a single writer
 //! commits each archive in its own transaction, so a cancelled update keeps
-//! everything finished so far.
+//! everything finished so far. GTA VI archives hold up to thousands of others
+//! and are written in parts; what a cancelled update wrote of one is replaced
+//! by the next.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rage_core::hash::joaat;
 use rage_crypto::GtaVKeys;
-use rage_rpf::{EntryKind, Gta4Archive, Rpf7, vfs};
+use rage_rpf::{EntryKind, Gta4Archive, Rpf7, Rpf9, vfs};
 use rayon::prelude::*;
 use rusqlite::params;
 
-use crate::content::{content_for, is_indexable};
+use crate::content::{content_for, is_indexable, is_indexable_gta6, rpf9_content, without_numbers};
 use crate::{EntryTag, Index, IndexError, schema};
 
 #[derive(Debug, Clone, Default)]
@@ -29,6 +31,9 @@ pub struct Progress {
     pub archives_done: usize,
     pub archives_total: usize,
     pub entries: u64,
+    /// How much of the archives that changed is read, in bytes of theirs.
+    pub bytes_done: u64,
+    pub bytes_total: u64,
     /// Archive that was just written.
     pub current: String,
 }
@@ -53,6 +58,10 @@ struct DiskArchive {
     gta4: bool,
     /// A Red Dead Redemption 2 archive (RPF8) rather than RPF7.
     rdr2: bool,
+    /// A GTA VI archive (RPF9) rather than RPF7.
+    gta6: bool,
+    /// How much of it is read, for the progress.
+    read: AtomicU64,
 }
 
 /// Largest loose file whose text is indexed (GTA IV's text tables are ~6 MB).
@@ -64,8 +73,11 @@ struct Record {
     kind: EntryTag,
     size: u64,
     body: Option<String>,
+    /// The hash of a file whose name is not known, from the archive's table.
+    hash: Option<u32>,
 }
 
+#[derive(Default)]
 struct Batch {
     rel: String,
     size: i64,
@@ -73,9 +85,11 @@ struct Batch {
     records: Vec<Record>,
     dictionary: HashSet<String>,
     errors: usize,
+    /// More of the same archive follows.
+    partial: bool,
 }
 
-fn stem(name: &str) -> &str {
+pub(crate) fn stem(name: &str) -> &str {
     name.split_once('.').map_or(name, |(s, _)| s)
 }
 
@@ -122,7 +136,7 @@ fn scan_disk(game_dir: &Path) -> (Vec<Record>, Vec<DiskArchive>, HashSet<String>
                 body = Some(text);
                 dictionary.extend(words);
             }
-            records.push(Record { vpath: rel.clone(), name, kind, size: meta.len(), body });
+            records.push(Record { vpath: rel.clone(), name, kind, size: meta.len(), body, hash: None });
             if meta.is_dir() {
                 stack.push((entry.path(), rel));
             } else if is_rpf {
@@ -133,6 +147,8 @@ fn scan_disk(game_dir: &Path) -> (Vec<Record>, Vec<DiskArchive>, HashSet<String>
                     mtime: mtime_of(&meta),
                     gta4,
                     rdr2: !gta4 && rage_rpf::Rpf8::file_is_rpf8(&entry.path()),
+                    gta6: !gta4 && Rpf9::file_is_rpf9(&entry.path()),
+                    read: AtomicU64::new(0),
                 });
             }
         }
@@ -171,7 +187,14 @@ fn read_gta4_archive(archive: &DiskArchive, mut batch: Batch) -> Batch {
                 Err(_) => batch.errors += 1,
             }
         }
-        batch.records.push(Record { vpath: path.to_owned(), name: e.name.clone(), kind, size: e.size(), body });
+        batch.records.push(Record {
+            vpath: path.to_owned(),
+            name: e.name.clone(),
+            kind,
+            size: e.size(),
+            body,
+            hash: None,
+        });
     });
     batch
 }
@@ -203,6 +226,7 @@ fn read_rdr2_archive(archive: &DiskArchive, mut batch: Batch) -> Batch {
                         kind: EntryTag::Dir,
                         size: 0,
                         body: None,
+                        hash: None,
                     });
                 }
             }
@@ -213,6 +237,7 @@ fn read_rdr2_archive(archive: &DiskArchive, mut batch: Batch) -> Batch {
                     kind: EntryTag::Archive,
                     size: e.size(),
                     body: None,
+                    hash: None,
                 });
                 match rpf.open_child(e) {
                     Ok(child) if depth < rage_rpf::MAX_NESTING => walk(&child, &vpath, depth + 1, batch),
@@ -233,7 +258,7 @@ fn read_rdr2_archive(archive: &DiskArchive, mut batch: Batch) -> Batch {
                     Err(_) => batch.errors += 1,
                 }
             }
-            batch.records.push(Record { vpath, name: base, kind, size: e.size(), body });
+            batch.records.push(Record { vpath, name: base, kind, size: e.size(), body, hash: None });
         }
     }
     match Rpf8::open_default(&archive.path) {
@@ -243,16 +268,180 @@ fn read_rdr2_archive(archive: &DiskArchive, mut batch: Batch) -> Batch {
     batch
 }
 
-/// Reads one top-level archive (and everything nested in it) into a batch.
-fn read_archive(archive: &DiskArchive, keys: Option<Arc<GtaVKeys>>) -> Batch {
-    let mut batch = Batch {
-        rel: archive.rel.clone(),
-        size: archive.size,
-        mtime: archive.mtime,
-        records: Vec::new(),
-        dictionary: HashSet::new(),
-        errors: 0,
+/// Larger members of GTA VI archives are not read for their text.
+const MAX_GTA6_TEXT: u64 = 64 << 20;
+/// Archives with gigabytes of metadata that is all numbers.
+const GTA6_NUMBERS: &str = "/audio/exterior_occlusion/";
+/// As many are read and converted at a time, and written in one transaction.
+const TEXTS_AT_ONCE: usize = 64;
+
+/// Reads a GTA VI archive (RPF9) and the archives nested in it. Only archives
+/// with a readable table are indexed: the recovery view of others takes a scan
+/// of the whole file, and has no names. Every nested archive is a part of its
+/// own, sent when it is read: opening one takes a while, as it learns names
+/// from its members. Returns the last part, or `None` if cancelled.
+fn read_gta6_archive(
+    archive: &DiskArchive,
+    mut batch: Batch,
+    cancel: &AtomicBool,
+    part: &(dyn Fn(Batch) + Sync),
+) -> Option<Batch> {
+    match Rpf9::open(&archive.path) {
+        Ok(rpf) if rpf.is_native() => {
+            walk_gta6(&rpf, &archive.rel, 0, cancel, part, &|| archive.part(), &|bytes| archive.add_read(bytes));
+        }
+        // Not readable with this executable: tried again by the next update.
+        _ => {
+            batch.errors += 1;
+            batch.partial = true;
+        }
+    }
+    (!cancel.load(Ordering::Relaxed)).then_some(batch)
+}
+
+fn walk_gta6(
+    rpf: &Rpf9,
+    prefix: &str,
+    depth: u8,
+    cancel: &AtomicBool,
+    part: &(dyn Fn(Batch) + Sync),
+    new_part: &(dyn Fn() -> Batch + Sync),
+    read: &(dyn Fn(u64) + Sync),
+) {
+    let mut batch = new_part();
+    let Ok(entries) = rpf.entries() else {
+        batch.errors += 1;
+        return part(batch);
     };
+    // Folders come from the entries' paths.
+    let mut dirs: HashSet<String> = HashSet::new();
+    let mut children = Vec::new();
+    let mut texts = Vec::new();
+    for e in entries.iter() {
+        let name = rpf.entry_name(e);
+        let vpath = format!("{prefix}/{name}");
+        let mut parts: Vec<&str> = name.split('/').collect();
+        let base = parts.pop().unwrap_or_default().to_owned();
+        let mut dir = prefix.to_owned();
+        for folder in parts {
+            dir = format!("{dir}/{folder}");
+            if dirs.insert(dir.to_ascii_lowercase()) {
+                batch.records.push(Record {
+                    vpath: dir.clone(),
+                    name: folder.to_owned(),
+                    kind: EntryTag::Dir,
+                    size: 0,
+                    body: None,
+                    hash: None,
+                });
+            }
+        }
+        let kind = if rpf.is_archive(e) {
+            children.push((e, vpath.clone()));
+            EntryTag::Archive
+        } else if rpf.resource_parts(e).is_some() {
+            EntryTag::Resource
+        } else {
+            EntryTag::File
+        };
+        if kind != EntryTag::Archive
+            && is_indexable_gta6(&base)
+            && e.size <= MAX_GTA6_TEXT
+            && !vpath.contains(GTA6_NUMBERS)
+        {
+            texts.push((e, vpath, base, kind));
+            continue;
+        }
+        let hash = rpf.unnamed_hash(e);
+        batch.records.push(Record { vpath, name: base, kind, size: e.size, body: None, hash });
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    part(batch);
+    // A few at a time: converted metadata is several times its size.
+    for chunk in texts.chunks(TEXTS_AT_ONCE) {
+        let found: Vec<_> = chunk
+            .par_iter()
+            .filter(|_| !cancel.load(Ordering::Relaxed))
+            .map(|(e, vpath, base, kind)| {
+                let content = rpf9_content(rpf, e, base).map(|found| {
+                    let is_text = is_indexable(base) || base.to_ascii_lowercase().ends_with(".#ldbmt");
+                    found.map(|(text, words)| (if is_text { text } else { without_numbers(&text) }, words))
+                });
+                let hash = rpf.unnamed_hash(e);
+                let record =
+                    Record { vpath: vpath.clone(), name: base.clone(), kind: *kind, size: e.size, body: None, hash };
+                (record, content)
+            })
+            .collect();
+        let mut batch = new_part();
+        for (mut record, content) in found {
+            match content {
+                Ok(Some((text, words))) => {
+                    record.body = Some(text);
+                    batch.dictionary.extend(words);
+                }
+                Ok(None) => {}
+                Err(_) => batch.errors += 1,
+            }
+            batch.records.push(record);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        part(batch);
+    }
+    children.par_iter().for_each(|(e, vpath)| {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        match rpf.open_child(e) {
+            Ok(child) if depth < rage_rpf::MAX_NESTING => {
+                walk_gta6(&child, vpath, depth + 1, cancel, part, new_part, &|_| {});
+            }
+            _ => part(Batch { errors: 1, ..new_part() }),
+        }
+        read(e.size);
+    });
+}
+
+impl DiskArchive {
+    fn batch(&self) -> Batch {
+        Batch { rel: self.rel.clone(), size: self.size, mtime: self.mtime, ..Default::default() }
+    }
+
+    fn add_read(&self, bytes: u64) {
+        self.read.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.read.load(Ordering::Relaxed).min(self.size as u64)
+    }
+
+    /// For some of its entries.
+    fn part(&self) -> Batch {
+        Batch { partial: true, ..self.batch() }
+    }
+}
+
+/// Reads one top-level archive (and everything nested in it) into a batch;
+/// a GTA VI archive into several, of which all but the last go to `part`.
+/// `None` if cancelled.
+fn read_archive(
+    archive: &DiskArchive,
+    keys: Option<Arc<GtaVKeys>>,
+    cancel: &AtomicBool,
+    part: &(dyn Fn(Batch) + Sync),
+) -> Option<Batch> {
+    if archive.gta6 {
+        return read_gta6_archive(archive, archive.batch(), cancel, part);
+    }
+    Some(read_other_archive(archive, keys))
+}
+
+fn read_other_archive(archive: &DiskArchive, keys: Option<Arc<GtaVKeys>>) -> Batch {
+    let mut batch = archive.batch();
     if archive.gta4 {
         return read_gta4_archive(archive, batch);
     }
@@ -292,7 +481,14 @@ fn read_archive(archive: &DiskArchive, keys: Option<Arc<GtaVKeys>>) -> Batch {
                     Err(_) => errors.set(errors.get() + 1),
                 }
             }
-            batch.records.push(Record { vpath: path.to_owned(), name: e.name.clone(), kind, size: e.size(), body });
+            batch.records.push(Record {
+                vpath: path.to_owned(),
+                name: e.name.clone(),
+                kind,
+                size: e.size(),
+                body,
+                hash: None,
+            });
         },
         &mut |_| errors.set(errors.get() + 1),
     );
@@ -341,6 +537,12 @@ impl Index {
             .filter(|a| stored.get(&a.rel).is_none_or(|&(_, size, mtime)| size != a.size || mtime != a.mtime))
             .collect();
         todo.sort_by_key(|a| std::cmp::Reverse(a.size)); // big ones first for better parallelism
+        // GTA VI archives are only indexed if the game's executable gives the
+        // keys. Asking one here also loads those before the threads that read
+        // archives wait for each other to do it.
+        if !todo.iter().rev().filter(|a| a.gta6).any(|a| Rpf9::open(&a.path).is_ok_and(|rpf| rpf.is_native())) {
+            todo.retain(|a| !a.gta6);
+        }
 
         {
             let tx = self.conn.transaction()?;
@@ -349,36 +551,58 @@ impl Index {
                 tx.execute("DELETE FROM entries WHERE source = ?1", [id])?;
                 tx.execute("DELETE FROM sources WHERE id = ?1", [id])?;
             }
-            let loose_batch =
-                Batch { rel: String::new(), size: 0, mtime: 0, records: loose, dictionary: loose_words, errors: 0 };
+            let loose_batch = Batch { records: loose, dictionary: loose_words, ..Default::default() };
             write_batch(&tx, &loose_batch)?;
             tx.commit()?;
         }
 
         let total = todo.len();
+        let bytes_total = todo.iter().map(|a| a.size as u64).sum();
+        let counted = todo.clone();
         let mut done = 0usize;
         let (sender, receiver) = mpsc::sync_channel::<Batch>(4);
         let conn = &mut self.conn;
         let result: Result<(), IndexError> = std::thread::scope(|scope| {
             scope.spawn(move || {
-                todo.par_iter().for_each_with(sender, |s, archive| {
-                    if !cancel.load(Ordering::Relaxed) {
-                        let _ = s.send(read_archive(archive, keys.clone()));
-                    }
-                });
+                let read = move || {
+                    todo.par_iter().for_each_with(sender, |s, archive| {
+                        if cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let s = &*s;
+                        let part = |batch| {
+                            let _ = s.send(batch);
+                        };
+                        if let Some(batch) = read_archive(archive, keys.clone(), cancel, &part) {
+                            archive.add_read(archive.size as u64);
+                            part(batch);
+                        }
+                    });
+                };
+                // Threads of its own: what is opened meanwhile does not wait
+                // behind the archives, and keeps some processors.
+                let threads = std::thread::available_parallelism().map_or(4, |n| (n.get() * 3 / 4).max(1));
+                match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+                    Ok(pool) => pool.install(read),
+                    Err(_) => read(),
+                }
             });
             for batch in receiver {
                 let tx = conn.transaction()?;
                 let added = write_batch(&tx, &batch)?;
                 tx.commit()?;
-                done += 1;
-                stats.archives_indexed += 1;
+                if !batch.partial {
+                    done += 1;
+                    stats.archives_indexed += 1;
+                }
                 stats.entries_added += added;
                 stats.read_errors += batch.errors;
                 progress(&Progress {
                     archives_done: done,
                     archives_total: total,
                     entries: stats.entries_added,
+                    bytes_done: counted.iter().map(|a| a.bytes_read()).sum(),
+                    bytes_total,
                     current: batch.rel,
                 });
             }
@@ -407,11 +631,14 @@ impl Index {
 }
 
 fn write_batch(tx: &rusqlite::Transaction<'_>, batch: &Batch) -> Result<u64, IndexError> {
-    tx.execute(
-        "INSERT INTO sources(path, size, mtime) VALUES(?1, ?2, ?3)",
-        params![batch.rel, batch.size, batch.mtime],
+    // An archive that is not complete matches no size on disk.
+    let (size, mtime) = if batch.partial { (-1, -1) } else { (batch.size, batch.mtime) };
+    let source: i64 = tx.query_row(
+        "INSERT INTO sources(path, size, mtime) VALUES(?1, ?2, ?3)
+         ON CONFLICT(path) DO UPDATE SET size = excluded.size, mtime = excluded.mtime RETURNING id",
+        params![batch.rel, size, mtime],
+        |r| r.get(0),
     )?;
-    let source = tx.last_insert_rowid();
     let mut entry = tx.prepare_cached(
         "INSERT INTO entries(source, vpath, name, kind, size, name_hash, stem_hash, has_text)
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -424,8 +651,8 @@ fn write_batch(tx: &rusqlite::Transaction<'_>, batch: &Batch) -> Result<u64, Ind
             r.name,
             r.kind as i64,
             r.size as i64,
-            joaat(&r.name) as i64,
-            joaat(stem(&r.name)) as i64,
+            r.hash.unwrap_or_else(|| joaat(&r.name)) as i64,
+            r.hash.unwrap_or_else(|| joaat(stem(&r.name))) as i64,
             r.body.is_some() as i64
         ])?;
         if let Some(body) = &r.body {
@@ -490,6 +717,69 @@ mod tests {
         assert!(hits("lamp_post_01").contains(&"pc/data/maps/area.img/lamp_post_01.wdr".to_owned()));
         assert!(hits("area_txd").contains(&"pc/data/maps/area.img/area.ide".to_owned()));
         assert!(hits("ADMIRAL").contains(&"common/data/handling.dat".to_owned()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gta6_archives_without_their_keys_are_left_for_later() {
+        let dir = std::env::temp_dir().join(format!("openrage-index-gta6-{}", std::process::id()));
+        let game = dir.join("game");
+        fs::create_dir_all(&game).unwrap();
+        let mut data = vec![0u8; 128];
+        data[..4].copy_from_slice(b"9FPR");
+        data[4..8].copy_from_slice(&64u32.to_le_bytes());
+        fs::write(game.join("common.rpf"), data).unwrap();
+        let mut index = Index::open(&dir.join("index.sqlite")).unwrap();
+        let stats = index.update(&game, None, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!((stats.archives_indexed, stats.read_errors, stats.cancelled), (0, 0, false));
+        // The archive itself is found, but is not taken for indexed.
+        assert_eq!(index.search("common.rpf", 5, None).unwrap().hits.len(), 1);
+        assert_eq!(index.stats().unwrap().archives, 0);
+        assert!(index.is_complete().unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_archive_written_in_part_is_read_again() {
+        let dir = std::env::temp_dir().join(format!("openrage-index-part-{}", std::process::id()));
+        let game = dir.join("game");
+        fs::create_dir_all(&game).unwrap();
+        let path = game.join("area.img");
+        fs::write(&path, img(&[("a.ide", b"objs\nend\n", false)])).unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        let mut index = Index::open(&dir.join("index.sqlite")).unwrap();
+        let part = |partial, name: &str| Batch {
+            rel: "area.img".into(),
+            size: meta.len() as i64,
+            mtime: mtime_of(&meta),
+            records: vec![Record {
+                vpath: format!("area.img/{name}"),
+                name: name.into(),
+                kind: EntryTag::File,
+                size: 1,
+                body: Some("stale_text".into()),
+                hash: None,
+            }],
+            partial,
+            ..Default::default()
+        };
+        let write = |index: &mut Index, batch: Batch| {
+            let tx = index.conn.transaction().unwrap();
+            write_batch(&tx, &batch).unwrap();
+            tx.commit().unwrap();
+        };
+        let update = |index: &mut Index| index.update(&game, None, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        // Parts are written to one archive; without the last it is replaced.
+        write(&mut index, part(true, "one.txt"));
+        write(&mut index, part(true, "two.txt"));
+        assert_eq!(index.search("stale_text", 5, None).unwrap().hits.len(), 2);
+        assert_eq!(index.stats().unwrap().archives, 1);
+        assert_eq!(update(&mut index).archives_indexed, 1);
+        assert!(index.search("stale_text", 5, None).unwrap().hits.is_empty());
+        // With it, it is complete.
+        write(&mut index, part(true, "one.txt"));
+        write(&mut index, part(false, "two.txt"));
+        assert_eq!(update(&mut index).archives_indexed, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -182,8 +182,9 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
     }
     let state = Rc::new(RefCell::new(State { entries, expanded, shown: Vec::new(), filter: String::new() }));
 
-    // Map files of GTA V: their objects in a 3D scene.
-    if vpath.to_ascii_lowercase().ends_with(".ymap")
+    // Map files of GTA V and VI: their objects in a 3D scene.
+    let lower = vpath.to_ascii_lowercase();
+    if (lower.ends_with(".ymap") || lower.ends_with(".#map"))
         && !crate::with_app(|a| a.game_dir.as_deref().is_some_and(crate::is_rdr2_dir))
     {
         win.set_is_map(true);

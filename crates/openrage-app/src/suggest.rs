@@ -62,6 +62,39 @@ const PED_CORE: [u16; 23] = [
     0xB1C5, 0x9D4D, 0xEEEB, 0x6E5C, 0x49D9, 0xDEAD, 0x9995, 0x796E, 0x322C,
 ];
 
+/// Main bones of Red Dead Redemption 2's people and animals. Their tags are
+/// hashes of the names like every other bone's ([`bone_tag`]), not GTA V's
+/// fixed ones; animals share these names, so they tell peds from objects
+/// but not people from animals.
+const RDR2_SKEL_CORE: [&str; 21] = [
+    "SKEL_Pelvis",
+    "SKEL_Spine_Root",
+    "SKEL_Spine0",
+    "SKEL_Spine1",
+    "SKEL_Spine2",
+    "SKEL_Spine3",
+    "SKEL_Neck0",
+    "SKEL_Neck1",
+    "SKEL_Head",
+    "SKEL_L_Thigh",
+    "SKEL_L_Calf",
+    "SKEL_L_Foot",
+    "SKEL_R_Thigh",
+    "SKEL_R_Calf",
+    "SKEL_R_Foot",
+    "SKEL_L_Clavicle",
+    "SKEL_L_UpperArm",
+    "SKEL_L_Forearm",
+    "SKEL_R_Clavicle",
+    "SKEL_R_UpperArm",
+    "SKEL_R_Forearm",
+];
+
+fn rdr2_core() -> &'static HashSet<u16> {
+    static TAGS: OnceLock<HashSet<u16>> = OnceLock::new();
+    TAGS.get_or_init(|| RDR2_SKEL_CORE.iter().map(|n| bone_tag(n)).collect())
+}
+
 /// The human skeleton's tags as a set (for ranking peds without loading them).
 pub fn ped_skeleton() -> Arc<HashSet<u16>> {
     static TAGS: OnceLock<Arc<HashSet<u16>>> = OnceLock::new();
@@ -169,7 +202,7 @@ pub fn classify(tags: &HashSet<u16>) -> Option<Kind> {
         return None;
     }
     let ped = tags.iter().filter(|t| PED_TAGS.contains(t)).count();
-    let core = tags.iter().filter(|t| PED_CORE.contains(t)).count();
+    let core = tags.iter().filter(|t| PED_CORE.contains(t) || rdr2_core().contains(t)).count();
     let vehicle = tags.iter().filter(|t| vehicle_tags().contains(t)).count();
     // Cutscene peds also move a full facial rig of their own, so the main
     // body bones count on their own.
@@ -243,6 +276,14 @@ pub fn clip_model(clip: &str) -> Option<String> {
     (name.len() > 2).then(|| name.to_ascii_lowercase())
 }
 
+/// A clip named after the object it moves (RDR2's doors and destruction:
+/// `p_door_barnslide01x`, `des_brt3_door_01`).
+fn prop_clip(clip: &str) -> Option<String> {
+    let name = clip.to_ascii_lowercase();
+    let prop = ["p_", "prop_", "des_", "s_"].iter().any(|p| name.starts_with(p));
+    (prop && !name.contains(['@', '/', ' '])).then_some(name)
+}
+
 /// Model names a dictionary name hints at, most specific first:
 /// `va_zion2` → `zion2`; `vehicle_cutter` → `cutter`;
 /// `anim@veh@armordillo@turret@base` → `armordillo`, `turret`.
@@ -282,6 +323,10 @@ pub struct Profile {
     pub female: bool,
     /// Model names from cutscene clip names, then from the dictionary name.
     pub hints: Vec<String>,
+    /// Moves RDR2's people or animals (their main bones, see [`RDR2_SKEL_CORE`]).
+    pub rdr2_peds: bool,
+    /// For RDR2's people and animals: every bone the dictionary moves.
+    all_bones: HashSet<u16>,
 }
 
 impl Profile {
@@ -312,17 +357,24 @@ impl Profile {
         let animal = name.split("creatures@").nth(1).map(|rest| rest.split('@').next().unwrap_or(rest).to_owned());
         let female = name.contains("_f@") || name.contains("female") || name.starts_with("move_f");
         let mut hints: Vec<String> = Vec::new();
-        for h in clips.iter().filter_map(|c| clip_model(c)).chain(name_hints(ycd)) {
+        for h in clips.iter().filter_map(|c| clip_model(c).or_else(|| prop_clip(c))).chain(name_hints(ycd)) {
             if !hints.contains(&h) {
                 hints.push(h);
             }
         }
-        Profile { animations, kinds, animal, female, hints }
+        let rdr2_peds = animations.iter().any(|(t, _)| t.iter().filter(|t| rdr2_core().contains(t)).count() >= 3);
+        let all_bones =
+            if rdr2_peds { animations.iter().flat_map(|(t, _)| t.iter().copied()).collect() } else { HashSet::new() };
+        Profile { animations, kinds, animal, female, hints, rdr2_peds, all_bones }
     }
 
     pub fn describe(&self) -> String {
         if let Some(a) = &self.animal {
             return format!("Animal animation ({a})");
+        }
+        // Facial tracks of RDR2's people count as objects: say what the body is.
+        if self.rdr2_peds {
+            return "Animation of people or animals".into();
         }
         let names: Vec<&str> = self
             .kinds
@@ -343,7 +395,16 @@ impl Profile {
 
     /// How well a skeleton fits: per mille of the best-fitting animation's
     /// bones it has, the number of those bones, and what that animation is for.
+    ///
+    /// RDR2's people and animals share the main bones' names, so a cow has
+    /// every bone of a clip that moves only the pelvis and spine. For them
+    /// the share of all the bones the dictionary moves counts instead (a
+    /// person has the fingers and face bones too).
     pub fn fit(&self, skeleton: &HashSet<u16>) -> (usize, usize, Option<Kind>) {
+        if self.rdr2_peds {
+            let hits = self.all_bones.iter().filter(|t| skeleton.contains(t)).count();
+            return (hits * 1000 / self.all_bones.len().max(1), hits, Some(Kind::Ped));
+        }
         self.animations
             .iter()
             .map(|(a, k)| {
@@ -476,6 +537,9 @@ pub fn skeleton_tags(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) 
     }
     let load = || -> Option<drawable::Skeleton> {
         let (node, _) = rage_mods::resolve(game_dir, vpath, keys).ok()?;
+        if let Node::Rpf8File(rpf, i) = node {
+            return rdr2_skeleton(&rpf, i);
+        }
         let Node::ArchiveFile(rpf, id) = node else { return None };
         let res = rpf.read_resource(id).ok()?;
         let lower = vpath.to_ascii_lowercase();
@@ -497,6 +561,83 @@ pub fn skeleton_tags(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) 
         c.insert(vpath.to_owned(), tags.clone());
     }
     tags
+}
+
+/// The skeleton of an RDR2 model: a fragment's, a drawable's, a drawable
+/// dictionary's own or its ped's base skeleton, or a ped's (outfit file).
+fn rdr2_skeleton(rpf: &rage_rpf::Rpf8, i: usize) -> Option<drawable::Skeleton> {
+    let full = rpf.entry_name(i);
+    let stem = model_stem(&full);
+    if crate::models::is_rdr2_ped_file(&full, rpf.display_name()) {
+        return crate::models::rdr2_ped_skeleton(&crate::rdr2::game_folder(rpf.path())?, &stem);
+    }
+    let res = rpf.read_resource(rpf.entries()?.get(i)?).ok()?;
+    let lower = full.to_ascii_lowercase();
+    if lower.ends_with(".yft") {
+        return drawable::parse_fragment_rdr2(&res).ok()?.drawable.skeleton;
+    }
+    if lower.ends_with(".ydr") {
+        return drawable::parse_ydr_rdr2(&res).ok()?.skeleton;
+    }
+    let own = drawable::parse_ydd_rdr2(&res).ok()?.into_iter().find_map(|(_, d)| d.skeleton);
+    own.or_else(|| crate::models::rdr2_base_skeleton(rpf, &stem))
+}
+
+/// RDR2's peds and animals as candidates: their outfit files
+/// (`…/metapeds.rpf/<ped>.ymt`), each with the tags of its base skeleton.
+/// The base skeletons (a few hundred, shared by many peds) are read once,
+/// in parallel. The player (Arthur) comes first, then story characters,
+/// then the rest.
+pub fn rdr2_ped_candidates(game_dir: &Path, outfit_files: Vec<String>) -> Vec<Candidate> {
+    use rayon::prelude::*;
+    type Cache = Mutex<HashMap<String, Option<Arc<HashSet<u16>>>>>;
+    static BASES: OnceLock<Cache> = OnceLock::new();
+    let cache = BASES.get_or_init(Default::default);
+    let mut files = outfit_files;
+    files.sort_by_key(|v| {
+        let n = model_stem(v);
+        (n != "player_zero", !n.starts_with("cs_"), n)
+    });
+    files.dedup_by(|a, b| model_stem(a) == model_stem(b));
+    let bases: Vec<(String, String)> = files
+        .iter()
+        .map(|v| {
+            let ped = model_stem(v);
+            (crate::models::rdr2_ped_base(game_dir, &ped).unwrap_or_default(), ped)
+        })
+        .collect();
+    let tags_of = |s: drawable::Skeleton| Arc::new(s.bones.iter().map(|b| b.tag).filter(|&t| t != 0).collect());
+    // Base skeletons not read yet, from the archive of base skeletons.
+    let mut missing: Vec<&str> = bases.iter().map(|(b, _)| b.as_str()).filter(|b| !b.is_empty()).collect();
+    missing.sort_unstable();
+    missing.dedup();
+    missing.retain(|b| cache.lock().is_ok_and(|c| !c.contains_key(*b)));
+    if let Some(frags) = crate::models::rdr2_base_skeletons(game_dir) {
+        let read: Vec<(String, Option<Arc<HashSet<u16>>>)> = missing
+            .par_iter()
+            .map(|base| {
+                let skeleton = frags
+                    .find(base)
+                    .and_then(|i| frags.entries()?.get(i).cloned())
+                    .and_then(|e| frags.read_resource(&e).ok())
+                    .and_then(|res| drawable::fragment_skeleton_rdr2(&res).ok().flatten());
+                (base.to_string(), skeleton.map(tags_of))
+            })
+            .collect();
+        if let Ok(mut c) = cache.lock() {
+            c.extend(read);
+        }
+    }
+    files
+        .into_iter()
+        .zip(bases)
+        .map(|(vpath, (base, ped))| {
+            let cached = (!base.is_empty()).then(|| cache.lock().ok().and_then(|c| c.get(&base).cloned())).flatten();
+            // Peds missing from the ped list: their skeleton guessed from the name.
+            let tags = cached.flatten().or_else(|| crate::models::rdr2_ped_skeleton(game_dir, &ped).map(tags_of));
+            Candidate { vpath, tags }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -604,6 +745,32 @@ mod tests {
             &rank(&cut, candidates())[..2],
             ["x64e.rpf/peds/a_m_y_hipster_01.ydd", "x64e.rpf/vehicles.rpf/zion2.yft"]
         );
+    }
+
+    #[test]
+    fn prop_clips_name_their_model() {
+        let door = set(&[bone_tag("door")]);
+        let p = profile("p_door", &[("p_door_barnslide01x", &door), ("idle", &door)]);
+        assert_eq!(p.hints[0], "p_door_barnslide01x");
+        assert!(!p.hints.contains(&"idle".to_owned()));
+    }
+
+    #[test]
+    fn rdr2_people_before_animals() {
+        let core = ["SKEL_Pelvis", "SKEL_Spine0", "SKEL_Spine1", "SKEL_Spine2", "SKEL_Neck0", "SKEL_Head"];
+        let hands = ["SKEL_L_Finger00", "SKEL_L_Finger01", "SKEL_R_Finger00", "SKEL_R_Finger01", "SKEL_Spine6"];
+        let body = names(&core);
+        let person: HashSet<u16> = names(&core).union(&names(&hands)).copied().collect();
+        // A sitting clip: the body alone, then the body with the hands.
+        let p = profile("de817d5c", &[("base", &body), ("enter", &person)]);
+        assert!(p.rdr2_peds);
+        assert_eq!(p.describe(), "Animation of people or animals");
+        // A cow has the body bones only; the person every bone.
+        let cow = Candidate { vpath: "metapeds.rpf/a_c_cow.ymt".into(), tags: Some(Arc::new(body.clone())) };
+        let man = Candidate { vpath: "metapeds.rpf/cs_abe.ymt".into(), tags: Some(Arc::new(person.clone())) };
+        assert_eq!(rank(&p, vec![cow, man]), ["metapeds.rpf/cs_abe.ymt", "metapeds.rpf/a_c_cow.ymt"]);
+        // GTA V's peds are not RDR2's.
+        assert!(!profile("move_m@generic", &[("walk", &set(&PED_CORE))]).rdr2_peds);
     }
 
     #[test]

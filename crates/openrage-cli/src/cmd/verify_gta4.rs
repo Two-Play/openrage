@@ -43,38 +43,36 @@ pub(crate) fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
     // Audio entries (RPF3) with a name instead of only a hash.
     let audio = std::sync::atomic::AtomicUsize::new(0);
     let audio_named = std::sync::atomic::AtomicUsize::new(0);
-    let stats: Vec<VerifyStats> = starts
-        .par_iter()
-        .map(|(prefix, a, dir)| {
-            let mut s = VerifyStats { archives: 1, ..Default::default() };
-            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
-                let e = a.entry(id);
-                if let Some(hash) = a.audio_hash_of(id) {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    audio.fetch_add(1, Relaxed);
-                    if e.name != format!("{hash:08x}") {
-                        audio_named.fetch_add(1, Relaxed);
-                    }
+    let stats: Vec<VerifyStats> = for_each_gta4_entry_parallel(
+        &starts,
+        true,
+        |_, _| true,
+        |a, id, p, s: &mut VerifyStats| {
+            let e = a.entry(id);
+            if let Some(hash) = a.audio_hash_of(id) {
+                use std::sync::atomic::Ordering::Relaxed;
+                audio.fetch_add(1, Relaxed);
+                if e.name != format!("{hash:08x}") {
+                    audio_named.fetch_add(1, Relaxed);
                 }
-                let result = if e.is_dir() {
-                    return;
-                } else if e.resource_type().is_some() {
-                    s.resources += 1;
-                    a.read_resource(id).map(|r| r.system.len() + r.graphics.len())
-                } else {
-                    s.files += 1;
-                    a.read(id).map(|d| d.len())
-                };
-                match result {
-                    Ok(n) => s.bytes += n as u64,
-                    Err(err) => s.errors.push(format!("{p}: {err}")),
-                }
-            });
-            eprintln!("  checked {prefix}");
-            s
-        })
-        .collect();
-    let mut total = VerifyStats { archives: open_errors.len(), errors: open_errors, ..Default::default() };
+            }
+            let result = if e.is_dir() {
+                return;
+            } else if e.resource_type().is_some() {
+                s.resources += 1;
+                a.read_resource(id).map(|r| r.system.len() + r.graphics.len())
+            } else {
+                s.files += 1;
+                a.read(id).map(|d| d.len())
+            };
+            match result {
+                Ok(n) => s.bytes += n as u64,
+                Err(err) => s.errors.push(format!("{p}: {err}")),
+            }
+        },
+    );
+    let mut total =
+        VerifyStats { archives: open_errors.len() + starts.len(), errors: open_errors, ..Default::default() };
     for s in stats {
         total.archives += s.archives;
         total.files += s.files;
@@ -82,6 +80,7 @@ pub(crate) fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
         total.bytes += s.bytes;
         total.errors.extend(s.errors);
     }
+    total.errors.sort();
     for e in &total.errors {
         outln!("FAIL {e}");
     }
@@ -111,34 +110,30 @@ pub(crate) fn cmd_verify_gta4(game_dir: &Path, within: &str) -> Result<()> {
 pub(crate) fn cmd_verify_gta4_scripts(game_dir: &Path, within: &str) -> Result<()> {
     let (starts, open_errors) = gta4_starts(game_dir, within)?;
     let started = Instant::now();
-    let all: Vec<(usize, usize, Vec<String>)> = starts
-        .par_iter()
-        .map(|(prefix, a, dir)| {
-            let (mut files, mut instructions, mut errors) = (0, 0, Vec::new());
-            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
-                if !a.entry(id).name.to_ascii_lowercase().ends_with(".sco") {
-                    return;
-                }
-                files += 1;
-                let checked = a
-                    .read(id)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|d| openrage_app::gta4::read_sco(&d))
-                    .and_then(|s| s.check().map_err(|e| anyhow::anyhow!(e)));
-                match checked {
-                    Ok(n) => instructions += n,
-                    Err(e) => errors.push(format!("{p}: {e:#}")),
-                }
-            });
-            (files, instructions, errors)
-        })
-        .collect();
+    let all: Vec<(usize, usize, Vec<String>)> = for_each_gta4_entry_parallel(
+        &starts,
+        false,
+        |a, id| a.entry(id).name.to_ascii_lowercase().ends_with(".sco"),
+        |a, id, p, (files, instructions, errors): &mut (usize, usize, Vec<String>)| {
+            *files += 1;
+            let checked = a
+                .read(id)
+                .map_err(anyhow::Error::from)
+                .and_then(|d| openrage_app::gta4::read_sco(&d))
+                .and_then(|s| s.check().map_err(|e| anyhow::anyhow!(e)));
+            match checked {
+                Ok(n) => *instructions += n,
+                Err(e) => errors.push(format!("{p}: {e:#}")),
+            }
+        },
+    );
     let (mut files, mut instructions, mut errors) = (0, 0, open_errors);
     for (f, i, e) in all {
         files += f;
         instructions += i;
         errors.extend(e);
     }
+    errors.sort();
     for e in errors.iter().take(50) {
         outln!("FAIL {e}");
     }
@@ -166,42 +161,36 @@ pub(crate) fn cmd_verify_gta4_animations(game_dir: &Path, within: &str) -> Resul
     }
     let (starts, open_errors) = gta4_starts(game_dir, within)?;
     let started = Instant::now();
-    let all: Vec<Stats> = starts
-        .par_iter()
-        .map(|(prefix, a, dir)| {
-            let mut s = Stats::default();
-            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
-                let e = a.entry(id);
-                if e.resource_type().is_none() || !e.name.to_ascii_lowercase().ends_with(".wad") {
-                    return;
-                }
-                s.files += 1;
-                match a
-                    .read_resource(id)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|r| Ok(rage_formats::wad::parse_wad(&r)?))
-                {
-                    Ok(dict) => {
-                        for anim in &dict.animations {
-                            s.animations += 1;
-                            s.tracks += anim.tracks.len();
-                            s.frames += anim.frames;
-                            for t in 0..anim.tracks.len() {
-                                for f in 0..anim.frames {
-                                    let ok = anim.value(t, f as f32).is_some_and(|v| v.iter().all(|c| c.is_finite()));
-                                    if !ok {
-                                        s.bad_values += 1;
-                                    }
+    let all: Vec<Stats> = for_each_gta4_entry_parallel(
+        &starts,
+        false,
+        |a, id| !a.entry(id).is_dir(),
+        |a, id, p, s: &mut Stats| {
+            let e = a.entry(id);
+            if e.resource_type().is_none() || !e.name.to_ascii_lowercase().ends_with(".wad") {
+                return;
+            }
+            s.files += 1;
+            match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| Ok(rage_formats::wad::parse_wad(&r)?)) {
+                Ok(dict) => {
+                    for anim in &dict.animations {
+                        s.animations += 1;
+                        s.tracks += anim.tracks.len();
+                        s.frames += anim.frames;
+                        for t in 0..anim.tracks.len() {
+                            for f in 0..anim.frames {
+                                let ok = anim.value(t, f as f32).is_some_and(|v| v.iter().all(|c| c.is_finite()));
+                                if !ok {
+                                    s.bad_values += 1;
                                 }
                             }
                         }
                     }
-                    Err(err) => s.errors.push(format!("{p}: {err:#}")),
                 }
-            });
-            s
-        })
-        .collect();
+                Err(err) => s.errors.push(format!("{p}: {err:#}")),
+            }
+        },
+    );
     let mut total = Stats { errors: open_errors, ..Default::default() };
     for s in all {
         total.files += s.files;
@@ -211,6 +200,7 @@ pub(crate) fn cmd_verify_gta4_animations(game_dir: &Path, within: &str) -> Resul
         total.bad_values += s.bad_values;
         total.errors.extend(s.errors);
     }
+    total.errors.sort();
     for e in total.errors.iter().take(50) {
         outln!("FAIL {e}");
     }
@@ -244,49 +234,47 @@ pub(crate) fn cmd_verify_gta4_collisions(game_dir: &Path, within: &str) -> Resul
     }
     let (starts, open_errors) = gta4_starts(game_dir, within)?;
     let started = Instant::now();
-    let all: Vec<Stats> = starts
-        .par_iter()
-        .map(|(prefix, a, dir)| {
-            let mut s = Stats::default();
-            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
-                let e = a.entry(id);
-                let lower = e.name.to_ascii_lowercase();
-                let fragment = lower.ends_with(".wft");
-                if e.resource_type().is_none() || !(lower.ends_with(".wbn") || lower.ends_with(".wbd") || fragment) {
-                    return;
-                }
-                let parsed = a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| {
-                    use rage_formats::wbn;
-                    Ok(if fragment {
-                        // The collision a fragment keeps for itself, if it has one.
-                        match rage_formats::wdr::fragment_bound(&r) {
-                            Some(at) => vec![wbn::parse_bound(&r, at)?.1],
-                            None => Vec::new(),
-                        }
-                    } else if lower.ends_with(".wbn") {
-                        vec![wbn::parse_wbn(&r)?.1]
-                    } else {
-                        wbn::parse_wbd(&r)?.into_iter().map(|(_, _, st)| st).collect()
-                    })
-                });
-                if !matches!(&parsed, Ok(list) if list.is_empty()) {
-                    s.files += 1;
-                }
-                match parsed {
-                    Ok(list) => {
-                        for st in list {
-                            s.bounds += st.bounds;
-                            s.triangles += st.triangles;
-                            s.primitives += st.primitives;
-                            s.materials.extend(st.materials);
-                        }
+    let all: Vec<Stats> = for_each_gta4_entry_parallel(
+        &starts,
+        false,
+        |a, id| !a.entry(id).is_dir(),
+        |a, id, p, s: &mut Stats| {
+            let e = a.entry(id);
+            let lower = e.name.to_ascii_lowercase();
+            let fragment = lower.ends_with(".wft");
+            if e.resource_type().is_none() || !(lower.ends_with(".wbn") || lower.ends_with(".wbd") || fragment) {
+                return;
+            }
+            let parsed = a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| {
+                use rage_formats::wbn;
+                Ok(if fragment {
+                    // The collision a fragment keeps for itself, if it has one.
+                    match rage_formats::wdr::fragment_bound(&r) {
+                        Some(at) => vec![wbn::parse_bound(&r, at)?.1],
+                        None => Vec::new(),
                     }
-                    Err(err) => s.errors.push(format!("{p}: {err:#}")),
-                }
+                } else if lower.ends_with(".wbn") {
+                    vec![wbn::parse_wbn(&r)?.1]
+                } else {
+                    wbn::parse_wbd(&r)?.into_iter().map(|(_, _, st)| st).collect()
+                })
             });
-            s
-        })
-        .collect();
+            if !matches!(&parsed, Ok(list) if list.is_empty()) {
+                s.files += 1;
+            }
+            match parsed {
+                Ok(list) => {
+                    for st in list {
+                        s.bounds += st.bounds;
+                        s.triangles += st.triangles;
+                        s.primitives += st.primitives;
+                        s.materials.extend(st.materials);
+                    }
+                }
+                Err(err) => s.errors.push(format!("{p}: {err:#}")),
+            }
+        },
+    );
     let mut total = Stats { errors: open_errors, ..Default::default() };
     for s in all {
         total.files += s.files;
@@ -296,6 +284,7 @@ pub(crate) fn cmd_verify_gta4_collisions(game_dir: &Path, within: &str) -> Resul
         total.materials.extend(s.materials);
         total.errors.extend(s.errors);
     }
+    total.errors.sort();
     for e in total.errors.iter().take(50) {
         outln!("FAIL {e}");
     }
@@ -329,43 +318,41 @@ pub(crate) fn cmd_verify_gta4_models(game_dir: &Path, within: &str) -> Result<()
     }
     let (starts, open_errors) = gta4_starts(game_dir, within)?;
     let started = Instant::now();
-    let all: Vec<Stats> = starts
-        .par_iter()
-        .map(|(prefix, a, dir)| {
-            let mut s = Stats::default();
-            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
-                let e = a.entry(id);
-                let lower = e.name.to_ascii_lowercase();
-                let kind = ["wdr", "wdd", "wft"].into_iter().find(|x| lower.ends_with(&format!(".{x}")));
-                let (Some(kind), Some(_)) = (kind, e.resource_type()) else { return };
-                s.files += 1;
-                let parsed = a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| {
-                    use rage_formats::wdr;
-                    Ok(match kind {
-                        "wdr" => vec![wdr::parse_wdr(&r)?],
-                        "wdd" => wdr::parse_wdd(&r)?.into_iter().map(|(_, d)| d).collect(),
-                        _ => {
-                            let f = wdr::parse_wft(&r)?;
-                            std::iter::once(f.drawable).chain(f.children.into_iter().map(|c| c.drawable)).collect()
-                        }
-                    })
-                });
-                match parsed {
-                    Ok(ds) => {
-                        for d in ds {
-                            s.drawables += 1;
-                            s.meshes += d.meshes.len();
-                            s.triangles += d.triangle_count();
-                            s.shaders += d.shaders.len();
-                            s.textured += d.shaders.iter().filter(|sh| sh.base_texture().is_some()).count();
-                        }
+    let all: Vec<Stats> = for_each_gta4_entry_parallel(
+        &starts,
+        false,
+        |a, id| !a.entry(id).is_dir(),
+        |a, id, p, s: &mut Stats| {
+            let e = a.entry(id);
+            let lower = e.name.to_ascii_lowercase();
+            let kind = ["wdr", "wdd", "wft"].into_iter().find(|x| lower.ends_with(&format!(".{x}")));
+            let (Some(kind), Some(_)) = (kind, e.resource_type()) else { return };
+            s.files += 1;
+            let parsed = a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| {
+                use rage_formats::wdr;
+                Ok(match kind {
+                    "wdr" => vec![wdr::parse_wdr(&r)?],
+                    "wdd" => wdr::parse_wdd(&r)?.into_iter().map(|(_, d)| d).collect(),
+                    _ => {
+                        let f = wdr::parse_wft(&r)?;
+                        std::iter::once(f.drawable).chain(f.children.into_iter().map(|c| c.drawable)).collect()
                     }
-                    Err(err) => s.errors.push(format!("{p}: {err:#}")),
-                }
+                })
             });
-            s
-        })
-        .collect();
+            match parsed {
+                Ok(ds) => {
+                    for d in ds {
+                        s.drawables += 1;
+                        s.meshes += d.meshes.len();
+                        s.triangles += d.triangle_count();
+                        s.shaders += d.shaders.len();
+                        s.textured += d.shaders.iter().filter(|sh| sh.base_texture().is_some()).count();
+                    }
+                }
+                Err(err) => s.errors.push(format!("{p}: {err:#}")),
+            }
+        },
+    );
     let mut total = Stats { errors: open_errors, ..Default::default() };
     for s in all {
         total.files += s.files;
@@ -376,6 +363,7 @@ pub(crate) fn cmd_verify_gta4_models(game_dir: &Path, within: &str) -> Result<()
         total.textured += s.textured;
         total.errors.extend(s.errors);
     }
+    total.errors.sort();
     for e in total.errors.iter().take(50) {
         outln!("FAIL {e}");
     }
@@ -543,82 +531,78 @@ pub(crate) fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: b
     }
     let (starts, open_errors) = gta4_starts(game_dir, within)?;
     let started = Instant::now();
-    let all: Vec<Stats> = starts
-        .par_iter()
-        .map(|(prefix, a, dir)| {
-            let mut s = Stats::default();
-            vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
-                let e = a.entry(id);
-                let lower = e.name.to_ascii_lowercase();
-                // Texture dictionaries, and models (.wdr) with textures of their own.
-                let model = lower.ends_with(".wdr");
-                if e.resource_type().is_none() || !(lower.ends_with(".wtd") || model) {
-                    return;
-                }
-                let read = a.read(id).map_err(anyhow::Error::from).and_then(|raw| {
-                    let header = rage_resource::rsc5_header(&raw).context("no RSC5 header")?;
-                    let res = rage_resource::Resource::from_rsc5(&raw)?;
-                    let root = match model {
-                        true => {
-                            rage_formats::wdr::embedded_textures(&res, rage_resource::Resource::ROOT).map(|e| e.root)
-                        }
-                        false => Some(rage_resource::Resource::ROOT),
-                    };
-                    let dict = root.map(|r| rage_formats::ytd::parse_gta4_at(&res, r)).transpose()?;
-                    Ok((header, res, root.zip(dict)))
-                });
-                let ((kind, flags), res, (root, dict)) = match read {
-                    Ok((h, r, Some(d))) => (h, r, d),
-                    Ok((_, _, None)) => return,
-                    Err(err) => return s.errors.push(format!("{p}: {err:#}")),
+    let all: Vec<Stats> = for_each_gta4_entry_parallel(
+        &starts,
+        false,
+        |a, id| !a.entry(id).is_dir(),
+        |a, id, p, s: &mut Stats| {
+            let e = a.entry(id);
+            let lower = e.name.to_ascii_lowercase();
+            // Texture dictionaries, and models (.wdr) with textures of their own.
+            let model = lower.ends_with(".wdr");
+            if e.resource_type().is_none() || !(lower.ends_with(".wtd") || model) {
+                return;
+            }
+            let read = a.read(id).map_err(anyhow::Error::from).and_then(|raw| {
+                let header = rage_resource::rsc5_header(&raw).context("no RSC5 header")?;
+                let res = rage_resource::Resource::from_rsc5(&raw)?;
+                let root = match model {
+                    true => rage_formats::wdr::embedded_textures(&res, rage_resource::Resource::ROOT).map(|e| e.root),
+                    false => Some(rage_resource::Resource::ROOT),
                 };
-                s.dicts += 1;
-                s.models += model as usize;
-                s.errors.extend(dict.errors.iter().map(|err| format!("{p}: {err}")));
-                if rebuild && dict.errors.is_empty() {
-                    // The writer's rebuild must read back to the same textures.
-                    let mut same_memory = false;
-                    let check = if model {
-                        rage_formats::wtd_write::rebuild_embedded(&res, kind, flags, root, &dict)
-                            .and_then(|file| rage_resource::Resource::from_rsc5(&file))
-                            .and_then(|r| {
-                                // Nothing changed: the model must come out byte for byte.
-                                same_memory = r.system == res.system && r.graphics == res.graphics;
-                                rage_formats::ytd::parse_gta4_at(&r, root)
-                            })
-                    } else {
-                        rage_formats::wtd_write::rebuild(&res, kind, flags, &dict)
-                            .and_then(|file| rage_resource::Resource::from_rsc5(&file))
-                            .and_then(|r| rage_formats::ytd::parse_gta4(&r))
-                    };
-                    s.identical += same_memory as usize;
-                    let key = |d: &rage_formats::ytd::TextureDictionary| {
-                        let mut v: Vec<_> = d
-                            .textures
-                            .iter()
-                            .map(|t| (t.name.clone(), t.width, t.height, t.levels, t.format, t.data.clone()))
-                            .collect();
-                        v.sort_by(|x, y| x.0.cmp(&y.0));
-                        v
-                    };
-                    match check {
-                        Ok(back) if back.errors.is_empty() && key(&back) == key(&dict) => s.rebuilt += 1,
-                        Ok(_) => s.errors.push(format!("{p}: rebuilt dictionary differs")),
-                        Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
-                    }
-                }
-                for t in &dict.textures {
-                    s.textures += 1;
-                    *s.formats.entry(t.format.name()).or_default() += 1;
-                    match t.to_rgba() {
-                        Some(_) => s.decoded += 1,
-                        None => s.errors.push(format!("{p}/{}: cannot decode {}", t.name, t.format.name())),
-                    }
-                }
+                let dict = root.map(|r| rage_formats::ytd::parse_gta4_at(&res, r)).transpose()?;
+                Ok((header, res, root.zip(dict)))
             });
-            s
-        })
-        .collect();
+            let ((kind, flags), res, (root, dict)) = match read {
+                Ok((h, r, Some(d))) => (h, r, d),
+                Ok((_, _, None)) => return,
+                Err(err) => return s.errors.push(format!("{p}: {err:#}")),
+            };
+            s.dicts += 1;
+            s.models += model as usize;
+            s.errors.extend(dict.errors.iter().map(|err| format!("{p}: {err}")));
+            if rebuild && dict.errors.is_empty() {
+                // The writer's rebuild must read back to the same textures.
+                let mut same_memory = false;
+                let check = if model {
+                    rage_formats::wtd_write::rebuild_embedded(&res, kind, flags, root, &dict)
+                        .and_then(|file| rage_resource::Resource::from_rsc5(&file))
+                        .and_then(|r| {
+                            // Nothing changed: the model must come out byte for byte.
+                            same_memory = r.system == res.system && r.graphics == res.graphics;
+                            rage_formats::ytd::parse_gta4_at(&r, root)
+                        })
+                } else {
+                    rage_formats::wtd_write::rebuild(&res, kind, flags, &dict)
+                        .and_then(|file| rage_resource::Resource::from_rsc5(&file))
+                        .and_then(|r| rage_formats::ytd::parse_gta4(&r))
+                };
+                s.identical += same_memory as usize;
+                let key = |d: &rage_formats::ytd::TextureDictionary| {
+                    let mut v: Vec<_> = d
+                        .textures
+                        .iter()
+                        .map(|t| (t.name.clone(), t.width, t.height, t.levels, t.format, t.data.clone()))
+                        .collect();
+                    v.sort_by(|x, y| x.0.cmp(&y.0));
+                    v
+                };
+                match check {
+                    Ok(back) if back.errors.is_empty() && key(&back) == key(&dict) => s.rebuilt += 1,
+                    Ok(_) => s.errors.push(format!("{p}: rebuilt dictionary differs")),
+                    Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
+                }
+            }
+            for t in &dict.textures {
+                s.textures += 1;
+                *s.formats.entry(t.format.name()).or_default() += 1;
+                match t.to_rgba() {
+                    Some(_) => s.decoded += 1,
+                    None => s.errors.push(format!("{p}/{}: cannot decode {}", t.name, t.format.name())),
+                }
+            }
+        },
+    );
     let mut total = Stats { errors: open_errors, ..Default::default() };
     for s in all {
         total.dicts += s.dicts;
@@ -632,6 +616,7 @@ pub(crate) fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: b
             *total.formats.entry(k).or_default() += v;
         }
     }
+    total.errors.sort();
     for e in total.errors.iter().take(50) {
         outln!("FAIL {e}");
     }

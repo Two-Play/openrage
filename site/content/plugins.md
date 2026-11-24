@@ -323,7 +323,7 @@ Y up (OBJ, glTF) need `(x, y, z) → (x, z, −y)` and `v → 1 − v` on the wa
   `name.mtl` and one PNG per texture. It only calls `load-model` and `load-texture`, so it works for every game
   OpenRAGE reads.
 - **Preview** of `.obj` files in the 3D view: the plugin returns a `model` view.
-- **Replace with OBJ…** on a GTA V Enhanced `.ydr` or vehicle `.yft` (a `modify` action with `pick = ["obj"]`): reads the chosen OBJ,
+- **Replace with OBJ…** on a GTA V Enhanced `.ydr`, `.yft` or `.ydd` (a `modify` action with `pick = ["obj"]`): reads the chosen OBJ,
   calls `build-model` with the drawable as the template and writes the result with `write-mod-file`. This is why it
   asks for `write-mods`.
 

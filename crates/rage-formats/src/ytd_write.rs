@@ -76,6 +76,56 @@ pub fn apply(
     apply_inner(res, system_flags, graphics_flags, dict, edits, false)
 }
 
+/// Red Dead Redemption 2 (`ytd::parse_rdr2`): replaces textures in place by
+/// ones of the same format, size, depth and mip count, writing their pixels
+/// into the padded layout the game stores. Returns the changed resource
+/// (same pages, same sizes). Adding and removing textures, and other shapes,
+/// are not supported yet.
+pub fn apply_rdr2(res: &Resource, dict: &TextureDictionary, edits: &[Edit]) -> Result<Resource, ResourceError> {
+    if !dict.errors.is_empty() {
+        return Err(bad(format!("dictionary has unreadable textures ({}); refusing to rewrite it", dict.errors[0])));
+    }
+    if dict.layout != crate::ytd::Layout::Rdr2 {
+        return Err(bad("not a Red Dead Redemption 2 dictionary (version 2)"));
+    }
+    let list = res.u64(Resource::ROOT + 0x30)?;
+    let mut out = res.clone();
+    for e in edits {
+        let t = match e {
+            Edit::Set(t) => t,
+            Edit::Remove(n) => {
+                return Err(bad(format!("{n}: removing textures from RDR2 dictionaries is not supported yet")));
+            }
+        };
+        let Some(i) = dict.textures.iter().position(|x| x.name.eq_ignore_ascii_case(&t.name)) else {
+            return Err(bad(format!("{}: adding textures to RDR2 dictionaries is not supported yet", t.name)));
+        };
+        let old = &dict.textures[i];
+        if !same_shape(old, t) {
+            return Err(bad(format!(
+                "{}: RDR2 textures can only be replaced by one of the same format, size and mip count \
+                 ({} {}×{}, {} levels; the new one is {} {}×{}, {} levels)",
+                t.name,
+                old.format.name(),
+                old.width,
+                old.height,
+                old.levels,
+                t.format.name(),
+                t.width,
+                t.height,
+                t.levels
+            )));
+        }
+        let (_, data_ptr, rows) = crate::ytd::rdr2_rows(res, res.u64(list + i as u64 * 8)?)?;
+        let mut from = 0;
+        for (at, len) in rows {
+            out.bytes_mut(data_ptr + at as u64, len)?.copy_from_slice(&t.data[from..from + len]);
+            from += len;
+        }
+    }
+    Ok(out)
+}
+
 /// Rebuilds a dictionary with a fresh layout and no changes (used to verify the writer).
 pub fn rebuild(dict: &TextureDictionary) -> Result<Vec<u8>, ResourceError> {
     let res = Resource { version: dict.version, system: Vec::new(), graphics: Vec::new() };

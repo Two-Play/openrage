@@ -6,7 +6,7 @@ use rage_formats::math::{self, Mat4};
 
 use crate::expr::Local;
 
-/// Reads a clip dictionary (`.ycd`, GTA V or RDR2; GTA IV `.wad`) or a cutscene's
+/// Reads a clip dictionary (`.ycd`, GTA V or RDR2; GTA IV `.wad`; GTA VI `.#cd`) or a cutscene's
 /// animation (`.cut`, its sections joined), mods included.
 pub fn load_clips(
     game_dir: &std::path::Path,
@@ -24,6 +24,10 @@ pub fn load_clips(
             let entry =
                 rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| anyhow::anyhow!("archive table not readable"))?;
             Ok(rage_formats::clip::parse_ycd(&rpf.read_resource(entry)?)?)
+        }
+        Node::Rpf9File(rpf, i) => {
+            let (system, graphics) = crate::rpf9::resource(&rpf, i)?;
+            Ok(rage_formats::clip6::parse(&rage_resource::Resource { version: 0, system, graphics })?)
         }
         _ => anyhow::bail!("{vpath} is not a file inside an archive"),
     }
@@ -88,7 +92,8 @@ impl Binding {
     pub fn new(skeleton: &Skeleton, animation: &Animation) -> Self {
         let mut tracks = vec![[None; 3]; skeleton.bones.len()];
         for (i, t) in animation.tracks.iter().enumerate() {
-            let Some(b) = skeleton.find_tag(t.bone) else { continue };
+            let found = if t.bone_hash != 0 { skeleton.find_hash(t.bone_hash) } else { skeleton.find_tag(t.bone) };
+            let Some(b) = found else { continue };
             let slot = match t.track {
                 TRACK_BONE_TRANSLATION => 0,
                 TRACK_BONE_ROTATION => 1,
@@ -224,7 +229,7 @@ mod tests {
         let animation = Animation::from_frames(
             1,
             0.0,
-            vec![BoneTrack { bone: 1, format: 1, track: TRACK_BONE_ROTATION }],
+            vec![BoneTrack { bone: 1, format: 1, track: TRACK_BONE_ROTATION, ..Default::default() }],
             vec![vec![[0.0, 0.0, h, h]]],
         );
         let binding = Binding::new(&skeleton, &animation);

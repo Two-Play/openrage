@@ -59,6 +59,11 @@ pub struct Mesh {
     /// is the bone tagged `bone_tags[i]` of the skeleton the part is worn
     /// on); empty when the indices are skeleton indices already.
     pub bone_tags: Vec<u16>,
+    /// The same for GTA VI: hashes of the bones' names.
+    pub bone_hashes: Vec<u32>,
+    /// GTA VI: what shades a vertex. Red: how much of the sky it sees; alpha:
+    /// how much of a decal, of dirt or of the second layer shows there.
+    pub shading: Vec<[u8; 4]>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,6 +103,11 @@ impl Skeleton {
         self.bones.iter().position(|b| b.tag == tag)
     }
 
+    /// The bone whose name has this hash (GTA VI's animations name bones so).
+    pub fn find_hash(&self, hash: u32) -> Option<usize> {
+        self.bones.iter().position(|b| rage_core::hash::joaat(&b.name) == hash)
+    }
+
     pub fn find_name(&self, name: &str) -> Option<usize> {
         self.bones.iter().position(|b| b.name.eq_ignore_ascii_case(name))
     }
@@ -111,6 +121,8 @@ pub mod param {
     pub const DIFFUSE_SAMPLER: u32 = 0xf1fe2b71;
     /// `DiffuseTex2`: a second colour layer on the second UV set (vehicle liveries and signs).
     pub const DIFFUSE_TEX2: u32 = 0x0df47048;
+    /// GTA VI: the colour of the second layer of layered shaders.
+    pub const LAYER_1_TEX: u32 = 0x7d4f_12e2;
     /// `DiffuseSampler2` (Legacy).
     pub const DIFFUSE_SAMPLER2: u32 = 0x0ad3a268;
     /// `DirtTex`, `SpecularTex`, `BumpTex`, `DamageTexture`.
@@ -126,10 +138,23 @@ pub mod param {
     /// `TextureSampler`: the base colour (GTA IV).
     pub const TEXTURE_SAMPLER: u32 = 0x2b5170fd;
 
+    /// RDR2 `lyr0DiffuseTex`: the colour of the first layer of layered
+    /// shaders (`standard_vehicle_2lyr`, …). With a tint palette it holds a
+    /// shade (and masks) that the palette colours.
+    pub const LYR0_DIFFUSE_TEX: u32 = 0x346394ea;
+    /// RDR2 `TintPaletteTex`: palette colours, one column per palette slot
+    /// (vertex colour blue), one row per tint.
+    pub const TINT_PALETTE_TEX: u32 = 0x2c8d7182;
+    /// RDR2 `vehTintPaletteTex`: vehicle colours, one row per colour
+    /// (`carcols.ymt`), columns from dark to light.
+    pub const VEH_TINT_PALETTE_TEX: u32 = 0x7b21acbf;
+
     /// Parameters that hold the base colour.
-    pub const BASE: [u32; 3] = [DIFFUSE_TEX, DIFFUSE_SAMPLER, TEXTURE_SAMPLER];
+    pub const BASE: [u32; 4] = [DIFFUSE_TEX, DIFFUSE_SAMPLER, TEXTURE_SAMPLER, LYR0_DIFFUSE_TEX];
     /// Parameters that never hold the base colour.
-    pub const NOT_BASE: [u32; 9] = [
+    pub const NOT_BASE: [u32; 11] = [
+        TINT_PALETTE_TEX,
+        VEH_TINT_PALETTE_TEX,
         DIFFUSE_TEX2,
         DIFFUSE_SAMPLER2,
         DIRT_TEX,
@@ -195,9 +220,11 @@ impl Shader {
     }
 
     /// A second colour layer drawn over the base colour with its alpha, on
-    /// the second UV set (vehicle liveries and signs: `DiffuseTex2`).
+    /// the second UV set (vehicle liveries and signs: `DiffuseTex2`), or the
+    /// second layer of GTA VI's layered shaders, on the first.
     pub fn overlay_texture(&self) -> Option<&str> {
-        self.sampler(param::DIFFUSE_TEX2).or_else(|| self.sampler(param::DIFFUSE_SAMPLER2))
+        let overlay = self.sampler(param::DIFFUSE_TEX2).or_else(|| self.sampler(param::DIFFUSE_SAMPLER2));
+        overlay.or_else(|| self.sampler(param::LAYER_1_TEX))
     }
 }
 
@@ -226,6 +253,8 @@ pub struct Fragment {
     pub drawable: Drawable,
     /// Children with meshes of their own (e.g. wheels).
     pub children: Vec<FragmentChild>,
+    /// Cloth (RDR2's flags and straps) in its rest pose, in model space.
+    pub cloths: Vec<Drawable>,
 }
 
 impl Drawable {
@@ -806,10 +835,56 @@ pub fn parse_yft(res: &Resource) -> Result<Drawable, ResourceError> {
     Ok(parse_fragment(res)?.drawable)
 }
 
-/// A `.yft` file with the child drawables (wheels and other parts).
 /// A Red Dead Redemption 2 `.yft`: its main drawable (at `0x20` of the
-/// fragment; found among the root's pointers if not). Children are not read yet.
+/// fragment; found among the root's pointers if not) and the children with
+/// meshes of their own (wheels, see [`read_fragment_children_rdr2`]).
 pub fn parse_fragment_rdr2(res: &Resource) -> Result<Fragment, ResourceError> {
+    let body = read_drawable_gen(res, fragment_drawable_rdr2(res)?, Gen::Rdr2)?;
+    // Cloth and children are optional extras, as in GTA V.
+    let (cloth_ptrs, cloths) = read_cloths_rdr2(res, &body).unwrap_or_default();
+    let children = read_fragment_children_rdr2(res, &body, &cloth_ptrs).unwrap_or_default();
+    Ok(Fragment { drawable: body, children, cloths })
+}
+
+/// The cloth of an RDR2 fragment (flags, straps, awnings), in its rest pose:
+/// a list at `0x48` of the fragment (16-byte entries, `u16` count at
+/// `0x50`), each cloth with its drawable at `0x18`. A cloth drawable without
+/// shaders of its own uses the body's. Returns the drawables' addresses too
+/// (a cloth's drawable can also be a child of the physics LOD).
+fn read_cloths_rdr2(res: &Resource, body: &Drawable) -> Result<(Vec<u64>, Vec<Drawable>), ResourceError> {
+    let ok = |p: u64| (0x5000_0000..0x6000_0000).contains(&p);
+    let list = res.u64(Resource::ROOT + 0x48)?;
+    if !ok(list) {
+        return Ok(Default::default());
+    }
+    let (mut ptrs, mut out) = (Vec::new(), Vec::new());
+    for i in 0..res.u16(Resource::ROOT + 0x50)?.min(64) as u64 {
+        let cloth = res.u64(list + i * 16)?;
+        let ptr = if ok(cloth) { res.u64(cloth + 0x18)? } else { 0 };
+        if !ok(ptr) || ptrs.contains(&ptr) {
+            continue;
+        }
+        let mut drawable = read_drawable_gen(res, ptr, Gen::Rdr2)?;
+        if drawable.shaders.is_empty() {
+            drawable.shaders = body.shaders.clone();
+        }
+        ptrs.push(ptr);
+        if !drawable.meshes.is_empty() {
+            out.push(drawable);
+        }
+    }
+    Ok((ptrs, out))
+}
+
+/// Only the skeleton of an RDR2 `.yft` (much faster than reading the meshes).
+pub fn fragment_skeleton_rdr2(res: &Resource) -> Result<Option<Skeleton>, ResourceError> {
+    let skeleton = res.u64(fragment_drawable_rdr2(res)? + 0x18)?;
+    Ok(if skeleton != 0 { Some(read_skeleton_gen(res, skeleton, Gen::Rdr2)?) } else { None })
+}
+
+/// The main drawable of an RDR2 fragment: at `0x20`, else the first of the
+/// root's pointers that looks like one.
+fn fragment_drawable_rdr2(res: &Resource) -> Result<u64, ResourceError> {
     let root = Resource::ROOT;
     let looks_like_drawable = |p: u64| -> bool {
         let ok = |q: u64| (0x5000_0000..0x6000_0000).contains(&q);
@@ -820,11 +895,79 @@ pub fn parse_fragment_rdr2(res: &Resource) -> Result<Fragment, ResourceError> {
             })
     };
     let candidates = std::iter::once(0x20).chain((0..0xC0).step_by(8));
-    let drawable = candidates
-        .filter_map(|o| res.u64(root + o).ok())
-        .find(|&p| looks_like_drawable(p))
-        .ok_or_else(|| bad("fragment without a drawable"))?;
-    Ok(Fragment { drawable: read_drawable_gen(res, drawable, Gen::Rdr2)?, children: Vec::new() })
+    let found = candidates.filter_map(|o| res.u64(root + o).ok()).find(|&p| looks_like_drawable(p));
+    // A fragment that is all cloth (a strap): the body has shaders and a
+    // skeleton but no meshes of its own.
+    let ok = |q: u64| (0x5000_0000..0x6000_0000).contains(&q);
+    let body_of_cloth = || {
+        let p = res.u64(root + 0x20).ok().filter(|&p| ok(p))?;
+        (res.u64(p + 0x10).is_ok_and(ok) && res.u64(root + 0x48).is_ok_and(ok)).then_some(p)
+    };
+    found.or_else(body_of_cloth).ok_or_else(|| bad("fragment without a drawable"))
+}
+
+/// The children of an RDR2 fragment that have meshes. The physics LOD group
+/// is at `0x90` of the fragment, its first LOD at `0x10`. Unlike GTA V's, a
+/// child is a drawable itself (list at `0x118` of the LOD, `u8` count at
+/// `0x146`) without a shader group: its meshes use the body's shaders. Its
+/// bone is named by its group (group of each child: `u16` list at `0x110`;
+/// groups at `0xC8`, with the parent group at `+0x06` and the name at
+/// `+0x4F`), and a group without a bone of that name sits on its parent's.
+fn read_fragment_children_rdr2(
+    res: &Resource,
+    body: &Drawable,
+    cloths: &[u64],
+) -> Result<Vec<FragmentChild>, ResourceError> {
+    let ok = |p: u64| (0x5000_0000..0x6000_0000).contains(&p);
+    let group = res.u64(Resource::ROOT + 0x90)?;
+    if !ok(group) {
+        return Ok(Vec::new());
+    }
+    let Some(lod) = (0..3).map(|i| res.u64(group + 0x10 + i * 8)).find_map(|p| p.ok().filter(|&p| ok(p))) else {
+        return Ok(Vec::new());
+    };
+    let (groups, group_of, list) = (res.u64(lod + 0xC8)?, res.u64(lod + 0x110)?, res.u64(lod + 0x118)?);
+    let (group_count, count) = (res.u8(lod + 0x140)? as u64, res.u8(lod + 0x146)? as u64);
+    if !ok(groups) || !ok(group_of) || !ok(list) {
+        return Ok(Vec::new());
+    }
+    let skeleton = body.skeleton.as_ref();
+    // The bone of group `g`: by its name, else its parent's (at most 64 steps up).
+    let bone_of = |mut g: u64| -> Option<u16> {
+        let skeleton = skeleton?;
+        for _ in 0..64 {
+            if g >= group_count {
+                return None;
+            }
+            let at = res.u64(groups + g * 8).ok().filter(|&p| ok(p))?;
+            let name = res.string(at + 0x4F).ok()?;
+            if let Some(b) = skeleton.find_name(&name) {
+                return Some(skeleton.bones[b].tag);
+            }
+            g = res.u8(at + 0x06).ok().filter(|&p| p != 0xFF)? as u64;
+        }
+        None
+    };
+    let mut seen = cloths.to_vec();
+    let mut out = Vec::new();
+    for i in 0..count {
+        let ptr = res.u64(list + i * 8)?;
+        if !ok(ptr) || seen.contains(&ptr) {
+            continue;
+        }
+        seen.push(ptr);
+        let mut drawable = read_drawable_gen(res, ptr, Gen::Rdr2)?;
+        if drawable.meshes.is_empty() {
+            continue;
+        }
+        if drawable.shaders.is_empty() {
+            drawable.shaders = body.shaders.clone();
+        }
+        let g = res.u16(group_of + i * 2)? as u64;
+        let bone_tag = bone_of(g).or_else(|| skeleton.and_then(|s| s.bones.first()).map(|b| b.tag)).unwrap_or(0);
+        out.push(FragmentChild { bone_tag, drawable });
+    }
+    Ok(out)
 }
 
 pub fn parse_fragment(res: &Resource) -> Result<Fragment, ResourceError> {
@@ -840,7 +983,7 @@ pub fn parse_fragment(res: &Resource) -> Result<Fragment, ResourceError> {
     }
     // Children are optional extras: a fragment without readable ones is still fine.
     let children = read_fragment_children(res, enhanced).unwrap_or_default();
-    Ok(Fragment { drawable: d, children })
+    Ok(Fragment { drawable: d, children, cloths: Vec::new() })
 }
 
 fn read_fragment_children(res: &Resource, enhanced: bool) -> Result<Vec<FragmentChild>, ResourceError> {
@@ -952,6 +1095,12 @@ mod tests {
         // Unknown parameters: by name.
         let unknown = s(&[(0, "plate01_n"), (0, "plate01")]);
         assert_eq!(unknown.base_texture(), Some("plate01"));
+        // RDR2 palette shaders: the shade in lyr0DiffuseTex, not the palette.
+        let pal = s(&[
+            (param::TINT_PALETTE_TEX, "w_repeater_cloth_strap01_pal"),
+            (param::LYR0_DIFFUSE_TEX, "w_repeater_cloth_strap01_ab"),
+        ]);
+        assert_eq!(pal.base_texture(), Some("w_repeater_cloth_strap01_ab"));
     }
 
     #[test]

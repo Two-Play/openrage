@@ -24,7 +24,14 @@ pub(crate) fn start_browsing(ui: &AppWindow) {
         format!("OpenRAGE — {name}")
     });
     ui.set_window_title(title.into());
+    ui.set_has_world_map(with_app(|a| a.game_dir.as_deref().is_some_and(detect::is_gta6_dir)));
     start_index_update(ui);
+    // GTA VI: its archives are read through once to find their files. That
+    // starts now, not when an archive is opened first.
+    match with_app(|a| a.game_dir.clone()).filter(|d| detect::is_gta6_dir(d)) {
+        Some(dir) => openrage_app::rpf9::index_in_background(&dir),
+        None => openrage_app::rpf9::stop_background(),
+    }
     refresh_asi(ui);
     refresh_tool_menu(ui);
     refresh_undo(ui);
@@ -276,12 +283,22 @@ pub(crate) fn refresh_files(ui: &AppWindow, select: Option<&str>) {
         ui.set_history_group(SharedString::new());
     }
     let archive_mode = with_app(|a| {
-        matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Archive(..) | Location::Gta4(..)))
+        matches!(
+            a.listing.as_ref().map(|l| &l.location),
+            Some(Location::Archive(..) | Location::Gta4(..) | Location::Rpf8(..))
+        )
     });
     ui.set_audio_mode_folder(with_app(|a| {
         matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::Audio { .. }))
     }));
-    ui.set_in_mods(with_app(|a| a.listing.as_ref().is_some_and(|l| l.origin != Origin::Base)));
+    // RDR2: a game archive with replaced files in lml/replace is still the
+    // game's own; only a nested archive copied there is a copy.
+    ui.set_in_mods(with_app(|a| {
+        a.listing.as_ref().is_some_and(|l| match l.location {
+            Location::Rpf8(..) => l.origin == Origin::Mods,
+            _ => l.origin != Origin::Base,
+        })
+    }));
     ui.set_archive_mode(archive_mode);
     ui.set_entry_selected(archive_mode && selected_row.is_some());
     if let (Some(row), Some(_)) = (selected_row, select) {
@@ -404,6 +421,12 @@ pub(crate) fn file_row(item: &Item) -> FileRow {
         can_open: is_openable(item),
         can_view: is_viewable(item),
         is_model: is_model_item(item),
+        is_openformats: item.kind == ItemKind::Resource
+            && item.mark != Some(Mark::Removed)
+            && openrage_app::openformats::Kind::of_game_file(&item.name).is_some(),
+        can_import_openformats: item.kind == ItemKind::Resource
+            && item.mark != Some(Mark::Removed)
+            && openrage_app::openformats::Kind::of_game_file(&item.name).is_some_and(|k| k.can_import()),
         can_edit_text: is_text_file(item),
         is_meta: is_meta_file(item),
         is_gfx: item.name.to_ascii_lowercase().ends_with(".gfx"),
@@ -500,6 +523,18 @@ pub(crate) fn set_meta(ui: &AppWindow, meta: &Meta) {
 pub(crate) fn show_folder_info(ui: &AppWindow) {
     // Read before `with_app` below: it would borrow the app state twice.
     let overlay = overlay_name();
+    // A video does not go on without its picture.
+    if ui.get_preview_loading() || with_app(|a| a.video.is_some()) {
+        with_app(|a| a.preview_generation.fetch_add(1, Ordering::SeqCst));
+        ui.set_preview_loading(false);
+        stop_sound(ui);
+        ui.set_audio_mode(false);
+        ui.set_video_mode(false);
+        with_app(|a| {
+            a.sound = None;
+            a.video = None;
+        });
+    }
     let info = with_app(|a| {
         let l = a.listing.as_ref()?;
         let name = location_title(l);
@@ -592,8 +627,23 @@ pub(crate) fn show_folder_info(ui: &AppWindow) {
                     kv("Type", "Inside a Red Dead Redemption 2 archive"),
                     kv("Archive", rpf.display_name().rsplit('/').next().unwrap_or_default()),
                     kv("Entries", grouped(h.entry_count as usize)),
-                    note("Read-only. Names come from `openrage rdr2-names`; unnamed files are under hash/."),
+                    note(
+                        "Changes go into lml/replace (Lenny's Mod Loader), never into the game's archives. \
+                         Names come from `openrage rdr2-names`; unnamed files are under hash/.",
+                    ),
                 ]
+            }
+            Location::Rpf9(rpf, _) => {
+                let mut meta = vec![
+                    kv(
+                        "Type",
+                        if rpf.is_native() { "Inside a GTA VI archive" } else { "Recovered from a GTA VI archive" },
+                    ),
+                    kv("Archive", rpf.display_name().rsplit('/').next().unwrap_or_default()),
+                ];
+                meta.extend(crate::preview::rpf9_archive_info(rpf));
+                meta.push(note("Read-only. Extract… saves the files unpacked."));
+                meta
             }
             Location::Gta4(a, _) => {
                 let mut meta = vec![kv("Type", "Inside a GTA IV archive")];

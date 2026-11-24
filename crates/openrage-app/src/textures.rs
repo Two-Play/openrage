@@ -21,6 +21,35 @@ pub fn edit_textures(
     edits: &[Edit],
 ) -> Result<(EditResult, PathBuf)> {
     let (node, _) = rage_mods::resolve(game_dir, vpath, keys.clone())?;
+    if let Node::Rpf8File(rpf, i) = node {
+        // RDR2: same-shape replacements, written into the padded layout.
+        let entry = rpf.entries().and_then(|e| e.get(i)).with_context(|| format!("{vpath} not found"))?.clone();
+        let res = rpf.read_resource(&entry)?;
+        let dict = rage_formats::ytd::parse_rdr2(&res).context("reading the texture dictionary")?;
+        let changed = ytd_write::apply_rdr2(&res, &dict, edits)?;
+        let mut file = rpf.resource_file(&entry)?;
+        file.truncate(16);
+        file.extend(&changed.system);
+        file.extend(&changed.graphics);
+        drop(rpf);
+        let applied = apply_at(game_dir, keys, vpath, Op::Set(file.clone()), &describe(vpath, edits))?;
+        let replaced = edits.len();
+        return Ok((EditResult { file, in_place: true, replaced, added: 0, removed: 0 }, applied.path));
+    }
+    if let Node::PlainFile(path) = &node
+        && let Some(res) = std::fs::read(path).ok().as_deref().and_then(rage_rpf::rpf8::parse_resource_file)
+    {
+        // RDR2: a dictionary already replaced in lml/replace (an RSC8 file).
+        let dict = rage_formats::ytd::parse_rdr2(&res).context("reading the texture dictionary")?;
+        let changed = ytd_write::apply_rdr2(&res, &dict, edits)?;
+        let mut file = std::fs::read(path)?;
+        file.truncate(16);
+        file.extend(&changed.system);
+        file.extend(&changed.graphics);
+        let applied = apply_at(game_dir, keys, vpath, Op::Set(file.clone()), &describe(vpath, edits))?;
+        let replaced = edits.len();
+        return Ok((EditResult { file, in_place: true, replaced, added: 0, removed: 0 }, applied.path));
+    }
     if let Node::Gta4File(archive, id) = node {
         // GTA IV (.wtd): an RSC5 resource inside an image archive.
         let raw = archive.read(id)?;
@@ -62,6 +91,12 @@ pub fn edit_textures(
     drop(rpf);
     let applied = apply_at(game_dir, keys, vpath, Op::Set(result.file.clone()), &describe(vpath, edits))?;
     Ok((result, applied.path))
+}
+
+/// The textures of a GTA VI dictionary (`.#td`).
+pub fn gta6_dictionary(rpf: &rage_rpf::Rpf9, index: usize) -> Result<rage_formats::ytd::TextureDictionary> {
+    let (system, graphics) = crate::rpf9::resource(rpf, index)?;
+    Ok(rage_formats::td6::parse(&system, &graphics)?)
 }
 
 /// The extension of a GTA V model (`ydr`, `yft`, `ydd`) named by `vpath`.

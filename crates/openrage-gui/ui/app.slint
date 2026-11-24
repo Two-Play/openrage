@@ -178,6 +178,10 @@ export struct FileRow {
     // Has a 3D or image view (model, texture).
     can-view: bool,
     is-model: bool,
+    // A GTA V model or texture dictionary: exportable as OpenIV openFormats text.
+    is-openformats: bool,
+    // … and openFormats files can be imported onto it (not drawable dictionaries).
+    can-import-openformats: bool,
     // A text file (opens in the text editor).
     can-edit-text: bool,
     // Binary metadata (.ymap, .ytyp, .ymt, …) shown as XML.
@@ -538,6 +542,11 @@ component FileItem inherits Rectangle {
                 icon: @image-url("icons/menu/export.svg");
                 activated => { root.action("plugin:" + i); }
             }
+            if !root.history-mode && item.kind == "Bink video": MenuItem {
+                title: @tr("Open player");
+                icon: @image-url("icons/menu/export.svg");
+                activated => { root.action("play"); }
+            }
             if !root.history-mode && item.kind != "Folder": MenuItem {
                 title: @tr("Open with system app (read-only copy)");
                 icon: @image-url("icons/menu/export.svg");
@@ -553,6 +562,11 @@ component FileItem inherits Rectangle {
                 icon: @image-url("icons/menu/export.svg");
                 activated => { root.action("gltf"); }
             }
+            if item.is-openformats: MenuItem {
+                title: @tr("Export openFormats…");
+                icon: @image-url("icons/menu/export.svg");
+                activated => { root.action("openformats-export"); }
+            }
             if root.texture-mode: MenuItem {
                 title: @tr("Save PNG…");
                 icon: @image-url("icons/menu/image.svg");
@@ -564,6 +578,12 @@ component FileItem inherits Rectangle {
                 icon: @image-url("icons/menu/replace.svg");
                 enabled: root.can-edit;
                 activated => { root.action("replace"); }
+            }
+            if root.archive-mode && item.can-import-openformats: MenuItem {
+                title: @tr("Import openFormats…");
+                icon: @image-url("icons/menu/replace.svg");
+                enabled: root.can-edit;
+                activated => { root.action("openformats-import"); }
             }
             if root.archive-mode: MenuItem {
                 title: @tr("Rename…");
@@ -1001,6 +1021,13 @@ export component AppWindow inherits Window {
     in property <[string]> languages;
     in-out property <int> language-index;
     in property <string> index-status;
+    in property <bool> index-running;
+    // The last update was stopped before its end.
+    in property <bool> index-stopped;
+    // 0 to 1; negative if not known.
+    in property <float> index-progress: -1;
+    callback index-stop();
+    callback index-resume();
 
     // Info + preview
     in property <string> info-title;
@@ -1023,6 +1050,8 @@ export component AppWindow inherits Window {
     in property <string> suggest-icon: "model";
     // Sound preview: waveform in the preview area, player controls above it.
     in property <bool> audio-mode;
+    // The audio controls play a video (audio-mode is set too).
+    in property <bool> video-mode;
     // The preview image is a texture or picture (not a waveform), so it can open in the viewer.
     in property <bool> image-viewable;
     in property <bool> audio-playing;
@@ -1107,6 +1136,8 @@ export component AppWindow inherits Window {
     in property <string> setup-log;
     in property <bool> setup-running;
     in property <bool> setup-can-cancel;
+    // Other games are set up: leaving the setup goes back to their list.
+    in property <bool> setup-has-games;
 
     callback navigate(string);
     callback go-back();
@@ -1132,6 +1163,10 @@ export component AppWindow inherits Window {
     callback suggestion-open(int);
     callback model-resized();
     callback export-gltf();
+    // The game's whole map can be shown (GTA VI).
+    in property <bool> has-world-map;
+    callback open-world-map();
+    callback open-player();
     callback audio-toggle();
     callback audio-stop();
     callback audio-seek(float);
@@ -1172,6 +1207,7 @@ export component AppWindow inherits Window {
     callback setup-browse-magic();
     callback setup-pick-detected(string);
     callback setup-run();
+    callback setup-leave();
     callback theme-changed(int);
     // Accent color (View → Accent color): mode 0 style, 1 orange, 2 custom color.
     callback accent-chosen(int, color);
@@ -1633,6 +1669,11 @@ export component AppWindow inherits Window {
         }
         Menu {
             title: @tr("Tools");
+            if root.has-world-map: MenuItem {
+                title: @tr("Map of the game (3D)…");
+                icon: @image-url("icons/menu/map.svg");
+                activated => { root.open-world-map(); }
+            }
             if root.plugin-tools.length == 0: MenuItem {
                 title: @tr("No plugin tools");
                 enabled: false;
@@ -2494,6 +2535,18 @@ export component AppWindow inherits Window {
                 }
 
                 // Actions for the selection
+                if root.video-mode: HorizontalLayout {
+                    spacing: Theme.space-s;
+                    Button {
+                        text: @tr("Open player");
+                        icon: @image-url("icons/expand.svg");
+                        colorize-icon: true;
+                        clicked => { root.open-player(); }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
+                }
                 if root.can-view: HorizontalLayout {
                     spacing: Theme.space-s;
                     Button {
@@ -2538,7 +2591,7 @@ export component AppWindow inherits Window {
                         padding-left: Theme.space-s;
                         padding-right: Theme.space-s;
                         spacing: 2px;
-                        Rectangle {
+                        if !root.video-mode: Rectangle {
                             width: 32px;
                             IconButton {
                                 x: (parent.width - self.width) / 2;
@@ -2598,7 +2651,7 @@ export component AppWindow inherits Window {
                                 clicked => { root.audio-skip(5); }
                             }
                         }
-                        Rectangle {
+                        if !root.video-mode: Rectangle {
                             width: 32px;
                             IconButton {
                                 x: (parent.width - self.width) / 2;
@@ -2628,7 +2681,7 @@ export component AppWindow inherits Window {
                             font-size: Theme.font-small;
                             color: Theme.text-muted;
                         }
-                        Rectangle {
+                        if !root.video-mode: Rectangle {
                             width: 32px;
                             IconButton {
                                 x: (parent.width - self.width) / 2;
@@ -2663,25 +2716,63 @@ export component AppWindow inherits Window {
                         x: 8px;
                         y: 8px;
                         width: parent.width - 16px;
-                        height: parent.height - 16px;
+                        height: parent.height - 16px - (root.video-mode ? 24px : 0px);
                         source: root.preview-image;
-                        image-fit: contain;
+                        // A waveform spans the area, as its position line does.
+                        image-fit: root.audio-mode && !root.video-mode ? fill : contain;
                         image-rendering: smooth;
                         accessible-role: image;
                         accessible-label: @tr("Preview of {}", root.info-title);
                     }
-                    if root.audio-mode: Rectangle {
+                    if root.video-mode: Rectangle {
+                        x: 8px;
+                        y: parent.height - 16px;
+                        width: parent.width - 16px;
+                        height: 4px;
+                        border-radius: 2px;
+                        background: Theme.border;
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * root.audio-position;
+                            border-radius: 2px;
+                            background: Theme.accent;
+                        }
+                    }
+                    if root.video-mode: TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.audio-toggle(); }
+                        double-clicked => { root.open-player(); }
+                    }
+                    if root.video-mode: TouchArea {
+                        y: parent.height - 28px;
+                        height: 28px;
+                        mouse-cursor: pointer;
+                        accessible-role: slider;
+                        accessible-label: @tr("Position in the video");
+                        accessible-value-minimum: 0;
+                        accessible-value-maximum: 1;
+                        accessible-value: root.audio-position;
+                        clicked => { root.audio-seek(max(0, min(1, (self.mouse-x - 8px) / (self.width - 16px)))); }
+                        moved => {
+                            if self.pressed {
+                                root.audio-seek(max(0, min(1, (self.mouse-x - 8px) / (self.width - 16px))));
+                            }
+                        }
+                    }
+                    if root.audio-mode && !root.video-mode: Rectangle {
                         x: 8px + (parent.width - 16px) * root.audio-position;
                         width: 2px;
                         background: Theme.accent;
                     }
-                    if root.audio-mode: TouchArea {
+                    if root.audio-mode && !root.video-mode: TouchArea {
                         mouse-cursor: pointer;
                         clicked => { root.audio-seek(max(0, min(1, (self.mouse-x - 8px) / (self.width - 16px)))); }
                     }
-                    if root.audio-mode: Text {
+                    if root.audio-mode && !root.video-mode: Text {
                         x: Theme.space-s;
                         y: parent.height - self.height - Theme.space-s;
+                        width: parent.width - 2 * Theme.space-s;
+                        overflow: elide;
                         text: @tr("Click the waveform to jump · Space plays and pauses");
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
@@ -2700,6 +2791,9 @@ export component AppWindow inherits Window {
                     if root.model-mode: Text {
                         x: Theme.space-s;
                         y: parent.height - self.height - Theme.space-s;
+                        // Beside the axes in the corner.
+                        width: max(0px, parent.width - 110px);
+                        overflow: elide;
                         text: @tr("Drag to rotate · scroll to zoom");
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
@@ -2845,11 +2939,49 @@ export component AppWindow inherits Window {
                         text: @markdown("\{root.status}");
                     }
                 }
+                if root.index-running: VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 120px;
+                        height: 5px;
+                        border-radius: 2.5px;
+                        background: Theme.border;
+                        accessible-role: progress-indicator;
+                        accessible-label: @tr("Progress of the search index");
+                        accessible-value-minimum: 0;
+                        accessible-value-maximum: 1;
+                        accessible-value: max(0, root.index-progress);
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * clamp(root.index-progress, 0, 1);
+                            border-radius: 2.5px;
+                            background: Theme.accent;
+                        }
+                    }
+                }
                 Text {
                     text: root.index-status;
                     font-size: Theme.font-small;
                     vertical-alignment: center;
                     color: Theme.text-muted;
+                }
+                if root.index-running: VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                    height: 24px;
+                    icon: @image-url("icons/stop.svg");
+                    label: @tr("Stop indexing (what is read by then stays)");
+                    clicked => { root.index-stop(); }
+                }
+                }
+                if root.index-stopped && !root.index-running: VerticalLayout {
+                    alignment: center;
+                    IconButton {
+                    height: 24px;
+                    icon: @image-url("icons/play.svg");
+                    label: @tr("Go on indexing");
+                    clicked => { root.index-resume(); }
+                }
                 }
                 if root.busy: Spinner {
                     width: 16px;
@@ -3653,7 +3785,7 @@ export component AppWindow inherits Window {
             height: 48px;
         }
         Text {
-            text: @tr("OpenRAGE reads the archive keys from your own copy of GTA V. No keys or game files are included with OpenRAGE.");
+            text: @tr("Choose the folder of your game. OpenRAGE reads the archive keys from your own copy; no keys or game files are included. GTA VI RPF9 archives open read-only in recovery view, without original names or encrypted files.");
             wrap: word-wrap;
             color: Theme.text-muted;
         }
@@ -3684,7 +3816,7 @@ export component AppWindow inherits Window {
                     text <=> root.setup-game-dir;
                     edited => { root.setup-game-dir-edited(); }
                     accessible-label: @tr("Game directory");
-                    placeholder-text: @tr("Folder containing GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe or RDR2.exe");
+                    placeholder-text: @tr("Folder of GTA V, GTA IV, Red Dead Redemption 2 or GTA VI");
                 }
                 Button {
                     text: @tr("Browse…");
@@ -3736,12 +3868,17 @@ export component AppWindow inherits Window {
                 indeterminate: true;
             }
             if root.setup-can-cancel: Button {
-                text: @tr("Close");
+                text: @tr("Cancel");
                 enabled: !root.setup-running;
                 clicked => { root.setup-visible = false; }
             }
+            if !root.setup-can-cancel: Button {
+                text: root.setup-has-games ? @tr("Back to the games") : @tr("Quit");
+                enabled: !root.setup-running;
+                clicked => { root.setup-leave(); }
+            }
             Button {
-                text: @tr("Derive keys");
+                text: @tr("Open");
                 primary: true;
                 enabled: !root.setup-running && root.setup-game-dir != "";
                 clicked => { root.setup-run(); }
@@ -3774,6 +3911,8 @@ export component ViewerWindow inherits Window {
     in-out property <bool> show-info: true;
     // First-person camera (WASD + mouse) instead of orbiting.
     in property <bool> fly-mode;
+    // How fast the camera flies.
+    in property <string> fly-speed;
     in property <[PartRow]> parts;
     in property <[MaterialRow]> materials;
     // RDR2 peds: the outfits to choose from (empty for other models).
@@ -3964,7 +4103,7 @@ export component ViewerWindow inherits Window {
                         x: Theme.space-m;
                         y: parent.height - self.height - Theme.space-s;
                         text: !root.model-mode ? @tr("Esc closes")
-                            : root.fly-mode ? @tr("W A S D move · Q E down/up · Shift faster · drag to look · F orbits · Esc closes")
+                            : root.fly-mode ? @tr("{} · wheel changes the speed · W A S D move · Q E down/up · Shift faster · drag to look · F orbits · Esc closes", root.fly-speed)
                             : @tr("Drag to rotate · scroll to zoom · F flies · R or double-click resets · Esc closes");
                         font-size: Theme.font-small;
                         color: Theme.text-faint;
@@ -5160,6 +5299,37 @@ export component XmlWindow inherits Window {
 
 // A whole cutscene in one scene: every actor with its animation, seen
 // through the cutscene camera or a free camera.
+// A setting with its value and a slider.
+component ViewSlider inherits VerticalLayout {
+    in property <string> label;
+    in property <string> text;
+    in property <float> minimum;
+    in property <float> maximum;
+    in-out property <float> value;
+    callback changed-by-user();
+    spacing: 2px;
+    HorizontalLayout {
+        Text {
+            horizontal-stretch: 1;
+            text: root.label;
+            font-size: Theme.font-small;
+            color: Theme.text-muted;
+        }
+        Text {
+            text: root.text;
+            font-size: Theme.font-small;
+            color: Theme.text;
+        }
+    }
+    Slider {
+        minimum: root.minimum;
+        maximum: root.maximum;
+        value <=> root.value;
+        accessible-label: root.label;
+        changed(v) => { root.changed-by-user(); }
+    }
+}
+
 export component SceneWindow inherits Window {
     title: root.heading + " — OpenRAGE";
     icon: @image-url("logo.svg");
@@ -5208,6 +5378,24 @@ export component SceneWindow inherits Window {
     out property <length> area-width: area.width;
     out property <length> area-height: area.height;
 
+    // Map scenes: a flying camera, and how fast it is.
+    in property <bool> can-fly;
+    in property <bool> fly-mode;
+    in property <string> fly-speed;
+    // How a map is shown.
+    in-out property <bool> show-panel;
+    in-out property <float> view-hour: 13;
+    in-out property <float> view-haze: 0.3;
+    in-out property <float> view-brightness: 1;
+    in-out property <float> view-fov: 60;
+    in-out property <float> view-range: 1;
+    in-out property <bool> view-water: true;
+    in-out property <bool> view-sea;
+    callback view-changed();
+    callback toggle-fly();
+    callback key-down(string, bool);
+    callback key-up(string, bool);
+    callback focus-lost();
     callback toggle-play();
     callback seek(float);
     callback toggle-camera();
@@ -5218,7 +5406,15 @@ export component SceneWindow inherits Window {
     changed theme-mode => { root.apply-theme(); }
     changed area-width => { root.resized(); }
     changed area-height => { root.resized(); }
-    init => { root.apply-theme(); }
+    init => {
+        root.apply-theme();
+        scope.focus();
+    }
+
+    function set-hour(hour: float) {
+        root.view-hour = hour;
+        root.view-changed();
+    }
 
     function apply-theme() {
         Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
@@ -5270,6 +5466,22 @@ export component SceneWindow inherits Window {
                 if root.has-camera: Button {
                     text: root.cut-camera ? @tr("Free camera") : @tr("Cutscene camera");
                     clicked => { root.toggle-camera(); }
+                }
+                if root.can-fly: Button {
+                    text: @tr("Fly (F)");
+                    checkable: true;
+                    checked: root.fly-mode;
+                    clicked => {
+                        self.checked = root.fly-mode;
+                        root.toggle-fly();
+                        scope.focus();
+                    }
+                }
+                if root.can-fly: Button {
+                    text: @tr("View");
+                    checkable: true;
+                    checked: root.show-panel;
+                    clicked => { root.show-panel = self.checked; }
                 }
                 if root.can-export: Button {
                     text: @tr("Export glTF…");
@@ -5361,6 +5573,7 @@ export component SceneWindow inherits Window {
                         if (e.kind == PointerEventKind.down) {
                             self.last-x = self.mouse-x;
                             self.last-y = self.mouse-y;
+                            scope.focus();
                         }
                     }
                     moved => {
@@ -5374,6 +5587,129 @@ export component SceneWindow inherits Window {
                         root.zoom(e.delta-y / 1px);
                         return EventResult.accept;
                     }
+                }
+                if root.can-fly && !root.loading && root.load-text == "": Rectangle {
+                    x: Theme.space-m;
+                    y: parent.height - self.height - Theme.space-s;
+                    width: min(hint.preferred-width + 2 * Theme.space-s, parent.width - 2 * Theme.space-m);
+                    height: hint.preferred-height + 2 * Theme.space-xs;
+                    border-radius: 6px;
+                    background: #000000a0;
+                    hint := Text {
+                    x: Theme.space-s;
+                    y: Theme.space-xs;
+                    width: parent.width - 2 * Theme.space-s;
+                    text: root.fly-mode ? @tr("{} · wheel changes the speed · W A S D move · Q E down/up · Shift faster · drag to look · F orbits", root.fly-speed)
+                        : @tr("Drag to turn · scroll to zoom · F flies");
+                    font-size: Theme.font-small;
+                    overflow: elide;
+                    color: #e0e0e0;
+                }
+                }
+            }
+            if root.can-fly && root.show-panel: Rectangle {
+                width: 240px;
+                background: Theme.surface;
+                ScrollView {
+                VerticalLayout {
+                    padding: Theme.space-m;
+                    spacing: Theme.space-m;
+                    alignment: start;
+                    Text {
+                        text: @tr("Time of day");
+                        font-weight: 600;
+                        color: Theme.text;
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.space-xs;
+                        Button {
+                            text: @tr("Dawn");
+                            clicked => { root.set-hour(6.4); }
+                        }
+                        Button {
+                            text: @tr("Noon");
+                            clicked => { root.set-hour(12.5); }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.space-xs;
+                        Button {
+                            text: @tr("Dusk");
+                            clicked => { root.set-hour(17.6); }
+                        }
+                        Button {
+                            text: @tr("Night");
+                            clicked => { root.set-hour(23); }
+                        }
+                    }
+                    ViewSlider {
+                        label: @tr("Hour");
+                        text: Math.floor(root.view-hour) + ":" + (Math.mod(Math.floor(root.view-hour * 60), 60) < 10 ? "0" : "") + Math.mod(Math.floor(root.view-hour * 60), 60);
+                        minimum: 0;
+                        maximum: 23.98;
+                        value <=> root.view-hour;
+                        changed-by-user => { root.view-changed(); }
+                    }
+                    ViewSlider {
+                        label: @tr("Brightness");
+                        text: Math.round(root.view-brightness * 100) + " %";
+                        minimum: 0.4;
+                        maximum: 2;
+                        value <=> root.view-brightness;
+                        changed-by-user => { root.view-changed(); }
+                    }
+                    ViewSlider {
+                        label: @tr("Haze (when flying)");
+                        text: Math.round(root.view-haze * 100) + " %";
+                        minimum: 0;
+                        maximum: 1;
+                        value <=> root.view-haze;
+                        changed-by-user => { root.view-changed(); }
+                    }
+                    CheckBox {
+                        text: @tr("Sea");
+                        checked <=> root.view-sea;
+                        toggled => { root.view-changed(); }
+                    }
+                    CheckBox {
+                        text: @tr("Moving water");
+                        checked <=> root.view-water;
+                        toggled => { root.view-changed(); }
+                    }
+                    Text {
+                        text: @tr("Camera");
+                        font-weight: 600;
+                        color: Theme.text;
+                    }
+                    ViewSlider {
+                        label: @tr("Field of view (when flying)");
+                        text: Math.round(root.view-fov) + "°";
+                        minimum: 30;
+                        maximum: 110;
+                        value <=> root.view-fov;
+                        changed-by-user => { root.view-changed(); }
+                    }
+                    ViewSlider {
+                        label: @tr("Detail distance");
+                        text: Math.round(root.view-range * 100) + " %";
+                        minimum: 0.3;
+                        maximum: 2.5;
+                        value <=> root.view-range;
+                        changed-by-user => { root.view-changed(); }
+                    }
+                    Button {
+                        text: @tr("Reset");
+                        clicked => {
+                            root.view-hour = 13;
+                            root.view-brightness = 1;
+                            root.view-haze = 0.3;
+                            root.view-fov = 60;
+                            root.view-range = 1;
+                            root.view-water = true;
+                            root.view-changed();
+                        }
+                    }
+                }
                 }
             }
             if root.objects.length > 0: Rectangle {
@@ -5489,13 +5825,292 @@ export component SceneWindow inherits Window {
             }
         }
     }
-    FocusScope {
+    scope := FocusScope {
         key-pressed(e) => {
-            if (e.text == " ") {
+            if (e.text == " " && root.timeline) {
                 root.toggle-play();
                 return EventResult.accept;
             }
+            if (root.can-fly) {
+                root.key-down(e.text, e.modifiers.shift);
+                return EventResult.accept;
+            }
             return EventResult.reject;
+        }
+        key-released(e) => {
+            root.key-up(e.text, e.modifiers.shift);
+            return EventResult.accept;
+        }
+        changed has-focus => {
+            if (!self.has-focus) {
+                root.focus-lost();
+            }
+        }
+    }
+}
+
+// A video in its own window.
+export component PlayerWindow inherits Window {
+    title: root.heading + " — OpenRAGE";
+    icon: @image-url("logo.svg");
+    preferred-width: 960px;
+    preferred-height: 600px;
+    min-width: 420px;
+    min-height: 260px;
+    background: Theme.background;
+    default-font-size: Theme.font-body;
+    forward-focus: scope;
+
+    in-out property <int> theme-mode;
+    in property <string> heading;
+    in property <string> mono-font;
+    in property <image> picture;
+    in property <bool> has-picture;
+    // The sound is read: it can be played.
+    in property <bool> ready;
+    in property <bool> playing;
+    in property <float> position;
+    in property <string> time;
+    in property <string> error;
+    in-out property <bool> loop;
+    in-out property <float> volume: 1;
+    // Only the picture while playing in full screen, until the mouse moves.
+    property <bool> bare: root.full-screen && root.playing && !root.awake;
+    property <bool> awake: true;
+
+    callback toggle();
+    callback stop();
+    callback skip(float);
+    callback seek(float);
+    callback volume-changed();
+    callback loop-changed();
+    callback close-player();
+
+    changed theme-mode => { root.apply-theme(); }
+    init => { root.apply-theme(); }
+
+    function apply-theme() {
+        Palette.color-scheme = root.theme-mode == 1 ? ColorScheme.light : root.theme-mode == 2 ? ColorScheme.dark : ColorScheme.unknown;
+    }
+
+    function set-full-screen(on: bool) {
+        root.full-screen = on;
+        root.wake();
+    }
+
+    function wake() {
+        root.awake = true;
+        idle.running = false;
+        idle.running = true;
+    }
+
+    idle := Timer {
+        interval: 2.5s;
+        running: false;
+        triggered => {
+            root.awake = false;
+            self.running = false;
+        }
+    }
+
+    scope := FocusScope {
+        key-pressed(e) => {
+            if (e.text == " " || e.text == "k") {
+                root.toggle();
+            } else if (e.text == Key.LeftArrow) {
+                root.skip(-5);
+            } else if (e.text == Key.RightArrow) {
+                root.skip(5);
+            } else if (e.text == Key.Home) {
+                root.seek(0);
+            } else if (e.text == Key.UpArrow) {
+                root.volume = min(1, root.volume + 0.1);
+                root.volume-changed();
+            } else if (e.text == Key.DownArrow) {
+                root.volume = max(0, root.volume - 0.1);
+                root.volume-changed();
+            } else if (e.text == "f" || e.text == Key.F11) {
+                root.set-full-screen(!root.full-screen);
+            } else if (e.text == "l") {
+                root.loop = !root.loop;
+                root.loop-changed();
+            } else if (e.text == Key.Escape && root.full-screen) {
+                root.set-full-screen(false);
+            } else if (e.text == Key.Escape) {
+                root.close-player();
+            } else {
+                return reject;
+            }
+            return accept;
+        }
+        VerticalLayout {
+            Rectangle {
+                vertical-stretch: 1;
+                background: black;
+                clip: true;
+                if root.has-picture: Image {
+                    width: 100%;
+                    height: 100%;
+                    source: root.picture;
+                    image-fit: contain;
+                    image-rendering: smooth;
+                    accessible-role: image;
+                    accessible-label: root.heading;
+                }
+                if root.error == "" && !root.ready: Spinner {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 40px;
+                    height: 40px;
+                    indeterminate: true;
+                }
+                if root.error != "": Text {
+                    width: parent.width - 32px;
+                    x: 16px;
+                    text: root.error;
+                    color: white;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                    accessible-role: text;
+                }
+                TouchArea {
+                    mouse-cursor: root.bare ? none : default;
+                    moved => { root.wake(); }
+                    changed mouse-x => { root.wake(); }
+                    clicked => {
+                        scope.focus();
+                        root.toggle();
+                    }
+                    double-clicked => { root.set-full-screen(!root.full-screen); }
+                }
+            }
+            if !root.bare: Rectangle {
+                height: 22px;
+                background: Theme.surface;
+                Rectangle {
+                    x: 12px;
+                    y: (parent.height - self.height) / 2;
+                    width: parent.width - 24px;
+                    height: 5px;
+                    border-radius: 2.5px;
+                    background: Theme.border;
+                    Rectangle {
+                        x: 0;
+                        width: parent.width * root.position;
+                        border-radius: 2.5px;
+                        background: Theme.accent;
+                    }
+                }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    accessible-role: slider;
+                    accessible-label: @tr("Position in the video");
+                    accessible-value-minimum: 0;
+                    accessible-value-maximum: 1;
+                    accessible-value: root.position;
+                    clicked => { root.seek(max(0, min(1, (self.mouse-x - 12px) / (self.width - 24px)))); }
+                    moved => {
+                        if self.pressed {
+                            root.seek(max(0, min(1, (self.mouse-x - 12px) / (self.width - 24px))));
+                        }
+                    }
+                }
+            }
+            if !root.bare: Rectangle {
+                height: 46px;
+                background: Theme.surface;
+                HorizontalLayout {
+                    padding-left: Theme.space-s;
+                    padding-right: Theme.space-s;
+                    spacing: 2px;
+                    Rectangle {
+                        width: 32px;
+                        IconButton {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/back5.svg");
+                            label: @tr("Back 5 seconds (←)");
+                            clicked => { root.skip(-5); }
+                        }
+                    }
+                    Rectangle {
+                        width: 32px;
+                        IconButton {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            icon: root.playing ? @image-url("icons/pause.svg") : @image-url("icons/play.svg");
+                            label: root.playing ? @tr("Pause (Space)") : @tr("Play (Space)");
+                            clicked => { root.toggle(); }
+                        }
+                    }
+                    Rectangle {
+                        width: 32px;
+                        IconButton {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/fwd5.svg");
+                            label: @tr("Forward 5 seconds (→)");
+                            clicked => { root.skip(5); }
+                        }
+                    }
+                    Rectangle {
+                        width: 32px;
+                        IconButton {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/stop.svg");
+                            label: @tr("Stop");
+                            clicked => { root.stop(); }
+                        }
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        text: root.time;
+                        overflow: elide;
+                        font-family: root.mono-font;
+                        font-size: Theme.font-small;
+                        color: Theme.text-muted;
+                    }
+                    Image {
+                        width: 18px;
+                        source: @image-url("icons/audio.svg");
+                        colorize: Theme.text-muted;
+                        image-fit: contain;
+                    }
+                    Slider {
+                        width: 100px;
+                        minimum: 0;
+                        maximum: 1;
+                        value <=> root.volume;
+                        accessible-label: @tr("Volume");
+                        changed(v) => { root.volume-changed(); }
+                    }
+                    Rectangle {
+                        width: 32px;
+                        IconButton {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/repeat.svg");
+                            label: @tr("Repeat (L)");
+                            active: root.loop;
+                            clicked => { root.loop = !root.loop; root.loop-changed(); }
+                        }
+                    }
+                    Rectangle {
+                        width: 32px;
+                        IconButton {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            icon: @image-url("icons/expand.svg");
+                            label: @tr("Full screen (F)");
+                            active: root.full-screen;
+                            clicked => { root.set-full-screen(!root.full-screen); }
+                        }
+                    }
+                }
+            }
         }
     }
 }

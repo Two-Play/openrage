@@ -4,11 +4,16 @@ description = "Change the game safely with OpenRAGE: edit mode, editing archives
 
 [extra]
 docs = true
-lead = "Every change goes to OpenIV's `mods` folder, never into your game files, and every change can be undone."
+lead = "Every change goes to OpenIV's `mods` folder (RDR2: the replace folder of Lenny's Mod Loader), never into your game files, and every change can be undone."
 toc = true
 +++
 
 ## Edit mode
+
+> [!NOTE]
+> **Red Dead Redemption 2** works the same way, but changes go into `lml/replace`, the replace folder of
+> [Lenny's Mod Loader](https://www.rdr2mods.com/downloads/rdr2/tools/76-lennys-mod-loader-rdr/): changed files
+> loose, changed nested archives as copies. See [Changing files](@/rdr2.md#changing-files) for what LML allows.
 
 OpenRAGE starts read-only, like OpenIV.
 
@@ -63,12 +68,12 @@ other texture, mesh, shader and bone unchanged. GTA V Legacy uses the same struc
 
 ## Models (preview)
 
-A drawable (`.ydr`) or a vehicle body (`.yft`) of GTA V Enhanced can get new geometry and textures from a Wavefront
-OBJ file:
+A drawable (`.ydr`), a vehicle with its wheels or one of its mod parts (`.yft`) and the drawables of a dictionary
+(`.ydd`: peds, clothing) of GTA V Enhanced can get new geometry and textures from a Wavefront OBJ file:
 
 - **In the explorer:** turn on the *OBJ tools* plugin (it comes with OpenRAGE, **Settings → Plugins**), unlock
-  editing, right-click the `.ydr` or `.yft` → **Replace with OBJ…** and choose the OBJ together with its `.mtl` and PNG
-  textures. The change goes into the `mods` folder and is one entry in **History**. *OBJ tools* also exports models as
+  editing, right-click the `.ydr`, `.yft` or `.ydd` → **Replace with OBJ…** and choose the OBJ together with its
+  `.mtl` and PNG textures. The change goes into the `mods` folder and is one entry in **History**. *OBJ tools* also exports models as
   OBJ with their textures, so you can export, edit (e.g. in Blender) and bring them back.
 - **From the command line:** `openrage replace-model x64i.rpf/levels/gta5/props/…/prop_x.ydr model.obj --mods`
   (it finds the `.mtl` and textures next to the OBJ), or `openrage plugin run obj-tools replace <path>.ydr --pick
@@ -93,10 +98,56 @@ How it works:
 - OBJ is converted from Y-up to the game's Z-up; missing normals are computed, tangents always. Meshes over 65,535
   vertices are split. `--mods` puts the result into the `mods` folder in place of the original (undo with **Undo** /
   `openrage undo`), `--out` writes the file elsewhere.
-- Not yet: GTA V Legacy, `.ydd`, peds and other models blended between bones, and collisions (the original collision
-  stays). The written drawables and vehicles read back identically in OpenRAGE (`openrage verify --models --rebuild`
-  rewrites every `.ydr` and `.yft` of the game, also with shader copies and embedded textures); please report how
-  they behave in the game.
+- **Collisions:** `--collision col.obj` builds a drawable's (`.ydr`) collision from an OBJ model instead of keeping
+  the original, and `replace-model …/x.ybn col.obj` replaces a collision file's. Every triangle goes into one
+  triangle mesh with a bounding volume hierarchy, built the way the game's own are (up to 32,767 triangles; vertices on a grid of 1/65,534 of the collision's size,
+  under a centimetre for a 600 m map collision). An OBJ
+  material named after a collision material of the game's `materials.dat` (`CONCRETE`, `WOOD_HIGH_DENSITY`, …, any
+  case) gets it; others get the original collision's first material. The new collision replaces all parts of the
+  original (also its boxes and spheres); it keeps its flags. Vehicles and other fragments (`.yft`) keep their
+  collision: theirs is split over the physics parts with their masses and joints.
+  `openrage verify --collisions --rebuild` writes every collision of the game anew from its own triangles and checks
+  the result, and first checks the game's own hierarchies against how OpenRAGE reads them.
+- Not yet: GTA V Legacy. The written drawables, vehicles with their
+  wheels and dictionaries read back identically in OpenRAGE (`openrage verify --models --rebuild` rewrites every
+  `.ydr`, `.yft` with its wheel models and every drawable of every `.ydd` of the game, with all bone weights, also with
+  shader copies and embedded textures); please report how they behave in the game.
+
+### openFormats (OpenIV)
+
+OpenIV's text formats go both ways: export a model or texture dictionary, edit the text files or textures (in a text
+editor, a script or a tool that reads openFormats), and import them back.
+
+- **In the explorer:** right-click a `.ydr`, `.yft`, `.ydd` or `.ytd` → **Export openFormats…** and choose a folder.
+  To bring the files back, unlock editing, right-click the same file → **Import openFormats…** and pick the `.odr`,
+  `.oft` or `.otd`. The change goes into the `mods` folder and is one entry in **History**.
+- **From the command line:** `openrage export-openformats x64i.rpf/levels/gta5/props/…/prop_x.ydr -o out/`, then
+  `openrage import-openformats x64i.rpf/levels/gta5/props/…/prop_x.ydr out/prop_x.odr --mods` (or `--out new.ydr`).
+
+What an import takes over (GTA V Enhanced models; texture dictionaries of both versions):
+
+- **Meshes and detail levels** of the `.mesh` files: positions, normals, colours, texture coordinates and, for
+  vehicles, the bone each vertex moves with. They are written like an OBJ import (above): every geometry keeps a
+  shader of the model and its vertex layout; meshes attached to other bones are moved onto the model's.
+- **Textures:** changed `.dds` files of a model's own textures replace them (any size and format); a `.otd` onto a
+  `.ytd` replaces, adds and removes textures.
+- **Kept from the game file:** the shaders (an `.odr` must name the model's shaders; changed parameters are reported
+  and not taken over), the skeleton, the physics and the parts of a fragment (wheels), collisions. Unchanged meshes
+  stay as they are, so a texture edit changes only the texture. `.odd` files cannot be imported yet.
+- The import says what it took over and what it kept (status bar and **History**, or the command's output).
+
+The files follow OpenIV's own exports (a prop exported by OpenRAGE matches OpenIV's `.odr`, `.mesh` and `.skel`
+line for line, apart from the last digit of some numbers). Not taken from OpenIV, so possibly different there: the
+embedded texture dictionary line of an `.odr`, the `.oft` layout (OpenRAGE writes the main drawable and its parts,
+not the physics) and vertex layouts OpenIV's exports have not shown, which OpenRAGE names with their layout
+(`N40597755555555996996`) instead of OpenIV's code. Whether OpenIV reads OpenRAGE's exports has not been tested yet.
+
+**Checked** on GTA V Enhanced with `openrage verify --models --openformats`: all 258,595 models and texture
+dictionaries of the game (248 GB of text) are written as openFormats and read back unchanged, apart from one texture
+stored as a cube map with 32 slices, which DDS cannot hold. 144,907 drawables and fragments are imported back onto
+themselves and read back with the same meshes, shaders, bones and textures; 749 more (mostly race track and stunt
+props) use shaders for some meshes that no geometry of the model shows the writer how to fill, so they cannot be
+written yet.
 
 ### Vehicles
 
@@ -106,12 +157,30 @@ The import keeps that:
 - **Parts by name:** an OBJ object or group (`o`, `g`) named like a bone goes on that bone, e.g. `door_dside_f`,
   `door_pside_f`, `bonnet`, `boot`, `bumper_f`. Blender's `.001` and the numbers *OBJ tools* adds (`bonnet_6`) are
   ignored. Everything else goes on the body (`bodyshell`). `replace-model` lists which part went where.
-- **Wheels** are models of their own: parts named after a wheel bone (`wheel_lf` …) are left out, and the original
-  wheels stay.
+- **Wheels** are models of their own. A part named after the wheel bone that has the vehicle's wheel model (usually
+  `wheel_lf`) replaces that model: it is moved into the bone's space, and the game copies it to every wheel bone
+  (turned around on the right). Parts named after the other wheel bones (`wheel_rf`, `wheel_lr` …, which *OBJ tools*
+  exports as copies) are left out. A vehicle with a rear wheel model of its own (`wheel_lr`) gets that one replaced
+  the same way. The wheel's collision and the radius the game drives it with stay.
 - **Export, edit, import:** *OBJ tools* exports a vehicle with one object per bone, so an export can be edited in
   Blender and brought back with every door still opening.
-- The skeleton, physics, damage, the wheels and the vehicle's detail levels stay; every level shows the new body.
+- The skeleton, physics, damage and the vehicle's detail levels stay; every level shows the new body (and wheel).
+- **Mod parts** (`sultan_hood_1.yft` in `sultan_mods.rpf`) are fragments of their own, in the space of the bone they
+  go on: import onto them like any `.yft`. They have no textures of their own, so the shared vehicle textures
+  (`vehshare.ytd`) lend the texture structure.
 - `openrage replace-model x64e.rpf/levels/gta5/vehicles.rpf/adder.yft car.obj --mods`.
+
+### Peds and clothing
+
+- **Drawable dictionaries (`.ydd`):** parts named after a drawable (`uppr_000_u`, as *OBJ tools* exports them)
+  replace that drawable; the others keep theirs. `--drawable uppr_000_u` (name or index) puts the parts named after
+  none on that drawable.
+- **Bone weights:** peds and clothing are blended between bones, but OBJ has no place for weights. Every new vertex
+  takes the bones and weights of the nearest vertex of the original drawable, so a changed shirt keeps moving with
+  the body where it lies close to the original; parts far from any original vertex follow the nearest one and can
+  look stiff. Exported and re-imported unchanged, every vertex keeps its weights (a vertex on a seam may take those
+  of the other side).
+- `openrage replace-model …/a_m_y_hipster_01.ydd ped.obj --mods`.
 
 ## Text files and game text
 
@@ -145,6 +214,15 @@ Packages of format 2.x:
 | Archives | new archives and DLC packs (`createIfNotExist`) |
 | Text edits | `add`, `insert`, `replace`, `delete` with Equal, StartWith or Mask |
 | XML edits | by XPath: `add` (First, Last, Before, After), `replace`, `remove`, keeping the formatting |
+| PSO edits | `<pso>`: binary metadata (`.ymt`, `.ymf`, `.ytyp`, … in PSO form) is converted to XML, edited with the same commands as `<xml>`, and written back as PSO |
+
+PSO edits work on the XML OpenRAGE shows for the file (**View as XML**, `openrage xml`), the same as CodeWalker's:
+hashes appear as their names where the name is known, otherwise as `hash_XXXXXXXX`; names that an XPath compares with
+(`Item[modelName = 'adder']`) are always recognised. The file keeps its own structure definitions, so the edit can
+change values and add or remove items, but not invent fields the file's structures do not have; the preview says so
+before anything is written. Written back unchanged, 80% of GTA V's PSO files come out byte for byte the same and every
+one reads back to the same XML (`openrage verify --meta --rebuild`); the rest differ only in bytes the XML does not
+carry, such as the unused fourth number of a 3D vector.
 
 ### Uninstalling
 
@@ -152,7 +230,8 @@ Every installed package can be **uninstalled** from **History** (or `openrage oi
 
 ### Not supported yet
 
-`<pso>` edits: such packages are refused with an explanation. `<defragmentation>` is skipped, as it only saves disk space.
+`<pso>` edits of metadata in resource form (`RSC7` `.ymt` files such as ped variations) are refused with an
+explanation; only PSO files can be edited that way. `<defragmentation>` is skipped, as it only saves disk space.
 
 ## ASI mods (GTA V)
 

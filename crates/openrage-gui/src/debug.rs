@@ -1,5 +1,6 @@
 //! Debug snapshots of the window (`OPENRAGE_DEBUG_*`), for checking the UI without a screen.
 
+#[cfg(debug_assertions)]
 use crate::*;
 
 /// Development aid (debug builds only): `OPENRAGE_SNAPSHOT=out.png` saves an
@@ -13,7 +14,9 @@ pub(crate) fn debug_snapshot(ui: &AppWindow) {
     }
     let Ok(path) = std::env::var("OPENRAGE_SNAPSHOT") else { return };
     let weak = ui.as_weak();
-    slint::Timer::single_shot(Duration::from_secs(5), move || {
+    // `OPENRAGE_SNAPSHOT_DELAY=<seconds>`: for folders that open slowly.
+    let delay = std::env::var("OPENRAGE_SNAPSHOT_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+    slint::Timer::single_shot(Duration::from_secs(delay), move || {
         let Some(ui) = weak.upgrade() else { return };
         debug_viewer(&ui);
         if std::env::var("OPENRAGE_FLY").is_ok()
@@ -54,6 +57,10 @@ pub(crate) fn debug_snapshot(ui: &AppWindow) {
             });
             if let Some(row) = row {
                 select_row(&ui, row);
+                // `OPENRAGE_PLAY=1` plays the selected sound or video.
+                if std::env::var("OPENRAGE_PLAY").is_ok() {
+                    with_app(|a| a.play_when_ready = true);
+                }
                 // `OPENRAGE_PLUGIN_RUN=<n>` runs the selected file's n-th plugin action.
                 if let Ok(i) = std::env::var("OPENRAGE_PLUGIN_RUN") {
                     row_action(&ui, row, &format!("plugin:{i}"));
@@ -108,6 +115,11 @@ pub(crate) fn debug_viewer(ui: &AppWindow) {
             let rows = v.get_anim_clips();
             if let Some(i) = (0..rows.row_count()).find(|&i| rows.row_data(i).is_some_and(|r| r.name == clip)) {
                 v.invoke_anim_select(i as i32);
+            }
+            // `OPENRAGE_ANIM_AT=<0..1>`: pause there (a share of the clip).
+            if let Ok(at) = std::env::var("OPENRAGE_ANIM_AT") {
+                v.invoke_anim_toggle();
+                v.invoke_anim_seek(at.parse().unwrap_or(0.0));
             }
         }
         if let Ok(hex) = std::env::var("OPENRAGE_PAINT") {
@@ -201,6 +213,8 @@ pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
         let lower = map.to_ascii_lowercase();
         if lower.ends_with(".wpl") || lower.ends_with(".img") {
             scene::open_map(ui, map);
+        } else if lower == "world" {
+            scene::open_map(ui, String::new()); // GTA VI's whole map
         } else {
             open_xml_view(ui, map);
             if let Some(x) = xmlview::newest() {
@@ -210,12 +224,25 @@ pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
         let waiting = std::rc::Rc::new(slint::Timer::default());
         let (started, timer) = (Instant::now(), std::rc::Rc::clone(&waiting));
         waiting.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
-            if !scene::ready() && started.elapsed() < Duration::from_secs(180) {
+            if !scene::ready() && started.elapsed() < Duration::from_secs(600) {
                 return;
             }
             timer.stop();
             let path = path.clone();
-            slint::Timer::single_shot(Duration::from_millis(800), move || {
+            // `OPENRAGE_FLY_TO=x,y,z,yaw,pitch`, and `OPENRAGE_FLY_WAIT=<s>` for the details to load.
+            let to: Vec<f32> = std::env::var("OPENRAGE_FLY_TO")
+                .map(|t| t.split(',').filter_map(|v| v.parse().ok()).collect())
+                .unwrap_or_default();
+            let mut wait = 800;
+            if let Ok(to) = <[f32; 5]>::try_from(to) {
+                scene::fly_to(to);
+                wait += std::env::var("OPENRAGE_FLY_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(20) * 1000;
+            }
+            slint::Timer::single_shot(Duration::from_millis(wait), move || {
+                // `OPENRAGE_BENCH=<pictures>`: how long they take.
+                if let Some(n) = std::env::var("OPENRAGE_BENCH").ok().and_then(|n| n.parse().ok()) {
+                    scene::bench(n);
+                }
                 if let Some(Ok(img)) = scene::newest().map(|w| w.window().take_snapshot()) {
                     let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
                         .map(|png| std::fs::write(&path, png));
@@ -277,6 +304,7 @@ pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
     slint::Timer::single_shot(Duration::from_secs(wait), move || {
         let Some(ui) = weak.upgrade() else { return };
         let snap = match (viewer::newest(), editor::newest(), history::window()) {
+            _ if let Some(p) = player::newest() => p.window().take_snapshot(),
             _ if let Some(x) = xmlview::newest() => {
                 if let Ok(tab) = std::env::var("OPENRAGE_TAB") {
                     x.set_tab(tab.parse().unwrap_or(0));

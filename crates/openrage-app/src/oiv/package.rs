@@ -98,9 +98,11 @@ pub enum Command {
         path: String,
         commands: Vec<XmlCmd>,
     },
-    /// PSO/META edits (`<pso>`); need a PSO converter, not supported yet.
+    /// Edits of a binary PSO metadata file (`<pso>`): converted to XML, edited
+    /// with the same commands as `<xml>`, and written back as PSO.
     Pso {
         path: String,
+        commands: Vec<XmlCmd>,
     },
     /// Archive rebuild to reclaim space; optional, skipped.
     Defragment {
@@ -275,39 +277,44 @@ fn parse_commands(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Vec<Com
                     commands,
                 }
             }
-            "xml" => {
-                let mut commands = Vec::new();
-                for x in c.children().filter(|x| x.is_element()) {
-                    let xpath = attr(x, "xpath").context("XML command without xpath")?;
-                    commands.push(match x.tag_name().name().to_ascii_lowercase().as_str() {
-                        "add" => XmlCmd::Add {
-                            append: match attr(x, "append")
-                                .unwrap_or_else(|| "Last".into())
-                                .to_ascii_lowercase()
-                                .as_str()
-                            {
-                                "first" => Append::First,
-                                "before" => Append::Before,
-                                "after" => Append::After,
-                                _ => Append::Last,
-                            },
-                            content: inner_xml(source, x),
-                            xpath,
-                        },
-                        "replace" => XmlCmd::Replace { content: inner_xml(source, x), xpath },
-                        "remove" => XmlCmd::Remove { xpath },
-                        other => bail!("unknown XML command <{other}>"),
-                    });
-                }
-                Command::Xml { path: attr(c, "path").context("<xml> without path")?, commands }
-            }
-            "pso" => Command::Pso { path: attr(c, "path").unwrap_or_default() },
+            "xml" => Command::Xml {
+                path: attr(c, "path").context("<xml> without path")?,
+                commands: xml_commands(source, c)?,
+            },
+            "pso" => Command::Pso {
+                path: attr(c, "path").context("<pso> without path")?,
+                commands: xml_commands(source, c)?,
+            },
             "defragmentation" => Command::Defragment { archive: attr(c, "archive").unwrap_or_default() },
             other => bail!("unknown package command <{other}>"),
         };
         out.push(cmd);
     }
     Ok(out)
+}
+
+/// The XML edits inside an `<xml>` or `<pso>` command.
+fn xml_commands(source: &str, c: roxmltree::Node<'_, '_>) -> Result<Vec<XmlCmd>> {
+    let mut commands = Vec::new();
+    for x in c.children().filter(|x| x.is_element()) {
+        let xpath = attr(x, "xpath").context("XML command without xpath")?;
+        commands.push(match x.tag_name().name().to_ascii_lowercase().as_str() {
+            "add" => XmlCmd::Add {
+                append: match attr(x, "append").unwrap_or_else(|| "Last".into()).to_ascii_lowercase().as_str() {
+                    "first" => Append::First,
+                    "before" => Append::Before,
+                    "after" => Append::After,
+                    _ => Append::Last,
+                },
+                content: inner_xml(source, x),
+                xpath,
+            },
+            "replace" => XmlCmd::Replace { content: inner_xml(source, x), xpath },
+            "remove" => XmlCmd::Remove { xpath },
+            other => bail!("unknown XML command <{other}>"),
+        });
+    }
+    Ok(commands)
 }
 
 fn parse_assembly(text: &str) -> Result<Package> {
@@ -412,6 +419,21 @@ mod tests {
         );
         let Command::Text { commands: text, create: true, .. } = &commands[2] else { panic!() };
         assert_eq!(text[1], TextCmd::Delete { line: "#*".into(), condition: Condition::Mask });
+    }
+
+    #[test]
+    fn parses_pso_edits() {
+        let pso = ASSEMBLY.replace(
+            "<defragmentation archive=\"update\\update.rpf\"/>",
+            r#"<pso path="x64\data\carcols.ymt"><remove xpath="/CVehicleModColors/kits/Item[1]"/></pso>"#,
+        );
+        let p = parse_assembly(&pso).unwrap();
+        let Command::Pso { path, commands } = &p.commands[2] else { panic!("{:?}", p.commands[2]) };
+        assert_eq!(path, "x64\\data\\carcols.ymt");
+        assert_eq!(commands, &[XmlCmd::Remove { xpath: "/CVehicleModColors/kits/Item[1]".into() }]);
+        assert!(
+            parse_assembly(&ASSEMBLY.replace("<defragmentation archive=\"update\\update.rpf\"/>", "<pso/>")).is_err()
+        );
     }
 
     #[test]

@@ -34,6 +34,8 @@ pub const VERSION: u32 = 2;
 pub const VERSION_RDR2: u32 = 3;
 
 const ARRAYINFO: u32 = 0x100;
+/// Zero-ended strings are cut off here.
+const MAX_STRING: usize = 1 << 20;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -61,6 +63,21 @@ mod ty {
     pub const OPAQUE32: u8 = 0x53;
     /// RDR2: a map; the entry's key holds the key and value type indices.
     pub const MAP: u8 = 0x71;
+    /// GTA VI: 2D vector, 3D vector without padding, 3×4 matrix.
+    pub const VEC2: u8 = 0x30;
+    pub const VEC3: u8 = 0x32;
+    pub const MATRIX34: u8 = 0x35;
+    /// GTA VI: another 32-bit name hash, a 64-bit one, a 16-bit enum.
+    pub const HASH2: u8 = 0x4D;
+    pub const HASH64: u8 = 0x4F;
+    pub const SHORT_ENUM: u8 = 0x61;
+    /// GTA VI: 16-byte values of unknown layout (shown as bytes).
+    pub const OPAQUE16: u8 = 0x5C;
+    pub const OPAQUE16B: u8 = 0x67;
+    /// GTA VI: pointer to a zero-ended string.
+    pub const STRING_POINTER: u8 = 0x42;
+    /// GTA VI: a hash table; its key is like a map's, the halves swapped.
+    pub const HASH_TABLE: u8 = 0x75;
     pub const STRUCTURE: u8 = 0x05;
     pub const STRUCTURE_POINTER: u8 = 0x07;
     pub const SBYTE: u8 = 0x10;
@@ -118,9 +135,18 @@ pub struct Meta {
     offset_shift: u32,
 }
 
+/// The name of a block that holds the items of a map.
+const MAP_BLOCK: u32 = 0x101;
+
 /// Whether a resource with this version is a meta file.
 pub fn is_meta(version: u32) -> bool {
     version == VERSION || version == VERSION_RDR2
+}
+
+/// Whether this is the system part of a GTA VI meta file. They are laid out
+/// like Red Dead Redemption 2's ([`VERSION_RDR2`]).
+pub fn is_gta6(system: &[u8]) -> bool {
+    system.get(0x10..0x18) == Some(b"0DRP\x7a\0\0\0")
 }
 
 pub fn parse(res: &Resource) -> Result<Meta, MetaError> {
@@ -133,7 +159,9 @@ pub fn parse(res: &Resource) -> Result<Meta, MetaError> {
     let shift = if res.version == VERSION_RDR2 { 8 } else { 0 };
     let root_block = res.u32(root + if res.version == VERSION_RDR2 { 0x20 } else { 0x1C })? as usize;
     let name_ptr = res.u64(root + 0x38 + shift)?;
-    let name = if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() };
+    // GTA VI has a list in place of the name.
+    let name =
+        if name_ptr != 0 && !is_gta6(&res.system) { res.string(name_ptr).unwrap_or_default() } else { String::new() };
 
     let mut structs = HashMap::new();
     let infos = res.u64(root + 0x20 + shift)?;
@@ -232,6 +260,11 @@ fn vector_attrs(name: &str, v: &[f32]) -> String {
     s
 }
 
+/// A 64-bit name hash; nothing for 0.
+fn hash64_text(hash: u64) -> String {
+    if hash == 0 { String::new() } else { format!("hash_{hash:016X}") }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Tag {
     None,
@@ -252,6 +285,33 @@ impl Meta {
     /// Names of the structures used, the root first; e.g. `CMapData`.
     pub fn root_type(&self) -> Option<String> {
         self.block(self.root_block).map(|b| names::field(b.name))
+    }
+
+    /// The texts of a GTA VI language file (`#ldbmt`), by the hash of their
+    /// label. They are in a map: groups of 16 control bytes (above `0x7f`: no
+    /// item) and as many items of 16 bytes, the label's hash and a pointer to
+    /// a struct with the text's pointer at 8.
+    pub fn label_texts(&self) -> Vec<(u32, String)> {
+        const GROUP: usize = 16 + 16 * 16;
+        let text = |item: &[u8]| -> Option<String> {
+            let (id, off) = self.unpack(item.u64_at(8)?);
+            let (id, off) = self.unpack(self.block(id)?.data.as_slice().u64_at(off + 8)?);
+            let start = self.block(id)?.data.get(off..)?;
+            let end = start.iter().position(|b| *b == 0)?;
+            Some(String::from_utf8_lossy(&start[..end]).into_owned())
+        };
+        let mut out = Vec::new();
+        for block in self.blocks.iter().filter(|b| b.name == MAP_BLOCK) {
+            for group in block.data.as_chunks::<GROUP>().0 {
+                let (control, items) = group.split_at(16);
+                for (item, _) in items.as_chunks::<16>().0.iter().zip(control).filter(|(_, c)| **c < 0x80) {
+                    if let (Some(label), Some(text)) = (item.u32_at(0), text(item)) {
+                        out.push((label, text));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Reads `count` items of `size` bytes starting at a packed pointer; long
@@ -371,7 +431,7 @@ impl Meta {
         let byte = |at: usize| data.get(at).copied().ok_or_else(|| format!("offset {at:#x} beyond block"));
         match entry.kind {
             ty::ARRAY => self.array_node(w, level, data, at, array_info, ename, depth)?,
-            ty::MAP => self.map_node(w, level, data, at, entry, owner, ename, depth)?,
+            ty::MAP | ty::HASH_TABLE => self.map_node(w, level, data, at, entry, owner, ename, depth)?,
             ty::ARRAY_OF_BYTES => {
                 let n = entry.key as usize;
                 let text = match array_info.kind {
@@ -413,6 +473,11 @@ impl Meta {
                 let text = if ptr == 0 || len == 0 { String::new() } else { self.string(ptr, len)? };
                 w.text(level, ename, &text);
             }
+            ty::STRING_POINTER => {
+                let ptr = u64_at(data, at)?;
+                let text = if ptr == 0 { String::new() } else { self.string(ptr, MAX_STRING)? };
+                w.text(level, ename, &text);
+            }
             ty::DATA_BLOCK_POINTER => {
                 let (id, _) = self.unpack(u64_at(data, at)?);
                 let bytes: Vec<String> = match self.block(id) {
@@ -424,7 +489,7 @@ impl Meta {
             ty::FLOAT => w.value(level, ename, &xml::float(f32_at(data, at)?)),
             ty::FLOAT_XYZ => w.empty(level, &vector_attrs(ename, &vector(data, at, 3)?)),
             ty::FLOAT_XYZW => w.empty(level, &vector_attrs(ename, &vector(data, at, 4)?)),
-            ty::HASH => w.string(level, ename, &names::value(u32_at(data, at)?)),
+            ty::HASH | ty::HASH2 => w.string(level, ename, &names::value(u32_at(data, at)?)),
             // RDR2's 0x63 flags are a single byte.
             ty::INT_FLAGS1 if self.offset_shift == 20 => {
                 w.string(level, ename, &self.enum_string(entry, i32::from(byte(at)?)));
@@ -446,9 +511,18 @@ impl Meta {
                     m.chunks(4).map(|r| r.iter().map(|v| xml::float(*v)).collect::<Vec<_>>().join(" ")).collect();
                 w.raw_array(level, ename, &rows, 1);
             }
-            ty::OPAQUE32 => {
+            ty::VEC2 => w.empty(level, &vector_attrs(ename, &vector(data, at, 2)?)),
+            ty::VEC3 => w.empty(level, &vector_attrs(ename, &vector(data, at, 3)?)),
+            ty::MATRIX34 => {
+                let v: Vec<String> = vector(data, at, 12)?.into_iter().map(xml::float).collect();
+                w.raw_array(level, ename, &v, 4);
+            }
+            ty::HASH64 => w.text(level, ename, &hash64_text(u64_at(data, at)?)),
+            ty::SHORT_ENUM => w.value(level, ename, &u16_at(data, at)?.to_string()),
+            ty::OPAQUE32 | ty::OPAQUE16 | ty::OPAQUE16B => {
+                let size = if entry.kind == ty::OPAQUE32 { 32 } else { 16 };
                 let b: Vec<String> =
-                    (0..32).map(|i| byte(at + i).map(|v| format!("{v:02X}"))).collect::<Result<_, _>>()?;
+                    (0..size).map(|i| byte(at + i).map(|v| format!("{v:02X}"))).collect::<Result<_, _>>()?;
                 w.raw_array(level, ename, &b, 16);
             }
             ty::SINT => w.value(level, ename, &(u32_at(data, at)? as i32).to_string()),
@@ -505,12 +579,18 @@ impl Meta {
         depth: usize,
     ) -> Result<(), String> {
         let ptr = u64_at(data, at + 8)?;
-        let count = u16_at(data, at + 16)? as usize;
+        // A hash table has its groups of 16 places and its count in front.
+        let table = entry.kind == ty::HASH_TABLE;
+        let groups = if table { u32_at(data, at)? as usize } else { 0 };
+        let count = if table { u32_at(data, at + 4)? as usize } else { u16_at(data, at + 16)? as usize };
         if count == 0 {
             w.empty(level, ename);
             return Ok(());
         }
-        let (ki, vi) = ((entry.key >> 16) as usize, (entry.key & 0xFFFF) as usize);
+        let (mut ki, mut vi) = ((entry.key >> 16) as usize, (entry.key & 0xFFFF) as usize);
+        if table {
+            std::mem::swap(&mut ki, &mut vi);
+        }
         let key_entry = *owner.entries.get(ki).ok_or("map key type not found")?;
         let value_entry = *owner.entries.get(vi).ok_or("map value type not found")?;
         // An array value's item type is the type entry before it.
@@ -519,7 +599,9 @@ impl Meta {
             ty::ARRAY => 16,
             ty::STRUCTURE => self.structs.get(&value_entry.key).map_or(8, |s| s.size),
             ty::INT_FLAGS1 if self.offset_shift == 20 => 1,
-            ty::HASH | ty::UINT | ty::SINT | ty::FLOAT | ty::INT_ENUM | ty::INT_FLAGS1 | ty::INT_FLAGS2 => 4,
+            ty::HASH | ty::HASH2 | ty::UINT | ty::SINT | ty::FLOAT | ty::INT_ENUM | ty::INT_FLAGS1 | ty::INT_FLAGS2 => {
+                4
+            }
             ty::BOOLEAN | ty::UBYTE | ty::SBYTE | ty::BYTE_ENUM => 1,
             ty::USHORT | ty::SSHORT | ty::SHORT_FLAGS => 2,
             ty::FLOAT_XYZ | ty::FLOAT_XYZW => 16,
@@ -528,9 +610,26 @@ impl Meta {
         let stride = (8 + value_size).next_multiple_of(8);
         let (id, off) = self.unpack(ptr);
         let block = self.block(id).ok_or_else(|| format!("map block {id} not found"))?;
+        // Where the pairs are: one after the other, or in a hash table's used
+        // places. Each group is 16 control bytes (the top bit set: unused),
+        // then 16 places.
+        let pairs: Vec<usize> = if table {
+            let group = 16 + 16 * stride;
+            let end = groups.checked_mul(group).and_then(|len| off.checked_add(len));
+            let bytes = end.and_then(|end| block.data.get(off..end)).ok_or("hash table beyond its block")?;
+            let used = |g: usize| {
+                let at = off + g * group;
+                (0..16).filter(move |i| bytes[g * group + i] < 0x80).map(move |i| at + 16 + i * stride)
+            };
+            (0..groups).flat_map(used).collect()
+        } else {
+            (0..count).map(|i| off + i * stride).collect()
+        };
+        if pairs.len() != count {
+            return Err(format!("{} places used, the table names {count}", pairs.len()));
+        }
         w.open(level, ename);
-        for i in 0..count {
-            let pair = off + i * stride;
+        for (i, pair) in pairs.into_iter().enumerate() {
             if pair + stride > block.data.len() {
                 w.error(level + 1, format!("map pair {i} beyond its block"));
                 break;
@@ -637,12 +736,67 @@ impl Meta {
                 })?;
                 w.item_array(level, ename, &v);
             }
-            ty::HASH => {
+            ty::HASH64 => {
+                let v = numbers(8, &|b| hash64_text(u64::from_le_bytes(b.try_into().unwrap_or_default())))?;
+                w.item_array(level, ename, &v);
+            }
+            ty::ULONG | ty::ULONG2 => {
+                let v = numbers(8, &|b| u64::from_le_bytes(b.try_into().unwrap_or_default()).to_string())?;
+                w.raw_array(level, ename, &v, 10);
+            }
+            ty::SINT => {
+                let v = numbers(4, &|b| i32::from_le_bytes(b.try_into().unwrap_or_default()).to_string())?;
+                w.raw_array(level, ename, &v, 10);
+            }
+            ty::SSHORT => {
+                let v = numbers(2, &|b| i16::from_le_bytes(b.try_into().unwrap_or_default()).to_string())?;
+                w.raw_array(level, ename, &v, 10);
+            }
+            ty::FLOAT_XYZW => {
+                let v = numbers(16, &|b| {
+                    b.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| xml::float(f32::from_le_bytes(*c)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })?;
+                w.item_array(level, ename, &v);
+            }
+            ty::HASH | ty::HASH2 => {
                 let v = numbers(4, &|b| names::value(u32::from_le_bytes(b.try_into().unwrap_or_default())))?;
                 w.item_array(level, ename, &v);
             }
             other => return Err(format!("unexpected array item type {other:#04x}")),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gta6_label_texts() {
+        let block = |name, data: Vec<u8>| Block { name, data };
+        let mut map = vec![0x80u8; 16];
+        map[2] = 0x2a;
+        map.resize(16 + 16 * 16, 0);
+        map[16 + 32..16 + 36].copy_from_slice(&7u32.to_le_bytes());
+        // Block 1, 16 bytes in; there the text is in block 3, 4 bytes in.
+        map[16 + 40..16 + 48].copy_from_slice(&(1u64 | 16 << 20).to_le_bytes());
+        let mut items = vec![0u8; 32];
+        items[24..].copy_from_slice(&(3u64 | 4 << 20).to_le_bytes());
+        let blocks = vec![block(9, items), block(MAP_BLOCK, map), block(0x10, b"abc\0Motel\0".to_vec())];
+        let meta = Meta {
+            name: String::new(),
+            root_block: 1,
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+            blocks,
+            offset_shift: 20,
+        };
+        assert_eq!(meta.label_texts(), [(7, "Motel".to_owned())]);
     }
 }

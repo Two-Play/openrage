@@ -298,6 +298,49 @@ pub fn parse_ynv(res: &Resource) -> Result<(Drawable, Stats), ResourceError> {
     Ok((finish(b, "nav mesh"), stats))
 }
 
+/// A GTA VI nav mesh (`.#nv`), from its system part: like GTA V's, with the
+/// polygons at `0x98` and the minimum corner behind the pointer at `0xA0`. A
+/// polygon (44 bytes) has at 4 its vertex count (low 4 bits) and the number
+/// of its first index. What kind of surface it is, is not known. Those with
+/// fewer than three vertices connect places and are left out.
+pub fn parse_nv6(system: Vec<u8>) -> Result<(Drawable, Stats), ResourceError> {
+    let res = Resource { version: 0, system, graphics: Vec::new() };
+    let root = Resource::ROOT;
+    let (size, min) = (vec3(&res, root + 0x60)?, vec3(&res, res.u64(root + 0xA0)?)?);
+    let verts: Vec<[f32; 3]> = nav_list(&res, res.u64(root + 0x70)?, 6)?
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|c| {
+            let q = [0, 2, 4].map(|o| u16::from_le_bytes([c[o], c[o + 1]]) as f32 / 65535.0);
+            std::array::from_fn(|k| min[k] + q[k] * size[k])
+        })
+        .collect();
+    let indices: Vec<u16> =
+        nav_list(&res, res.u64(root + 0x80)?, 2)?.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
+    let mut b = Builder::default();
+    let mut stats = Stats::default();
+    for p in nav_list(&res, res.u64(root + 0x98)?, 44)?.as_chunks::<44>().0 {
+        let word = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+        let (first, count) = ((word >> 4) as usize, (word & 15) as usize);
+        let corners: Option<Vec<[f32; 3]>> = first
+            .checked_add(count)
+            .and_then(|end| indices.get(first..end))
+            .and_then(|range| range.iter().map(|&i| verts.get(usize::from(i)).copied()).collect());
+        let corners = corners.ok_or_else(|| ResourceError::Format("a polygon names no vertex".into()))?;
+        if corners.len() < 3 {
+            continue;
+        }
+        stats.polygons += 1;
+        let lift = |v: [f32; 3]| [v[0], v[1], v[2] + 0.05];
+        for k in 1..corners.len() - 1 {
+            let triangle = [corners[0], corners[k], corners[k + 1]].map(lift);
+            b.triangle(part::GROUND, &crate::math::IDENTITY, triangle);
+        }
+    }
+    Ok((finish(b, "nav mesh"), stats))
+}
+
 /// Reads a path file by its extension (`ynd`, `yvr`, `ywr`, `ynv`).
 pub fn parse(res: &Resource, extension: &str) -> Result<(Drawable, Stats), ResourceError> {
     match extension.to_ascii_lowercase().as_str() {

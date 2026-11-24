@@ -64,7 +64,7 @@ pub(crate) enum Command {
         /// Instead of archives, decode every sound of every audio container (.awc).
         #[arg(long, conflicts_with_all = ["textures", "models"])]
         audio: bool,
-        /// Instead of archives, parse every clip dictionary (.ycd) and evaluate every frame.
+        /// Instead of archives, parse every clip dictionary (.ycd; GTA VI .#cd) and evaluate its frames.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio"])]
         animations: bool,
         /// Instead of archives, convert every metadata file (.ymap, .ytyp, .ymt, .ymf, .cut, .pso) to XML.
@@ -86,7 +86,8 @@ pub(crate) enum Command {
         /// Instead of archives, disassemble every script (.ysc) and check every jump.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths"])]
         scripts: bool,
-        /// Instead of archives, read the header of every Scaleform movie (.gfx) and Bink video (.bik).
+        /// Instead of archives, read the header of every Scaleform movie (.gfx) and Bink video (.bik, .bk2),
+        /// and decode the first second of every video.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths", "scripts"])]
         media: bool,
         /// Instead of archives, read every GTA IV cutscene (.cut): its sections, the clips of
@@ -94,12 +95,25 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths", "scripts", "media"])]
         cutscenes: bool,
         /// With --textures: also rebuild every dictionary and check that it reads back identically.
-        /// With --models: write every GTA V Enhanced drawable (.ydr) anew with its own meshes and
-        /// check that it reads back identically.
+        /// With --models: write every GTA V Enhanced drawable (.ydr, .yft, .ydd) anew with its own
+        /// meshes and check that it reads back identically.
+        /// With --collisions: write every GTA V Enhanced collision (.ybn, and those of .ydr) anew
+        /// from its own triangles and check that it reads back the same.
+        /// With --meta: convert every PSO file (.ymt, .ymf, .pso, …) to XML and back, and check
+        /// that it comes out byte for byte the same or at least reads back to the same XML.
         /// GTA IV without --textures: rebuild the table of every .rpf package in memory and
         /// check that it matches the stored one byte for byte (nothing is written).
+        /// RDR2 without --textures: edit a temporary copy of every archive (top-level ones up to
+        /// 512 MB, and every nested one) with the RPF8 writer, check that every entry reads back
+        /// as it should, undo the edit and check that the copy is the original again.
         #[arg(long)]
         rebuild: bool,
+        /// With --models: write every model (.ydr, .yft, .ydd) and texture dictionary (.ytd) as
+        /// OpenIV openFormats text and read it back, checking that nothing changes; GTA V
+        /// Enhanced drawables and fragments are also imported back onto themselves (meshes
+        /// written anew) and must read back as the original.
+        #[arg(long, requires = "models")]
+        openformats: bool,
     },
     /// Convert a metadata file (.ymap, .ytyp, .ymt, .ymf, .cut, .pso) to XML.
     Xml {
@@ -115,7 +129,8 @@ pub(crate) enum Command {
     /// Put a map file (.ymap) together: its objects with their models and textures
     /// (builds the world cache on first use).
     Map {
-        /// Virtual path of the .ymap (GTA IV: .wpl; none with --check).
+        /// Virtual path of the .ymap (GTA IV: .wpl; GTA VI: .#map, or none for the whole map from afar; none with
+        /// --check).
         path: Option<String>,
         /// Render a picture of the whole map file (PNG).
         #[arg(long)]
@@ -208,16 +223,29 @@ pub(crate) enum Command {
         /// Instead of only reading files, convert all metadata (.ymap, .ytyp, .ymt, .ymf) to XML.
         #[arg(long, conflicts_with_all = ["textures", "models", "text"])]
         meta: bool,
+        /// With --meta: convert every PSO file to XML and back, and check that it comes out the
+        /// same bytes or at least reads back to the same XML.
+        #[arg(long, requires = "meta")]
+        rebuild: bool,
         /// Instead of only reading files, decode every sound of every audio container.
         #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta"])]
         audio: bool,
-        /// Instead of only reading files, parse every clip dictionary (.ycd) and evaluate every frame.
+        /// Instead of only reading files, parse every clip dictionary (.ycd; GTA VI .#cd) and evaluate its frames.
         #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta", "audio"])]
         anims: bool,
     },
-    /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
+    /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik, .bk2).
     Media {
         path: String,
+        /// For a Bink video: write its pictures as PNG files into this directory.
+        #[arg(long)]
+        frames: Option<PathBuf>,
+        /// Only write every n-th picture.
+        #[arg(long, default_value_t = 1, requires = "frames")]
+        every: usize,
+        /// For a Bink video: write its sound as a WAV file (the second track and on as `name.2.wav` …).
+        #[arg(long)]
+        wav: Option<PathBuf>,
         /// For a .gfx: write it as a Flash file (.swf) for Flash tools such as JPEXS or Ruffle.
         #[arg(long)]
         swf: Option<PathBuf>,
@@ -250,10 +278,14 @@ pub(crate) enum Command {
         #[arg(long, value_name = "TEXT", conflicts_with = "out")]
         import: Option<PathBuf>,
     },
-    /// Replace the meshes of a GTA V Enhanced drawable (.ydr) or vehicle body (.yft) with a
-    /// Wavefront OBJ model. The model's shaders and textures stay; OBJ materials go to its
-    /// shaders in order. Vehicles: OBJ parts named like a bone (`door_dside_f`, `bonnet`) move
-    /// with it, other parts with the body.
+    /// Replace the meshes of a GTA V Enhanced drawable (.ydr), fragment (.yft: vehicles, their
+    /// mod parts) or drawable dictionary (.ydd: peds, clothing) with a Wavefront OBJ model. The
+    /// model's shaders and textures stay; OBJ materials go to its shaders in order. Vehicles: OBJ
+    /// parts named like a bone (`door_dside_f`, `bonnet`) move with it, parts named after the
+    /// wheel (`wheel_lf`) replace its model, other parts move with the body. Dictionaries: parts
+    /// named after a drawable (`uppr_000_u`) replace it. Models blended between bones take the
+    /// weights of the original's nearest vertex. A collision file (.ybn) gets the OBJ as its
+    /// collision.
     ReplaceModel {
         /// The model in the game, e.g. `x64i.rpf/levels/gta5/props/…/prop_x.ydr` or
         /// `x64e.rpf/levels/gta5/vehicles.rpf/adder.yft`.
@@ -275,6 +307,39 @@ pub(crate) enum Command {
         /// Keep the drawable's textures instead of embedding the ones the OBJ's materials name.
         #[arg(long)]
         no_textures: bool,
+        /// Drawable dictionaries (.ydd): the drawable (name or index) for the OBJ's parts that
+        /// are named after none.
+        #[arg(long)]
+        drawable: Option<String>,
+        /// Drawables (.ydr): build the collision from this OBJ model instead of keeping the
+        /// original (OBJ materials named like a collision material, e.g. CONCRETE, get it).
+        #[arg(long, value_name = "OBJ")]
+        collision: Option<PathBuf>,
+    },
+    /// Export a model or texture dictionary as OpenIV openFormats text files: .ydr → .odr,
+    /// .yft → .oft, .ydd → .odd, .ytd → .otd, with meshes (.mesh), skeletons (.skel) and
+    /// textures (.otx + .dds) in a folder named after the file.
+    ExportOpenformats {
+        /// The file in the game, e.g. `x64i.rpf/levels/gta5/props/…/prop_x.ydr`.
+        path: String,
+        /// Folder to write into.
+        #[arg(short, long, default_value = ".")]
+        out: PathBuf,
+    },
+    /// Import openFormats files (.odr, .oft, .otd) onto the game file they belong to: its
+    /// meshes, detail levels and embedded textures (dictionaries: textures) are replaced, its
+    /// shaders, skeleton and physics stay. GTA V Enhanced models; texture dictionaries of both.
+    ImportOpenformats {
+        /// The file in the game, e.g. `x64i.rpf/levels/gta5/props/…/prop_x.ydr`.
+        path: String,
+        /// The main openFormats file (`prop_x.odr`).
+        file: PathBuf,
+        /// Write the new game file to this file.
+        #[arg(short, long, required_unless_present = "mods")]
+        out: Option<PathBuf>,
+        /// Put the new file into the mods folder in place of the original (can be undone).
+        #[arg(long, conflicts_with = "out")]
+        mods: bool,
     },
     /// Show a model (.ydr, .yft, .ydd; GTA IV .wdr, .wft, .wdd) and optionally export it as glTF (.glb).
     Model {
@@ -296,7 +361,7 @@ pub(crate) enum Command {
         #[arg(long)]
         outfit: Option<usize>,
     },
-    /// List the clips of a clip dictionary (.ycd; GTA IV .wad).
+    /// List the clips of a clip dictionary (.ycd; GTA IV .wad; GTA VI .#cd).
     Clips {
         /// Virtual path of the .ycd file.
         path: String,
@@ -324,6 +389,23 @@ pub(crate) enum Command {
         /// Export every sound into this folder as .wav.
         #[arg(short = 'o', long, visible_alias = "out")]
         export: Option<PathBuf>,
+    },
+    /// GTA VI: count the textures of a texture pool (.ttpf) and optionally export them as PNG.
+    Ttpf {
+        /// The pool file.
+        path: PathBuf,
+        /// Export the textures into this folder as .png, named by their number.
+        #[arg(short = 'o', long, visible_alias = "out")]
+        export: Option<PathBuf>,
+        /// The first texture to read.
+        #[arg(long, default_value_t = 0)]
+        from: usize,
+        /// How many textures to read (default: all).
+        #[arg(long)]
+        count: Option<usize>,
+        /// Read the largest mip level that is at most this many pixels wide and high.
+        #[arg(long)]
+        max_side: Option<u32>,
     },
     /// List the textures of a texture dictionary (.ytd) and optionally export them.
     Textures {

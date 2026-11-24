@@ -152,8 +152,8 @@ fn track_values(res: &Resource, track: u64, frames: usize) -> Result<Option<Trac
     let Some(&last) = values.last() else { return Ok(None) };
     values.resize(frames, last);
     let track = match kind {
-        KIND_CAMERA_FOV => BoneTrack { bone, format: 0, track: TRACK_CAMERA_FOV },
-        _ => BoneTrack { bone, format: quat as u8, track: kind },
+        KIND_CAMERA_FOV => BoneTrack { bone, format: 0, track: TRACK_CAMERA_FOV, ..Default::default() },
+        _ => BoneTrack { bone, format: quat as u8, track: kind, ..Default::default() },
     };
     Ok(Some((track, values)))
 }
