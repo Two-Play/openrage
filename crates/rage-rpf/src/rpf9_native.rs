@@ -126,21 +126,74 @@ impl NativeArchive {
         file.read_exact(&mut bytes[64..]).map_err(|e| e.to_string())?;
         decode_header(&materials.cipher, &mut bytes).ok_or("unsupported or damaged native header transform")?;
         let catalog = Catalog::parse(bytes, extent)?;
-        let mut paths = Vec::with_capacity(catalog.entries.len());
-        let mut by_path = HashMap::with_capacity(catalog.entries.len());
-        for entry in &catalog.entries {
-            let name = entry
-                .name_hash64
-                .and_then(|hash| materials.names.find(hash, entry.name_hash32, entry.type_id))
-                .filter(|name| !by_path.contains_key(&name.to_ascii_lowercase()));
+        let mut archive = Self { catalog, materials, paths: Vec::new(), by_path: HashMap::new() };
+        archive.name_entries(&HashMap::new());
+        Ok(archive)
+    }
+
+    /// The archive at `base` in a file, with the names its own files tell.
+    /// The last few opened ones are kept.
+    pub fn cached(path: &Path, base: u64, extent: u64) -> Option<Arc<Self>> {
+        type Key = (PathBuf, u64, u64, Option<std::time::SystemTime>);
+        static OPENED: Mutex<Vec<(Key, Arc<NativeArchive>)>> = Mutex::new(Vec::new());
+        let key = (path.to_path_buf(), base, extent, std::fs::metadata(path).and_then(|m| m.modified()).ok());
+        if let Some((_, found)) = OPENED.lock().ok()?.iter().find(|(k, _)| *k == key) {
+            return Some(Arc::clone(found));
+        }
+        let mut archive = Self::open(path, base, extent, materials(path)?).ok()?;
+        let learned = archive.learn_names(path, base);
+        if !learned.is_empty() {
+            archive.name_entries(&learned);
+        }
+        let archive = Arc::new(archive);
+        let mut opened = OPENED.lock().ok()?;
+        if opened.len() >= KEPT {
+            opened.remove(0);
+        }
+        opened.push((key, Arc::clone(&archive)));
+        Some(archive)
+    }
+
+    /// Gives the entries their paths: names by slot, then the known ones.
+    fn name_entries(&mut self, learned: &HashMap<usize, String>) {
+        self.paths = Vec::with_capacity(self.catalog.entries.len());
+        self.by_path = HashMap::with_capacity(self.catalog.entries.len());
+        for entry in &self.catalog.entries {
+            let name = learned
+                .get(&entry.slot)
+                .cloned()
+                .or_else(|| {
+                    let hash = entry.name_hash64?;
+                    self.materials.names.find(hash, entry.name_hash32, entry.type_id)
+                })
+                .filter(|name| !self.by_path.contains_key(&name.to_ascii_lowercase()));
             let path = name.unwrap_or_else(|| {
                 let ext = rpf9_names::type_extension(entry.type_id);
-                format!("entries/{:06}_{:016x}.{ext}", entry.slot, entry.name_hash64.unwrap_or(0))
+                format!("{UNNAMED}/{:06}_{:016x}.{ext}", entry.slot, entry.name_hash64.unwrap_or(0))
             });
-            by_path.insert(path.to_ascii_lowercase(), entry.slot);
-            paths.push(path);
+            self.by_path.insert(path.to_ascii_lowercase(), entry.slot);
+            self.paths.push(path);
         }
-        Ok(Self { catalog, materials, paths, by_path })
+    }
+
+    /// Names of unnamed entries, found in their own data: models, clip
+    /// dictionaries and some others hold their name. What is found is
+    /// checked against the hash in the table.
+    fn learn_names(&self, path: &Path, base: u64) -> HashMap<usize, String> {
+        self.catalog
+            .entries
+            .par_iter()
+            .filter(|e| SELF_NAMED.contains(&e.type_id) && e.size <= LEARN_MAX)
+            .filter(|e| self.paths[e.slot].strip_prefix(UNNAMED).is_some_and(|rest| rest.starts_with('/')))
+            .filter_map(|e| {
+                let wanted = e.name_hash64?;
+                let mut data = Vec::new();
+                self.copy_to(path, base, e, &mut data).ok()?;
+                let mut names = rpf9_names::Dictionary::default();
+                rpf9_names::tokens(&data).iter().for_each(|text| names.add(text));
+                Some((e.slot, names.find(wanted, e.name_hash32, e.type_id)?))
+            })
+            .collect()
     }
 
     /// The slot with this path (case-insensitive).
@@ -206,7 +259,16 @@ impl NativeArchive {
     }
 }
 
-/// Larger members are not searched for names.
+/// Where entries without a known name are listed.
+const UNNAMED: &str = "entries";
+/// Types whose files hold their own name: drawables, fragments, drawable
+/// dictionaries, and registered ones where this was seen in the game's data.
+const SELF_NAMED: [u8; 10] = [2, 3, 4, 66, 67, 69, 70, 72, 102, 109];
+/// Larger members are not searched for their own name.
+const LEARN_MAX: u64 = 8 << 20;
+/// Opened archives to keep.
+const KEPT: usize = 16;
+/// Larger members are not searched for names of others.
 const STRINGS_MAX: u64 = 64 << 20;
 
 /// Clear bytes in front of a resource's chunks.

@@ -391,8 +391,14 @@ pub(crate) fn report_rpf8_extract(rpf: &rage_rpf::Rpf8, dir: &str, file: Option<
     extraction_result(s.failures.len())
 }
 
-pub(crate) fn report_rpf9_extract(rpf: &rage_rpf::Rpf9, dir: &str, file: Option<usize>, out: &Path) -> Result<()> {
-    let s = openrage_app::rpf9::extract(rpf, dir, file, out, &AtomicBool::new(false), &mut |_, _| {})?;
+pub(crate) fn report_rpf9_extract(
+    rpf: &rage_rpf::Rpf9,
+    dir: &str,
+    file: Option<usize>,
+    out: &Path,
+    expand: bool,
+) -> Result<()> {
+    let s = openrage_app::rpf9::extract(rpf, dir, file, out, expand, &AtomicBool::new(false), &mut |_, _| {})?;
     for f in &s.failures {
         eprintln!("warning: {f}");
     }
@@ -446,8 +452,8 @@ pub(crate) fn cmd_extract(
         Node::ArchiveFile(rpf, id) | Node::ArchiveDir(rpf, id) => (rpf, id),
         Node::Rpf8File(rpf, i) => return report_rpf8_extract(&rpf, "", Some(i), out),
         Node::Rpf8Dir(rpf, dir) => return report_rpf8_extract(&rpf, &dir, None, out),
-        Node::Rpf9File(rpf, i) => return report_rpf9_extract(&rpf, "", Some(i), out),
-        Node::Rpf9Dir(rpf, dir) => return report_rpf9_extract(&rpf, &dir, None, out),
+        Node::Rpf9File(rpf, i) => return report_rpf9_extract(&rpf, "", Some(i), out, expand),
+        Node::Rpf9Dir(rpf, dir) => return report_rpf9_extract(&rpf, &dir, None, out, expand),
         Node::Gta4Dir(a, id) | Node::Gta4File(a, id) => {
             let s = openrage_app::gta4::extract(&a, id, out, &AtomicBool::new(false), &mut |_, _| {})?;
             for f in &s.failures {

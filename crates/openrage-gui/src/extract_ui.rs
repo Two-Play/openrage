@@ -75,7 +75,7 @@ pub(crate) fn start_extract(ui: &AppWindow) {
     });
     if let Some((rpf, dir, file)) = gta6 {
         spawn_extract(ui, move |out, cancel, progress| {
-            openrage_app::rpf9::extract(&rpf, &dir, file, out, cancel, progress)
+            openrage_app::rpf9::extract(&rpf, &dir, file, out, false, cancel, progress)
         });
         return;
     }

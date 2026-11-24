@@ -40,7 +40,7 @@ use rayon::prelude::*;
 
 use crate::RpfError;
 use crate::rpf9_index::{NativeEntry, Storage};
-use crate::rpf9_native::{self, NativeArchive};
+use crate::rpf9_native::NativeArchive;
 
 const MAGIC: u32 = 0x5250_4639;
 /// Length of the header in front of the table of contents.
@@ -292,7 +292,7 @@ pub struct Rpf9 {
     /// Where the archive starts in the file: a nested one, inside its parent.
     base: u64,
     /// The archive's own table, read on first use.
-    native: OnceLock<Option<NativeArchive>>,
+    native: OnceLock<Option<Arc<NativeArchive>>>,
     /// Filled on first use: finding the entries means reading the archive.
     entries: Mutex<Option<Arc<Vec<Entry>>>>,
     /// Filled on first use.
@@ -341,12 +341,7 @@ impl Rpf9 {
     /// The archive's own table; `None` without the game's executable (or
     /// with another build's) and for damaged tables.
     fn native(&self) -> Option<&NativeArchive> {
-        self.native
-            .get_or_init(|| {
-                let materials = rpf9_native::materials(&self.path)?;
-                NativeArchive::open(&self.path, self.base, self.size, materials).ok()
-            })
-            .as_ref()
+        self.native.get_or_init(|| NativeArchive::cached(&self.path, self.base, self.size)).as_deref()
     }
 
     /// Whether the archive's own table is read, rather than a recovery view

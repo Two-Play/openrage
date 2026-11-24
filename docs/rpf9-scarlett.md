@@ -113,12 +113,16 @@ checksums and every decoded length matching.
 The table holds only hashes, of paths relative to the archive without the
 extensions that have a type number. Names come from path strings in the
 executable and in the files of `common.rpf` and `data.rpf`, checked against
-the hashes. They cover most top-level files; those without are listed as
+the hashes. They cover most top-level files. Inside nested archives, drawables, fragments,
+clip dictionaries and some other types hold their own name, which is checked
+against the hash the same way (over 99% of drawables and fragments in a sample
+of 1,826 archives). Files without a name are listed as
 `entries/<slot>_<hash>`.
 
 ## Remaining work
 
-Names inside nested archives, the extensions of types the game registers at
+Names of the other types inside nested archives (textures, collisions, maps),
+the extensions of types the game registers at
 run time (shown as `type<number>`), signature checks and archive writing.
 
 ## Local recovery validation

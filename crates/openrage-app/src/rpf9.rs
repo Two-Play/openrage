@@ -301,59 +301,92 @@ pub fn coverage(rpf: &Rpf9, entries: &[Entry]) -> Coverage {
 
 /// Extracts from a GTA VI archive into `out`: one file (`file`), or
 /// everything below folder `dir`. Files are written unpacked, straight to
-/// disk. Unreadable files are listed in `failures` and skipped.
+/// disk; with `expand`, archives inside become folders. Unreadable files are
+/// listed in `failures` and skipped.
 pub fn extract(
     rpf: &Rpf9,
     dir: &str,
     file: Option<usize>,
     out: &Path,
+    expand: bool,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&ExtractSummary, &str),
 ) -> Result<ExtractSummary> {
-    let entries = rpf.entries()?;
     let mut summary = ExtractSummary { target: out.to_path_buf(), ..Default::default() };
-    let mut write = |i: usize, rel: &str, s: &mut ExtractSummary| -> Result<()> {
-        let target = out.join(vfs::safe_relative_path(rel).with_context(|| format!("unsafe path {rel}"))?);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut writer = BufWriter::new(fs::File::create(&target)?);
-        match rpf.copy_to(&entries[i], &mut writer).and_then(|n| Ok(writer.flush().map(|()| n)?)) {
-            Ok(bytes) => {
-                s.files += 1;
-                s.bytes += bytes;
-            }
-            Err(e) => {
-                drop(writer);
-                let _ = fs::remove_file(&target);
-                s.failures.push(e.to_string());
-            }
-        }
-        progress(s, rel);
-        Ok(())
-    };
     if let Some(i) = file {
-        let name = rpf.entry_name(&entries[i]);
+        let entries = rpf.entries()?;
+        let entry = entries.get(i).context("no such entry")?;
+        let name = rpf.entry_name(entry);
         let base = name.rsplit('/').next().unwrap_or(&name).to_owned();
-        write(i, &base, &mut summary)?;
+        extract_entry(rpf, entry, &base, out, expand, cancel, progress, &mut summary)?;
         summary.target = out.join(base);
-        return Ok(summary);
+    } else {
+        extract_dir(rpf, dir, out, expand, cancel, progress, &mut summary)?;
     }
-    // Everything below `dir`, with its path from there on.
-    let prefix = if dir.is_empty() { String::new() } else { format!("{}/", dir.to_ascii_lowercase()) };
-    for (i, e) in entries.iter().enumerate() {
+    Ok(summary)
+}
+
+/// Everything below `dir`, with its path from there on.
+fn extract_dir(
+    rpf: &Rpf9,
+    dir: &str,
+    out: &Path,
+    expand: bool,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&ExtractSummary, &str),
+    summary: &mut ExtractSummary,
+) -> Result<()> {
+    let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+    for e in rpf.entries()?.iter() {
         let name = rpf.entry_name(e);
-        let Some(rel) = name.get(..prefix.len()).filter(|s| s.eq_ignore_ascii_case(&prefix)).map(|s| &name[s.len()..])
-        else {
+        if !name.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(&prefix)) {
             continue;
-        };
+        }
         if cancel.load(Ordering::Relaxed) {
             summary.cancelled = true;
             break;
         }
-        write(i, rel, &mut summary)?;
+        extract_entry(rpf, e, &name[prefix.len()..], out, expand, cancel, progress, summary)?;
     }
-    Ok(summary)
+    Ok(())
+}
+
+#[expect(clippy::too_many_arguments)]
+fn extract_entry(
+    rpf: &Rpf9,
+    entry: &Entry,
+    rel: &str,
+    out: &Path,
+    expand: bool,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&ExtractSummary, &str),
+    summary: &mut ExtractSummary,
+) -> Result<()> {
+    let target = out.join(vfs::safe_relative_path(rel).with_context(|| format!("unsafe path {rel}"))?);
+    if expand && rpf.is_archive(entry) {
+        match rpf.open_child(entry) {
+            Ok(child) => return extract_dir(&child, "", &target, expand, cancel, progress, summary),
+            Err(e) => summary.failures.push(e.to_string()),
+        }
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut writer = BufWriter::new(fs::File::create(&target)?);
+    match rpf.copy_to(entry, &mut writer).and_then(|n| Ok(writer.flush().map(|()| n)?)) {
+        Ok(bytes) => {
+            summary.files += 1;
+            summary.bytes += bytes;
+        }
+        Err(e) => {
+            drop(writer);
+            let _ = fs::remove_file(&target);
+            summary.failures.push(e.to_string());
+        }
+    }
+    progress(summary, rel);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -419,11 +452,11 @@ mod tests {
         rpf.set_entries(rpf.scan(&AtomicBool::new(false), &|_, _| {}).unwrap());
         let quiet = AtomicBool::new(false);
 
-        let all = extract(&rpf, "", None, &dir.join("all"), &quiet, &mut |_, _| {}).unwrap();
+        let all = extract(&rpf, "", None, &dir.join("all"), false, &quiet, &mut |_, _| {}).unwrap();
         assert_eq!((all.files, all.failures.len()), (2, 0));
         assert_eq!(fs::read(dir.join("all/xml/000000000040.xml")).unwrap(), b"<?xml version=\"1.0\"?><a/>");
 
-        let psin = extract(&rpf, "PSIN", None, &dir.join("psin"), &quiet, &mut |_, _| {}).unwrap();
+        let psin = extract(&rpf, "PSIN", None, &dir.join("psin"), false, &quiet, &mut |_, _| {}).unwrap();
         assert_eq!(psin.files, 1);
         assert!(
             fs::read_dir(dir.join("psin"))
@@ -432,7 +465,7 @@ mod tests {
                 .all(|f| f.file_name().to_string_lossy().ends_with(".psin"))
         );
 
-        let one = extract(&rpf, "", Some(0), &dir.join("one"), &quiet, &mut |_, _| {}).unwrap();
+        let one = extract(&rpf, "", Some(0), &dir.join("one"), false, &quiet, &mut |_, _| {}).unwrap();
         assert_eq!(one.target, dir.join("one/000000000040.xml"));
         assert!(one.target.is_file());
         fs::remove_dir_all(dir).unwrap();
