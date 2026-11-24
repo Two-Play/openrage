@@ -30,8 +30,10 @@
 //!   and 16 bits) with a bias and a scale in the buffer's first bytes and an
 //!   order of the axes.
 //! - Skinning: up to eight weights of 8 bits (parts 16 and 17) with the
-//!   numbers of their bones (20 and 21, 8 bits each), or one bone without a
-//!   weight. Of the weights the four largest are kept.
+//!   numbers of their bones (20 and 21, 8 bits each, or 32 bits of which the
+//!   lower 12 are the number), or one bone without a weight. Of the weights
+//!   the four largest are kept. A bone's number is its place in the model's
+//!   list of the hashes of its bones' names (40).
 //! - Texture coordinates (part 28): two floats, or two 16-bit numbers with a
 //!   scale.
 //!
@@ -47,10 +49,11 @@
 //! scale (32), its name (48), the next sibling and the parent (68, 70, 16 bits
 //! each, -1 for none), its number (72) and its tag (74).
 //!
-//! Not read: the other textures of materials, the lower levels of detail,
-//! which bone meshes without bone numbers belong to, and the skinning of the
-//! parts of people and animals (made for other bones than the part's own
-//! skeleton has, some with bone numbers of 32 bits).
+//! Parts of people and animals use bones of a skeleton in another file
+//! ([`Mesh::bone_hashes`]).
+//!
+//! Not read: the other textures of materials, the lower levels of detail, and
+//! which bone meshes without bone numbers belong to.
 //!
 //! The layout is the one found by the rpf9-explorer project
 //! (<https://github.com/breadbbbb/rpf9-explorer>), whose decoder was read to
@@ -259,10 +262,25 @@ impl<'a> Reader<'a> {
             }
             let geometries = self.s(model + 8, count * 8)?;
             let shaders = self.s(model + 32, count * 2).ok();
-            // A model made for other bones than the skeleton's is not skinned.
-            let bones = if self.u16(model + 20)? == bones { bones } else { 0 };
+            let used = self.u16(model + 20)?;
+            // What its bones are called; a model without such a list has the skeleton's.
+            let hashes: Vec<u32> = match self.s(model + 40, used * 4) {
+                Ok(list) => (0..used).filter_map(|i| self.sys.u32_at(list + i * 4)).collect(),
+                Err(_) => Vec::new(),
+            };
+            let bones = if !hashes.is_empty() || used == bones { used } else { 0 };
+            // The skeleton's, if it has them all; else those of another one.
+            let own: Option<Vec<u16>> = skeleton
+                .as_ref()
+                .filter(|_| !hashes.is_empty())
+                .and_then(|s| hashes.iter().map(|&h| s.find_hash(h).map(|b| b as u16)).collect());
             for g in 0..count {
                 let mut mesh = self.mesh(self.s(geometries + g * 8, 160)?, bones)?;
+                match &own {
+                    Some(map) => mesh.bone_indices.iter_mut().flatten().for_each(|b| *b = map[usize::from(*b)]),
+                    None if !mesh.bone_indices.is_empty() => mesh.bone_hashes = hashes.clone(),
+                    None => {}
+                }
                 mesh.shader = shaders.and_then(|s| self.sys.u16_at(s + g * 2)).unwrap_or(0);
                 meshes.push(mesh);
             }
@@ -433,16 +451,21 @@ impl<'a> Reader<'a> {
             if let Some(single) = bytes(BONES[0], 1, 62) {
                 return Some(([u16::from(single[i]), 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
             }
-            let mut found: Vec<(u8, u8)> = Vec::with_capacity(8);
+            let mut found: Vec<(u8, u16)> = Vec::with_capacity(8);
             for (weights, numbers) in WEIGHTS.into_iter().zip(BONES) {
-                if let (Some(w), Some(n)) = (bytes(weights, 4, 28), bytes(numbers, 4, 30)) {
-                    found.extend((0..4).map(|k| (w[i * 4 + k], n[i * 4 + k])));
+                let Some(w) = bytes(weights, 4, 28) else { continue };
+                if let Some(n) = bytes(numbers, 4, 30) {
+                    found.extend((0..4).map(|k| (w[i * 4 + k], u16::from(n[i * 4 + k]))));
+                } else if let Some(n) = bytes(numbers, 16, 3) {
+                    // The bone is in the lower 12 bits.
+                    let number = |k: usize| u16::from_le_bytes([n[(i * 4 + k) * 4], n[(i * 4 + k) * 4 + 1]]) & 0xFFF;
+                    found.extend((0..4).map(|k| (w[i * 4 + k], number(k))));
                 }
             }
             found.sort_by_key(|(w, _)| std::cmp::Reverse(*w));
             let (mut numbers, mut weights) = ([0; 4], [0.0; 4]);
             for (k, (w, n)) in found.into_iter().filter(|(w, _)| *w > 0).take(4).enumerate() {
-                numbers[k] = u16::from(n);
+                numbers[k] = n;
                 weights[k] = f32::from(w) / 255.0;
             }
             let total: f32 = weights.iter().sum();

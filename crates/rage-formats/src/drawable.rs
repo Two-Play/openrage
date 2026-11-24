@@ -59,6 +59,8 @@ pub struct Mesh {
     /// is the bone tagged `bone_tags[i]` of the skeleton the part is worn
     /// on); empty when the indices are skeleton indices already.
     pub bone_tags: Vec<u16>,
+    /// The same for GTA VI: hashes of the bones' names.
+    pub bone_hashes: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Default)]

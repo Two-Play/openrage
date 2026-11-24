@@ -697,13 +697,15 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
             let (mesh, _) = rage_formats::paths::parse_nv6(crate::rpf9::resource(&rpf, i)?.0)?;
             return Ok(LoadedModel::from_drawables(vec![("nav mesh".to_owned(), mesh)]));
         }
-        let drawables = crate::gta6_models::load(&rpf, i)?;
+        let mut drawables = crate::gta6_models::load(&rpf, i)?;
         let textures = crate::gta6_textures::for_drawables(game_dir, &drawables);
+        let name = vpath.rsplit('/').next().unwrap_or(vpath);
         // A dictionary's drawables have skeletons of their own.
-        let skeleton = match drawables.as_slice() {
+        let worn_on = crate::gta6_models::bind(game_dir, name, &mut drawables);
+        let skeleton = worn_on.or_else(|| match drawables.as_slice() {
             [(_, d)] => d.skeleton.clone(),
             _ => None,
-        };
+        });
         let mut model = LoadedModel::from_drawables(drawables);
         model.skeleton = skeleton;
         if let Some(textures) = textures {
