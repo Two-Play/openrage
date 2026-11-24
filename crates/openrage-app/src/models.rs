@@ -538,6 +538,7 @@ pub fn is_model(name: &str) -> bool {
         || n.ends_with(".#ft")
         || n.ends_with(".#dd")
         || n.ends_with(".#bn")
+        || n.ends_with(".#nv")
         || rage_formats::paths::is_path_file(&n)
 }
 
@@ -691,6 +692,10 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
                 rage_formats::shaders::register(id, label, color);
             }
             return Ok(LoadedModel::from_drawables(vec![("collision".to_owned(), collision)]));
+        }
+        if vpath.to_ascii_lowercase().ends_with(".#nv") {
+            let (mesh, _) = rage_formats::paths::parse_nv6(crate::rpf9::resource(&rpf, i)?.0)?;
+            return Ok(LoadedModel::from_drawables(vec![("nav mesh".to_owned(), mesh)]));
         }
         let drawables = crate::gta6_models::load(&rpf, i)?;
         let textures = crate::gta6_textures::for_drawables(game_dir, &drawables);
