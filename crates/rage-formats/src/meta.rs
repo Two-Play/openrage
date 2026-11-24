@@ -34,6 +34,8 @@ pub const VERSION: u32 = 2;
 pub const VERSION_RDR2: u32 = 3;
 
 const ARRAYINFO: u32 = 0x100;
+/// Zero-ended strings are cut off here.
+const MAX_STRING: usize = 1 << 20;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -72,6 +74,10 @@ mod ty {
     /// GTA VI: 16-byte values of unknown layout (shown as bytes).
     pub const OPAQUE16: u8 = 0x5C;
     pub const OPAQUE16B: u8 = 0x67;
+    /// GTA VI: pointer to a zero-ended string.
+    pub const STRING_POINTER: u8 = 0x42;
+    /// GTA VI: a hash table; its key is like a map's, the halves swapped.
+    pub const HASH_TABLE: u8 = 0x75;
     pub const STRUCTURE: u8 = 0x05;
     pub const STRUCTURE_POINTER: u8 = 0x07;
     pub const SBYTE: u8 = 0x10;
@@ -395,7 +401,7 @@ impl Meta {
         let byte = |at: usize| data.get(at).copied().ok_or_else(|| format!("offset {at:#x} beyond block"));
         match entry.kind {
             ty::ARRAY => self.array_node(w, level, data, at, array_info, ename, depth)?,
-            ty::MAP => self.map_node(w, level, data, at, entry, owner, ename, depth)?,
+            ty::MAP | ty::HASH_TABLE => self.map_node(w, level, data, at, entry, owner, ename, depth)?,
             ty::ARRAY_OF_BYTES => {
                 let n = entry.key as usize;
                 let text = match array_info.kind {
@@ -435,6 +441,11 @@ impl Meta {
                 let ptr = u64_at(data, at)?;
                 let len = u16_at(data, at + 8)? as usize;
                 let text = if ptr == 0 || len == 0 { String::new() } else { self.string(ptr, len)? };
+                w.text(level, ename, &text);
+            }
+            ty::STRING_POINTER => {
+                let ptr = u64_at(data, at)?;
+                let text = if ptr == 0 { String::new() } else { self.string(ptr, MAX_STRING)? };
                 w.text(level, ename, &text);
             }
             ty::DATA_BLOCK_POINTER => {
@@ -538,12 +549,18 @@ impl Meta {
         depth: usize,
     ) -> Result<(), String> {
         let ptr = u64_at(data, at + 8)?;
-        let count = u16_at(data, at + 16)? as usize;
+        // A hash table has its groups of 16 places and its count in front.
+        let table = entry.kind == ty::HASH_TABLE;
+        let groups = if table { u32_at(data, at)? as usize } else { 0 };
+        let count = if table { u32_at(data, at + 4)? as usize } else { u16_at(data, at + 16)? as usize };
         if count == 0 {
             w.empty(level, ename);
             return Ok(());
         }
-        let (ki, vi) = ((entry.key >> 16) as usize, (entry.key & 0xFFFF) as usize);
+        let (mut ki, mut vi) = ((entry.key >> 16) as usize, (entry.key & 0xFFFF) as usize);
+        if table {
+            std::mem::swap(&mut ki, &mut vi);
+        }
         let key_entry = *owner.entries.get(ki).ok_or("map key type not found")?;
         let value_entry = *owner.entries.get(vi).ok_or("map value type not found")?;
         // An array value's item type is the type entry before it.
@@ -563,9 +580,26 @@ impl Meta {
         let stride = (8 + value_size).next_multiple_of(8);
         let (id, off) = self.unpack(ptr);
         let block = self.block(id).ok_or_else(|| format!("map block {id} not found"))?;
+        // Where the pairs are: one after the other, or in a hash table's used
+        // places. Each group is 16 control bytes (the top bit set: unused),
+        // then 16 places.
+        let pairs: Vec<usize> = if table {
+            let group = 16 + 16 * stride;
+            let end = groups.checked_mul(group).and_then(|len| off.checked_add(len));
+            let bytes = end.and_then(|end| block.data.get(off..end)).ok_or("hash table beyond its block")?;
+            let used = |g: usize| {
+                let at = off + g * group;
+                (0..16).filter(move |i| bytes[g * group + i] < 0x80).map(move |i| at + 16 + i * stride)
+            };
+            (0..groups).flat_map(used).collect()
+        } else {
+            (0..count).map(|i| off + i * stride).collect()
+        };
+        if pairs.len() != count {
+            return Err(format!("{} places used, the table names {count}", pairs.len()));
+        }
         w.open(level, ename);
-        for i in 0..count {
-            let pair = off + i * stride;
+        for (i, pair) in pairs.into_iter().enumerate() {
             if pair + stride > block.data.len() {
                 w.error(level + 1, format!("map pair {i} beyond its block"));
                 break;
