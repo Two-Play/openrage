@@ -421,10 +421,19 @@ pub(crate) fn cmd_clips(game_dir: &Path, path: &str, clip: Option<&str>, keys: O
             if t < 12 {
                 let first = vals.first().copied().unwrap_or_default();
                 let mid = vals.get(vals.len() / 2).copied().unwrap_or_default();
+                // GTA VI names bones and tracks by hash.
+                let name = if tr.bone_hash != 0 || tr.kind_hash != 0 {
+                    let kind = rage_formats::clip6::kind_name(tr.kind_hash);
+                    format!(
+                        "{:08x} {}",
+                        tr.bone_hash,
+                        kind.map_or_else(|| format!("{:08x}", tr.kind_hash), str::to_owned)
+                    )
+                } else {
+                    format!("{:04x} track {}", tr.bone, tr.track)
+                };
                 outln!(
-                    "  bone {:04x} track {} fmt {}: f0 [{:.3} {:.3} {:.3} {:.3}]  mid [{:.3} {:.3} {:.3} {:.3}]",
-                    tr.bone,
-                    tr.track,
+                    "  bone {name} fmt {}: f0 [{:.3} {:.3} {:.3} {:.3}]  mid [{:.3} {:.3} {:.3} {:.3}]",
                     tr.format,
                     first[0],
                     first[1],

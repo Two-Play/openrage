@@ -1036,7 +1036,108 @@ pub(crate) fn hex(b: &[u8]) -> String {
 /// Per archive: files, clips, animations, frame-count mismatches, bad values, errors.
 pub(crate) type AnimStats = (usize, usize, usize, usize, usize, Vec<String>);
 
+/// Reads every GTA VI clip dictionary (`.#cd`) below a path, archives inside
+/// included, and checks its values. An animation that does not add up is an
+/// error of the reader already.
+fn verify_gta6_animations(node: Node, within: &str) -> Result<()> {
+    use rayon::prelude::*;
+    let started = Instant::now();
+    /// The clip dictionaries of an archive and the archives inside.
+    fn collect(
+        rpf: Arc<rage_rpf::Rpf9>,
+        dir: &str,
+        out: &mut Vec<(Arc<rage_rpf::Rpf9>, usize)>,
+        errors: &mut Vec<String>,
+    ) {
+        let entries = match rpf.entries() {
+            Ok(entries) => entries,
+            Err(e) => return errors.push(format!("{}: {e}", rpf.display_name())),
+        };
+        let prefix = if dir.is_empty() { String::new() } else { format!("{}/", dir.to_ascii_lowercase()) };
+        for (i, e) in entries.iter().enumerate() {
+            let name = rpf.entry_name(e).to_ascii_lowercase();
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            if name.ends_with(".#cd") {
+                out.push((Arc::clone(&rpf), i));
+            } else if rpf.is_archive(e) {
+                match rpf.open_child(e) {
+                    Ok(child) => collect(Arc::new(child), "", out, errors),
+                    Err(e) => errors.push(e.to_string()),
+                }
+            }
+        }
+    }
+    let (mut files, mut errors) = (Vec::new(), Vec::new());
+    match node {
+        Node::Rpf9Dir(rpf, dir) => collect(rpf, &dir, &mut files, &mut errors),
+        Node::Rpf9File(rpf, i) => files.push((rpf, i)),
+        _ => bail!("{within}: not a GTA VI archive"),
+    }
+    let check = |(rpf, i): &(Arc<rage_rpf::Rpf9>, usize)| -> Result<(usize, usize, usize, usize, usize)> {
+        let (system, graphics) = openrage_app::rpf9::resource(rpf, *i)?;
+        let dict = rage_formats::clip6::parse(&rage_resource::Resource { version: 0, system, graphics })?;
+        let (mut tracks, mut values, mut bad) = (0, 0, 0);
+        for a in &dict.animations {
+            tracks += a.tracks.len();
+            for (t, track) in a.tracks.iter().enumerate() {
+                for f in (0..a.frames).step_by(7) {
+                    let Some(v) = a.value(t, f as f32) else { bail!("a track without values") };
+                    values += 1;
+                    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if v.iter().any(|x| !x.is_finite()) || (track.format == 1 && !(0.99..=1.01).contains(&norm)) {
+                        bad += 1;
+                    }
+                }
+            }
+        }
+        Ok((dict.clips.len(), dict.animations.len(), tracks, values, bad))
+    };
+    let results: Vec<_> = files
+        .par_iter()
+        .map(|file| {
+            check(file).map_err(|e| {
+                let name = file.0.entries().ok().and_then(|es| es.get(file.1).map(|e| file.0.entry_name(e)));
+                format!("{}/{}: {e:#}", file.0.display_name(), name.unwrap_or_default())
+            })
+        })
+        .collect();
+    let mut total = [0usize; 5];
+    for r in results {
+        match r {
+            Ok((clips, animations, tracks, values, bad)) => {
+                for (sum, n) in total.iter_mut().zip([clips, animations, tracks, values, bad]) {
+                    *sum += n;
+                }
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    for e in errors.iter().take(40) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} clip dictionaries, {} clips, {} animations, {} tracks; {} values checked, {} bad; {} errors ({:.1}s)",
+        files.len(),
+        total[0],
+        total[1],
+        total[2],
+        total[3],
+        total[4],
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() || total[4] > 0 {
+        bail!("verification found {} errors", errors.len() + total[4]);
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_verify_animations(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    if let node @ (Node::Rpf9Dir(..) | Node::Rpf9File(..)) = vfs::resolve(game_dir, within, keys.clone())? {
+        return verify_gta6_animations(node, within);
+    }
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     let (all, nested) = for_each_entry_parallel(

@@ -13,10 +13,12 @@
 //!   count, frame length, …) then the packed channel data. Every bone track
 //!   is an "anim sequence" of up to four channels; channel parameters come
 //!   first, then per-frame bit fields, then the channel list.
+//!
+//! GTA VI's dictionaries (`.#cd`) are read by [`crate::clip6`].
 
 use rage_resource::{Resource, ResourceError};
 
-fn bad(msg: impl Into<String>) -> ResourceError {
+pub(crate) fn bad(msg: impl Into<String>) -> ResourceError {
     ResourceError::Format(msg.into())
 }
 
@@ -24,19 +26,27 @@ pub const TRACK_BONE_TRANSLATION: u8 = 0;
 pub const TRACK_BONE_ROTATION: u8 = 1;
 pub const TRACK_BONE_SCALE: u8 = 2;
 
-#[derive(Debug, Clone, Copy)]
+/// Track kind of GTA VI tracks that move no bone, or that are not known; what
+/// they are is in [`BoneTrack::kind_hash`].
+pub const TRACK_OTHER: u8 = 255;
+
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BoneTrack {
-    /// Bone tag (`0` is the skeleton root).
+    /// Bone tag (`0` is the skeleton root, and every GTA VI track).
     pub bone: u16,
     /// 0: vector, 1: quaternion.
     pub format: u8,
     /// What is animated: 0 translation, 1 rotation, 2 scale, 5/6 mover, …
     pub track: u8,
+    /// GTA VI: the hash of the bone's name (0 in the other games).
+    pub bone_hash: u32,
+    /// GTA VI: the hash of the name of what is animated (0 in the other games).
+    pub kind_hash: u32,
 }
 
 /// One block of frames: decoded values per bone track and frame.
 #[derive(Debug, Clone)]
-struct Block {
+pub(crate) struct Block {
     frames: usize,
     /// `values[track][frame]`: vector (x, y, z, 0) or quaternion (x, y, z, w).
     values: Vec<Vec<[f32; 4]>>,
@@ -50,7 +60,7 @@ pub struct Animation {
     pub frames_per_block: usize,
     pub duration: f32,
     pub tracks: Vec<BoneTrack>,
-    blocks: Vec<Block>,
+    pub(crate) blocks: Vec<Block>,
 }
 
 impl Animation {
@@ -86,7 +96,7 @@ pub struct Clip {
 }
 
 impl ClipPart {
-    fn duration(&self) -> f32 {
+    pub(crate) fn duration(&self) -> f32 {
         (self.end - self.start).max(0.0) / self.rate.max(0.001)
     }
 }
@@ -308,6 +318,18 @@ fn read_channel(kind: u16, c: &mut Cursor, frames: usize) -> Result<Channel, Res
             Channel::LinearFloat(values)
         }
         7 | 8 => Channel::CachedQuaternion { index: 0 },
+        10 => {
+            let start = c.pos;
+            let num_ints = c.u32()? as usize;
+            let counts = c.u32()?;
+            let quantum = c.f32()?;
+            let offset = c.f32()?;
+            let words =
+                c.data.get(c.pos..start + num_ints * 4).ok_or_else(|| bad("packed channel outside the block"))?;
+            let values = packed_float(words, frames, counts)?;
+            c.pos = start + num_ints * 4;
+            Channel::LinearFloat(values.into_iter().map(|v| v as f32 * quantum + offset).collect())
+        }
         k => return Err(bad(format!("unknown animation channel type {k}"))),
     })
 }
@@ -392,6 +414,72 @@ fn key_spans(
     Some(spans)
 }
 
+/// Frames of a chunk of delta-coded values.
+const CHUNK_FRAMES: usize = 64;
+/// Lanes of a packed channel.
+const LANES: usize = 8;
+
+/// GTA VI's kind-10 channels, the values before quantum and offset. The
+/// parameters are those of linear floats, but `count3` is the number of
+/// 32-byte groups of packed deltas at the end (a word for each of eight
+/// lanes). In front of them, LSB first: per chunk of 64 frames the bit its
+/// deltas start at in the lanes (`count1` bits), per chunk its start value
+/// (`count2` bits), then per eight frames of a chunk a unary number, the bits
+/// of a delta there (zeros, then a one). Each lane has the deltas of every
+/// eighth frame; they are zigzag numbers and change the increment to the next
+/// frame, so the last one of a full chunk leads to the next chunk's start.
+/// Streams that do not add up (offsets, chunk starts, length) are refused.
+fn packed_float(data: &[u8], frames: usize, counts: u32) -> Result<Vec<i64>, ResourceError> {
+    let [c1, c2, groups, _] = counts.to_le_bytes().map(usize::from);
+    let chunks = frames.div_ceil(CHUNK_FRAMES).max(1);
+    let lanes_at = data.len().checked_sub(groups * LANES * 4).ok_or_else(|| bad("packed channel cut off"))?;
+    if c1 > 32 || c2 > 32 || (chunks * (c1 + c2)).div_ceil(8) > lanes_at {
+        return Err(bad("impossible packed channel"));
+    }
+    let delta = |lane: usize, at: usize, width: u32| -> i64 {
+        let word = |i: usize| u64::from(bits(data, (lanes_at + (i * LANES + lane) * 4) * 8, 32));
+        let both = word(at / 32) | word(at / 32 + 1) << 32;
+        let z = (both >> (at % 32)) as i64 & ((1i64 << width) - 1);
+        (z >> 1) ^ -(z & 1)
+    };
+    let mut pos = chunks * (c1 + c2);
+    let mut lane_bit = 0;
+    let mut reached = None;
+    let mut out = Vec::with_capacity(frames);
+    for chunk in 0..chunks {
+        let start = i64::from(bits(data, chunks * c1 + chunk * c2, c2 as u32));
+        if bits(data, chunk * c1, c1 as u32) as usize != lane_bit || reached.is_some_and(|v| v != start) {
+            return Err(bad("packed channel whose chunks do not fit together"));
+        }
+        let n = (frames - chunk * CHUNK_FRAMES).min(CHUNK_FRAMES);
+        let (mut value, mut step) = (start, 0i64);
+        out.push(value);
+        for group in 0..n.saturating_sub(1).div_ceil(LANES) {
+            let mut width = 0;
+            while bits(data, pos, 1) == 0 {
+                (width, pos) = (width + 1, pos + 1);
+                if width > 32 || pos >= lanes_at * 8 {
+                    return Err(bad("packed channel without its widths"));
+                }
+            }
+            pos += 1;
+            for lane in 0..LANES {
+                step += delta(lane, lane_bit, width);
+                value += step;
+                if group * LANES + lane + 1 < n {
+                    out.push(value);
+                }
+            }
+            lane_bit += width as usize;
+        }
+        reached = (n == CHUNK_FRAMES).then_some(value);
+    }
+    if pos.div_ceil(32) * 4 != lanes_at || lane_bit.div_ceil(32) != groups {
+        return Err(bad("packed channel of another length"));
+    }
+    Ok(out)
+}
+
 fn linear_float(data: &[u8], base: usize, frames: usize, counts: u32, quantum: f32, offset: f32) -> Vec<f32> {
     const CHUNK: usize = 64;
     let (c1, c2, c3) = (counts & 0xFF, (counts >> 8) & 0xFF, (counts >> 16) & 0xFF);
@@ -430,12 +518,18 @@ fn linear_float(data: &[u8], base: usize, frames: usize, counts: u32, quantum: f
     out
 }
 
-/// Decodes one sequence block (header at `ptr`).
-/// RDR2 has a tenth channel kind after GTA V's nine (kind 9 here): floats
-/// with the parameters of GTA V's linear floats but another coding.
-const RDR2_KINDS: [u16; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+/// Which game's sequence blocks. RDR2 has a tenth channel kind after GTA V's
+/// nine (kind 9 here): floats with the parameters of GTA V's linear floats but
+/// another coding. GTA VI has an eleventh ([`packed_float`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Layout {
+    GtaV,
+    Rdr2,
+    GtaVi,
+}
 
-fn read_block(res: &Resource, ptr: u64, tracks: usize, rdr2: bool) -> Result<Block, ResourceError> {
+/// Decodes one sequence block (header at `ptr`).
+pub(crate) fn read_block(res: &Resource, ptr: u64, tracks: usize, layout: Layout) -> Result<Block, ResourceError> {
     let data_len = res.u32(ptr + 0x04)? as usize;
     let frame_offset = res.u32(ptr + 0x0C)? as usize;
     let frames = res.u16(ptr + 0x16)? as usize;
@@ -451,13 +545,22 @@ fn read_block(res: &Resource, ptr: u64, tracks: usize, rdr2: bool) -> Result<Blo
     // (anim sequence, slot, channel)
     let mut channels: Vec<(usize, usize, Channel)> = Vec::new();
     let mut params = Cursor { data, pos: 0 };
-    let kinds = if rdr2 { 10 } else { 9 };
+    let kinds = match layout {
+        Layout::GtaV => 9,
+        Layout::Rdr2 => 10,
+        Layout::GtaVi => 11,
+    };
+    if layout == Layout::GtaVi && usize::from(res.u8(ptr + 0x1E)?) != kinds {
+        return Err(bad("a block with an unknown number of channel kinds"));
+    }
     let mut item = list + kinds * 2;
     let mut frame_bit = 0usize;
-    for stored in 0..kinds as u16 {
-        let n = count(stored as usize)?;
-        let kind = if rdr2 { RDR2_KINDS[stored as usize] } else { stored };
-
+    for kind in 0..kinds as u16 {
+        let n = count(kind as usize)?;
+        // Kinds no GTA VI file was seen to have: their coding there is not known.
+        if layout == Layout::GtaVi && n != 0 && matches!(kind, 6 | 9) {
+            return Err(bad(format!("channels of kind {kind}, which are not known in GTA VI")));
+        }
         for _ in 0..n {
             let raw = data.get(item..item + 2).ok_or_else(|| bad("channel item outside the block"))?;
             let raw = u16::from_le_bytes([raw[0], raw[1]]) as usize;
@@ -468,7 +571,7 @@ fn read_block(res: &Resource, ptr: u64, tracks: usize, rdr2: bool) -> Result<Blo
             let (seq, mut slot) = (raw >> 2, raw & 3);
             if let Channel::CachedQuaternion { index } = &mut ch {
                 // RDR2 always derives w; its low bits mean something else there.
-                *index = if rdr2 { 3 } else { slot };
+                *index = if layout == Layout::Rdr2 { 3 } else { slot };
                 slot = if kind == 7 { 3 } else { 4 };
             }
             channels.push((seq, slot, ch));
@@ -478,6 +581,19 @@ fn read_block(res: &Resource, ptr: u64, tracks: usize, rdr2: bool) -> Result<Blo
         }
     }
 
+    if layout == Layout::GtaVi {
+        // Everything has to add up: the parameters end where the frames
+        // start, the frames are as long as their fields, and every track has
+        // channels.
+        let covered: std::collections::HashSet<usize> = channels.iter().map(|(seq, ..)| *seq).collect();
+        if params.pos != frame_offset
+            || frame_bit.div_ceil(32) * 4 != frame_len
+            || covered.len() != tracks
+            || covered.iter().any(|t| *t >= tracks)
+        {
+            return Err(bad("a block whose channels do not fit its tracks"));
+        }
+    }
     let mut values = vec![vec![[0.0f32, 0.0, 0.0, 1.0]; frames]; tracks];
     for (seq, slots) in group(channels).into_iter().enumerate() {
         let Some(out) = values.get_mut(seq) else { break };
@@ -574,11 +690,11 @@ fn read_animation(res: &Resource, ptr: u64) -> Result<Animation, ResourceError> 
     let tracks: Vec<BoneTrack> = (0..track_count)
         .map(|i| {
             let v = res.u32(track_ptr + i * 4)?;
-            Ok(BoneTrack { bone: v as u16, format: (v >> 16) as u8, track: (v >> 24) as u8 })
+            Ok(BoneTrack { bone: v as u16, format: (v >> 16) as u8, track: (v >> 24) as u8, ..Default::default() })
         })
         .collect::<Result<_, ResourceError>>()?;
     let blocks = (0..seq_count)
-        .map(|i| read_block(res, res.u64(seq_ptr + i * 8)?, tracks.len(), false))
+        .map(|i| read_block(res, res.u64(seq_ptr + i * 8)?, tracks.len(), Layout::GtaV))
         .collect::<Result<_, _>>()?;
     Ok(Animation { flags: 0, frames, frames_per_block, duration, tracks, blocks })
 }
@@ -729,18 +845,18 @@ fn read_animation_rdr2(res: &Resource, ptr: u64) -> Result<Animation, ResourceEr
     let tracks: Vec<BoneTrack> = (0..track_count)
         .map(|i| {
             let v = res.u32(track_ptr + i * 4)?;
-            Ok(BoneTrack { bone: v as u16, format: (v >> 16) as u8, track: (v >> 24) as u8 })
+            Ok(BoneTrack { bone: v as u16, format: (v >> 16) as u8, track: (v >> 24) as u8, ..Default::default() })
         })
         .collect::<Result<_, ResourceError>>()?;
     let blocks = (0..seq_count)
-        .map(|i| read_block(res, res.u64(seq_ptr + i * 8)?, tracks.len(), true))
+        .map(|i| read_block(res, res.u64(seq_ptr + i * 8)?, tracks.len(), Layout::Rdr2))
         .collect::<Result<_, _>>()?;
     Ok(Animation { flags: res.u16(ptr + 0x20)?, frames, frames_per_block, duration, tracks, blocks })
 }
 
 /// Walks a hash map (bucket pointers, entries chained at +0x10) and returns
 /// the object pointer (+0x08) of every entry.
-fn map_objects(res: &Resource, buckets: u64, count: u64) -> Result<Vec<u64>, ResourceError> {
+pub(crate) fn map_objects(res: &Resource, buckets: u64, count: u64) -> Result<Vec<u64>, ResourceError> {
     let mut out = Vec::new();
     for b in 0..count.min(65536) {
         let mut entry = res.u64(buckets + b * 8)?;
@@ -958,6 +1074,28 @@ mod tests {
             assert_eq!(clip.parts.len(), 1, "kind {kind}");
             assert_eq!((clip.parts[0].animation, clip.parts[0].end, clip.parts[0].rate), (0, 1.0, 1.0));
         }
+    }
+
+    #[test]
+    fn gta6_packed_floats() {
+        // Ten frames: start 100, deltas of the increment for nine frames. The
+        // first eight take 3 bits (zigzag: 1, -1, 2, …), the ninth 2 bits.
+        let first: [u32; 8] = [2, 1, 4, 0, 3, 0, 0, 5];
+        let mut words = [0u32; 1 + 8];
+        // c1 = 0, c2 = 7: start, then unary 3 and 2.
+        words[0] = 100 | 0b1000 << 7 | 0b100 << 11;
+        for (lane, z) in first.iter().enumerate() {
+            words[1 + lane] = *z;
+        }
+        words[1] |= 3 << 3; // frame 9: -2
+        let data: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let counts = 7 << 8 | 1 << 16;
+        // Increments: 1, 0, 2, 2, 0, 0, 0, -3, -5.
+        assert_eq!(packed_float(&data, 10, counts).unwrap(), [100, 101, 101, 103, 105, 105, 105, 105, 102, 97]);
+        // Another number of frames or a wrong group count does not add up.
+        assert!(packed_float(&data, 30, counts).is_err());
+        assert!(packed_float(&data, 10, 7 << 8 | 2 << 16).is_err());
+        assert!(packed_float(&data[..8], 10, counts).is_err());
     }
 
     #[test]

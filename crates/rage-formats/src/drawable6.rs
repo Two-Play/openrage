@@ -15,8 +15,9 @@
 //!
 //! A level of detail lists *models* (pointers, count at 8); a model lists
 //! *geometries* (pointers at 8, count at 16) with their bounds (24) and
-//! shaders (32, a 16-bit index each). A geometry has a vertex buffer (8) and,
-//! through a descriptor (64), an index buffer.
+//! shaders (32, a 16-bit index each) and the number of bones it was made for
+//! (20). A geometry has a vertex buffer (8) and, through a descriptor (64), an
+//! index buffer.
 //!
 //! A buffer says how many elements of how many bytes it has (8, 12) and
 //! where they are in the graphics part (24). The vertex buffer's format (64)
@@ -28,6 +29,9 @@
 //! - Positions (part 0): three floats, or 64 bits of fixed point (24, 24
 //!   and 16 bits) with a bias and a scale in the buffer's first bytes and an
 //!   order of the axes.
+//! - Skinning: up to eight weights of 8 bits (parts 16 and 17) with the
+//!   numbers of their bones (20 and 21, 8 bits each), or one bone without a
+//!   weight. Of the weights the four largest are kept.
 //! - Texture coordinates (part 28): two floats, or two 16-bit numbers with a
 //!   scale.
 //!
@@ -38,8 +42,15 @@
 //! A shader names its textures by keys into the texture pools
 //! ([`crate::ttpf`]); of those, the one for the base colour is read.
 //!
-//! Not read: the other textures of materials, skeletons and skinning, the
-//! lower levels of detail.
+//! A drawable's skeleton (24) has its bones at 40 and their number at 108. A
+//! bone has 80 bytes: rotation, translation (16), the hash of its name (28),
+//! scale (32), its name (48), the next sibling and the parent (68, 70, 16 bits
+//! each, -1 for none), its number (72) and its tag (74).
+//!
+//! Not read: the other textures of materials, the lower levels of detail,
+//! which bone meshes without bone numbers belong to, and the skinning of the
+//! parts of people and animals (made for other bones than the part's own
+//! skeleton has, some with bone numbers of 32 bits).
 //!
 //! The layout is the one found by the rpf9-explorer project
 //! (<https://github.com/breadbbbb/rpf9-explorer>), whose decoder was read to
@@ -47,7 +58,7 @@
 
 use rage_core::bytes::LeRead;
 
-use crate::drawable::{Drawable, Mesh, Shader};
+use crate::drawable::{Bone, Drawable, Mesh, Shader, Skeleton};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -74,7 +85,11 @@ const MAX_VERTICES: usize = 1_000_000;
 const MAX_MESHES: usize = 1024;
 /// Slots of the vertex format.
 const POSITION: usize = 0;
+const WEIGHTS: [usize; 2] = [16, 17];
+const BONES: [usize; 2] = [20, 21];
 const TEXCOORD: usize = 28;
+/// Most bones a skeleton has.
+const MAX_BONES: usize = 4096;
 
 /// The parameters of shaders that hold the base colour, the best first:
 /// `diffusetex`, `diffusetexture`, and the first layer of the layered ones
@@ -233,6 +248,8 @@ impl<'a> Reader<'a> {
             return Err(bad("an impossible number of models"));
         }
         let list = self.s(lod, models * 8)?;
+        let skeleton = self.skeleton(at);
+        let bones = skeleton.as_ref().map_or(0, |s| s.bones.len());
         let mut meshes = Vec::new();
         for m in 0..models {
             let model = self.s(list + m * 8, 56)?;
@@ -242,8 +259,10 @@ impl<'a> Reader<'a> {
             }
             let geometries = self.s(model + 8, count * 8)?;
             let shaders = self.s(model + 32, count * 2).ok();
+            // A model made for other bones than the skeleton's is not skinned.
+            let bones = if self.u16(model + 20)? == bones { bones } else { 0 };
             for g in 0..count {
-                let mut mesh = self.mesh(self.s(geometries + g * 8, 160)?)?;
+                let mut mesh = self.mesh(self.s(geometries + g * 8, 160)?, bones)?;
                 mesh.shader = shaders.and_then(|s| self.sys.u16_at(s + g * 2)).unwrap_or(0);
                 meshes.push(mesh);
             }
@@ -255,8 +274,37 @@ impl<'a> Reader<'a> {
             textures: None,
             bounds_min: bounds(48)?,
             bounds_max: bounds(64)?,
-            skeleton: None,
+            skeleton,
         })
+    }
+
+    /// A drawable's skeleton; `None` if it has none or it does not make sense.
+    fn skeleton(&self, drawable: usize) -> Option<Skeleton> {
+        let at = self.s(drawable + 24, 112).ok()?;
+        let count = self.u16(at + 108).ok().filter(|n| (1..=MAX_BONES).contains(n))?;
+        let list = self.s(at + 40, count * 80).ok()?;
+        let bones = (0..count)
+            .map(|i| {
+                let bone = list + i * 80;
+                let parent = self.sys.u16_at(bone + 70)? as i16;
+                let turn = vec3(self.sys, bone)?;
+                let w = f32::from_bits(self.sys.u32_at(bone + 12)?);
+                let length = turn.iter().map(|v| v * v).sum::<f32>() + w * w;
+                // Parents come first; a rotation is a unit quaternion.
+                if i32::from(parent) >= i as i32 || parent < -1 || !(0.99..1.01).contains(&length) {
+                    return None;
+                }
+                Some(Bone {
+                    name: self.name(bone + 48).ok()?,
+                    tag: self.sys.u16_at(bone + 74)?,
+                    parent,
+                    translation: vec3(self.sys, bone + 16)?,
+                    rotation: [turn[0], turn[1], turn[2], w],
+                    scale: vec3(self.sys, bone + 32)?,
+                })
+            })
+            .collect::<Option<Vec<Bone>>>()?;
+        Some(Skeleton { bones })
     }
 
     /// The key of the texture a shader binds to one of the parameters for
@@ -306,7 +354,8 @@ impl<'a> Reader<'a> {
             .collect()
     }
 
-    fn mesh(&self, geometry: usize) -> Result<Mesh, ModelError> {
+    /// A geometry of a drawable with `bones` bones.
+    fn mesh(&self, geometry: usize, bones: usize) -> Result<Mesh, ModelError> {
         let vb = self.s(geometry + 8, 80)?;
         let format = self.s(vb + 64, 320)?;
         let flags = self.u32(format + 0x138)?;
@@ -375,6 +424,38 @@ impl<'a> Reader<'a> {
             _ => Vec::new(),
         };
 
+        let bytes = |slot: usize, size: usize, encoding: u8| -> Option<&[u8]> {
+            let (offset, own_size, own_encoding) = part(slot);
+            let at = within(offset, size).filter(|_| (usize::from(own_size), own_encoding) == (size, encoding))?;
+            data.get(at..at + vertices * size)
+        };
+        let skinning = |i: usize| -> Option<([u16; 4], [f32; 4])> {
+            if let Some(single) = bytes(BONES[0], 1, 62) {
+                return Some(([u16::from(single[i]), 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
+            }
+            let mut found: Vec<(u8, u8)> = Vec::with_capacity(8);
+            for (weights, numbers) in WEIGHTS.into_iter().zip(BONES) {
+                if let (Some(w), Some(n)) = (bytes(weights, 4, 28), bytes(numbers, 4, 30)) {
+                    found.extend((0..4).map(|k| (w[i * 4 + k], n[i * 4 + k])));
+                }
+            }
+            found.sort_by_key(|(w, _)| std::cmp::Reverse(*w));
+            let (mut numbers, mut weights) = ([0; 4], [0.0; 4]);
+            for (k, (w, n)) in found.into_iter().filter(|(w, _)| *w > 0).take(4).enumerate() {
+                numbers[k] = u16::from(n);
+                weights[k] = f32::from(w) / 255.0;
+            }
+            let total: f32 = weights.iter().sum();
+            (total > 0.0).then(|| (numbers, weights.map(|w| w / total)))
+        };
+        // All vertices, with bones the skeleton has, or none.
+        let (bone_indices, bone_weights) = (0..vertices)
+            .map(|i| skinning(i).filter(|(n, _)| n.iter().all(|n| usize::from(*n) < bones)))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
+            .into_iter()
+            .unzip();
+
         let descriptor = self.s(geometry + 64, 16)?;
         let (index, stride) = self.buffer(self.s(descriptor, 64)?)?;
         if stride != 4 {
@@ -382,7 +463,7 @@ impl<'a> Reader<'a> {
         }
         let indices = clusters(index, vertices)?;
         let normals = smooth_normals(&positions, &indices);
-        Ok(Mesh { positions, normals, uvs, indices, ..Default::default() })
+        Ok(Mesh { positions, normals, uvs, indices, bone_indices, bone_weights, ..Default::default() })
     }
 }
 
@@ -588,6 +669,61 @@ mod tests {
         assert_eq!(d.bounds_max, [1.0, 1.0, 0.0]);
         assert_eq!(name(&s).as_deref(), Some("square"));
         assert_eq!(name(&s[..0x400]), None);
+    }
+
+    #[test]
+    fn reads_the_skeleton_and_skinning() {
+        let (mut s, mut g) = resource();
+        s.resize(0xA00, 0);
+        g.resize(0x300, 0);
+        let (skeleton, bones, names) = (0x800, 0x880, 0x960);
+        pointer(&mut s, 24, SYSTEM, skeleton);
+        pointer(&mut s, skeleton + 40, SYSTEM, bones);
+        put(&mut s, skeleton + 108, &[2]);
+        for i in 0..2usize {
+            let at = bones + i * 80;
+            put(&mut s, at + 12, &1.0f32.to_le_bytes());
+            put(&mut s, at + 16, &(i as f32).to_le_bytes());
+            for k in 0..3 {
+                put(&mut s, at + 32 + k * 4, &1.0f32.to_le_bytes());
+            }
+            pointer(&mut s, at + 48, SYSTEM, names + i * 8);
+            put(&mut s, at + 70, &(i as i16 - 1).to_le_bytes());
+            put(&mut s, at + 74, &[7 + i as u8]);
+        }
+        put(&mut s, names, b"root\0");
+        put(&mut s, names + 8, b"tip\0");
+        // Weights at 0x200 and bone numbers at 0x210 of the graphics part.
+        put(&mut s, 0x1B0 + 20, &[2]);
+        put(&mut s, 0x308, &0x300u32.to_le_bytes());
+        let format = 0x380;
+        for (slot, offset, encoding) in [(16, 0x200u32, 28), (20, 0x210, 30)] {
+            put(&mut s, format + slot * 4, &offset.to_le_bytes());
+            s[format + 0xD0 + slot] = 4;
+            s[format + 0x104 + slot] = encoding;
+        }
+        for i in 0..4 {
+            put(&mut g, 0x200 + i * 4, &[51, 204, 0, 0]);
+            put(&mut g, 0x210 + i * 4, &[0, 1, 9, 9]);
+        }
+        let d = &parse(&s, &g).unwrap()[0];
+        let skeleton = d.skeleton.as_ref().unwrap();
+        let found: Vec<_> = skeleton.bones.iter().map(|b| (b.name.as_str(), b.parent, b.tag)).collect();
+        assert_eq!(found, [("root", -1, 7), ("tip", 0, 8)]);
+        assert_eq!(skeleton.bones[1].translation, [1.0, 0.0, 0.0]);
+        assert_eq!(skeleton.find_hash(rage_core::hash::joaat("TIP")), Some(1));
+        let mesh = &d.meshes[0];
+        assert_eq!((mesh.bone_indices[3], mesh.bone_weights[3]), ([1, 0, 0, 0], [0.8, 0.2, 0.0, 0.0]));
+        // A bone the skeleton does not have: not skinned at all.
+        g[0x214] = 2;
+        assert!(parse(&s, &g).unwrap()[0].meshes[0].bone_indices.is_empty());
+        // A model for another number of bones.
+        g[0x214] = 1;
+        s[0x1B0 + 20] = 3;
+        assert!(parse(&s, &g).unwrap()[0].meshes[0].bone_indices.is_empty());
+        // A parent behind its child: no skeleton.
+        s[bones + 70] = 1;
+        assert!(parse(&s, &g).unwrap()[0].skeleton.is_none());
     }
 
     #[test]

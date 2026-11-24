@@ -699,7 +699,13 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         }
         let drawables = crate::gta6_models::load(&rpf, i)?;
         let textures = crate::gta6_textures::for_drawables(game_dir, &drawables);
+        // A dictionary's drawables have skeletons of their own.
+        let skeleton = match drawables.as_slice() {
+            [(_, d)] => d.skeleton.clone(),
+            _ => None,
+        };
         let mut model = LoadedModel::from_drawables(drawables);
+        model.skeleton = skeleton;
         if let Some(textures) = textures {
             model.add_textures("texture pools".to_owned(), textures);
         }

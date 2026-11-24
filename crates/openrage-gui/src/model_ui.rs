@@ -480,15 +480,33 @@ pub(crate) fn save_png_image(img: &slint::Image, name: String, main: Weak<AppWin
 // ---------------------------------------------------------------------------
 // Animations
 
-/// Whether an item is a clip dictionary (`.ycd`; GTA IV `.wad`).
+/// Whether an item is a clip dictionary (`.ycd`; GTA IV `.wad`; GTA VI `.#cd`).
 pub(crate) fn is_clip_dictionary(item: &Item) -> bool {
     let n = item.name.to_ascii_lowercase();
-    n.ends_with(".ycd") || (n.ends_with(".wad") && item.kind == ItemKind::Resource)
+    n.ends_with(".ycd") || n.ends_with(".#cd") || (n.ends_with(".wad") && item.kind == ItemKind::Resource)
 }
 
 /// Selecting a `.ycd` (or `.wad`): its clips and (found in the background) the models it fits.
 pub(crate) fn show_clip_dictionary(ui: &AppWindow, vpath: String, mut info: Meta) {
     match load_clip_dictionary(&vpath) {
+        Ok(dict) if vpath.to_ascii_lowercase().ends_with(".#cd") => {
+            // Bones are named by hash there and there is no search index, so
+            // no models are looked for.
+            info.push(kv("Clips", dict.clips.len()));
+            for c in dict.clips.iter().take(40) {
+                let animation = c.parts.first().and_then(|p| dict.animations.get(p.animation));
+                let size = animation
+                    .map_or_else(String::new, |a| format!(" · {} frames · {} tracks", a.frames, a.tracks.len()));
+                info.push(kv(&c.name, format!("{:.2} s{size}", c.duration())));
+            }
+            if dict.clips.len() > 40 {
+                info.push(note(format!("… and {} more", dict.clips.len() - 40)));
+            }
+            info.push(note(
+                "To play it on a model with a skeleton, open the model and enter this file's path in its animation search.",
+            ));
+            set_meta(ui, &info);
+        }
         Ok(dict) => {
             let profile = suggest::Profile::new(&vpath, &dict);
             info.push(kv("Clips", dict.clips.len()));

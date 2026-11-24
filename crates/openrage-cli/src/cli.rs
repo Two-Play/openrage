@@ -64,7 +64,7 @@ pub(crate) enum Command {
         /// Instead of archives, decode every sound of every audio container (.awc).
         #[arg(long, conflicts_with_all = ["textures", "models"])]
         audio: bool,
-        /// Instead of archives, parse every clip dictionary (.ycd) and evaluate every frame.
+        /// Instead of archives, parse every clip dictionary (.ycd; GTA VI .#cd) and evaluate its frames.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio"])]
         animations: bool,
         /// Instead of archives, convert every metadata file (.ymap, .ytyp, .ymt, .ymf, .cut, .pso) to XML.
@@ -229,7 +229,7 @@ pub(crate) enum Command {
         /// Instead of only reading files, decode every sound of every audio container.
         #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta"])]
         audio: bool,
-        /// Instead of only reading files, parse every clip dictionary (.ycd) and evaluate every frame.
+        /// Instead of only reading files, parse every clip dictionary (.ycd; GTA VI .#cd) and evaluate its frames.
         #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta", "audio"])]
         anims: bool,
     },
@@ -360,7 +360,7 @@ pub(crate) enum Command {
         #[arg(long)]
         outfit: Option<usize>,
     },
-    /// List the clips of a clip dictionary (.ycd; GTA IV .wad).
+    /// List the clips of a clip dictionary (.ycd; GTA IV .wad; GTA VI .#cd).
     Clips {
         /// Virtual path of the .ycd file.
         path: String,
