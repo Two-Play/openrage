@@ -17,7 +17,9 @@ use wgpu::util::DeviceExt;
 
 const SAMPLES: u32 = 4;
 /// Bones the skinning matrices cover (16 KiB of uniforms, the downlevel limit).
-const MAX_BONES: usize = 256;
+const MAX_BONES: usize = 1024;
+/// Bytes of a bone's matrix.
+const BONE: u32 = 64;
 /// Bytes of per-draw data: colour (vec4) and model matrix (mat4).
 const DRAW_DATA: usize = 16 + 64;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -44,6 +46,9 @@ struct Globals {
 // Overlay drawn over the base colour with its alpha, on the second UV set
 // (vehicle liveries and signs); transparent when there is none.
 @group(1) @binding(2) var overlay: texture_2d<f32>;
+// Flat and black when there is none.
+@group(1) @binding(3) var normal_map: texture_2d<f32>;
+@group(1) @binding(4) var specular_map: texture_2d<f32>;
 // Per draw: material colour (multiplied with the texture) and the model's
 // placement in the scene.
 struct DrawData {
@@ -52,7 +57,7 @@ struct DrawData {
 };
 @group(2) @binding(0) var<uniform> draw: DrawData;
 // Skinning matrices per skeleton bone (identity when not animated).
-@group(3) @binding(0) var<uniform> skin: array<mat4x4<f32>, 256>;
+@group(3) @binding(0) var<uniform> skin: array<mat4x4<f32>, {BONES}>;
 
 struct VsIn {
     @location(0) pos: vec3<f32>,
@@ -77,8 +82,8 @@ fn vs_main(v: VsIn) -> VsOut {
     var normal = v.normal;
     let total = v.weights.x + v.weights.y + v.weights.z + v.weights.w;
     if (total > 0.0) {
-        let m = (skin[min(v.joints.x, 255u)] * v.weights.x + skin[min(v.joints.y, 255u)] * v.weights.y
-            + skin[min(v.joints.z, 255u)] * v.weights.z + skin[min(v.joints.w, 255u)] * v.weights.w) * (1.0 / total);
+        let m = (skin[min(v.joints.x, {LAST_BONE})] * v.weights.x + skin[min(v.joints.y, {LAST_BONE})] * v.weights.y
+            + skin[min(v.joints.z, {LAST_BONE})] * v.weights.z + skin[min(v.joints.w, {LAST_BONE})] * v.weights.w) * (1.0 / total);
         pos = m * pos;
         normal = (m * vec4<f32>(normal, 0.0)).xyz;
     }
@@ -102,6 +107,25 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
         n = vec3<f32>(0.0, 0.0, 1.0);
     }
     n = normalize(n);
+    // The normal map bends it, along the directions the texture runs in.
+    let bump = textureSample(normal_map, samp, i.uv).xy * 2.0 - vec2<f32>(1.0);
+    let px = dpdx(i.world);
+    let py = dpdy(i.world);
+    let ux = dpdx(i.uv);
+    let uy = dpdy(i.uv);
+    let shine = textureSample(specular_map, samp, i.uv);
+    let layer = textureSample(overlay, samp, i.uv1);
+    let det = ux.x * uy.y - uy.x * ux.y;
+    if (abs(det) > 1e-12 && dot(bump, bump) > 0.0004) {
+        let t = (px * uy.y - py * ux.y) / det;
+        let b = (py * ux.x - px * uy.x) / det;
+        let tangent = t - n * dot(n, t);
+        let bitangent = b - n * dot(n, b);
+        if (dot(tangent, tangent) > 1e-12 && dot(bitangent, bitangent) > 1e-12) {
+            let z = sqrt(max(1.0 - dot(bump, bump), 0.05));
+            n = normalize(n * z + normalize(tangent) * bump.x + normalize(bitangent) * bump.y);
+        }
+    }
     // Headlight plus a little sky light; double-sided.
     var light = vec3<f32>(0.25 + 0.65 * abs(dot(n, globals.forward.xyz)) + 0.1 * max(n.z, 0.0));
     let count = u32(globals.forward.w);
@@ -125,9 +149,10 @@ fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
             light = light + l.color.rgb * amount;
         }
     }
-    let layer = textureSample(overlay, samp, i.uv1);
     let colour = mix(base.rgb * draw.tint.rgb, layer.rgb, layer.a);
-    return vec4<f32>(colour * light, 1.0);
+    // What shines towards the viewer.
+    let glint = pow(abs(dot(n, globals.forward.xyz)), 24.0) * max(max(shine.r, shine.g), shine.b) * 0.25;
+    return vec4<f32>(colour * light + vec3<f32>(glint), 1.0);
 }
 
 // Particles: camera-facing squares, built on the CPU in world space.
@@ -225,6 +250,10 @@ struct Gpu {
     white: wgpu::TextureView,
     /// Transparent 1×1 texture for meshes without an overlay.
     clear: wgpu::TextureView,
+    /// 1×1 normal map for meshes without one.
+    flat: wgpu::TextureView,
+    /// Bones the skinning can use: devices differ.
+    bones: usize,
 }
 
 struct Draw {
@@ -243,8 +272,8 @@ struct Draw {
 struct GpuModel {
     owner: Weak<crate::ModelPreview>,
     draws: Vec<Draw>,
-    /// Bind groups: 0 is the plain texture, then one per pair of decoded
-    /// images (base colour, overlay).
+    /// Bind groups: 0 is the plain texture, then one per combination of
+    /// decoded images.
     textures: Vec<wgpu::BindGroup>,
 }
 
@@ -283,16 +312,22 @@ fn init() -> Option<Gpu> {
         ..Default::default()
     }))
     .ok()?;
+    let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+    // People of GTA VI have about 600 bones.
+    let wanted = adapter.limits().max_uniform_buffer_binding_size.min((MAX_BONES as u32 * BONE).into());
+    limits.max_uniform_buffer_binding_size = limits.max_uniform_buffer_binding_size.max(wanted);
+    let bones = (limits.max_uniform_buffer_binding_size / u64::from(BONE)) as usize;
+    let bones = bones.min(MAX_BONES);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("openrage"),
-        required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+        required_limits: limits,
         ..Default::default()
     }))
     .ok()?;
 
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("model"),
-        source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        source: wgpu::ShaderSource::Wgsl(shader_source(bones).into()),
     });
     let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("globals"),
@@ -328,6 +363,26 @@ fn init() -> Option<Gpu> {
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -471,6 +526,7 @@ fn init() -> Option<Gpu> {
     });
     let white = upload_texture(&device, &queue, 1, 1, &[255, 255, 255, 255]);
     let clear = upload_texture(&device, &queue, 1, 1, &[0, 0, 0, 0]);
+    let flat = upload_texture(&device, &queue, 1, 1, &[128, 128, 255, 255]);
     Some(Gpu {
         sprite_blend,
         sprite_add,
@@ -485,6 +541,8 @@ fn init() -> Option<Gpu> {
         sampler,
         white,
         clear,
+        flat,
+        bones,
     })
 }
 
@@ -516,8 +574,24 @@ fn upload_texture(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, rg
     texture.create_view(&Default::default())
 }
 
-/// A material's textures: base colour and overlay.
-fn texture_bind_group(gpu: &Gpu, base: &wgpu::TextureView, overlay: &wgpu::TextureView) -> wgpu::BindGroup {
+/// The shader, for devices that can skin with this many bones.
+fn shader_source(bones: usize) -> String {
+    SHADER.replace("{BONES}", &bones.to_string()).replace("{LAST_BONE}", &format!("{}u", bones - 1))
+}
+
+/// A texture that is only a colour.
+fn plain_bind_group(gpu: &Gpu, base: &wgpu::TextureView) -> wgpu::BindGroup {
+    texture_bind_group(gpu, base, &gpu.clear, &gpu.flat, &gpu.clear)
+}
+
+/// A material's textures: base colour, overlay, normal and specular map.
+fn texture_bind_group(
+    gpu: &Gpu,
+    base: &wgpu::TextureView,
+    overlay: &wgpu::TextureView,
+    normal: &wgpu::TextureView,
+    specular: &wgpu::TextureView,
+) -> wgpu::BindGroup {
     gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &gpu.texture_layout,
@@ -525,17 +599,19 @@ fn texture_bind_group(gpu: &Gpu, base: &wgpu::TextureView, overlay: &wgpu::Textu
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(base) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&gpu.sampler) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(overlay) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(normal) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(specular) },
         ],
     })
 }
 
 /// Uploads every part of the model (placements baked into the vertices).
 fn upload(gpu: &Gpu, model: &LoadedModel, materials: &Materials) -> (Vec<Draw>, Vec<wgpu::BindGroup>) {
-    let mut textures = vec![texture_bind_group(gpu, &gpu.white, &gpu.clear)];
-    // Material image index → uploaded texture; (base, overlay) image indices → bind group.
+    let mut textures = vec![plain_bind_group(gpu, &gpu.white)];
+    // Material image index → uploaded texture; image indices → bind group.
     let mut views: HashMap<usize, wgpu::TextureView> = HashMap::new();
-    let mut texture_of: HashMap<(Option<usize>, Option<usize>), usize> = HashMap::new();
-    texture_of.insert((None, None), 0);
+    let mut texture_of: HashMap<[Option<usize>; 4], usize> = HashMap::new();
+    texture_of.insert([None; 4], 0);
     let mut draws = Vec::new();
     for (part_index, part) in model.parts.iter().enumerate() {
         let Some((_, d)) = model.drawables.get(part.drawable) else { continue };
@@ -569,17 +645,25 @@ fn upload(gpu: &Gpu, model: &LoadedModel, materials: &Materials) -> (Vec<Draw>, 
                 .collect();
             let base = materials.texture(part.drawable, mesh.shader).filter(|_| has_uv);
             let overlay = materials.overlay(part.drawable, mesh.shader).filter(|_| has_uv1);
+            let normal = materials.normal(part.drawable, mesh.shader).filter(|_| has_uv);
+            let specular = materials.specular(part.drawable, mesh.shader).filter(|_| has_uv);
             let mut view = |image: Option<(usize, usize, usize, &[u8])>| {
                 image.map(|(i, w, h, rgba)| {
                     views.entry(i).or_insert_with(|| upload_texture(&gpu.device, &gpu.queue, w as u32, h as u32, rgba));
                     i
                 })
             };
-            let key = (view(base), view(overlay));
+            let key = [view(base), view(overlay), view(normal), view(specular)];
             let texture = *texture_of.entry(key).or_insert_with(|| {
-                let base = key.0.map_or(&gpu.white, |i| &views[&i]);
-                let overlay = key.1.map_or(&gpu.clear, |i| &views[&i]);
-                textures.push(texture_bind_group(gpu, base, overlay));
+                let [base, overlay, normal, specular] = key;
+                let of = |image: Option<usize>, none| image.map_or(none, |i| &views[&i]);
+                textures.push(texture_bind_group(
+                    gpu,
+                    of(base, &gpu.white),
+                    of(overlay, &gpu.clear),
+                    of(normal, &gpu.flat),
+                    of(specular, &gpu.clear),
+                ));
                 textures.len() - 1
             });
             let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
@@ -811,7 +895,7 @@ pub fn render_scene(
             if !st.sprite_textures.iter().any(|(o, _)| o.as_ptr() == ptr) {
                 let t = &sprite.texture;
                 let view = upload_texture(&gpu.device, &gpu.queue, t.width, t.height, &t.rgba);
-                st.sprite_textures.push((Arc::downgrade(t), texture_bind_group(gpu, &view, &gpu.clear)));
+                st.sprite_textures.push((Arc::downgrade(t), plain_bind_group(gpu, &view)));
             }
         }
         if st.targets.as_ref().is_none_or(|t| t.size != (w, h)) {
@@ -895,7 +979,7 @@ pub fn render_scene(
 
         // A bone palette per skinned item; the others share the rest pose.
         let palette_group = |skin: Option<&[math::Mat4]>| {
-            let mut palette = vec![math::IDENTITY; MAX_BONES];
+            let mut palette = vec![math::IDENTITY; gpu.bones];
             for (slot, m) in palette.iter_mut().zip(skin.unwrap_or_default()) {
                 *slot = *m;
             }
@@ -1078,7 +1162,7 @@ mod tests {
 
     #[test]
     fn shader_is_valid_wgsl() {
-        let module = naga::front::wgsl::parse_str(super::SHADER).expect("WGSL parses");
+        let module = naga::front::wgsl::parse_str(&super::shader_source(super::MAX_BONES)).expect("WGSL parses");
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
             .validate(&module)
             .expect("WGSL validates");

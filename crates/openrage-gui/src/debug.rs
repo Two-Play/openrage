@@ -213,6 +213,8 @@ pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
         let lower = map.to_ascii_lowercase();
         if lower.ends_with(".wpl") || lower.ends_with(".img") {
             scene::open_map(ui, map);
+        } else if lower == "world" {
+            scene::open_map(ui, String::new()); // GTA VI's whole map
         } else {
             open_xml_view(ui, map);
             if let Some(x) = xmlview::newest() {

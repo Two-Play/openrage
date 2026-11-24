@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use rayon::prelude::*;
 
@@ -22,6 +22,21 @@ impl std::fmt::Debug for Materials {
         f.debug_struct("Materials").field("names", &self.names.len()).finish_non_exhaustive()
     }
 }
+
+/// Names of files that were learned from other archives, by their hash.
+static LEARNED: RwLock<Option<HashMap<u64, Box<str>>>> = RwLock::new(None);
+
+/// Adds names files may have, without their extension. Archives opened from
+/// now on use them.
+pub fn add_names(names: impl IntoIterator<Item = String>) {
+    let mut learned = LEARNED.write().unwrap_or_else(|e| e.into_inner());
+    let learned = learned.get_or_insert_default();
+    learned.extend(names.into_iter().map(|name| (rpf9_names::hash64(name.as_bytes()), name.into_boxed_str())));
+    OPENED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+type OpenedKey = (PathBuf, u64, u64, Option<std::time::SystemTime>);
+static OPENED: Mutex<Vec<(OpenedKey, Arc<NativeArchive>)>> = Mutex::new(Vec::new());
 
 /// Reuses runtime tables, never a checked-in or on-disk key cache.
 pub(crate) fn materials(path: &Path) -> Option<Arc<Materials>> {
@@ -53,16 +68,12 @@ fn load_materials(executable: &Path) -> Option<Materials> {
     drop(bytes);
     let nameless = Arc::new(Materials { cipher, names: Default::default() });
     let mut strings = Vec::new();
-    let mut read = || {
+    let read = || {
         for archive in ["common.rpf", "data.rpf"].map(|name| executable.with_file_name(name)) {
             strings.extend(NativeArchive::strings(&archive, &nameless).unwrap_or_default());
         }
     };
-    // Threads of its own: the shared ones may all be waiting for this.
-    match rayon::ThreadPoolBuilder::new().build() {
-        Ok(pool) => pool.install(read),
-        Err(_) => read(),
-    }
+    crate::in_own_threads(read);
     strings.iter().for_each(|text| names.add(text));
     let cipher = Arc::into_inner(nameless)?.cipher;
     Some(Materials { cipher, names })
@@ -152,8 +163,6 @@ impl NativeArchive {
     /// The archive at `base` in a file, with the names its own files tell.
     /// The last few opened ones are kept.
     pub fn cached(path: &Path, base: u64, extent: u64) -> Option<Arc<Self>> {
-        type Key = (PathBuf, u64, u64, Option<std::time::SystemTime>);
-        static OPENED: Mutex<Vec<(Key, Arc<NativeArchive>)>> = Mutex::new(Vec::new());
         let key = (path.to_path_buf(), base, extent, std::fs::metadata(path).and_then(|m| m.modified()).ok());
         if let Some((_, found)) = OPENED.lock().ok()?.iter().find(|(k, _)| *k == key) {
             return Some(Arc::clone(found));
@@ -178,6 +187,7 @@ impl NativeArchive {
 
     /// Gives the entries their paths: names by slot, then the known ones.
     fn name_entries(&mut self, learned: &HashMap<usize, String>) {
+        let shared = LEARNED.read().unwrap_or_else(|e| e.into_inner());
         self.paths = Vec::with_capacity(self.catalog.entries.len());
         self.by_path = HashMap::with_capacity(self.catalog.entries.len());
         for entry in &self.catalog.entries {
@@ -187,6 +197,11 @@ impl NativeArchive {
                 .or_else(|| {
                     let hash = entry.name_hash64?;
                     self.materials.names.find(hash, entry.name_hash32, entry.type_id)
+                })
+                .or_else(|| {
+                    // Archives keep the place they were found at.
+                    let hash = entry.name_hash64.filter(|_| entry.type_id != 0)?;
+                    Some(rpf9_names::with_type(shared.as_ref()?.get(&hash)?, entry.type_id))
                 })
                 .filter(|name| !self.by_path.contains_key(&name.to_ascii_lowercase()));
             let path = name.unwrap_or_else(|| {

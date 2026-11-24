@@ -4,6 +4,7 @@
 //! with alpha cut-out, and simple headlight shading. Fast enough for
 //! interactive previews of game models (tens of thousands of triangles).
 
+use rage_formats::drawable::param;
 use std::collections::HashMap;
 
 use rage_formats::math;
@@ -42,13 +43,22 @@ impl Image {
 /// Decoded textures, shared between frames.
 pub struct Materials {
     images: Vec<Image>,
-    /// Indices into `images` per drawable and shader: base colour and the
-    /// overlay drawn over it on the second UV set (liveries, signs).
-    per_shader: Vec<Vec<(Option<usize>, Option<usize>)>>,
+    /// Indices into `images` per drawable and shader.
+    per_shader: Vec<Vec<Slots>>,
+}
+
+/// A shader's textures: indices into [`Materials::images`].
+#[derive(Clone, Copy, Default)]
+struct Slots {
+    base: Option<usize>,
+    /// Drawn over the base on the second UV set (liveries, signs).
+    overlay: Option<usize>,
+    normal: Option<usize>,
+    specular: Option<usize>,
 }
 
 impl Materials {
-    /// Decodes the base and overlay textures of every shader of every drawable.
+    /// Decodes the textures of every shader of every drawable.
     pub fn new(model: &LoadedModel) -> Self {
         let mut by_name: HashMap<String, Option<usize>> = HashMap::new();
         let mut images: Vec<Image> = Vec::new();
@@ -74,7 +84,12 @@ impl Materials {
                     .iter()
                     .map(|s| {
                         let opaque = rage_formats::shaders::alpha_is_not_opacity(s.name_hash);
-                        (decode(d, s.base_texture(), opaque), decode(d, s.overlay_texture(), false))
+                        Slots {
+                            base: decode(d, s.base_texture(), opaque),
+                            overlay: decode(d, s.overlay_texture(), false),
+                            normal: decode(d, s.sampler(param::BUMP_TEX), false),
+                            specular: decode(d, s.sampler(param::SPECULAR_TEX), false),
+                        }
                     })
                     .collect()
             })
@@ -82,29 +97,41 @@ impl Materials {
         Self { images, per_shader }
     }
 
-    fn slot(&self, drawable: usize, shader: u16) -> (Option<usize>, Option<usize>) {
+    fn slot(&self, drawable: usize, shader: u16) -> Slots {
         self.per_shader.get(drawable).and_then(|s| s.get(shader as usize)).copied().unwrap_or_default()
     }
 
     fn image(&self, drawable: usize, shader: u16) -> Option<&Image> {
-        self.slot(drawable, shader).0.map(|i| &self.images[i])
+        self.slot(drawable, shader).base.map(|i| &self.images[i])
     }
 
     fn overlay_image(&self, drawable: usize, shader: u16) -> Option<&Image> {
-        self.slot(drawable, shader).1.map(|i| &self.images[i])
+        self.slot(drawable, shader).overlay.map(|i| &self.images[i])
     }
 
     /// RGBA pixels of the base texture of a drawable's shader (for GPU upload).
     pub fn texture(&self, drawable: usize, shader: u16) -> Option<(usize, usize, usize, &[u8])> {
-        let i = self.slot(drawable, shader).0?;
-        let img = &self.images[i];
-        Some((i, img.w, img.h, &img.rgba))
+        self.pixels(self.slot(drawable, shader).base)
     }
 
     /// RGBA pixels of the overlay texture of a drawable's shader, drawn over
     /// the base colour with its alpha on the second UV set (for GPU upload).
     pub fn overlay(&self, drawable: usize, shader: u16) -> Option<(usize, usize, usize, &[u8])> {
-        let i = self.slot(drawable, shader).1?;
+        self.pixels(self.slot(drawable, shader).overlay)
+    }
+
+    /// The same of its normal map.
+    pub fn normal(&self, drawable: usize, shader: u16) -> Option<(usize, usize, usize, &[u8])> {
+        self.pixels(self.slot(drawable, shader).normal)
+    }
+
+    /// The same of its specular map.
+    pub fn specular(&self, drawable: usize, shader: u16) -> Option<(usize, usize, usize, &[u8])> {
+        self.pixels(self.slot(drawable, shader).specular)
+    }
+
+    fn pixels(&self, image: Option<usize>) -> Option<(usize, usize, usize, &[u8])> {
+        let i = image?;
         let img = &self.images[i];
         Some((i, img.w, img.h, &img.rgba))
     }

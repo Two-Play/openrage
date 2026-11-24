@@ -16,6 +16,7 @@ pub mod gta4_cutscene;
 pub mod gta4_effects;
 pub mod gta6_models;
 pub mod gta6_textures;
+pub mod gta6_world;
 pub mod install;
 pub mod journal;
 pub mod licenses;

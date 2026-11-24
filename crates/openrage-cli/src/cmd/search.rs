@@ -18,6 +18,10 @@ pub(crate) fn cmd_index(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> Result<
         last = (p.archives_done, Instant::now());
         eprintln!("  [{}/{}] {} ({} entries)", p.archives_done, p.archives_total, p.current, p.entries);
     })?;
+    let names = openrage_app::rpf9::learn_names(&mut index)?;
+    if names > 0 {
+        outln!("Learned {names} names of GTA VI files from other archives.");
+    }
     let s = index.stats()?;
     outln!(
         "Indexed {} archives, removed {}, unchanged {} in {:.1}s ({} read errors).",

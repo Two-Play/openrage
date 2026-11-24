@@ -41,6 +41,7 @@ use rayon::prelude::*;
 use crate::RpfError;
 use crate::rpf9_index::{NativeEntry, Storage};
 use crate::rpf9_native::NativeArchive;
+pub use crate::rpf9_native::add_names;
 
 const MAGIC: u32 = 0x5250_4639;
 /// Length of the header in front of the table of contents.

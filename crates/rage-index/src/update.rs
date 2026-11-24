@@ -89,7 +89,7 @@ struct Batch {
     partial: bool,
 }
 
-fn stem(name: &str) -> &str {
+pub(crate) fn stem(name: &str) -> &str {
     name.split_once('.').map_or(name, |(s, _)| s)
 }
 

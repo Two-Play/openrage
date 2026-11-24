@@ -70,3 +70,19 @@ pub use rpf7::{Encryption, Entry, EntryId, EntryKind, Rpf7};
 pub use rpf8::Rpf8;
 pub use rpf9::Rpf9;
 pub use writer::{ArchiveWriter, RawEntry, entry_for, file_entry, resource_entry};
+
+/// Runs something parallel that others wait for, on threads of its own. The
+/// shared ones may all be waiting for it; and one that waited for it there
+/// could meanwhile take up work that needs the result, and wait for itself.
+pub fn in_own_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
+    std::thread::scope(|scope| {
+        let thread = scope.spawn(|| match rayon::ThreadPoolBuilder::new().build() {
+            Ok(pool) => pool.install(work),
+            Err(_) => work(),
+        });
+        match thread.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}

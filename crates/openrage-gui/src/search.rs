@@ -58,6 +58,11 @@ pub(crate) fn start_index_update(ui: &AppWindow) {
                 }
             })?;
             stopped = stats.cancelled;
+            let due = stats.archives_indexed > 0 || !openrage_app::rpf9::knows_names();
+            if !stopped && due && detect::is_gta6_dir(&game_dir) {
+                // Names are a help, not needed.
+                let _ = openrage_app::rpf9::learn_names(&mut index);
+            }
             // Names of models, textures, … so hashes in metadata read as names.
             if let Ok(names) = index.known_names() {
                 rage_formats::names::register(names);

@@ -58,9 +58,9 @@ impl Catalog {
     }
 
     /// The texture with this key, named by the key.
-    pub fn texture(&self, key: u64) -> Option<rage_formats::texture::Texture> {
+    pub fn texture(&self, key: u64, side: u32) -> Option<rage_formats::texture::Texture> {
         let (pool, number) = *self.by_key.get(&key)?;
-        let mut texture = self.pools[pool].1.texture(number, Some(MAX_SIDE)).ok()?;
+        let mut texture = self.pools[pool].1.texture(number, Some(side)).ok()?;
         texture.name = texture_name(key);
         Some(texture)
     }
@@ -70,14 +70,32 @@ impl Catalog {
 pub fn catalog(game_dir: &Path) -> Arc<Catalog> {
     static CATALOGS: OnceLock<Mutex<HashMap<PathBuf, Arc<Catalog>>>> = OnceLock::new();
     let mut catalogs = CATALOGS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    Arc::clone(catalogs.entry(game_dir.to_path_buf()).or_insert_with(|| Arc::new(Catalog::build(game_dir))))
+    Arc::clone(
+        catalogs
+            .entry(game_dir.to_path_buf())
+            .or_insert_with(|| Arc::new(rage_rpf::in_own_threads(|| Catalog::build(game_dir)))),
+    )
 }
 
 /// The textures the shaders of these drawables name, from the pools of the
 /// game: a dictionary of them, `None` if none was found.
 pub fn for_drawables(game_dir: &Path, drawables: &[(String, Drawable)]) -> Option<TextureDictionary> {
-    let mut names: Vec<&str> =
-        drawables.iter().flat_map(|(_, d)| &d.shaders).flat_map(|s| &s.textures).map(String::as_str).collect();
+    for_drawables_up_to(game_dir, drawables, MAX_SIDE)
+}
+
+/// The same with textures of at most this size.
+pub fn for_drawables_up_to(game_dir: &Path, drawables: &[(String, Drawable)], side: u32) -> Option<TextureDictionary> {
+    use rage_formats::drawable::param::{BUMP_TEX, DIFFUSE_TEX, DIFFUSE_TEX2, SPECULAR_TEX};
+    // Small ones are for views of many models, where only the colours show.
+    let wanted: &[u32] =
+        if side < MAX_SIDE { &[DIFFUSE_TEX] } else { &[DIFFUSE_TEX, DIFFUSE_TEX2, BUMP_TEX, SPECULAR_TEX] };
+    let mut names: Vec<&str> = drawables
+        .iter()
+        .flat_map(|(_, d)| &d.shaders)
+        .flat_map(|s| &s.samplers)
+        .filter(|(parameter, _)| wanted.contains(parameter))
+        .map(|(_, name)| name.as_str())
+        .collect();
     names.sort_unstable();
     names.dedup();
     if names.is_empty() {
@@ -88,7 +106,7 @@ pub fn for_drawables(game_dir: &Path, drawables: &[(String, Drawable)]) -> Optio
     let mut textures = Vec::new();
     for (i, name) in names.into_iter().take(MAX_TEXTURES).enumerate() {
         crate::progress::set("Loading textures", i as u64, total as u64);
-        if let Some(texture) = u64::from_str_radix(name, 16).ok().and_then(|key| catalog.texture(key)) {
+        if let Some(texture) = u64::from_str_radix(name, 16).ok().and_then(|key| catalog.texture(key, side)) {
             textures.push(texture);
         }
     }

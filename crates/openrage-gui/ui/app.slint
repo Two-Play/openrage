@@ -1163,6 +1163,9 @@ export component AppWindow inherits Window {
     callback suggestion-open(int);
     callback model-resized();
     callback export-gltf();
+    // The game's whole map can be shown (GTA VI).
+    in property <bool> has-world-map;
+    callback open-world-map();
     callback open-player();
     callback audio-toggle();
     callback audio-stop();
@@ -1666,6 +1669,11 @@ export component AppWindow inherits Window {
         }
         Menu {
             title: @tr("Tools");
+            if root.has-world-map: MenuItem {
+                title: @tr("Map of the game (3D)…");
+                icon: @image-url("icons/menu/map.svg");
+                activated => { root.open-world-map(); }
+            }
             if root.plugin-tools.length == 0: MenuItem {
                 title: @tr("No plugin tools");
                 enabled: false;

@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 mod content;
+mod gta6;
 mod schema;
 mod search;
 mod update;

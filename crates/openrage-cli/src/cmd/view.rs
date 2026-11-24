@@ -130,17 +130,29 @@ pub(crate) fn cmd_map(
 ) -> Result<()> {
     use openrage_app::world;
     let started = Instant::now();
-    let w = world::load(game_dir, keys.clone())?;
-    let files = world::files(game_dir)?;
-    if check {
-        return check_maps(game_dir, &w, &files, keys, started);
-    }
-    let path = path.context("which map file? (or --check for all)")?;
-    let scene = world::load_map(&w, &files, game_dir, keys, path, &|done, total| {
-        if done % 25 == 0 || done == total {
-            eprint!("\rloading models: {done}/{total}");
+    let show = |what: &str, done: usize, total: usize| {
+        if done.is_multiple_of(25) || done == total {
+            eprint!("\r{what}: {done}/{total}    ");
         }
-    })?;
+    };
+    let scene = if openrage_app::detect::is_gta6_dir(game_dir) {
+        if check {
+            bail!("--check is not supported for GTA VI yet");
+        }
+        match path {
+            Some(path) => openrage_app::gta6_world::place(game_dir, path, openrage_app::gta6_world::AROUND, &show)?,
+            None => openrage_app::gta6_world::overview(game_dir, &show)?,
+        }
+    } else {
+        let w = world::load(game_dir, keys.clone())?;
+        let files = world::files(game_dir)?;
+        if check {
+            return check_maps(game_dir, &w, &files, keys, started);
+        }
+        let path = path.context("which map file? (or --check for all)")?;
+        world::load_map(&w, &files, game_dir, keys, path, &|done, total| show("loading models", done, total))?
+    };
+    let path = path.unwrap_or("map");
     eprintln!();
     let placed: usize = scene.models.iter().map(|(_, _, t)| t.len()).sum();
     outln!(

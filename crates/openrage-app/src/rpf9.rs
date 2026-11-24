@@ -169,6 +169,41 @@ pub fn register(report: Arc<Report>) {
     let _ = REPORT.set(Arc::clone(&report));
     rpf9::set_indexer(Arc::new(move |rpf: &Rpf9| index(rpf, &AtomicBool::new(false), &*report)));
     rpf9::set_namer(Arc::new(|rpf: &Rpf9| load_names(rpf.path())));
+    if let Some(learned) = learned_path().and_then(|p| fs::read_to_string(p).ok()) {
+        rpf9::add_names(learned.lines().map(str::to_owned));
+    }
+}
+
+/// Where names that were learned from all of the game's archives are stored.
+/// They are checked by their hashes, so they are good for any game folder.
+fn learned_path() -> Option<PathBuf> {
+    Some(crate::paths::cache_dir()?.join("gta6-names.txt"))
+}
+
+/// Whether names were learned before.
+pub fn knows_names() -> bool {
+    learned_path().is_some_and(|p| p.is_file())
+}
+
+/// Names files in a game's index after those in other archives, and keeps the
+/// names for when archives are opened.
+pub fn learn_names(index: &mut rage_index::Index) -> Result<usize> {
+    let mut found = index.learn_gta6_names()?;
+    let count = found.len();
+    if count == 0 {
+        return Ok(0);
+    }
+    let path = learned_path().context("no cache directory")?;
+    if let Ok(known) = fs::read_to_string(&path) {
+        found.extend(known.lines().map(str::to_owned));
+    }
+    found.sort_unstable();
+    found.dedup();
+    let partial = path.with_extension("txt.part");
+    fs::write(&partial, found.join("\n"))?;
+    fs::rename(&partial, &path)?;
+    rpf9::add_names(found);
+    Ok(count)
 }
 
 static REPORT: OnceLock<Arc<Report>> = OnceLock::new();

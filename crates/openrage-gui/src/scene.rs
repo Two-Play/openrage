@@ -1027,12 +1027,13 @@ fn on_stage(dict: &ClipDictionary, clip: &rage_formats::clip::Clip, time: f32) -
 }
 
 /// Opens a map file (`.ymap`; GTA IV `.wpl` or a map archive) as a scene: every object it places, with its
-/// model and textures, an object list and glTF export.
+/// model and textures, an object list and glTF export. GTA VI: a `.#map` with what is around it; with an empty
+/// path, the whole map from afar.
 pub fn open_map(ui: &AppWindow, vpath: String) {
     let Ok(win) = SceneWindow::new() else { return };
     win.set_theme_mode(ui.get_theme_mode());
     crate::accent::apply(&win);
-    let name = vpath.rsplit('/').next().unwrap_or(&vpath).to_owned();
+    let name = if vpath.is_empty() { "Map" } else { vpath.rsplit('/').next().unwrap_or(&vpath) }.to_owned();
     win.set_heading(name.clone().into());
     win.set_path(vpath.clone().into());
     win.set_timeline(false);
@@ -1059,6 +1060,14 @@ pub fn open_map(ui: &AppWindow, vpath: String) {
             let scene = if openrage_app::gta4::is_gta4_dir(&game_dir) {
                 // GTA IV: a placement file (.wpl) or a map archive (.img).
                 openrage_app::gta4::load_map(&game_dir, &vpath, &|done, total| progress.step(done, total))?
+            } else if openrage_app::detect::is_gta6_dir(&game_dir) {
+                use openrage_app::gta6_world;
+                let show = |what: &str, done, total| progress.set(what, done, total);
+                if vpath.is_empty() {
+                    gta6_world::overview(&game_dir, &show)?
+                } else {
+                    gta6_world::place(&game_dir, &vpath, gta6_world::AROUND, &show)?
+                }
             } else {
                 let world = openrage_app::world::load(&game_dir, keys.clone())?;
                 let files = openrage_app::world::files(&game_dir)?;

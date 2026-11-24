@@ -129,7 +129,8 @@ pub(crate) enum Command {
     /// Put a map file (.ymap) together: its objects with their models and textures
     /// (builds the world cache on first use).
     Map {
-        /// Virtual path of the .ymap (GTA IV: .wpl; none with --check).
+        /// Virtual path of the .ymap (GTA IV: .wpl; GTA VI: .#map, or none for the whole map from afar; none with
+        /// --check).
         path: Option<String>,
         /// Render a picture of the whole map file (PNG).
         #[arg(long)]

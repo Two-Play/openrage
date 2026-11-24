@@ -24,6 +24,7 @@ pub(crate) fn start_browsing(ui: &AppWindow) {
         format!("OpenRAGE — {name}")
     });
     ui.set_window_title(title.into());
+    ui.set_has_world_map(with_app(|a| a.game_dir.as_deref().is_some_and(detect::is_gta6_dir)));
     start_index_update(ui);
     // GTA VI: its archives are read through once to find their files. That
     // starts now, not when an archive is opened first.

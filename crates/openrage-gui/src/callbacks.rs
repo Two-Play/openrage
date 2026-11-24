@@ -546,6 +546,8 @@ fn wire_settings(ui: &AppWindow) {
 /// Sound playback.
 fn wire_sound(ui: &AppWindow) {
     let w = ui.as_weak();
+    ui.on_open_world_map(move || with_ui(&w, |ui| scene::open_map(ui, String::new())));
+    let w = ui.as_weak();
     ui.on_open_player(move || with_ui(&w, player::open_selected));
     let w = ui.as_weak();
     ui.on_index_stop(move || with_ui(&w, stop_index_update));

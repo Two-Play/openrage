@@ -12,8 +12,10 @@ use rage_resource::Resource;
 use rage_rpf::vfs::Node;
 
 /// Extensions of files that hold metadata.
-pub const EXTENSIONS: &[&str] =
-    &["ymap", "ytyp", "ymt", "ymf", "cut", "pso", "psin", "rbf0", "#mt", "#map", "#typ", "#ldb", "#ldbmt"];
+pub const EXTENSIONS: &[&str] = &[
+    "ymap", "ytyp", "ymt", "ymf", "cut", "pso", "psin", "rbf0", "#mt", "#map", "#typ", "#ldb", "#ldbmt", "#as", "#cov",
+    "#kit", "#fc", "#lfc",
+];
 
 pub fn is_metadata(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();

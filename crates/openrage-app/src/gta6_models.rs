@@ -91,7 +91,7 @@ fn base_skeletons(game: &Path) -> Skeletons {
     {
         return Arc::clone(found);
     }
-    let found = Arc::new(read_base_skeletons(game).unwrap_or_default());
+    let found = Arc::new(rage_rpf::in_own_threads(|| read_base_skeletons(game)).unwrap_or_default());
     *cache = Some((game.to_path_buf(), Arc::clone(&found)));
     found
 }

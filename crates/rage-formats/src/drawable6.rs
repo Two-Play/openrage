@@ -331,7 +331,7 @@ impl<'a> Reader<'a> {
     /// and a word whose low two bits are 0 for a texture, with its number in
     /// the next eight. A texture (80 bytes) points at 48 to its asset, whose
     /// second word is the key by which the texture pools know it.
-    fn base_texture(&self, shader: usize) -> Option<u64> {
+    fn bound_textures(&self, shader: usize) -> Option<Vec<(u32, u64)>> {
         let info = self.s(shader + 32, 8).ok()?;
         let (textures, parameters) = (usize::from(self.sys[info + 1]), usize::from(self.sys[info + 4]));
         let list = self.s(shader + 16, textures * 8).ok()?;
@@ -348,8 +348,7 @@ impl<'a> Reader<'a> {
             // In front of an asset: its kind, 6 for a texture of the pools.
             (self.sys.u32_at(asset.checked_sub(16)?)? == 6).then_some((name, key))
         };
-        let bound: Vec<(u32, u64)> = (0..parameters).filter_map(key).collect();
-        BASE_COLOUR.iter().find_map(|wanted| bound.iter().find(|(name, _)| name == wanted).map(|(_, key)| *key))
+        Some((0..parameters).filter_map(key).collect())
     }
 
     /// The shaders of a drawable, by their name hashes, each with the
@@ -365,9 +364,17 @@ impl<'a> Reader<'a> {
         (0..count)
             .map(|i| {
                 let shader = self.s(list + i * 8, 64)?;
-                let texture: Vec<String> = self.base_texture(shader).map(texture_name).into_iter().collect();
-                let samplers = texture.iter().map(|name| (crate::drawable::param::DIFFUSE_TEX, name.clone())).collect();
-                Ok(Shader { name_hash: self.u32(shader)?, textures: texture, samplers })
+                let bound = self.bound_textures(shader).unwrap_or_default();
+                let base = BASE_COLOUR.iter().find_map(|wanted| bound.iter().find(|(name, _)| name == wanted));
+                // The base colour first, under the name it has in other games.
+                let mut samplers: Vec<(u32, String)> = base
+                    .map(|(_, key)| (crate::drawable::param::DIFFUSE_TEX, texture_name(*key)))
+                    .into_iter()
+                    .collect();
+                let others = bound.iter().filter(|b| Some(*b) != base);
+                samplers.extend(others.map(|(name, key)| (*name, texture_name(*key))));
+                let textures = base.map(|(_, key)| texture_name(*key)).into_iter().collect();
+                Ok(Shader { name_hash: self.u32(shader)?, textures, samplers })
             })
             .collect()
     }
