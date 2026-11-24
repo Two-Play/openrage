@@ -59,7 +59,7 @@ BSD 3-Clause licence.
 
 ## Librempeg
 
-The Bink 2 video and audio decoder in `crates/rage-formats/src/bink2` is a port
+The Bink 2 video and audio decoder in `crates/rage-formats/src/bink` is a port
 to Rust of the one in Librempeg (https://github.com/librempeg/librempeg;
 `libavcodec/bink2.c`, `bink2.h`, `bink2g.h`, `libavcodec/binkaudio.c` and
 `libavformat/bink.c`), which is licensed under the GNU General Public License
@@ -70,6 +70,19 @@ Copyright (c) 2014 Konstantin Shishkov
 Copyright (c) 2019 Paul B Mahol
 Copyright (c) 2007-2011 Peter Ross
 Copyright (c) 2009 Daniel Verkamp
+```
+
+## FFmpeg
+
+The Bink 1 video decoder in `crates/rage-formats/src/bink` (`video1.rs`,
+`tables1.rs`) is a port to Rust of the one in FFmpeg (https://ffmpeg.org;
+`libavcodec/bink.c`, `binkdata.h` and `binkdsp.c`), which is licensed under the
+GNU Lesser General Public License version 2.1 or later and used here under the
+GNU General Public License version 3, as section 3 of the former allows:
+
+```
+Copyright (c) 2009 Konstantin Shishkov
+Copyright (c) 2011 Peter Ross
 ```
 
 Bink is a trademark of Epic Games Tools LLC (RAD Game Tools). OpenRAGE is not

@@ -20,13 +20,20 @@ pub(crate) fn start_index_update(ui: &AppWindow) {
     };
     let weak = ui.as_weak();
     ui.set_index_status("Index: checking…".into());
+    ui.set_index_running(true);
+    ui.set_index_stopped(false);
+    ui.set_index_progress(-1.0);
     std::thread::spawn(move || {
         let current = Arc::clone(&cancel);
-        let status = |text: String| {
+        let status = |text: String, progress: f32| {
             if !cancel.load(Ordering::Relaxed) {
-                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_index_status(text.into()));
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_index_status(text.into());
+                    ui.set_index_progress(progress);
+                });
             }
         };
+        let mut stopped = false;
         let result = (|| -> Result<rage_index::IndexStats, rage_index::IndexError> {
             // One update at a time: a stopped one still writes what it has.
             static UPDATING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -34,15 +41,23 @@ pub(crate) fn start_index_update(ui: &AppWindow) {
             let path = index_path(&game_dir).ok_or_else(|| std::io::Error::other("no cache directory"))?;
             let mut index = Index::open(&path)?;
             let mut last = Instant::now();
-            index.update(&game_dir, keys, &cancel, &mut |p| {
+            let stats = index.update(&game_dir, keys, &cancel, &mut |p| {
                 if last.elapsed() > Duration::from_millis(200) {
                     last = Instant::now();
-                    status(format!(
-                        "Indexing {}/{} archives ({} entries)…",
-                        p.archives_done, p.archives_total, p.entries
-                    ));
+                    let part = p.bytes_done as f32 / p.bytes_total.max(1) as f32;
+                    status(
+                        format!(
+                            "Indexing: {:.0} % · {} of {} archives · {} entries",
+                            (part * 100.0).floor(),
+                            p.archives_done,
+                            p.archives_total,
+                            p.entries
+                        ),
+                        part,
+                    );
                 }
             })?;
+            stopped = stats.cancelled;
             // Names of models, textures, … so hashes in metadata read as names.
             if let Ok(names) = index.known_names() {
                 rage_formats::names::register(names);
@@ -50,6 +65,7 @@ pub(crate) fn start_index_update(ui: &AppWindow) {
             index.stats()
         })();
         let text = match result {
+            Ok(s) if stopped => format!("Index stopped: {} entries so far", s.entries),
             Ok(s) => format!("Index: {} entries", s.entries),
             Err(e) => format!("Index error: {e}"),
         };
@@ -64,9 +80,25 @@ pub(crate) fn start_index_update(ui: &AppWindow) {
             });
             if newest {
                 ui.set_index_status(text.into());
+                ui.set_index_running(false);
+                ui.set_index_stopped(stopped);
             }
         });
     });
+}
+
+/// Stops the update of the index; what is read by then stays in it.
+pub(crate) fn stop_index_update(ui: &AppWindow) {
+    let running = with_app(|a| {
+        let (_, cancel) = a.index_running.as_ref()?;
+        cancel.store(true, Ordering::Relaxed);
+        Some(())
+    });
+    if running.is_some() {
+        openrage_app::rpf9::stop_background();
+        ui.set_index_status("Index: stopping…".into());
+        ui.set_index_running(false);
+    }
 }
 
 pub(crate) fn start_search(ui: &AppWindow, query: String, record: bool) {

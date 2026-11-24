@@ -22,6 +22,7 @@ mod model_ui;
 mod mods_ui;
 mod navigate;
 mod openformats_ui;
+mod player;
 mod plugins;
 mod plugins_ui;
 mod preview;
@@ -35,7 +36,7 @@ mod video_ui;
 mod viewer;
 mod xmlview;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,7 @@ use about::*;
 use archive_ops::*;
 use asi_ui::*;
 use callbacks::*;
+#[cfg(debug_assertions)]
 use debug::*;
 use docs::*;
 use extract_ui::*;

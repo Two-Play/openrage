@@ -9,7 +9,7 @@
 
 pub mod awc;
 pub mod bcpack;
-pub mod bink2;
+pub mod bink;
 pub mod bn6;
 pub mod clip;
 pub mod clip6;

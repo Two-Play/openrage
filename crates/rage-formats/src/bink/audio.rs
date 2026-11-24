@@ -7,7 +7,7 @@
 //! a sixteenth.
 
 use super::bits::Bits;
-use super::{Bink2Error, Track};
+use super::{BinkError, Track};
 use std::f32::consts::PI;
 
 /// Upper frequencies of the critical bands.
@@ -30,12 +30,13 @@ pub struct Decoder {
     quant: [f32; 96],
     bands: Vec<usize>,
     previous: Vec<Vec<f32>>,
+    twiddles: Vec<Complex>,
     /// Samples all blocks of a packet may have.
     limit: usize,
 }
 
 impl Decoder {
-    pub fn new(track: &Track, revision: u8) -> Result<Self, Bink2Error> {
+    pub fn new(track: &Track, revision: u8) -> Result<Self, BinkError> {
         let mut rate = track.sample_rate;
         if rate == 0 {
             return super::bad("sound without a sample rate");
@@ -67,12 +68,13 @@ impl Decoder {
             quant: std::array::from_fn(|i| (i as f32 * 0.152_891_65).exp() * root),
             bands,
             previous: Vec::new(),
+            twiddles: twiddles(if track.dct { 2 * len } else { len }),
             limit: 1 << 22,
         })
     }
 
     /// Decodes a packet and appends its samples, channels interleaved.
-    pub fn packet(&mut self, data: &[u8], out: &mut Vec<i16>) -> Result<(), Bink2Error> {
+    pub fn packet(&mut self, data: &[u8], out: &mut Vec<i16>) -> Result<(), BinkError> {
         if data.len() < 4 {
             return Ok(());
         }
@@ -87,7 +89,7 @@ impl Decoder {
         Ok(())
     }
 
-    fn block(&mut self, bits: &mut Bits, out: &mut Vec<i16>) -> Result<(), Bink2Error> {
+    fn block(&mut self, bits: &mut Bits, out: &mut Vec<i16>) -> Result<(), BinkError> {
         if self.dct {
             bits.read(2);
         }
@@ -95,7 +97,7 @@ impl Decoder {
         let mut blocks = Vec::with_capacity(self.channels);
         for _ in 0..self.channels {
             let coeffs = self.coefficients(bits)?;
-            blocks.push(if self.dct { dct(coeffs) } else { rdft(&coeffs) });
+            blocks.push(if self.dct { dct(&coeffs, &self.twiddles) } else { rdft(&coeffs, &self.twiddles) });
         }
         for (ch, block) in blocks.iter_mut().enumerate() {
             let count = (overlap * self.channels) as f32;
@@ -113,7 +115,7 @@ impl Decoder {
         Ok(())
     }
 
-    fn coefficients(&self, bits: &mut Bits) -> Result<Vec<f32>, Bink2Error> {
+    fn coefficients(&self, bits: &mut Bits) -> Result<Vec<f32>, BinkError> {
         let mut coeffs = vec![0f32; self.len];
         for c in &mut coeffs[..2] {
             let power = bits.read(5) as i32;
@@ -160,8 +162,18 @@ impl Decoder {
 
 type Complex = (f32, f32);
 
+/// e^(2πi·k/n) for the first half of k.
+fn twiddles(n: usize) -> Vec<Complex> {
+    (0..n / 2)
+        .map(|i| {
+            let (s, c) = (2.0 * PI * i as f32 / n as f32).sin_cos();
+            (c, s)
+        })
+        .collect()
+}
+
 /// The sum over k of `v[k]`·e^(2πi·k·t/n), in place.
-fn fft(v: &mut [Complex]) {
+fn fft(v: &mut [Complex], twiddles: &[Complex]) {
     let n = v.len();
     let mut j = 0;
     for i in 1..n {
@@ -175,12 +187,6 @@ fn fft(v: &mut [Complex]) {
             v.swap(i, j);
         }
     }
-    let twiddles: Vec<Complex> = (0..n / 2)
-        .map(|i| {
-            let (s, c) = (2.0 * PI * i as f32 / n as f32).sin_cos();
-            (c, s)
-        })
-        .collect();
     let mut size = 2;
     while size <= n {
         let step = n / size;
@@ -199,7 +205,7 @@ fn fft(v: &mut [Complex]) {
 
 /// Real samples from coefficients: first and middle, then the others as
 /// conjugated complex numbers; scaled by a half.
-fn rdft(c: &[f32]) -> Vec<f32> {
+fn rdft(c: &[f32], twiddles: &[Complex]) -> Vec<f32> {
     let n = c.len();
     let mut v = vec![(0.0, 0.0); n];
     v[0].0 = c[0];
@@ -208,20 +214,20 @@ fn rdft(c: &[f32]) -> Vec<f32> {
         v[k] = (c[2 * k], -c[2 * k + 1]);
         v[n - k] = (c[2 * k], c[2 * k + 1]);
     }
-    fft(&mut v);
+    fft(&mut v, twiddles);
     v.into_iter().map(|v| v.0 * 0.5).collect()
 }
 
 /// The sum over k of `c[k]`·cos(π·k·(2t+1)/2n), scaled by 2/n.
-fn dct(c: Vec<f32>) -> Vec<f32> {
+fn dct(c: &[f32], twiddles: &[Complex]) -> Vec<f32> {
     let n = c.len();
     // Real part of a Fourier transform of twice the length.
     let mut v = vec![(0.0, 0.0); 2 * n];
-    for (k, (v, c)) in v.iter_mut().zip(&c).enumerate() {
+    for (k, (v, c)) in v.iter_mut().zip(c).enumerate() {
         let (s, co) = (PI * k as f32 / (2 * n) as f32).sin_cos();
         *v = (c * co, c * s);
     }
-    fft(&mut v);
+    fft(&mut v, twiddles);
     v[..n].iter().map(|v| v.0 * 2.0 / n as f32).collect()
 }
 
@@ -233,7 +239,7 @@ mod tests {
     fn transforms_match_their_sums() {
         let n = 16;
         let c: Vec<f32> = (0..n).map(|i| ((i * 7 + 3) % 11) as f32 - 5.0).collect();
-        let (r, d) = (rdft(&c), dct(c.clone()));
+        let (r, d) = (rdft(&c, &twiddles(n)), dct(&c, &twiddles(2 * n)));
         for t in 0..n {
             let angle = |k: usize| 2.0 * PI * (k * t) as f32 / n as f32;
             let mut sum = (c[0] + c[1] * angle(n / 2).cos()) / 2.0;

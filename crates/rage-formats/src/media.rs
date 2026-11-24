@@ -1,7 +1,5 @@
-//! Facts about media files the game plays: Scaleform movies (`.gfx`) and
-//! Bink videos (`.bik`). Neither is played back (Bink 2 is, see
-//! [`crate::bink2`]); this reads their headers (and, for `.gfx`, the names it
-//! exports and the images it loads).
+//! Facts about Scaleform movies (`.gfx`): their header, the names they export
+//! and the images they load. For videos see [`crate::bink`].
 
 use rage_core::bytes::LeRead;
 use std::io::Read;
@@ -11,49 +9,6 @@ use std::io::Read;
 pub enum MediaError {
     #[error("invalid media file: {0}")]
     Invalid(String),
-}
-
-/// A Bink video's header.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Bink {
-    /// `BIK` + revision letter, or `KB2` + revision for Bink 2.
-    pub signature: String,
-    pub width: u32,
-    pub height: u32,
-    pub frames: u32,
-    pub fps: f32,
-    pub audio_tracks: u32,
-    /// Size of the largest frame in bytes.
-    pub largest_frame: u32,
-}
-
-impl Bink {
-    pub fn duration(&self) -> f32 {
-        if self.fps > 0.0 { self.frames as f32 / self.fps } else { 0.0 }
-    }
-}
-
-fn u32_at(d: &[u8], at: usize) -> Result<u32, MediaError> {
-    d.u32_at(at).ok_or_else(|| MediaError::Invalid(format!("header ends before {at:#x}")))
-}
-
-/// Reads a Bink (1 or 2) header: signature, file size, frames, largest frame,
-/// frames again, width, height, fps numerator and denominator, flags, audio tracks.
-pub fn bink(data: &[u8]) -> Result<Bink, MediaError> {
-    let sig = data.get(..4).ok_or_else(|| MediaError::Invalid("too short".into()))?;
-    if &sig[..3] != b"BIK" && &sig[..3] != b"KB2" {
-        return Err(MediaError::Invalid("not a Bink video".into()));
-    }
-    let (num, den) = (u32_at(data, 0x1C)?, u32_at(data, 0x20)?);
-    Ok(Bink {
-        signature: String::from_utf8_lossy(sig).into_owned(),
-        frames: u32_at(data, 0x08)?,
-        largest_frame: u32_at(data, 0x0C)?,
-        width: u32_at(data, 0x14)?,
-        height: u32_at(data, 0x18)?,
-        fps: if den > 0 { num as f32 / den as f32 } else { 0.0 },
-        audio_tracks: u32_at(data, 0x28)?,
-    })
 }
 
 /// A Scaleform (Flash) movie's header and the names in it.
@@ -117,7 +72,7 @@ pub fn gfx(data: &[u8]) -> Result<Gfx, MediaError> {
         b"CFX" | b"CWS" => true,
         _ => return Err(MediaError::Invalid("not a Scaleform movie".into())),
     };
-    let length = u32_at(data, 4)? as usize;
+    let length = data.u32_at(4).ok_or_else(|| MediaError::Invalid("too short".into()))? as usize;
     let body: Vec<u8> = if compressed {
         let mut out = Vec::with_capacity(length.saturating_sub(8).min(256 << 20));
         flate2::read::ZlibDecoder::new(&data[8..])
@@ -215,18 +170,6 @@ mod tests {
         assert_eq!(&gfx_to_swf(b"GFX\x08rest").unwrap()[..3], b"FWS");
         assert_eq!(&gfx_to_swf(b"CFX\x08rest").unwrap()[..3], b"CWS");
         assert!(gfx_to_swf(b"BIKi").is_err());
-    }
-
-    #[test]
-    fn bink_header() {
-        let mut d = b"BIKi".to_vec();
-        for v in [0x2f9e34u32, 187, 0xc12c, 187, 1024, 576, 2997, 100, 0, 1] {
-            d.extend(v.to_le_bytes());
-        }
-        let b = bink(&d).unwrap();
-        assert_eq!((b.width, b.height, b.frames, b.audio_tracks), (1024, 576, 187, 1));
-        assert!((b.fps - 29.97).abs() < 0.01);
-        assert!((b.duration() - 6.24).abs() < 0.01);
     }
 
     #[test]

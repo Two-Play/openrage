@@ -2,36 +2,42 @@
 // libavformat/bink.c, Copyright (c) 2008-2010 Peter Ross, 2009 Daniel Verkamp,
 // GNU General Public License version 3 or later; used here under version 3.
 
-//! Bink 2 videos (`.bk2`): the file, its pictures ([`Player`]) and its sound.
+//! Bink videos (`.bik` and, Bink 2, `.bk2`): the file, its pictures
+//! ([`Player`]) and its sound.
 //!
-//! Revisions `g` to `n` are decoded; `a` to `f` use another transform and
-//! are not. Sound comes in the same two codecs as in Bink 1.
+//! Of Bink 1 the revisions `f` to `k` are decoded, of Bink 2 `g` to `n`; the
+//! earlier ones use other transforms and are not. The file and the two sound
+//! codecs are the same in both.
 
 mod audio;
 mod bits;
-mod tables;
-mod video;
+mod tables1;
+mod tables2;
+mod video1;
+mod video2;
 
 use rage_core::bytes::LeRead;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum Bink2Error {
-    #[error("damaged Bink 2 video: {0}")]
+pub enum BinkError {
+    #[error("damaged Bink video: {0}")]
     Invalid(String),
-    #[error("Bink 2 revision {0:?} is not supported")]
+    #[error("Bink revision {0:?} is not supported")]
     Unsupported(char),
 }
 
-fn bad<T>(what: impl Into<String>) -> Result<T, Bink2Error> {
-    Err(Bink2Error::Invalid(what.into()))
+fn bad<T>(what: impl Into<String>) -> Result<T, BinkError> {
+    Err(BinkError::Invalid(what.into()))
 }
 
-/// One decoded picture: full-range YCbCr 4:2:0, with alpha if the video has it.
+/// One decoded picture: YCbCr 4:2:0, with alpha if the video has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
+    /// Black and white are 0 and 255, otherwise 16 and 235.
+    pub full_range: bool,
     pub y: Vec<u8>,
     pub cb: Vec<u8>,
     pub cr: Vec<u8>,
@@ -56,9 +62,11 @@ pub struct Packet {
     end: usize,
 }
 
-/// A Bink 2 file's header and index.
+/// A Bink file's header and index.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Bink2 {
+pub struct Bink {
+    /// Bink 1 or 2.
+    pub version: u8,
     pub revision: u8,
     pub width: u32,
     pub height: u32,
@@ -74,20 +82,21 @@ const MAX_WIDTH: u32 = 32767;
 const MAX_PIXELS: u64 = 8192 * 8192;
 const MAX_TRACKS: usize = 256;
 
-/// Whether the file is a Bink 2 video.
-pub fn is_bink2(data: &[u8]) -> bool {
-    data.starts_with(b"KB2")
+/// Whether the file is a Bink video.
+pub fn is_bink(data: &[u8]) -> bool {
+    data.starts_with(b"KB2") || (data.starts_with(b"BIK") && data.get(3).is_some_and(u8::is_ascii_alphanumeric))
 }
 
 /// Reads the header and the frame index.
-pub fn read(data: &[u8]) -> Result<Bink2, Bink2Error> {
-    if !is_bink2(data) {
-        return bad("no KB2 signature");
+pub fn read(data: &[u8]) -> Result<Bink, BinkError> {
+    if !is_bink(data) {
+        return bad("no Bink signature");
     }
     let u32_at = |at: usize| match data.u32_at(at) {
         Some(v) => Ok(v),
         None => bad(format!("the header ends before {at:#x}")),
     };
+    let version = if data[0] == b'K' { 2 } else { 1 };
     let revision = u32_at(0)?.to_le_bytes()[3];
     let frames = u32_at(0x08)? as usize;
     let (width, height) = (u32_at(0x14)?, u32_at(0x18)?);
@@ -105,7 +114,7 @@ pub fn read(data: &[u8]) -> Result<Bink2, Bink2Error> {
     if count > MAX_TRACKS {
         return bad(format!("{count} sound tracks"));
     }
-    let mut at = 0x2C + if revision >= b'i' { 4 } else { 0 };
+    let mut at = 0x2C + if revision == b'k' || (version == 2 && revision >= b'i') { 4 } else { 0 };
     let mut tracks = Vec::with_capacity(count);
     for i in 0..count {
         let info = u32_at(at + 4 * count + 4 * i)?;
@@ -131,10 +140,10 @@ pub fn read(data: &[u8]) -> Result<Bink2, Bink2Error> {
         }
         packets.push(Packet { key: i == 0 || here & 1 != 0, start, end });
     }
-    Ok(Bink2 { revision, width, height, fps, flags, tracks, packets })
+    Ok(Bink { version, revision, width, height, fps, flags, tracks, packets })
 }
 
-impl Bink2 {
+impl Bink {
     pub fn frames(&self) -> usize {
         self.packets.len()
     }
@@ -148,11 +157,11 @@ impl Bink2 {
     }
 
     pub fn has_alpha(&self) -> bool {
-        self.flags & video::ALPHA != 0
+        self.flags & video2::ALPHA != 0
     }
 
     /// The sound packets of a frame, one per track, and its picture.
-    fn split<'a>(&self, data: &'a [u8], frame: usize) -> Result<(Vec<&'a [u8]>, &'a [u8]), Bink2Error> {
+    fn split<'a>(&self, data: &'a [u8], frame: usize) -> Result<(Vec<&'a [u8]>, &'a [u8]), BinkError> {
         let Some(p) = self.packets.get(frame) else { return bad(format!("there is no frame {frame}")) };
         let Some(mut rest) = data.get(p.start..p.end) else { return bad(format!("frame {frame} is cut off")) };
         let mut sounds = Vec::with_capacity(self.tracks.len());
@@ -166,7 +175,7 @@ impl Bink2 {
     }
 
     /// Decodes a sound track. `None` if there is no such track.
-    pub fn sound(&self, data: &[u8], track: usize) -> Option<Result<crate::awc::Pcm, Bink2Error>> {
+    pub fn sound(&self, data: &[u8], track: usize) -> Option<Result<crate::awc::Pcm, BinkError>> {
         let t = self.tracks.get(track)?;
         Some((|| {
             let mut decoder = audio::Decoder::new(t, self.revision)?;
@@ -179,19 +188,28 @@ impl Bink2 {
     }
 }
 
+enum Decoder {
+    One(Box<video1::Decoder>),
+    Two(Box<video2::Decoder>),
+}
+
 /// Decodes the pictures of a video.
 pub struct Player<D> {
     data: D,
-    pub video: Bink2,
-    decoder: video::Decoder,
+    pub video: Bink,
+    decoder: Decoder,
     /// The frame to decode next.
     next: usize,
 }
 
 impl<D: AsRef<[u8]>> Player<D> {
-    pub fn new(data: D) -> Result<Self, Bink2Error> {
+    pub fn new(data: D) -> Result<Self, BinkError> {
         let video = read(data.as_ref())?;
-        let decoder = video::Decoder::new(video.revision, video.flags, video.width, video.height)?;
+        let (revision, flags, width, height) = (video.revision, video.flags, video.width, video.height);
+        let decoder = match video.version {
+            1 => Decoder::One(video1::Decoder::new(revision, flags, width, height)?.into()),
+            _ => Decoder::Two(video2::Decoder::new(revision, flags, width, height)?.into()),
+        };
         Ok(Self { data, video, decoder, next: 0 })
     }
 
@@ -200,14 +218,17 @@ impl<D: AsRef<[u8]>> Player<D> {
     }
 
     /// Decodes the next frame. Gives the number of bytes left unread in each
-    /// of its slices: at most 3 of padding in an undamaged video.
-    pub fn advance(&mut self) -> Result<Vec<usize>, Bink2Error> {
+    /// of its slices (of Bink 2): at most 3 of padding in an undamaged video.
+    pub fn advance(&mut self) -> Result<Vec<usize>, BinkError> {
         let picture = self.video.split(self.data.as_ref(), self.next)?.1;
         // A frame without data repeats the one before.
         let left = if picture.is_empty() && self.next > 0 {
             Vec::new()
         } else {
-            self.decoder.decode(picture, self.video.packets[self.next].key)?
+            match &mut self.decoder {
+                Decoder::One(d) => d.decode(picture).map(|()| Vec::new())?,
+                Decoder::Two(d) => d.decode(picture, self.video.packets[self.next].key)?,
+            }
         };
         self.next += 1;
         Ok(left)
@@ -216,7 +237,7 @@ impl<D: AsRef<[u8]>> Player<D> {
     /// Decodes one frame on the way to `frame`, jumping to the key frame
     /// before it unless the decoder is already in between. Gives whether it
     /// is there.
-    pub fn step_towards(&mut self, frame: usize) -> Result<bool, Bink2Error> {
+    pub fn step_towards(&mut self, frame: usize) -> Result<bool, BinkError> {
         let Some(before) = self.video.packets.get(..=frame) else { return bad(format!("there is no frame {frame}")) };
         if self.next == frame + 1 {
             return Ok(true);
@@ -230,7 +251,7 @@ impl<D: AsRef<[u8]>> Player<D> {
     }
 
     /// Decodes up to `frame`.
-    pub fn seek(&mut self, frame: usize) -> Result<(), Bink2Error> {
+    pub fn seek(&mut self, frame: usize) -> Result<(), BinkError> {
         while !self.step_towards(frame)? {}
         Ok(())
     }
@@ -242,12 +263,15 @@ impl<D: AsRef<[u8]>> Player<D> {
 
     /// The picture decoded last.
     pub fn frame(&self) -> Frame {
-        self.decoder.frame()
+        match &self.decoder {
+            Decoder::One(d) => d.frame(),
+            Decoder::Two(d) => d.frame(),
+        }
     }
 }
 
 impl Frame {
-    /// The picture as RGBA (BT.601 weights, full range), opaque if it has no alpha.
+    /// The picture as RGBA (BT.601 weights), opaque if it has no alpha.
     pub fn rgba(&self) -> Vec<u8> {
         let (w, h) = (self.width as usize, self.height as usize);
         let mut out = vec![255; w * h * 4];
@@ -255,15 +279,22 @@ impl Frame {
             return out;
         }
         let half = w.div_ceil(2);
+        // In 1/65536: black, then the factors of the planes.
+        let (black, l_y, cr_r, cb_g, cr_g, cb_b) = if self.full_range {
+            (0, 1 << 16, 91881, 22554, 46802, 116_130)
+        } else {
+            (16, 76309, 104_597, 25675, 53279, 132_201)
+        };
         for (y, row) in out.chunks_exact_mut(w * 4).enumerate() {
             let luma = &self.y[y * w..][..w];
             let (cb, cr) = (&self.cb[y / 2 * half..][..half], &self.cr[y / 2 * half..][..half]);
             for (x, p) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let (l, u, v) = (i32::from(luma[x]) << 16, i32::from(cb[x / 2]) - 128, i32::from(cr[x / 2]) - 128);
+                let (l, u, v) =
+                    ((i32::from(luma[x]) - black) * l_y, i32::from(cb[x / 2]) - 128, i32::from(cr[x / 2]) - 128);
                 let at = |c: i32| ((l + c + (1 << 15)) >> 16).clamp(0, 255) as u8;
-                p[0] = at(91881 * v);
-                p[1] = at(-22554 * u - 46802 * v);
-                p[2] = at(116130 * u);
+                p[0] = at(cr_r * v);
+                p[1] = at(-cb_g * u - cr_g * v);
+                p[2] = at(cb_b * u);
             }
             if let Some(a) = &self.a {
                 row.as_chunks_mut::<4>().0.iter_mut().zip(&a[y * w..]).for_each(|(p, &a)| p[3] = a);
@@ -334,7 +365,9 @@ mod tests {
 
     #[test]
     fn colours() {
-        let f = |y, cb, cr, a| Frame { width: 1, height: 1, y: vec![y], cb: vec![cb], cr: vec![cr], a }.rgba();
+        let f = |y, cb, cr, a| {
+            Frame { width: 1, height: 1, full_range: true, y: vec![y], cb: vec![cb], cr: vec![cr], a }.rgba()
+        };
         assert_eq!(f(255, 128, 128, None), [255, 255, 255, 255]);
         assert_eq!(f(0, 128, 128, Some(vec![9])), [0, 0, 0, 9]);
         assert_eq!(f(76, 85, 255, None), [254, 0, 0, 255]);

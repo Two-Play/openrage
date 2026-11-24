@@ -223,8 +223,17 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
     let plugin = (matches!(item.kind, ItemKind::File | ItemKind::Resource) && !badges::is_known(&item.name))
         .then(|| plugins::previews(&item.name))
         .flatten();
+    let nameless = may_be_video(row);
     let game = plugins::GameContext { dir: with_app(|a| a.game_dir.clone()), keys: keys.clone() };
     std::thread::spawn(move || {
+        if nameless && is_video_source(&source) {
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if counter.load(Ordering::SeqCst) == generation {
+                    start_video_preview(&ui, vpath, info, generation);
+                }
+            });
+            return;
+        }
         let mut from_plugin = plugin.and_then(|(id, specific)| plugin_preview(&id, specific, &game, &vpath));
         // A plugin's 3D model goes to the model view.
         if let Some(model) = from_plugin.as_mut().and_then(|p| p.model.take()) {
@@ -252,6 +261,7 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
             if counter.load(Ordering::SeqCst) != generation {
                 return;
             }
+            with_app(|a| a.play_when_ready = false);
             if !extra.is_empty() {
                 set_meta(&ui, &info.iter().cloned().chain(extra).collect());
             }
@@ -269,6 +279,32 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
             ui.set_preview_loading(false);
         });
     });
+}
+
+/// Whether the row is a file whose name does not tell what it is. RDR2's
+/// videos have no names, for example.
+pub(crate) fn may_be_video(row: usize) -> bool {
+    with_app(|a| {
+        let listing = a.listing.as_ref()?;
+        let item = listing.items.get(*a.visible.get(row)?)?;
+        Some(item.kind == ItemKind::File && !item.name.contains('.'))
+    }) == Some(true)
+}
+
+/// Whether the file is a video, by its first bytes.
+fn is_video_source(source: &PreviewSource) -> bool {
+    use rage_formats::bink::is_bink;
+    match source {
+        PreviewSource::Rpf8(rpf, i) => {
+            rpf.entries().and_then(|e| e.get(*i)).and_then(|e| rpf.read(e).ok()).is_some_and(|d| is_bink(&d))
+        }
+        PreviewSource::DiskFile(path) => {
+            let mut start = [0; 4];
+            std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut start)).is_ok()
+                && is_bink(&start)
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn texture_info(t: &rage_formats::texture::Texture) -> Meta {
@@ -374,44 +410,11 @@ pub(crate) fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -
                 Err(e) => (vec![kv("Error", e)], String::new(), None),
             }
         }
-        PreviewSource::Entry(rpf, id) if rpf.entry(id).name.to_ascii_lowercase().ends_with(".bik") => {
-            let name = rpf.entry(id).name.clone();
-            let (meta, body) = load_preview_text(PreviewSource::Entry(Arc::clone(&rpf), id), keys);
-            let frame = rpf.read(id).ok().and_then(|d| video_frame(&name, &d));
-            (meta, body, frame)
-        }
         other => {
             let (meta, body) = load_preview_text(other, keys);
             (meta, body, None)
         }
     }
-}
-
-/// A frame from the middle of a Bink video, if FFmpeg is installed (it
-/// decodes Bink 1; OpenRAGE only decodes Bink 2 itself).
-pub(crate) fn video_frame(name: &str, data: &[u8]) -> Option<Rgba> {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    let b = rage_formats::media::bink(data).ok()?;
-    if b.width == 0 || b.height == 0 {
-        return None;
-    }
-    let (w, h) = (640u32.min(b.width), (640u32.min(b.width) * b.height / b.width).max(1) & !1);
-    let dir = std::env::temp_dir().join("openrage-preview");
-    std::fs::create_dir_all(&dir).ok()?;
-    let file = dir.join(format!("{:08x}.bik", rage_core::hash::joaat(name)));
-    std::fs::File::create(&file).ok()?.write_all(data).ok()?;
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-ss", &format!("{:.2}", b.duration() / 2.0), "-i"])
-        .arg(&file)
-        .args(["-frames:v", "1", "-vf", &format!("scale={w}:{h}"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok();
-    let _ = std::fs::remove_file(&file);
-    let pixels = output?.stdout;
-    (pixels.len() == (w * h * 4) as usize).then_some((w, h, pixels))
 }
 
 /// Returns (metadata, preview body).
@@ -542,14 +545,12 @@ pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys
             if openrage_app::media::is_media(&entry.name)
                 && let Ok(data) = rpf.read(id)
             {
-                return match openrage_app::media::rows(&entry.name, &data) {
+                return match openrage_app::media::rows(&data) {
                     Ok(rows) => {
                         let mut meta: Meta = rows.into_iter().filter(|(_, v)| !v.is_empty()).collect();
-                        meta.push(note(if !entry.name.to_ascii_lowercase().ends_with(".gfx") {
-                            "Double-click plays it in your video player (VLC, mpv and other FFmpeg-based players play Bink)."
-                        } else {
-                            "Right-click → Export as SWF… opens it in Flash tools such as JPEXS or Ruffle."
-                        }));
+                        meta.push(note(
+                            "Right-click → Export as SWF… opens it in Flash tools such as JPEXS or Ruffle.",
+                        ));
                         (meta, String::new())
                     }
                     Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new()),

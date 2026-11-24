@@ -10,13 +10,13 @@
 //! the frame before or from neighbours, then smoothed by a loop filter.
 
 use super::bits::Bits;
-use super::tables::*;
-use super::{Bink2Error, Frame};
+use super::tables2::*;
+use super::{BinkError, Frame};
 
-type Result<T> = std::result::Result<T, Bink2Error>;
+type Result<T> = std::result::Result<T, BinkError>;
 
 fn bad<T>(what: &str) -> Result<T> {
-    Err(Bink2Error::Invalid(what.to_owned()))
+    Err(BinkError::Invalid(what.to_owned()))
 }
 
 const INTRA: usize = 0;
@@ -131,7 +131,7 @@ fn wrap(v: i32) -> i16 {
 impl Decoder {
     pub fn new(revision: u8, flags: u32, width: u32, height: u32) -> Result<Self> {
         if !matches!(revision, b'g'..=b'n') {
-            return Err(Bink2Error::Unsupported(revision as char));
+            return Err(BinkError::Unsupported(revision as char));
         }
         let (width, height) = (width as usize, height as usize);
         let coded = (width.next_multiple_of(32), height.next_multiple_of(32));
@@ -298,6 +298,7 @@ impl Decoder {
         Frame {
             width: self.width as u32,
             height: self.height as u32,
+            full_range: true,
             y: crop(0),
             cb: crop(2),
             cr: crop(1),

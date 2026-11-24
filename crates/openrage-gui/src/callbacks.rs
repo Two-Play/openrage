@@ -171,25 +171,29 @@ fn wire_files(ui: &AppWindow) {
                 open_script_view(ui, vpath);
                 return;
             }
-            let video = with_app(|a| {
+            let is_video = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
-                let name = item.name.to_ascii_lowercase();
-                name.ends_with(".bik")
-                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+                Some(item.kind == ItemKind::File && browser::is_video(&item.name) && item.mark != Some(Mark::Removed))
             });
-            if let Some(vpath) = video {
-                // Video players built on FFmpeg (VLC, mpv, …) play Bink.
-                open_with_system(ui, vpath);
+            // Or a file without a name that turned out to be one.
+            if is_video == Some(true) || (ui.get_file_selected() == i && ui.get_video_mode()) {
+                if ui.get_file_selected() != i {
+                    select_row(ui, i as usize);
+                }
+                player::open_selected(ui);
                 return;
             }
-            // A Bink 2 video or an audio container with one sound: the row plays it (it is
+            if ui.get_file_selected() == i && ui.get_preview_loading() && may_be_video(i as usize) {
+                with_app(|a| a.play_when_ready = true);
+                return;
+            }
+            // An audio container with one sound: the row plays it (it is
             // selected, so the sound is loaded or about to be).
             let is_container = with_app(|a| {
                 let listing = a.listing.as_ref()?;
                 let item = &listing.items[*a.visible.get(i as usize)?];
-                let playable = (item.vpath.is_none() && browser::is_audio(&item.name)) || browser::is_video(&item.name);
-                Some(item.kind == ItemKind::File && playable)
+                Some(item.kind == ItemKind::File && item.vpath.is_none() && browser::is_audio(&item.name))
             });
             if is_container == Some(true) {
                 if ui.get_file_selected() != i {
@@ -202,17 +206,6 @@ fn wire_files(ui: &AppWindow) {
                 // Still decoding; a container with several has its list by now.
                 if ui.get_preview_loading() {
                     with_app(|a| a.play_when_ready = true);
-                    return;
-                }
-                // A video that cannot be shown here: perhaps elsewhere.
-                let video = with_app(|a| {
-                    let listing = a.listing.as_ref()?;
-                    let item = &listing.items[*a.visible.get(i as usize)?];
-                    browser::is_video(&item.name)
-                        .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-                });
-                if let Some(vpath) = video {
-                    open_with_system(ui, vpath);
                     return;
                 }
             }
@@ -501,6 +494,7 @@ fn wire_settings(ui: &AppWindow) {
             accent::apply(&ui);
         }
         viewer::set_accent();
+        player::set_accent();
         editor::set_accent();
         xmlview::set_accent();
         history::set_accent();
@@ -514,6 +508,7 @@ fn wire_settings(ui: &AppWindow) {
             accent::apply(&ui);
         }
         viewer::set_accent();
+        player::set_accent();
         editor::set_accent();
         xmlview::set_accent();
         history::set_accent();
@@ -530,6 +525,7 @@ fn wire_settings(ui: &AppWindow) {
         with_app(|a| a.cfg.theme = Some(theme_name(mode).to_owned()));
         with_ui(&w, save_settings);
         viewer::set_theme(mode);
+        player::set_theme(mode);
         editor::set_theme(mode);
         xmlview::set_theme(mode);
         history::set_theme(mode);
@@ -549,6 +545,12 @@ fn wire_settings(ui: &AppWindow) {
 
 /// Sound playback.
 fn wire_sound(ui: &AppWindow) {
+    let w = ui.as_weak();
+    ui.on_open_player(move || with_ui(&w, player::open_selected));
+    let w = ui.as_weak();
+    ui.on_index_stop(move || with_ui(&w, stop_index_update));
+    let w = ui.as_weak();
+    ui.on_index_resume(move || with_ui(&w, start_index_update));
     let w = ui.as_weak();
     ui.on_audio_toggle(move || with_ui(&w, toggle_sound));
     let w = ui.as_weak();
@@ -779,6 +781,7 @@ pub(crate) fn row_action(ui: &AppWindow, row: usize, action: &str) {
     }
     match action {
         "open" => ui.invoke_file_open(row as i32),
+        "play" => player::open_selected(ui),
         "view" => open_viewer(ui),
         "edit" | "system" => {
             let vpath = with_app(|a| {

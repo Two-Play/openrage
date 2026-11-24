@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +31,9 @@ pub struct Progress {
     pub archives_done: usize,
     pub archives_total: usize,
     pub entries: u64,
+    /// How much of the archives that changed is read, in bytes of theirs.
+    pub bytes_done: u64,
+    pub bytes_total: u64,
     /// Archive that was just written.
     pub current: String,
 }
@@ -57,6 +60,8 @@ struct DiskArchive {
     rdr2: bool,
     /// A GTA VI archive (RPF9) rather than RPF7.
     gta6: bool,
+    /// How much of it is read, for the progress.
+    read: AtomicU64,
 }
 
 /// Largest loose file whose text is indexed (GTA IV's text tables are ~6 MB).
@@ -143,6 +148,7 @@ fn scan_disk(game_dir: &Path) -> (Vec<Record>, Vec<DiskArchive>, HashSet<String>
                     gta4,
                     rdr2: !gta4 && rage_rpf::Rpf8::file_is_rpf8(&entry.path()),
                     gta6: !gta4 && Rpf9::file_is_rpf9(&entry.path()),
+                    read: AtomicU64::new(0),
                 });
             }
         }
@@ -281,7 +287,9 @@ fn read_gta6_archive(
     part: &(dyn Fn(Batch) + Sync),
 ) -> Option<Batch> {
     match Rpf9::open(&archive.path) {
-        Ok(rpf) if rpf.is_native() => walk_gta6(&rpf, &archive.rel, 0, cancel, part, &|| archive.part()),
+        Ok(rpf) if rpf.is_native() => {
+            walk_gta6(&rpf, &archive.rel, 0, cancel, part, &|| archive.part(), &|bytes| archive.add_read(bytes));
+        }
         // Not readable with this executable: tried again by the next update.
         _ => {
             batch.errors += 1;
@@ -298,6 +306,7 @@ fn walk_gta6(
     cancel: &AtomicBool,
     part: &(dyn Fn(Batch) + Sync),
     new_part: &(dyn Fn() -> Batch + Sync),
+    read: &(dyn Fn(u64) + Sync),
 ) {
     let mut batch = new_part();
     let Ok(entries) = rpf.entries() else {
@@ -389,16 +398,25 @@ fn walk_gta6(
         }
         match rpf.open_child(e) {
             Ok(child) if depth < rage_rpf::MAX_NESTING => {
-                walk_gta6(&child, vpath, depth + 1, cancel, part, new_part);
+                walk_gta6(&child, vpath, depth + 1, cancel, part, new_part, &|_| {});
             }
             _ => part(Batch { errors: 1, ..new_part() }),
         }
+        read(e.size);
     });
 }
 
 impl DiskArchive {
     fn batch(&self) -> Batch {
         Batch { rel: self.rel.clone(), size: self.size, mtime: self.mtime, ..Default::default() }
+    }
+
+    fn add_read(&self, bytes: u64) {
+        self.read.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.read.load(Ordering::Relaxed).min(self.size as u64)
     }
 
     /// For some of its entries.
@@ -539,6 +557,8 @@ impl Index {
         }
 
         let total = todo.len();
+        let bytes_total = todo.iter().map(|a| a.size as u64).sum();
+        let counted = todo.clone();
         let mut done = 0usize;
         let (sender, receiver) = mpsc::sync_channel::<Batch>(4);
         let conn = &mut self.conn;
@@ -554,6 +574,7 @@ impl Index {
                             let _ = s.send(batch);
                         };
                         if let Some(batch) = read_archive(archive, keys.clone(), cancel, &part) {
+                            archive.add_read(archive.size as u64);
                             part(batch);
                         }
                     });
@@ -580,6 +601,8 @@ impl Index {
                     archives_done: done,
                     archives_total: total,
                     entries: stats.entries_added,
+                    bytes_done: counted.iter().map(|a| a.bytes_read()).sum(),
+                    bytes_total,
                     current: batch.rel,
                 });
             }

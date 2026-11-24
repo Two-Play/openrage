@@ -1,11 +1,11 @@
-//! Playing Bink 2 videos in the preview.
+//! Playing Bink videos in the preview; [`crate::player`] has a window for them.
 //!
 //! The sound (silence if the video has none) goes through the sound player,
 //! whose position is the clock; a worker thread decodes the picture for it.
 
 use crate::*;
 use rage_formats::awc::Pcm;
-use rage_formats::bink2::{self, Player};
+use rage_formats::bink::{self, Player};
 use std::sync::{Condvar, Mutex};
 
 /// While the decoder catches up, a picture is shown this often, so that
@@ -48,7 +48,7 @@ impl Drop for Video {
     }
 }
 
-fn picture(player: &Player<Vec<u8>>) -> slint::SharedPixelBuffer<slint::Rgba8Pixel> {
+fn picture(player: &Player<Shared>) -> Picture {
     let f = player.frame();
     slint::SharedPixelBuffer::clone_from_slice(&f.rgba(), f.width, f.height)
 }
@@ -57,7 +57,7 @@ fn picture(player: &Player<Vec<u8>>) -> slint::SharedPixelBuffer<slint::Rgba8Pix
 const MAX_SILENCE: usize = 1 << 28;
 
 /// The sound of a video, as long as the video. Silence if there is none.
-fn sound(video: &bink2::Bink2, data: &[u8]) -> (Pcm, Option<String>) {
+fn sound(video: &bink::Bink, data: &[u8]) -> (Pcm, Option<String>) {
     let (mut pcm, error) = match video.sound(data, 0) {
         Some(Ok(pcm)) => (pcm, None),
         Some(Err(e)) => (Pcm { sample_rate: 8000, channels: 1, samples: Vec::new() }, Some(e.to_string())),
@@ -70,94 +70,131 @@ fn sound(video: &bink2::Bink2, data: &[u8]) -> (Pcm, Option<String>) {
     (pcm, error)
 }
 
-/// Selecting a `.bk2`: its first picture and the player.
+/// A video file, shared by the threads that decode picture and sound.
+#[derive(Clone)]
+struct Shared(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for Shared {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+pub(crate) type Picture = slint::SharedPixelBuffer<slint::Rgba8Pixel>;
+
+/// What opening and playing a video gives, in this order.
+pub(crate) enum Event {
+    /// Facts about it, its first picture and its decoder.
+    Opened(Vec<(String, String)>, Picture, Video),
+    /// Its sound, and why there is none if it cannot be read.
+    Sound(Pcm, Option<String>),
+    Picture(Picture),
+    /// It cannot be read; nothing follows.
+    Failed(String),
+}
+
+/// Opens a video in the background. `event` is called from other threads, and
+/// gives whether the events are still wanted. The decoder runs until the
+/// [`Video`] is dropped.
+pub(crate) fn open_video(
+    vpath: String,
+    game_dir: Option<PathBuf>,
+    keys: Option<Arc<GtaVKeys>>,
+    event: impl Fn(Event) -> bool + Send + Clone + 'static,
+) {
+    std::thread::spawn(move || {
+        let opened = (|| -> anyhow::Result<_> {
+            let game_dir = game_dir.ok_or_else(|| anyhow::anyhow!("no game folder"))?;
+            let data = Shared(Arc::new(read_vpath(&game_dir, &vpath, keys)?));
+            let rows = openrage_app::media::rows(data.as_ref())?;
+            let mut player = Player::new(data.clone())?;
+            player.seek(0)?;
+            Ok((rows, player, data))
+        })();
+        let (rows, mut player, data) = match opened {
+            Ok(v) => v,
+            Err(e) => {
+                event(Event::Failed(format!("{e:#}")));
+                return;
+            }
+        };
+        let job = Arc::new((Mutex::new(Job::Show(0)), Condvar::new()));
+        let video =
+            Video { job: Arc::clone(&job), fps: player.video.frames_per_second(), frames: player.video.frames() };
+        if !event(Event::Opened(rows, picture(&player), video)) {
+            return;
+        }
+        // The sound of a long video takes a while: the picture is there meanwhile.
+        let (file, event_of_sound) = (player.video.clone(), event.clone());
+        std::thread::spawn(move || {
+            let (pcm, error) = sound(&file, data.as_ref());
+            event_of_sound(Event::Sound(pcm, error));
+        });
+        decode_loop(&mut player, &job, |player| {
+            event(Event::Picture(picture(player)));
+        });
+    });
+}
+
+/// Selecting a video: its first picture and the player.
 pub(crate) fn start_video_preview(ui: &AppWindow, vpath: String, info: Meta, generation: u64) {
     let (counter, game_dir, keys) =
         with_app(|a| (Arc::clone(&a.preview_generation), a.game_dir.clone(), a.keys.clone()));
     ui.set_preview_loading(true);
     let weak = ui.as_weak();
-    std::thread::spawn(move || {
-        let current = || counter.load(Ordering::SeqCst) == generation;
-        let mut meta = info;
-        let opened = (|| -> anyhow::Result<_> {
-            let game_dir = game_dir.ok_or_else(|| anyhow::anyhow!("no game folder"))?;
-            let data = read_vpath(&game_dir, &vpath, keys)?;
-            if !current() {
-                return Ok(None);
-            }
-            meta.extend(openrage_app::media::rows(&vpath, &data)?);
-            let mut player = Player::new(data)?;
-            player.seek(0)?;
-            let image = picture(&player);
-            let (pcm, error) = sound(&player.video, player.data());
-            Ok(Some((player, image, pcm, error)))
-        })();
-        if !current() {
-            return;
-        }
-        let (mut player, image, pcm, sound_error) = match opened {
-            Ok(Some(v)) => v,
-            Ok(None) => return,
-            Err(e) => {
-                meta.push(kv("Error", format!("{e:#}")));
-                let _ = weak.upgrade_in_event_loop(move |ui| {
-                    if counter.load(Ordering::SeqCst) == generation {
-                        ui.set_preview_loading(false);
-                        with_app(|a| a.play_when_ready = false);
-                        set_meta(&ui, &meta);
+    open_video(vpath, game_dir, keys, move |event| {
+        let info = info.clone();
+        let here = Arc::clone(&counter);
+        counter.load(Ordering::SeqCst) == generation
+            && weak
+                .upgrade_in_event_loop(move |ui| {
+                    if here.load(Ordering::SeqCst) == generation {
+                        preview_event(&ui, event, info);
                     }
-                });
-                return;
-            }
-        };
-        if let Some(e) = sound_error {
-            meta.push(kv("Sound", e));
-        }
-        let job = Arc::new((Mutex::new(Job::Show(0)), Condvar::new()));
-        let video =
-            Video { job: Arc::clone(&job), fps: player.video.frames_per_second(), frames: player.video.frames() };
-        let shown = weak.upgrade_in_event_loop({
-            let counter = Arc::clone(&counter);
-            move |ui| {
-                if counter.load(Ordering::SeqCst) != generation {
-                    return; // drops the video, which ends its thread
-                }
-                ui.set_preview_loading(false);
-                set_meta(&ui, &meta);
-                ui.set_preview_image(slint::Image::from_rgba8(image));
-                ui.set_has_image(true);
-                with_app(|a| {
-                    a.sound = Some(Arc::new(pcm));
-                    a.sound_start = 0.0;
-                    a.video = Some(video);
-                });
-                ui.set_video_mode(true);
-                ui.set_audio_mode(true);
-                ui.set_audio_has_prev(false);
-                ui.set_audio_has_next(false);
-                update_sound_ui(&ui);
-                if with_app(|a| std::mem::take(&mut a.play_when_ready)) {
-                    toggle_sound(&ui);
-                }
-            }
-        });
-        if shown.is_err() {
-            return;
-        }
-        decode_loop(&mut player, &job, |player| {
-            let image = picture(player);
-            let counter = Arc::clone(&counter);
-            let _ = weak.upgrade_in_event_loop(move |ui| {
-                if counter.load(Ordering::SeqCst) == generation {
-                    ui.set_preview_image(slint::Image::from_rgba8(image));
-                }
-            });
-        });
+                })
+                .is_ok()
     });
 }
 
+fn preview_event(ui: &AppWindow, event: Event, mut meta: Meta) {
+    match event {
+        Event::Opened(rows, image, video) => {
+            ui.set_preview_loading(false);
+            meta.extend(rows);
+            set_meta(ui, &meta);
+            ui.set_preview_image(slint::Image::from_rgba8(image));
+            ui.set_has_image(true);
+            ui.set_video_mode(true);
+            with_app(|a| a.video = Some(video));
+            if with_app(|a| std::mem::take(&mut a.play_when_ready)) {
+                player::open_selected(ui);
+            }
+        }
+        Event::Sound(pcm, error) => {
+            if let Some(e) = error {
+                ui.set_status(format!("The sound of this video cannot be read: {e}").into());
+            }
+            with_app(|a| {
+                a.sound = Some(Arc::new(pcm));
+                a.sound_start = 0.0;
+            });
+            ui.set_audio_mode(true);
+            ui.set_audio_has_prev(false);
+            ui.set_audio_has_next(false);
+            update_sound_ui(ui);
+        }
+        Event::Picture(image) => ui.set_preview_image(slint::Image::from_rgba8(image)),
+        Event::Failed(e) => {
+            meta.push(kv("Error", e));
+            ui.set_preview_loading(false);
+            with_app(|a| a.play_when_ready = false);
+            set_meta(ui, &meta);
+        }
+    }
+}
+
 /// Decodes towards the wanted frame and shows it, until told to stop.
-fn decode_loop(player: &mut Player<Vec<u8>>, job: &(Mutex<Job>, Condvar), mut show: impl FnMut(&Player<Vec<u8>>)) {
+fn decode_loop(player: &mut Player<Shared>, job: &(Mutex<Job>, Condvar), mut show: impl FnMut(&Player<Shared>)) {
     let (lock, changed) = job;
     let mut shown = player.position();
     let mut shown_at = Instant::now();

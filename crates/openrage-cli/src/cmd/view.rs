@@ -615,11 +615,11 @@ pub(crate) fn cmd_media(
         Node::Gta4File(a, id) => a.read(id)?,
         _ => bail!("{path} is not a file"),
     };
-    for (k, v) in openrage_app::media::rows(path, &data)? {
+    for (k, v) in openrage_app::media::rows(&data)? {
         outln!("{k:<14}{v}");
     }
     if let Some(dir) = frames {
-        let mut player = rage_formats::bink2::Player::new(&data)?;
+        let mut player = rage_formats::bink::Player::new(&data)?;
         fs::create_dir_all(dir)?;
         let total = player.video.frames();
         for i in 0..total {
@@ -632,7 +632,7 @@ pub(crate) fn cmd_media(
         outln!("Wrote {} of {total} frames to {}", total.div_ceil(every.max(1)), dir.display());
     }
     if let Some(out) = wav {
-        let video = rage_formats::bink2::read(&data)?;
+        let video = rage_formats::bink::read(&data)?;
         if video.tracks.is_empty() {
             bail!("{path} has no sound");
         }

@@ -1,5 +1,6 @@
 //! Debug snapshots of the window (`OPENRAGE_DEBUG_*`), for checking the UI without a screen.
 
+#[cfg(debug_assertions)]
 use crate::*;
 
 /// Development aid (debug builds only): `OPENRAGE_SNAPSHOT=out.png` saves an
@@ -288,6 +289,7 @@ pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
     slint::Timer::single_shot(Duration::from_secs(wait), move || {
         let Some(ui) = weak.upgrade() else { return };
         let snap = match (viewer::newest(), editor::newest(), history::window()) {
+            _ if let Some(p) = player::newest() => p.window().take_snapshot(),
             _ if let Some(x) = xmlview::newest() => {
                 if let Ok(tab) = std::env::var("OPENRAGE_TAB") {
                     x.set_tab(tab.parse().unwrap_or(0));

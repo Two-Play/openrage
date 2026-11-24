@@ -1,6 +1,6 @@
 //! Bit reader, least significant bit first.
 
-use super::tables::Vlc;
+use super::tables2::Vlc;
 
 /// Reads past the end give zeros; [`Bits::overread`] tells.
 pub struct Bits<'a> {
