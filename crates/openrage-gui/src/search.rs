@@ -3,31 +3,66 @@
 use crate::*;
 
 pub(crate) fn start_index_update(ui: &AppWindow) {
-    let Some((game_dir, keys)) = with_app(|a| {
-        if a.index_running {
-            return None;
+    let Some((game_dir, keys, cancel)) = with_app(|a| {
+        let dir = a.game_dir.clone()?;
+        if let Some((running, cancel)) = &a.index_running {
+            if *running == dir {
+                return None;
+            }
+            // Another game was opened meanwhile: its index comes first.
+            cancel.store(true, Ordering::Relaxed);
         }
-        a.index_running = true;
-        a.game_dir.clone().map(|d| (d, a.keys.clone()))
+        let cancel = Arc::new(AtomicBool::new(false));
+        a.index_running = Some((dir.clone(), Arc::clone(&cancel)));
+        Some((dir, a.keys.clone(), cancel))
     }) else {
         return;
     };
     let weak = ui.as_weak();
     ui.set_index_status("Index: checking…".into());
+    ui.set_index_running(true);
+    ui.set_index_stopped(false);
+    ui.set_index_progress(-1.0);
     std::thread::spawn(move || {
-        let status = |text: String| {
-            let _ = weak.upgrade_in_event_loop(move |ui| ui.set_index_status(text.into()));
+        let current = Arc::clone(&cancel);
+        let status = |text: String, progress: f32| {
+            if !cancel.load(Ordering::Relaxed) {
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_index_status(text.into());
+                    ui.set_index_progress(progress);
+                });
+            }
         };
+        let mut stopped = false;
         let result = (|| -> Result<rage_index::IndexStats, rage_index::IndexError> {
+            // One update at a time: a stopped one still writes what it has.
+            static UPDATING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _updating = UPDATING.lock().unwrap_or_else(|e| e.into_inner());
             let path = index_path(&game_dir).ok_or_else(|| std::io::Error::other("no cache directory"))?;
             let mut index = Index::open(&path)?;
             let mut last = Instant::now();
-            index.update(&game_dir, keys, &AtomicBool::new(false), &mut |p| {
+            let stats = index.update(&game_dir, keys, &cancel, &mut |p| {
                 if last.elapsed() > Duration::from_millis(200) {
                     last = Instant::now();
-                    status(format!("Indexing {}/{} archives…", p.archives_done, p.archives_total));
+                    let part = p.bytes_done as f32 / p.bytes_total.max(1) as f32;
+                    status(
+                        format!(
+                            "Indexing: {:.0} % · {} of {} archives · {} entries",
+                            (part * 100.0).floor(),
+                            p.archives_done,
+                            p.archives_total,
+                            p.entries
+                        ),
+                        part,
+                    );
                 }
             })?;
+            stopped = stats.cancelled;
+            let due = stats.archives_indexed > 0 || !openrage_app::rpf9::knows_names();
+            if !stopped && due && detect::is_gta6_dir(&game_dir) {
+                // Names are a help, not needed.
+                let _ = openrage_app::rpf9::learn_names(&mut index);
+            }
             // Names of models, textures, … so hashes in metadata read as names.
             if let Ok(names) = index.known_names() {
                 rage_formats::names::register(names);
@@ -35,14 +70,40 @@ pub(crate) fn start_index_update(ui: &AppWindow) {
             index.stats()
         })();
         let text = match result {
+            Ok(s) if stopped => format!("Index stopped: {} entries so far", s.entries),
             Ok(s) => format!("Index: {} entries", s.entries),
             Err(e) => format!("Index error: {e}"),
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {
-            with_app(|a| a.index_running = false);
-            ui.set_index_status(text.into());
+            // The status belongs to the newest run.
+            let newest = with_app(|a| {
+                let newest = a.index_running.as_ref().is_some_and(|(_, c)| Arc::ptr_eq(c, &current));
+                if newest {
+                    a.index_running = None;
+                }
+                newest
+            });
+            if newest {
+                ui.set_index_status(text.into());
+                ui.set_index_running(false);
+                ui.set_index_stopped(stopped);
+            }
         });
     });
+}
+
+/// Stops the update of the index; what is read by then stays in it.
+pub(crate) fn stop_index_update(ui: &AppWindow) {
+    let running = with_app(|a| {
+        let (_, cancel) = a.index_running.as_ref()?;
+        cancel.store(true, Ordering::Relaxed);
+        Some(())
+    });
+    if running.is_some() {
+        openrage_app::rpf9::stop_background();
+        ui.set_index_status("Index: stopping…".into());
+        ui.set_index_running(false);
+    }
 }
 
 pub(crate) fn start_search(ui: &AppWindow, query: String, record: bool) {
@@ -59,18 +120,21 @@ pub(crate) fn start_search(ui: &AppWindow, query: String, record: bool) {
         let result = index_path(&game_dir)
             .ok_or_else(|| "no cache directory".to_owned())
             .and_then(|p| Index::open(&p).map_err(|e| e.to_string()))
-            .and_then(|idx| match idx.stats() {
-                Ok(s) if s.updated_at.is_none() => {
-                    Err("the search index is still being built — please try again in a moment".to_owned())
+            .and_then(|idx| {
+                let results = idx.search(&query, 1000, language.as_deref()).map_err(|e| e.to_string())?;
+                // What is indexed already can be searched meanwhile.
+                let complete = idx.is_complete().unwrap_or(true);
+                if !complete && results.hits.is_empty() {
+                    return Err("the search index is still being built — please try again in a moment".to_owned());
                 }
-                _ => idx.search(&query, 1000, language.as_deref()).map_err(|e| e.to_string()),
+                Ok((results, complete))
             });
         let ms = started.elapsed().as_millis();
         if counter.load(Ordering::SeqCst) != generation {
             return;
         }
         let _ = weak.upgrade_in_event_loop(move |ui| match result {
-            Ok(results) => show_search_results(&ui, query, results, ms, record),
+            Ok((results, complete)) => show_search_results(&ui, query, results, complete, ms, record),
             Err(e) => show_error(&ui, format!("Search failed: {e}")),
         });
     });
@@ -80,6 +144,7 @@ pub(crate) fn show_search_results(
     ui: &AppWindow,
     query: String,
     results: rage_index::SearchResults,
+    complete: bool,
     ms: u128,
     record: bool,
 ) {
@@ -123,6 +188,9 @@ pub(crate) fn show_search_results(
         items.len(),
         if results.limited { " (first 1000)" } else { "" }
     ));
+    if !complete {
+        summary.push_str(" · the index is still being built, there may be more");
+    }
     let vpath = format!("?{query}");
     with_app(|a| {
         if record {

@@ -18,6 +18,7 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
     let data = match node {
         Node::ArchiveFile(rpf, id) => rpf.read(id)?,
         Node::PlainFile(p) => std::fs::read(p)?,
+        Node::Rpf9File(rpf, i) => rpf.read_at(i)?,
         _ => bail!("{vpath} is not a file"),
     };
     parse(data, keys.as_deref())

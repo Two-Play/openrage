@@ -65,6 +65,8 @@ pub(crate) enum PreviewSource {
     Entry(Arc<Rpf7>, EntryId),
     /// A file in a Red Dead Redemption 2 archive (index into its entries).
     Rpf8(Arc<rage_rpf::Rpf8>, usize),
+    /// A recovered file of a GTA VI archive (index into its entries).
+    Rpf9(Arc<rage_rpf::Rpf9>, usize),
     /// A file in a GTA IV archive.
     Gta4(Arc<rage_rpf::Gta4Archive>, rage_rpf::Gta4EntryId),
     /// A texture of an opened texture dictionary (index into its textures).
@@ -127,6 +129,10 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
             (Location::Rpf8(rpf, dir), _) if item.kind != ItemKind::Dir => {
                 rpf.find(&browser::join(dir, &item.name)).map(|i| PreviewSource::Rpf8(Arc::clone(rpf), i))
             }
+            (Location::Rpf9(rpf, dir), _) if item.kind != ItemKind::Dir => rpf
+                .loaded()
+                .and_then(|entries| rpf.find(&entries, &browser::join(dir, &item.name)))
+                .map(|i| PreviewSource::Rpf9(Arc::clone(rpf), i)),
             (Location::Gta4(a, dir), _) if item.kind != ItemKind::Dir => {
                 a.find_child(*dir, &item.name).map(|i| PreviewSource::Gta4(Arc::clone(a), i))
             }
@@ -155,6 +161,8 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
         info.push(kv(if is_version { "Version" } else { "Details" }, &item.info));
     }
     set_info(ui, &item.name, &vpath, &info, badges::icon(&item.name, item.kind));
+    // What was loading belongs to the row before.
+    ui.set_preview_loading(false);
     ui.set_preview_text(SharedString::new());
     ui.set_has_image(false);
     ui.set_model_mode(false);
@@ -162,7 +170,11 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
     with_app(|a| a.model = None);
     stop_sound(ui);
     ui.set_audio_mode(false);
-    with_app(|a| a.sound = None);
+    ui.set_video_mode(false);
+    with_app(|a| {
+        a.sound = None;
+        a.video = None;
+    });
     ui.set_suggestions(ModelRc::default());
     ui.set_suggest_title(SharedString::new());
     ui.set_suggest_pending(false);
@@ -177,7 +189,7 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
         return;
     }
     if browser::is_audio(&item.name) && item.kind == ItemKind::File && item.mark != Some(Mark::Removed) {
-        show_audio_container(ui, vpath.clone(), info);
+        show_audio_container(ui, vpath.clone(), info, generation);
         return;
     }
     if item.kind == ItemKind::Sound {
@@ -189,6 +201,10 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
             let index = with_app(|a| a.selected).unwrap_or(0);
             start_sound_preview(ui, awc, index, info, generation);
         }
+        return;
+    }
+    if browser::is_video(&item.name) && item.kind == ItemKind::File && item.mark != Some(Mark::Removed) {
+        start_video_preview(ui, vpath.clone(), info, generation);
         return;
     }
     if is_model_item(&item) {
@@ -207,8 +223,17 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
     let plugin = (matches!(item.kind, ItemKind::File | ItemKind::Resource) && !badges::is_known(&item.name))
         .then(|| plugins::previews(&item.name))
         .flatten();
+    let nameless = may_be_video(row);
     let game = plugins::GameContext { dir: with_app(|a| a.game_dir.clone()), keys: keys.clone() };
     std::thread::spawn(move || {
+        if nameless && is_video_source(&source) {
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if counter.load(Ordering::SeqCst) == generation {
+                    start_video_preview(&ui, vpath, info, generation);
+                }
+            });
+            return;
+        }
         let mut from_plugin = plugin.and_then(|(id, specific)| plugin_preview(&id, specific, &game, &vpath));
         // A plugin's 3D model goes to the model view.
         if let Some(model) = from_plugin.as_mut().and_then(|p| p.model.take()) {
@@ -236,6 +261,7 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
             if counter.load(Ordering::SeqCst) != generation {
                 return;
             }
+            with_app(|a| a.play_when_ready = false);
             if !extra.is_empty() {
                 set_meta(&ui, &info.iter().cloned().chain(extra).collect());
             }
@@ -253,6 +279,32 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
             ui.set_preview_loading(false);
         });
     });
+}
+
+/// Whether the row is a file whose name does not tell what it is. RDR2's
+/// videos have no names, for example.
+pub(crate) fn may_be_video(row: usize) -> bool {
+    with_app(|a| {
+        let listing = a.listing.as_ref()?;
+        let item = listing.items.get(*a.visible.get(row)?)?;
+        Some(item.kind == ItemKind::File && !item.name.contains('.'))
+    }) == Some(true)
+}
+
+/// Whether the file is a video, by its first bytes.
+fn is_video_source(source: &PreviewSource) -> bool {
+    use rage_formats::bink::is_bink;
+    match source {
+        PreviewSource::Rpf8(rpf, i) => {
+            rpf.entries().and_then(|e| e.get(*i)).and_then(|e| rpf.read(e).ok()).is_some_and(|d| is_bink(&d))
+        }
+        PreviewSource::DiskFile(path) => {
+            let mut start = [0; 4];
+            std::fs::File::open(path).and_then(|mut f| std::io::Read::read_exact(&mut f, &mut start)).is_ok()
+                && is_bink(&start)
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn texture_info(t: &rage_formats::texture::Texture) -> Meta {
@@ -321,6 +373,12 @@ pub(crate) fn texture_image(t: &rage_formats::texture::Texture) -> Option<Rgba> 
 /// Preview with an optional image: textures and texture dictionaries show a picture.
 pub(crate) fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, String, Option<Rgba>) {
     match source {
+        PreviewSource::Rpf9(rpf, i) if rpf9_texture_dict(&rpf, i) => {
+            match openrage_app::textures::gta6_dictionary(&rpf, i) {
+                Ok(dict) => texture_dict_preview(&dict),
+                Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new(), None),
+            }
+        }
         PreviewSource::Texture(dict, idx) => match dict.textures.get(idx) {
             Some(t) => {
                 let image = texture_image(t);
@@ -352,12 +410,6 @@ pub(crate) fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -
                 Err(e) => (vec![kv("Error", e)], String::new(), None),
             }
         }
-        PreviewSource::Entry(rpf, id) if rpf.entry(id).name.to_ascii_lowercase().ends_with(".bik") => {
-            let name = rpf.entry(id).name.clone();
-            let (meta, body) = load_preview_text(PreviewSource::Entry(Arc::clone(&rpf), id), keys);
-            let frame = rpf.read(id).ok().and_then(|d| video_frame(&name, &d));
-            (meta, body, frame)
-        }
         other => {
             let (meta, body) = load_preview_text(other, keys);
             (meta, body, None)
@@ -365,61 +417,33 @@ pub(crate) fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -
     }
 }
 
-/// A frame from the middle of a Bink video, if FFmpeg is installed (it
-/// decodes Bink; OpenRAGE has no decoder of its own).
-pub(crate) fn video_frame(name: &str, data: &[u8]) -> Option<Rgba> {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-    let b = rage_formats::media::bink(data).ok()?;
-    if b.width == 0 || b.height == 0 {
-        return None;
-    }
-    let (w, h) = (640u32.min(b.width), (640u32.min(b.width) * b.height / b.width).max(1) & !1);
-    let dir = std::env::temp_dir().join("openrage-preview");
-    std::fs::create_dir_all(&dir).ok()?;
-    let file = dir.join(format!("{:08x}.bik", rage_core::hash::joaat(name)));
-    std::fs::File::create(&file).ok()?.write_all(data).ok()?;
-    let output = Command::new("ffmpeg")
-        .args(["-v", "error", "-ss", &format!("{:.2}", b.duration() / 2.0), "-i"])
-        .arg(&file)
-        .args(["-frames:v", "1", "-vf", &format!("scale={w}:{h}"), "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok();
-    let _ = std::fs::remove_file(&file);
-    let pixels = output?.stdout;
-    (pixels.len() == (w * h * 4) as usize).then_some((w, h, pixels))
-}
-
 /// Returns (metadata, preview body).
 pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, String) {
     match source {
-        PreviewSource::Virtual { game_dir, vpath, query, overlay } => match if overlay {
+        PreviewSource::Virtual { game_dir, vpath, query: Some(query), overlay } => {
+            let matching = vfs::resolve(&game_dir, &vpath, keys.clone())
+                .ok()
+                .and_then(|node| rage_index::snippet(&rage_index::node_text(&node)?, &query));
+            let (mut meta, body) =
+                load_preview_text(PreviewSource::Virtual { game_dir, vpath, query: None, overlay }, keys);
+            if let Some(line) = matching {
+                meta.insert(0, kv("Match", line));
+            }
+            (meta, body)
+        }
+        PreviewSource::Virtual { game_dir, vpath, query: None, overlay } => match if overlay {
             rage_mods::resolve(&game_dir, &vpath, keys.clone()).map(|(n, _)| n)
         } else {
             vfs::resolve(&game_dir, &vpath, keys.clone())
         } {
-            Ok(Node::ArchiveFile(rpf, id)) => {
-                let (mut meta, body) = load_preview_text(PreviewSource::Entry(Arc::clone(&rpf), id), keys);
-                if let Some(q) = query {
-                    let name = rpf.entry(id).name.clone();
-                    let line = rpf
-                        .read(id)
-                        .ok()
-                        .and_then(|d| rage_index::content_for(&name, &d))
-                        .and_then(|(text, _)| rage_index::snippet(&text, &q));
-                    if let Some(line) = line {
-                        meta.insert(0, kv("Match", line));
-                    }
-                }
-                (meta, body)
-            }
+            Ok(Node::ArchiveFile(rpf, id)) => load_preview_text(PreviewSource::Entry(rpf, id), keys),
             Ok(Node::ArchiveDir(rpf, id)) if id == Rpf7::ROOT => (archive_info(&rpf), String::new()),
             Ok(Node::ArchiveDir(..)) | Ok(Node::Dir(_)) => (Meta::new(), String::new()),
             Ok(Node::PlainFile(p)) => load_preview_text(PreviewSource::DiskFile(p), keys),
             Ok(Node::Rpf8File(rpf, i)) => rpf8_preview(&rpf, i),
             Ok(Node::Rpf8Dir(..)) => (Meta::new(), String::new()),
+            Ok(Node::Rpf9File(rpf, i)) => rpf9_preview(&rpf, i),
+            Ok(Node::Rpf9Dir(rpf, dir)) if dir.is_empty() => (rpf9_archive_info(&rpf), String::new()),
             Ok(Node::Gta4File(a, i)) => gta4_preview(&a, i),
             Ok(Node::Gta4Dir(a, i)) if i == rage_rpf::Gta4Archive::ROOT => (gta4_archive_info(&a), String::new()),
             Ok(Node::Gta4Dir(..)) => (Meta::new(), String::new()),
@@ -427,6 +451,7 @@ pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys
             Err(e) => (vec![kv("Error", e)], String::new()),
         },
         PreviewSource::Rpf8(rpf, i) => rpf8_preview(&rpf, i),
+        PreviewSource::Rpf9(rpf, i) => rpf9_preview(&rpf, i),
         PreviewSource::Gta4(a, i) => gta4_preview(&a, i),
         PreviewSource::Texture(..) => (Meta::new(), String::new()),
         PreviewSource::DiskFile(path)
@@ -468,6 +493,31 @@ pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys
                 Err(e) => (vec![kv("Error", e)], String::new()),
             }
         }
+        // GTA VI: a texture pool.
+        PreviewSource::DiskArchive(path) if browser::is_texture_pool(&path.to_string_lossy()) => {
+            match rage_formats::ttpf::Pool::open(&path) {
+                Ok(pool) => {
+                    let plain = (0..pool.len()).filter(|i| pool.descriptor(*i).is_some_and(|d| d.is_2d())).count();
+                    let meta = vec![
+                        kv("Format", "Texture pool (GTA VI)"),
+                        kv("Textures", grouped(pool.len())),
+                        kv("Arrays, cube maps, volumes", grouped(pool.len() - plain)),
+                        note(
+                            "Opens as folders of 64 textures. Textures have no names here, only numbers. \
+                             Arrays, cube maps and volumes are not read yet; textures packed with BCPack \
+                             are shown from their largest level that is not.",
+                        ),
+                    ];
+                    (meta, String::new())
+                }
+                Err(e) => (vec![kv("Error", e)], String::new()),
+            }
+        }
+        // GTA VI: RPF9. Described from its header and a stored index: no scan here.
+        PreviewSource::DiskArchive(path) if rage_rpf::Rpf9::file_is_rpf9(&path) => match rage_rpf::Rpf9::open(&path) {
+            Ok(rpf) => (rpf9_archive_info(&rpf), String::new()),
+            Err(e) => (vec![kv("Error", e)], String::new()),
+        },
         // RDR2: RPF8, not RPF7.
         PreviewSource::DiskArchive(path) if rage_rpf::Rpf8::file_is_rpf8(&path) => {
             match rage_rpf::Rpf8::open_default(&path) {
@@ -495,14 +545,12 @@ pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys
             if openrage_app::media::is_media(&entry.name)
                 && let Ok(data) = rpf.read(id)
             {
-                return match openrage_app::media::rows(&entry.name, &data) {
+                return match openrage_app::media::rows(&data) {
                     Ok(rows) => {
                         let mut meta: Meta = rows.into_iter().filter(|(_, v)| !v.is_empty()).collect();
-                        meta.push(note(if entry.name.to_ascii_lowercase().ends_with(".bik") {
-                            "Double-click plays it in your video player (VLC, mpv and other FFmpeg-based players play Bink)."
-                        } else {
-                            "Right-click → Export as SWF… opens it in Flash tools such as JPEXS or Ruffle."
-                        }));
+                        meta.push(note(
+                            "Right-click → Export as SWF… opens it in Flash tools such as JPEXS or Ruffle.",
+                        ));
                         (meta, String::new())
                     }
                     Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new()),
@@ -765,6 +813,121 @@ pub(crate) fn gta4_preview(a: &rage_rpf::Gta4Archive, i: rage_rpf::Gta4EntryId) 
             }
         }
         rage_rpf::Gta4EntryKind::Dir { .. } => (meta, String::new()),
+    }
+}
+
+/// Overview of a GTA VI archive (RPF9): what was recovered, if it has been
+/// indexed already. Never starts the scan.
+pub(crate) fn rpf9_archive_info(rpf: &rage_rpf::Rpf9) -> Meta {
+    use openrage_app::extract::human_size;
+    let mut meta = vec![
+        kv("Format", "RPF9 (GTA VI)"),
+        kv("Data", human_size(rpf.data_len())),
+        kv("Declared index slots", grouped(rpf.header().entry_count as usize)),
+        kv("TOC transform tag", format!("{:#04x}", rpf.header().toc_transform)),
+    ];
+    match openrage_app::rpf9::known_entries(rpf) {
+        Some(entries) => {
+            let c = openrage_app::rpf9::coverage(rpf, &entries);
+            meta.push(kv(if rpf.is_native() { "Files" } else { "Recovered files" }, grouped(c.files as usize)));
+            meta.push(kv("Unpacked", human_size(c.unpacked)));
+            if rpf.is_native() {
+                meta.push(note(
+                    "Read with the game's executable. The table holds only hashes of names: files whose name is \
+                     not known are under entries/.",
+                ));
+                return meta;
+            }
+            meta.push(kv("Not read", human_size(c.unread)));
+        }
+        None => meta.push(note(
+            "Not indexed yet: opening it reads the whole archive once, which takes a while for large ones.",
+        )),
+    }
+    meta.push(note(
+        "The table of contents is encrypted, so names and folders are unknown. Files are found in the data itself \
+         and named by their offset; data that is neither zlib, Bink 2 nor an audio container is not listed. \
+         Recovered streams do not correspond one-to-one to the declared index slots.",
+    ));
+    meta
+}
+
+/// Whether an entry of a GTA VI archive is a texture dictionary.
+fn rpf9_texture_dict(rpf: &rage_rpf::Rpf9, i: usize) -> bool {
+    let name = rpf.loaded().and_then(|entries| Some(rpf.entry_name(entries.get(i)?)));
+    name.is_some_and(|name| browser::is_texture_dict(&name))
+}
+
+/// Facts about a recovered file of a GTA VI archive, and the start of it as
+/// text or hex.
+pub(crate) fn rpf9_preview(rpf: &rage_rpf::Rpf9, i: usize) -> (Meta, String) {
+    let Some(entries) = rpf.loaded() else { return (Meta::new(), String::new()) };
+    let Some(e) = entries.get(i) else { return (Meta::new(), String::new()) };
+    let mut meta = vec![
+        kv("Offset", format!("0x{:x}", e.offset)),
+        kv("Stored", openrage_app::extract::human_size(e.stored)),
+        kv(
+            "Stored as",
+            match e.kind {
+                rage_rpf::rpf9::Kind::Bink2 => "Bink 2 video".to_owned(),
+                rage_rpf::rpf9::Kind::Awc => "audio container".to_owned(),
+                rage_rpf::rpf9::Kind::Zlib if e.streams > 1 => format!("{} zlib streams", e.streams),
+                rage_rpf::rpf9::Kind::Zlib => "zlib stream".to_owned(),
+                rage_rpf::rpf9::Kind::Native { slot } => format!("slot {slot}"),
+            },
+        ),
+    ];
+    if let Some((system, graphics)) = rpf.resource_parts(e) {
+        meta.push(kv("System part", openrage_app::extract::human_size(system)));
+        meta.push(kv("Graphics part", openrage_app::extract::human_size(graphics)));
+    }
+    if openrage_app::metadata::is_metadata(&rpf.entry_name(e))
+        && e.size <= 64 << 20
+        && let Ok(xml) = openrage_app::metadata::from_rpf9(rpf, i)
+    {
+        let (more, text) = metadata_lines(xml);
+        meta.extend(more);
+        return (meta, text);
+    }
+    if matches!(e.kind, rage_rpf::rpf9::Kind::Bink2 | rage_rpf::rpf9::Kind::Awc) || rpf.is_archive(e) {
+        return (meta, String::new());
+    }
+    // The start is enough for a look; large files are not unpacked whole.
+    let mut start = Vec::new();
+    let mut limited = LimitedWriter { out: &mut start, left: 1 << 20 };
+    match rpf.copy_to(e, &mut limited) {
+        Ok(_) => {}
+        Err(_) if limited.left == 0 => meta.push(note("Showing the start; Extract… saves all of it.")),
+        Err(err) => {
+            meta.push(kv("Error", err));
+            return (meta, String::new());
+        }
+    }
+    // A start that was cut off ends in the middle of a string.
+    let whole = start.iter().rposition(|b| *b == 0).map_or(&start[..], |end| &start[..=end]);
+    let text = crate::docs::zero_ended_strings(whole);
+    (meta, preview::render(text.as_deref().unwrap_or(&start)))
+}
+
+/// Takes up to `left` bytes, then fails, which ends the unpacking.
+struct LimitedWriter<'a> {
+    out: &'a mut Vec<u8>,
+    left: usize,
+}
+
+impl std::io::Write for LimitedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.left == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        let n = buf.len().min(self.left);
+        self.out.extend_from_slice(&buf[..n]);
+        self.left -= n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

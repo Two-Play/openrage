@@ -3981,10 +3981,11 @@ dependencies = [
 
 [[package]]
 name = "openrage-app"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "flate2",
  "memchr",
  "openrage-plugins",
  "png",
@@ -4003,7 +4004,7 @@ dependencies = [
 
 [[package]]
 name = "openrage-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4022,7 +4023,7 @@ dependencies = [
 
 [[package]]
 name = "openrage-gui"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4049,7 +4050,7 @@ dependencies = [
 
 [[package]]
 name = "openrage-plugins"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -4067,6 +4068,12 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "opus-rs"
+version = "0.1.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bafbcaf2ed381cdf68ced4ed8d16517de90ffd7424e36f0b9e45d67fbe30b1f9"
 
 [[package]]
 name = "orbclient"
@@ -4528,11 +4535,11 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rage-core"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "rage-crypto"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes",
  "flate2",
@@ -4543,10 +4550,11 @@ dependencies = [
 
 [[package]]
 name = "rage-formats"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "flate2",
  "lewton",
+ "opus-rs",
  "png",
  "rage-core",
  "rage-resource",
@@ -4559,11 +4567,13 @@ dependencies = [
 
 [[package]]
 name = "rage-index"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "flate2",
  "rage-core",
  "rage-crypto",
+ "rage-formats",
+ "rage-resource",
  "rage-rpf",
  "rayon",
  "rusqlite",
@@ -4572,7 +4582,7 @@ dependencies = [
 
 [[package]]
 name = "rage-mods"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "rage-crypto",
  "rage-rpf",
@@ -4580,7 +4590,7 @@ dependencies = [
 
 [[package]]
 name = "rage-resource"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "flate2",
  "thiserror 2.0.21",
@@ -4588,7 +4598,7 @@ dependencies = [
 
 [[package]]
 name = "rage-rpf"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "flate2",
  "memchr",
@@ -4604,7 +4614,7 @@ dependencies = [
 
 [[package]]
 name = "rage-tfit2"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "rand"

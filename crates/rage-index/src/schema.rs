@@ -5,7 +5,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Bump when the schema or the indexing rules change; older databases are rebuilt.
 /// 3: GTA IV audio entries are indexed by name (not only their hash).
 /// 4: RDR2 archives (RPF8) are indexed; indexes that skipped them are rebuilt.
-const SCHEMA_VERSION: &str = "4";
+/// 5: GTA VI archives (RPF9) are indexed; indexes that failed on them are rebuilt.
+const SCHEMA_VERSION: &str = "5";
 
 pub fn prepare(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;

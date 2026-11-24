@@ -11,7 +11,7 @@ use rage_crypto::GtaVKeys;
 
 #[cfg(feature = "rdr2")]
 use crate::Rpf8;
-use crate::{EntryId, Gta4Archive, Gta4EntryId, Rpf7, RpfError};
+use crate::{EntryId, Gta4Archive, Gta4EntryId, Rpf7, Rpf9, RpfError};
 
 /// What a virtual path points to. More variants appear with crate features
 /// (`rdr2`), so matches need a fallback arm.
@@ -37,6 +37,10 @@ pub enum Node {
     Gta4Dir(Arc<Gta4Archive>, Gta4EntryId),
     /// A file inside a GTA IV archive.
     Gta4File(Arc<Gta4Archive>, Gta4EntryId),
+    /// A folder of a GTA VI archive ("" for its top).
+    Rpf9Dir(Arc<Rpf9>, String),
+    /// A file of a GTA VI archive (index into its entries).
+    Rpf9File(Arc<Rpf9>, usize),
 }
 
 fn is_rpf(name: &str) -> bool {
@@ -68,6 +72,10 @@ pub fn resolve(root: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
             if Rpf8::file_is_rpf8(&next) {
                 let rest: Vec<String> = components.collect();
                 return resolve_rpf8(Arc::new(Rpf8::open_default(&next)?), &rest, vpath);
+            }
+            if Rpf9::file_is_rpf9(&next) {
+                let rest: Vec<String> = components.collect();
+                return resolve_rpf9(Arc::new(Rpf9::open(&next)?), &rest, vpath);
             }
             archive = Some(Arc::new(Rpf7::open(&next, keys.clone())?));
             break;
@@ -127,6 +135,41 @@ fn resolve_rpf8(mut archive: Arc<Rpf8>, rest: &[String], vpath: &str) -> Result<
         }
     }
     Ok(Node::Rpf8Dir(archive, dir))
+}
+
+/// Walks the rest of a path inside a GTA VI archive; nested archives are
+/// entered. The archive itself resolves without its entries; anything below
+/// needs them, which scans the archive if its own table cannot be read and no
+/// index is at hand.
+fn resolve_rpf9(mut archive: Arc<Rpf9>, rest: &[String], vpath: &str) -> Result<Node, RpfError> {
+    if rest.is_empty() {
+        return Ok(Node::Rpf9Dir(archive, String::new()));
+    }
+    let mut dir = String::new();
+    for (n, comp) in rest.iter().enumerate() {
+        if !dir.is_empty() {
+            dir.push('/');
+        }
+        dir.push_str(comp);
+        // Only the last component and archives on the way are entries.
+        if n + 1 < rest.len() && !is_rpf(comp) {
+            continue;
+        }
+        let entries = archive.entries()?;
+        let Some(i) = archive.find(&entries, &dir) else { continue };
+        if archive.is_archive(&entries[i]) {
+            archive = Arc::new(archive.open_child(&entries[i])?);
+            dir.clear();
+        } else if n + 1 == rest.len() {
+            return Ok(Node::Rpf9File(archive, i));
+        } else {
+            return Err(RpfError::NotFound(vpath.to_owned()));
+        }
+    }
+    if archive.is_dir(&archive.entries()?, &dir) {
+        return Ok(Node::Rpf9Dir(archive, dir.to_ascii_lowercase()));
+    }
+    Err(RpfError::NotFound(vpath.to_owned()))
 }
 
 /// Walks the rest of a path inside a GTA IV archive.

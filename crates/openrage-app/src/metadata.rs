@@ -12,7 +12,10 @@ use rage_resource::Resource;
 use rage_rpf::vfs::Node;
 
 /// Extensions of files that hold metadata.
-pub const EXTENSIONS: &[&str] = &["ymap", "ytyp", "ymt", "ymf", "cut", "pso"];
+pub const EXTENSIONS: &[&str] = &[
+    "ymap", "ytyp", "ymt", "ymf", "cut", "pso", "psin", "rbf0", "#mt", "#map", "#typ", "#ldb", "#ldbmt", "#as", "#cov",
+    "#kit", "#fc", "#lfc",
+];
 
 pub fn is_metadata(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -72,6 +75,11 @@ fn from_bytes_for(data: &[u8], rdr2: bool) -> Result<Xml> {
         }
         return from_resource(&res);
     }
+    if rage_formats::psin::is_psin(data) {
+        let psin = rage_formats::psin::parse(data)?;
+        let (text, errors) = psin.to_xml();
+        return Ok(Xml { text, encoding: Encoding::Pso, root: Some(psin.root_type()), errors });
+    }
     if rage_formats::pso::is_pso(data) {
         let pso = if rdr2 { rage_formats::pso::parse_rdr2(data)? } else { rage_formats::pso::parse(data)? };
         let (text, errors) = pso.to_xml();
@@ -109,6 +117,16 @@ pub fn from_rpf8(rpf: &rage_rpf::Rpf8, i: usize) -> Result<Xml> {
     from_bytes_rdr2(&rpf.read(entry)?)
 }
 
+/// Converts a metadata file in a GTA VI archive (resource or PSO) to XML.
+pub fn from_rpf9(rpf: &rage_rpf::Rpf9, i: usize) -> Result<Xml> {
+    match crate::rpf9::resource(rpf, i) {
+        Ok((system, graphics)) if rage_formats::meta::is_gta6(&system) => {
+            from_resource(&Resource { version: rage_formats::meta::VERSION_RDR2, system, graphics })
+        }
+        _ => from_bytes(&rpf.read_at(i)?),
+    }
+}
+
 /// Reads a metadata file (mods included) and converts it to XML.
 pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result<Xml> {
     let (node, _) = rage_mods::resolve(game_dir, vpath, keys)?;
@@ -116,6 +134,7 @@ pub fn load(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result
         Node::ArchiveFile(rpf, id) => rpf.read(id)?,
         Node::PlainFile(p) => std::fs::read(p)?,
         Node::Rpf8File(rpf, i) => return from_rpf8(&rpf, i),
+        Node::Rpf9File(rpf, i) => return from_rpf9(&rpf, i),
         _ => bail!("{vpath} is not a file"),
     };
     from_bytes(&data)

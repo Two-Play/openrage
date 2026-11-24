@@ -93,6 +93,12 @@ pub fn edit_textures(
     Ok((result, applied.path))
 }
 
+/// The textures of a GTA VI dictionary (`.#td`).
+pub fn gta6_dictionary(rpf: &rage_rpf::Rpf9, index: usize) -> Result<rage_formats::ytd::TextureDictionary> {
+    let (system, graphics) = crate::rpf9::resource(rpf, index)?;
+    Ok(rage_formats::td6::parse(&system, &graphics)?)
+}
+
 /// The extension of a GTA V model (`ydr`, `yft`, `ydd`) named by `vpath`.
 pub fn gta5_model_ext(vpath: &str) -> Option<&str> {
     let ext = vpath.rsplit('.').next()?;

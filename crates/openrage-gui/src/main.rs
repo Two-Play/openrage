@@ -16,12 +16,14 @@ mod debug;
 mod docs;
 mod editor;
 mod extract_ui;
+mod fly;
 mod gpu;
 mod history;
 mod model_ui;
 mod mods_ui;
 mod navigate;
 mod openformats_ui;
+mod player;
 mod plugins;
 mod plugins_ui;
 mod preview;
@@ -29,12 +31,14 @@ mod scene;
 mod search;
 mod setup_ui;
 mod sound_ui;
+mod stream;
 mod tools_ui;
 mod util;
+mod video_ui;
 mod viewer;
 mod xmlview;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -62,6 +66,7 @@ use about::*;
 use archive_ops::*;
 use asi_ui::*;
 use callbacks::*;
+#[cfg(debug_assertions)]
 use debug::*;
 use docs::*;
 use extract_ui::*;
@@ -75,6 +80,7 @@ use setup_ui::*;
 use sound_ui::*;
 use tools_ui::*;
 use util::*;
+use video_ui::start_video_preview;
 
 slint::include_modules!();
 
@@ -124,6 +130,8 @@ struct App {
     /// Play the selected sound as soon as it is decoded (double-click).
     play_when_ready: bool,
     audio_timer: slint::Timer,
+    /// The selected video; `sound` holds its sound.
+    video: Option<video_ui::Video>,
     /// The list in the preview area: models suggested for a clip dictionary
     /// (`suggest_ycd` set), or the sounds of an audio container (`suggest_awc`).
     suggestions: Vec<String>,
@@ -131,7 +139,8 @@ struct App {
     suggest_awc: String,
     /// Models for `suggest_ycd` are still being looked for.
     suggest_pending: bool,
-    index_running: bool,
+    /// The game whose index is being updated, and how to stop that.
+    index_running: Option<(PathBuf, Arc<AtomicBool>)>,
     /// Plugin package shown in the install dialog.
     plugin_package: Option<Arc<openrage_plugins::package::Package>>,
 }
@@ -156,6 +165,25 @@ fn main() -> anyhow::Result<()> {
     }
     let cfg = Config::load();
     plugins::reload(&cfg);
+    // GTA VI archives are read through once to find their files: show how far that is.
+    let status = ui.as_weak();
+    openrage_app::rpf9::register(std::sync::Arc::new(move |step| {
+        static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        let text = match step {
+            Some((name, done, total)) => {
+                let percent = done * 100 / total.max(1);
+                if SHOWN.swap(percent, Ordering::Relaxed) == percent {
+                    return;
+                }
+                format!("Indexing {name} (read once, then remembered)… {percent} %")
+            }
+            None => {
+                SHOWN.store(u64::MAX, Ordering::Relaxed);
+                String::new()
+            }
+        };
+        let _ = status.upgrade_in_event_loop(move |ui| ui.set_status(text.into()));
+    }));
     let keys = load_keys().unwrap_or(None);
     // Several games set up and none chosen as default: ask (after the window is up).
     let known = installed_games(&cfg);
@@ -167,7 +195,9 @@ fn main() -> anyhow::Result<()> {
         default.or_else(|| cfg.game_dir.clone().filter(|d| known.contains(d))).or_else(|| known.first().cloned())
     };
     let rdr2_ready = game_dir.as_deref().is_some_and(|d| {
-        (is_rdr2_dir(d) && register_rdr2(d)) || (is_gta4_dir(d) && openrage_app::gta4::register(d).is_ok())
+        (is_rdr2_dir(d) && register_rdr2(d))
+            || (is_gta4_dir(d) && openrage_app::gta4::register(d).is_ok())
+            || detect::is_gta6_dir(d)
     });
 
     APP.with(|a| {
@@ -202,11 +232,12 @@ fn main() -> anyhow::Result<()> {
             sound_start: 0.0,
             play_when_ready: false,
             audio_timer: slint::Timer::default(),
+            video: None,
             suggestions: Vec::new(),
             suggest_ycd: String::new(),
             suggest_awc: String::new(),
             suggest_pending: false,
-            index_running: false,
+            index_running: None,
             plugin_package: None,
         })
     });

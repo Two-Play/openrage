@@ -64,7 +64,7 @@ pub(crate) enum Command {
         /// Instead of archives, decode every sound of every audio container (.awc).
         #[arg(long, conflicts_with_all = ["textures", "models"])]
         audio: bool,
-        /// Instead of archives, parse every clip dictionary (.ycd) and evaluate every frame.
+        /// Instead of archives, parse every clip dictionary (.ycd; GTA VI .#cd) and evaluate its frames.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio"])]
         animations: bool,
         /// Instead of archives, convert every metadata file (.ymap, .ytyp, .ymt, .ymf, .cut, .pso) to XML.
@@ -86,7 +86,8 @@ pub(crate) enum Command {
         /// Instead of archives, disassemble every script (.ysc) and check every jump.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths"])]
         scripts: bool,
-        /// Instead of archives, read the header of every Scaleform movie (.gfx) and Bink video (.bik).
+        /// Instead of archives, read the header of every Scaleform movie (.gfx) and Bink video (.bik, .bk2),
+        /// and decode the first second of every video.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths", "scripts"])]
         media: bool,
         /// Instead of archives, read every GTA IV cutscene (.cut): its sections, the clips of
@@ -128,7 +129,8 @@ pub(crate) enum Command {
     /// Put a map file (.ymap) together: its objects with their models and textures
     /// (builds the world cache on first use).
     Map {
-        /// Virtual path of the .ymap (GTA IV: .wpl; none with --check).
+        /// Virtual path of the .ymap (GTA IV: .wpl; GTA VI: .#map, or none for the whole map from afar; none with
+        /// --check).
         path: Option<String>,
         /// Render a picture of the whole map file (PNG).
         #[arg(long)]
@@ -228,13 +230,22 @@ pub(crate) enum Command {
         /// Instead of only reading files, decode every sound of every audio container.
         #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta"])]
         audio: bool,
-        /// Instead of only reading files, parse every clip dictionary (.ycd) and evaluate every frame.
+        /// Instead of only reading files, parse every clip dictionary (.ycd; GTA VI .#cd) and evaluate its frames.
         #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta", "audio"])]
         anims: bool,
     },
-    /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
+    /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik, .bk2).
     Media {
         path: String,
+        /// For a Bink video: write its pictures as PNG files into this directory.
+        #[arg(long)]
+        frames: Option<PathBuf>,
+        /// Only write every n-th picture.
+        #[arg(long, default_value_t = 1, requires = "frames")]
+        every: usize,
+        /// For a Bink video: write its sound as a WAV file (the second track and on as `name.2.wav` …).
+        #[arg(long)]
+        wav: Option<PathBuf>,
         /// For a .gfx: write it as a Flash file (.swf) for Flash tools such as JPEXS or Ruffle.
         #[arg(long)]
         swf: Option<PathBuf>,
@@ -350,7 +361,7 @@ pub(crate) enum Command {
         #[arg(long)]
         outfit: Option<usize>,
     },
-    /// List the clips of a clip dictionary (.ycd; GTA IV .wad).
+    /// List the clips of a clip dictionary (.ycd; GTA IV .wad; GTA VI .#cd).
     Clips {
         /// Virtual path of the .ycd file.
         path: String,
@@ -378,6 +389,23 @@ pub(crate) enum Command {
         /// Export every sound into this folder as .wav.
         #[arg(short = 'o', long, visible_alias = "out")]
         export: Option<PathBuf>,
+    },
+    /// GTA VI: count the textures of a texture pool (.ttpf) and optionally export them as PNG.
+    Ttpf {
+        /// The pool file.
+        path: PathBuf,
+        /// Export the textures into this folder as .png, named by their number.
+        #[arg(short = 'o', long, visible_alias = "out")]
+        export: Option<PathBuf>,
+        /// The first texture to read.
+        #[arg(long, default_value_t = 0)]
+        from: usize,
+        /// How many textures to read (default: all).
+        #[arg(long)]
+        count: Option<usize>,
+        /// Read the largest mip level that is at most this many pixels wide and high.
+        #[arg(long)]
+        max_side: Option<u32>,
     },
     /// List the textures of a texture dictionary (.ytd) and optionally export them.
     Textures {

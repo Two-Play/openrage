@@ -9,9 +9,19 @@ pub(crate) fn open_index(game_dir: &Path) -> Result<rage_index::Index> {
 
 pub(crate) fn cmd_index(game_dir: &Path, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     let mut index = open_index(game_dir)?;
+    // A GTA VI archive reports each part of it: not a line for every one.
+    let mut last = (0, Instant::now());
     let stats = index.update(game_dir, keys, &AtomicBool::new(false), &mut |p| {
+        if p.archives_done == last.0 && last.1.elapsed().as_secs() < 2 {
+            return;
+        }
+        last = (p.archives_done, Instant::now());
         eprintln!("  [{}/{}] {} ({} entries)", p.archives_done, p.archives_total, p.current, p.entries);
     })?;
+    let names = openrage_app::rpf9::learn_names(&mut index)?;
+    if names > 0 {
+        outln!("Learned {names} names of GTA VI files from other archives.");
+    }
     let s = index.stats()?;
     outln!(
         "Indexed {} archives, removed {}, unchanged {} in {:.1}s ({} read errors).",
@@ -62,7 +72,7 @@ pub(crate) fn cmd_search(
             .iter()
             .map(|hit| {
                 let snippet = (hit.reason == rage_index::HitReason::Content)
-                    .then(|| content_snippet(game_dir, &hit.vpath, &hit.name, &needle, keys.clone()))
+                    .then(|| content_snippet(game_dir, &hit.vpath, &needle, keys.clone()))
                     .flatten();
                 serde_json::json!({
                     "match": reason(&hit.reason),
@@ -98,7 +108,7 @@ pub(crate) fn cmd_search(
     for hit in &results.hits {
         outln!("{:<5} {:>8}  {}", reason(&hit.reason), human(hit.size), hit.vpath);
         if hit.reason == rage_index::HitReason::Content
-            && let Some(line) = content_snippet(game_dir, &hit.vpath, &hit.name, &needle, keys.clone())
+            && let Some(line) = content_snippet(game_dir, &hit.vpath, &needle, keys.clone())
         {
             outln!("      └ {line}");
         }
@@ -116,18 +126,38 @@ pub(crate) fn cmd_search(
 pub(crate) fn content_snippet(
     game_dir: &Path,
     vpath: &str,
-    name: &str,
     query: &str,
     keys: Option<Arc<GtaVKeys>>,
 ) -> Option<String> {
-    let Node::ArchiveFile(rpf, id) = vfs::resolve(game_dir, vpath, keys).ok()? else { return None };
-    let data = rpf.read(id).ok()?;
-    let (text, _) = rage_index::content_for(name, &data)?;
+    let text = rage_index::node_text(&vfs::resolve(game_dir, vpath, keys).ok()?)?;
     rage_index::snippet(&text, query)
 }
 
 pub(crate) fn cmd_find(game_dir: &Path, within: &str, pattern: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
     let needle = pattern.to_ascii_lowercase();
+    match vfs::resolve(game_dir, within, keys.clone())? {
+        Node::Rpf9Dir(rpf, dir) => {
+            let prefix = within.trim_end_matches('/');
+            let top = if dir.is_empty() { prefix } else { prefix[..prefix.len() - dir.len()].trim_end_matches('/') };
+            return find_rpf9(&[(top.to_owned(), rpf, dir)], &needle);
+        }
+        Node::Dir(dir) if openrage_app::detect::is_gta6_dir(game_dir) => {
+            let mut found = Vec::new();
+            collect_rpfs(&dir, &mut found);
+            let mut starts = Vec::new();
+            for path in found.into_iter().filter(|p| rage_rpf::Rpf9::file_is_rpf9(p)) {
+                let rel = path.strip_prefix(game_dir).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                // Asked one after the other: the first loads the keys.
+                match rage_rpf::Rpf9::open(&path) {
+                    Ok(rpf) if rpf.is_native() => starts.push((rel, Arc::new(rpf), String::new())),
+                    Ok(_) => eprintln!("warning: {rel}: its table cannot be read"),
+                    Err(e) => eprintln!("warning: {e}"),
+                }
+            }
+            return find_rpf9(&starts, &needle);
+        }
+        _ => {}
+    }
     let starts = archive_roots(game_dir, within, keys)?;
 
     let started = Instant::now();
@@ -160,6 +190,53 @@ pub(crate) fn cmd_find(game_dir: &Path, within: &str, pattern: &str, keys: Optio
         hits += h.len();
         h.iter().for_each(|p| outln!("{p}"));
     }
+    eprintln!("{hits} matches in {total} entries ({:.1}s)", started.elapsed().as_secs_f32());
+    Ok(())
+}
+
+/// `find` in GTA VI archives and those inside them, below a folder of each.
+fn find_rpf9(starts: &[(String, Arc<rage_rpf::Rpf9>, String)], needle: &str) -> Result<()> {
+    fn walk(prefix: &str, rpf: &rage_rpf::Rpf9, dir: &str, needle: &str) -> (usize, usize) {
+        let entries = match rpf.entries() {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!("warning: {e}");
+                return (0, 0);
+            }
+        };
+        let below = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        entries
+            .par_iter()
+            .map(|e| {
+                let name = rpf.entry_name(e);
+                if !name.get(..below.len()).is_some_and(|start| start.eq_ignore_ascii_case(&below)) {
+                    return (0, 0);
+                }
+                let path = format!("{prefix}/{name}");
+                let base = name.rsplit('/').next().unwrap_or(&name);
+                let mut found = (0, 1);
+                if base.to_ascii_lowercase().contains(needle) {
+                    outln!("{path}");
+                    found.0 = 1;
+                }
+                if rpf.is_archive(e) {
+                    match rpf.open_child(e) {
+                        Ok(child) => {
+                            let inside = walk(&path, &child, "", needle);
+                            found = (found.0 + inside.0, found.1 + inside.1);
+                        }
+                        Err(e) => eprintln!("warning: {e}"),
+                    }
+                }
+                found
+            })
+            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+    }
+    let started = Instant::now();
+    let (hits, total) = starts
+        .iter()
+        .map(|(prefix, rpf, dir)| walk(prefix, rpf, dir, needle))
+        .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
     eprintln!("{hits} matches in {total} entries ({:.1}s)", started.elapsed().as_secs_f32());
     Ok(())
 }

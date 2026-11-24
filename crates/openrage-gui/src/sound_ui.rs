@@ -3,41 +3,34 @@
 use crate::*;
 
 /// Selecting an `.awc`: its sounds as a list (click one to play it).
-pub(crate) fn show_audio_container(ui: &AppWindow, vpath: String, mut info: Meta) {
+/// A container with only one sound is played like a sound.
+pub(crate) fn show_audio_container(ui: &AppWindow, vpath: String, mut info: Meta, generation: u64) {
     let (keys, rdr2) = with_app(|a| (a.keys.clone(), a.game_dir.as_deref().is_some_and(is_rdr2_dir)));
     let parse = |d: Vec<u8>| -> anyhow::Result<rage_formats::awc::Awc> {
         if rdr2 { Ok(rage_formats::awc::Awc::parse_rdr2(d)?) } else { openrage_app::audio::parse(d, keys.as_deref()) }
     };
     match read_file(ui, &vpath).and_then(parse) {
+        Ok(awc) if awc.stream_format.is_some() || awc.sounds.len() == 1 => {
+            start_sound_preview(ui, Arc::new(awc), 0, info, generation);
+        }
         Ok(awc) => {
-            let (names, rows): (Vec<String>, Vec<ClipRow>) = match &awc.stream_format {
-                Some(f) => {
-                    let stem = vpath.rsplit('/').next().unwrap_or(&vpath).trim_end_matches(".awc").to_owned();
-                    let secs = awc.sounds.first().map_or(0.0, |s| s.duration_secs());
-                    let name = format!("{stem} (stream)");
-                    let info = format!("{} · {} channels · music/stream", browser::seconds(secs), f.channels);
-                    (vec![name.clone()], vec![ClipRow { name: name.into(), info: info.into() }])
-                }
-                None => awc
-                    .sounds
-                    .iter()
-                    .map(|s| {
-                        let name = format!("{:08x}", s.id);
-                        let info = format!(
-                            "{} · {} Hz · {}",
-                            browser::seconds(s.duration_secs()),
-                            s.sample_rate,
-                            s.codec.name().replace("codec 7", "MPEG")
-                        );
-                        (name.clone(), ClipRow { name: name.into(), info: info.into() })
-                    })
-                    .unzip(),
-            };
+            let (names, rows): (Vec<String>, Vec<ClipRow>) = awc
+                .sounds
+                .iter()
+                .map(|s| {
+                    let name = format!("{:08x}", s.id);
+                    let info = format!(
+                        "{} · {} Hz · {}",
+                        browser::seconds(s.duration_secs()),
+                        s.sample_rate,
+                        s.codec.name().replace("codec 7", "MPEG")
+                    );
+                    (name.clone(), ClipRow { name: name.into(), info: info.into() })
+                })
+                .unzip();
             let total: f32 = awc.sounds.iter().map(|s| s.duration_secs()).sum();
             info.push(kv("Contains", format!("{} sound(s)", rows.len())));
-            if awc.stream_format.is_none() {
-                info.push(kv("Total length", browser::seconds(total)));
-            }
+            info.push(kv("Total length", browser::seconds(total)));
             if awc.encrypted || awc.flags & 0xA != 0 {
                 info.push(kv("Encrypted", "yes"));
             }
@@ -52,6 +45,7 @@ pub(crate) fn show_audio_container(ui: &AppWindow, vpath: String, mut info: Meta
             });
         }
         Err(e) => {
+            with_app(|a| a.play_when_ready = false);
             info.push(kv("Error", format!("{e:#}")));
             set_meta(ui, &info);
         }
@@ -67,10 +61,7 @@ pub(crate) fn start_sound_preview(
 ) {
     let counter = with_app(|a| Arc::clone(&a.preview_generation));
     ui.set_preview_loading(true);
-    let (w, h) = (
-        (ui.get_preview_area_width() - 16.0).max(64.0) as usize,
-        (ui.get_preview_area_height() - 16.0).max(64.0) as usize,
-    );
+    let (w, h) = preview_pixels(ui);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let sound = awc.sounds.get(index).cloned();
@@ -116,6 +107,7 @@ pub(crate) fn start_sound_preview(
                     }
                 }
                 Err(e) => {
+                    with_app(|a| a.play_when_ready = false);
                     meta.push(kv("Error", e));
                     set_meta(&ui, &meta);
                 }
@@ -136,7 +128,7 @@ pub(crate) fn step_sound(ui: &AppWindow, delta: i32, play: bool) -> bool {
         return false;
     }
     with_app(|a| a.play_when_ready = play);
-    ui.invoke_select_row(target);
+    select_row(ui, target as usize);
     true
 }
 
@@ -232,7 +224,7 @@ pub(crate) fn update_sound_ui(ui: &AppWindow) {
             a.audio_timer.stop();
         });
         // "Play all": continue with the next sound (outside this timer tick).
-        if ui.get_audio_play_all() {
+        if ui.get_audio_play_all() && !ui.get_video_mode() {
             let weak = ui.as_weak();
             slint::Timer::single_shot(Duration::ZERO, move || {
                 if let Some(ui) = weak.upgrade() {
@@ -241,6 +233,11 @@ pub(crate) fn update_sound_ui(ui: &AppWindow) {
             });
         }
     }
+    with_app(|a| {
+        if let Some(video) = &a.video {
+            video.show_at(pos);
+        }
+    });
     ui.set_audio_position(pos / total);
     ui.set_audio_playing(playing && !finished);
     ui.set_audio_time(format!("{} / {}", browser::seconds(pos), browser::seconds(total)).into());

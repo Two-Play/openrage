@@ -82,6 +82,8 @@ pub enum Location {
     Archive(Arc<Rpf7>, EntryId),
     /// A folder inside a Red Dead Redemption 2 archive (read-only).
     Rpf8(Arc<rage_rpf::Rpf8>, String),
+    /// A folder of a GTA VI archive (read-only).
+    Rpf9(Arc<rage_rpf::Rpf9>, String),
     /// A folder inside a GTA IV archive (`.img`, RPF2/RPF3; read-only).
     Gta4(Arc<rage_rpf::Gta4Archive>, rage_rpf::Gta4EntryId),
     /// Results of a search; `summary` describes hash lookups etc.
@@ -108,6 +110,12 @@ pub enum Location {
     },
 }
 
+/// Whether a file name is a video the preview plays.
+pub fn is_video(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".bk2") || lower.ends_with(".bik")
+}
+
 /// Whether a file name is an audio container that can be opened like a folder.
 pub fn is_audio(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".awc")
@@ -116,7 +124,72 @@ pub fn is_audio(name: &str) -> bool {
 /// Whether a file name is a texture dictionary that can be opened like a folder.
 pub fn is_texture_dict(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".ytd") || lower.ends_with(".ypt") || lower.ends_with(".wtd")
+    lower.ends_with(".ytd") || lower.ends_with(".ypt") || lower.ends_with(".wtd") || lower.ends_with(".#td")
+}
+
+/// GTA VI texture pools (`.ttpf`): they open as folders of [`POOL_PAGE`]
+/// textures each.
+pub fn is_texture_pool(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".ttpf")
+}
+
+/// Textures per folder of a texture pool: as many as are read at once.
+const POOL_PAGE: usize = 64;
+
+/// For `…/pool.ttpf/000128-000191`: the pool's path and the first texture.
+fn pool_page(vpath: &str) -> Option<(&str, usize)> {
+    let (pool, page) = vpath.rsplit_once('/')?;
+    let (from, to) = page.split_once('-')?;
+    let numeric = |s: &str| s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit());
+    (is_texture_pool(pool) && numeric(from) && numeric(to)).then(|| Some((pool, from.parse().ok()?))).flatten()
+}
+
+fn pool_error(vpath: &str, e: rage_formats::ttpf::TtpfError) -> RpfError {
+    RpfError::BadResource { path: vpath.to_owned(), reason: e.to_string() }
+}
+
+/// A texture pool: its pages as folders.
+fn list_pool(vpath: String, file: &Path, origin: Origin) -> Result<Listing, RpfError> {
+    let pool = rage_formats::ttpf::Pool::open(file).map_err(|e| pool_error(&vpath, e))?;
+    let items = (0..pool.len())
+        .step_by(POOL_PAGE)
+        .map(|from| {
+            let to = (from + POOL_PAGE).min(pool.len()) - 1;
+            Item {
+                name: format!("{from:06}-{to:06}"),
+                kind: ItemKind::Dir,
+                size: 0,
+                info: format!("{} textures", to - from + 1),
+                entry: None,
+                vpath: None,
+                mark: None,
+                detail: None,
+            }
+        })
+        .collect();
+    Ok(Listing { vpath, origin, location: Location::Disk(file.to_path_buf()), items })
+}
+
+/// A page of a texture pool as a texture dictionary (read-only). Textures
+/// that cannot be read are left out and counted in the dictionary's errors.
+fn list_pool_page(vpath: String, file: &Path, from: usize, origin: Origin) -> Result<Listing, RpfError> {
+    let pool = rage_formats::ttpf::Pool::open(file).map_err(|e| pool_error(&vpath, e))?;
+    let (mut textures, mut errors) = (Vec::new(), Vec::new());
+    for index in (from..pool.len()).take(POOL_PAGE) {
+        match pool.texture(index, None) {
+            Ok(t) => textures.push(t),
+            Err(e) => errors.push(format!("{index:06}: {e}")),
+        }
+    }
+    let dict = rage_formats::ytd::TextureDictionary {
+        textures,
+        errors,
+        layout: rage_formats::ytd::Layout::Enhanced,
+        version: 0,
+        root: Vec::new(),
+        stored: Vec::new(),
+    };
+    Ok(texture_listing(vpath, dict, origin, true))
 }
 
 /// Particle dictionaries open like texture dictionaries, read-only.
@@ -244,6 +317,17 @@ pub fn list(
             let (listing, _) = list(game_dir, &dict_path, keys, overlay)?;
             return Ok((listing, Some(last_segment(&vpath))));
         }
+        // `…/pool.ttpf/000000-000063`: a page of a GTA VI texture pool.
+        Err(_) if pool_page(&vpath).is_some() => {
+            let (pool, from) = pool_page(&vpath).unwrap_or_default();
+            let (Node::PlainFile(file), origin) = resolve(pool)? else { return Err(RpfError::NotFound(vpath)) };
+            return Ok((list_pool_page(vpath.clone(), &file, from, origin)?, None));
+        }
+        // `…/pool.ttpf/000000-000063/000012`: that page, with the texture selected.
+        Err(_) if parent(&vpath).is_some_and(|p| pool_page(&p).is_some()) => {
+            let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys, overlay)?;
+            return Ok((listing, Some(last_segment(&vpath))));
+        }
         // `…/model/textures`: the textures inside a model (GTA IV .wdr, GTA V .ydr/.yft/.ydd).
         Err(RpfError::NotFound(_)) if model_of_textures(&vpath).is_some() => {
             let model = model_of_textures(&vpath).unwrap_or_default();
@@ -294,6 +378,18 @@ pub fn list(
             let entry = rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| RpfError::NotFound(vpath.clone()))?;
             let data = rpf.read(entry)?;
             let awc = rage_formats::awc::Awc::parse_rdr2(data)
+                .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
+            Ok((audio_listing(vpath, awc, origin), None))
+        }
+        Node::PlainFile(file) if is_texture_pool(&vpath) => Ok((list_pool(vpath, &file, origin)?, None)),
+        Node::Rpf9Dir(rpf, dir) => Ok((list_rpf9(vpath, rpf, dir, origin)?, None)),
+        Node::Rpf9File(rpf, i) if is_texture_dict(&vpath) => {
+            let dict = openrage_app::textures::gta6_dictionary(&rpf, i)
+                .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
+            Ok((texture_listing(vpath, dict, origin, true), None))
+        }
+        Node::Rpf9File(rpf, i) if is_audio(&vpath) => {
+            let awc = rage_formats::awc::Awc::parse(rpf.read_at(i)?, None)
                 .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
             Ok((audio_listing(vpath, awc, origin), None))
         }
@@ -516,6 +612,7 @@ fn list_disk(vpath: String, dir: PathBuf, origin: Origin) -> Result<Listing, Rpf
         let kind = if meta.is_dir() {
             ItemKind::Dir
         } else if lower.ends_with(".rpf")
+            || is_texture_pool(&lower)
             || (lower.ends_with(".img") && rage_rpf::Gta4Archive::file_is_gta4(&entry.path()))
         {
             ItemKind::Archive
@@ -579,6 +676,44 @@ fn list_rpf8(vpath: String, rpf: Arc<rage_rpf::Rpf8>, dir: String, origin: Origi
         items.push(Item { name, kind, size: e.size(), info, entry: None, vpath: None, mark: None, detail: None });
     }
     Listing { vpath, origin, location: Location::Rpf8(rpf, dir), items }
+}
+
+/// A folder of a GTA VI archive. In the recovery view files are named by their
+/// offset, in folders by what they look like.
+fn list_rpf9(vpath: String, rpf: Arc<rage_rpf::Rpf9>, dir: String, origin: Origin) -> Result<Listing, RpfError> {
+    let entries = rpf.entries()?;
+    let (dirs, files) = rpf.list_dir(&entries, &dir);
+    let item = |name: String, kind, size, info| Item {
+        name,
+        kind,
+        size,
+        info,
+        entry: None,
+        vpath: None,
+        mark: None,
+        detail: None,
+    };
+    let mut items: Vec<Item> = dirs.into_iter().map(|name| item(name, ItemKind::Dir, 0, String::new())).collect();
+    for i in files {
+        let e = &entries[i];
+        let full = rpf.entry_name(e);
+        let info = match e.kind {
+            rage_rpf::rpf9::Kind::Bink2 => "video".to_owned(),
+            rage_rpf::rpf9::Kind::Awc => "sounds".to_owned(),
+            rage_rpf::rpf9::Kind::Zlib if e.streams > 1 => format!("{} chunks", e.streams),
+            _ => String::new(),
+        };
+        // The entries known to be models open in the viewer.
+        let kind = if rpf.is_archive(e) {
+            ItemKind::Archive
+        } else if openrage_app::models::is_model(&full) || rpf.resource_parts(e).is_some() {
+            ItemKind::Resource
+        } else {
+            ItemKind::File
+        };
+        items.push(item(full.rsplit('/').next().unwrap_or(&full).to_owned(), kind, e.size, info));
+    }
+    Ok(Listing { vpath, origin, location: Location::Rpf9(rpf, dir), items })
 }
 
 /// A folder of a GTA IV archive: its folders, files and resources.

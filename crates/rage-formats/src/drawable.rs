@@ -59,6 +59,11 @@ pub struct Mesh {
     /// is the bone tagged `bone_tags[i]` of the skeleton the part is worn
     /// on); empty when the indices are skeleton indices already.
     pub bone_tags: Vec<u16>,
+    /// The same for GTA VI: hashes of the bones' names.
+    pub bone_hashes: Vec<u32>,
+    /// GTA VI: what shades a vertex. Red: how much of the sky it sees; alpha:
+    /// how much of a decal, of dirt or of the second layer shows there.
+    pub shading: Vec<[u8; 4]>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -98,6 +103,11 @@ impl Skeleton {
         self.bones.iter().position(|b| b.tag == tag)
     }
 
+    /// The bone whose name has this hash (GTA VI's animations name bones so).
+    pub fn find_hash(&self, hash: u32) -> Option<usize> {
+        self.bones.iter().position(|b| rage_core::hash::joaat(&b.name) == hash)
+    }
+
     pub fn find_name(&self, name: &str) -> Option<usize> {
         self.bones.iter().position(|b| b.name.eq_ignore_ascii_case(name))
     }
@@ -111,6 +121,8 @@ pub mod param {
     pub const DIFFUSE_SAMPLER: u32 = 0xf1fe2b71;
     /// `DiffuseTex2`: a second colour layer on the second UV set (vehicle liveries and signs).
     pub const DIFFUSE_TEX2: u32 = 0x0df47048;
+    /// GTA VI: the colour of the second layer of layered shaders.
+    pub const LAYER_1_TEX: u32 = 0x7d4f_12e2;
     /// `DiffuseSampler2` (Legacy).
     pub const DIFFUSE_SAMPLER2: u32 = 0x0ad3a268;
     /// `DirtTex`, `SpecularTex`, `BumpTex`, `DamageTexture`.
@@ -208,9 +220,11 @@ impl Shader {
     }
 
     /// A second colour layer drawn over the base colour with its alpha, on
-    /// the second UV set (vehicle liveries and signs: `DiffuseTex2`).
+    /// the second UV set (vehicle liveries and signs: `DiffuseTex2`), or the
+    /// second layer of GTA VI's layered shaders, on the first.
     pub fn overlay_texture(&self) -> Option<&str> {
-        self.sampler(param::DIFFUSE_TEX2).or_else(|| self.sampler(param::DIFFUSE_SAMPLER2))
+        let overlay = self.sampler(param::DIFFUSE_TEX2).or_else(|| self.sampler(param::DIFFUSE_SAMPLER2));
+        overlay.or_else(|| self.sampler(param::LAYER_1_TEX))
     }
 }
 

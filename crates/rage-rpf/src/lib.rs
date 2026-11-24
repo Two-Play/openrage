@@ -1,8 +1,8 @@
 //! Reader for RAGE RPF archives.
 //!
 //! Supports RPF7 (GTA V Legacy and Enhanced, including nested archives),
-//! the GTA IV archives (IMG3, RPF2, RPF3) and, with the `rdr2` feature,
-//! RPF8 (RDR2).
+//! the GTA IV archives (IMG3, RPF2, RPF3), the unencrypted data of RPF9
+//! (GTA VI; see [`rpf9`]) and, with the `rdr2` feature, RPF8 (RDR2).
 //!
 //! # Licence of the `rdr2` feature
 //!
@@ -35,6 +35,11 @@ pub mod rpf8_exe;
 pub mod rpf8_keys;
 #[cfg(feature = "rdr2")]
 pub mod rpf8_names;
+pub mod rpf9;
+mod rpf9_cipher;
+pub mod rpf9_index;
+pub mod rpf9_names;
+mod rpf9_native;
 mod toc;
 pub mod vfs;
 pub mod writer;
@@ -63,4 +68,21 @@ pub use gta4::{Gta4Archive, Gta4Entry, Gta4EntryId, Gta4EntryKind, Gta4Format};
 pub use rpf7::{Encryption, Entry, EntryId, EntryKind, Rpf7};
 #[cfg(feature = "rdr2")]
 pub use rpf8::Rpf8;
+pub use rpf9::Rpf9;
 pub use writer::{ArchiveWriter, RawEntry, entry_for, file_entry, resource_entry};
+
+/// Runs something parallel that others wait for, on threads of its own. The
+/// shared ones may all be waiting for it; and one that waited for it there
+/// could meanwhile take up work that needs the result, and wait for itself.
+pub fn in_own_threads<R: Send>(work: impl FnOnce() -> R + Send) -> R {
+    std::thread::scope(|scope| {
+        let thread = scope.spawn(|| match rayon::ThreadPoolBuilder::new().build() {
+            Ok(pool) => pool.install(work),
+            Err(_) => work(),
+        });
+        match thread.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}

@@ -130,17 +130,29 @@ pub(crate) fn cmd_map(
 ) -> Result<()> {
     use openrage_app::world;
     let started = Instant::now();
-    let w = world::load(game_dir, keys.clone())?;
-    let files = world::files(game_dir)?;
-    if check {
-        return check_maps(game_dir, &w, &files, keys, started);
-    }
-    let path = path.context("which map file? (or --check for all)")?;
-    let scene = world::load_map(&w, &files, game_dir, keys, path, &|done, total| {
-        if done % 25 == 0 || done == total {
-            eprint!("\rloading models: {done}/{total}");
+    let show = |what: &str, done: usize, total: usize| {
+        if done.is_multiple_of(25) || done == total {
+            eprint!("\r{what}: {done}/{total}    ");
         }
-    })?;
+    };
+    let scene = if openrage_app::detect::is_gta6_dir(game_dir) {
+        if check {
+            bail!("--check is not supported for GTA VI yet");
+        }
+        match path {
+            Some(path) => openrage_app::gta6_world::place(game_dir, path, openrage_app::gta6_world::AROUND, &show)?,
+            None => openrage_app::gta6_world::overview(game_dir, &show)?,
+        }
+    } else {
+        let w = world::load(game_dir, keys.clone())?;
+        let files = world::files(game_dir)?;
+        if check {
+            return check_maps(game_dir, &w, &files, keys, started);
+        }
+        let path = path.context("which map file? (or --check for all)")?;
+        world::load_map(&w, &files, game_dir, keys, path, &|done, total| show("loading models", done, total))?
+    };
+    let path = path.unwrap_or("map");
     eprintln!();
     let placed: usize = scene.models.iter().map(|(_, _, t)| t.len()).sum();
     outln!(
@@ -421,10 +433,19 @@ pub(crate) fn cmd_clips(game_dir: &Path, path: &str, clip: Option<&str>, keys: O
             if t < 12 {
                 let first = vals.first().copied().unwrap_or_default();
                 let mid = vals.get(vals.len() / 2).copied().unwrap_or_default();
+                // GTA VI names bones and tracks by hash.
+                let name = if tr.bone_hash != 0 || tr.kind_hash != 0 {
+                    let kind = rage_formats::clip6::kind_name(tr.kind_hash);
+                    format!(
+                        "{:08x} {}",
+                        tr.bone_hash,
+                        kind.map_or_else(|| format!("{:08x}", tr.kind_hash), str::to_owned)
+                    )
+                } else {
+                    format!("{:04x} track {}", tr.bone, tr.track)
+                };
                 outln!(
-                    "  bone {:04x} track {} fmt {}: f0 [{:.3} {:.3} {:.3} {:.3}]  mid [{:.3} {:.3} {:.3} {:.3}]",
-                    tr.bone,
-                    tr.track,
+                    "  bone {name} fmt {}: f0 [{:.3} {:.3} {:.3} {:.3}]  mid [{:.3} {:.3} {:.3} {:.3}]",
                     tr.format,
                     first[0],
                     first[1],
@@ -491,6 +512,49 @@ pub(crate) fn cmd_audio(game_dir: &Path, path: &str, export: Option<&Path>, keys
     Ok(())
 }
 
+/// GTA VI: what a texture pool holds, and its textures as PNG.
+pub(crate) fn cmd_ttpf(
+    path: &Path,
+    export: Option<&Path>,
+    from: usize,
+    count: Option<usize>,
+    max_side: Option<u32>,
+) -> Result<()> {
+    let pool = rage_formats::ttpf::Pool::open(path)?;
+    outln!("{}: {} textures", path.display(), pool.len());
+    if let Some(dir) = export {
+        fs::create_dir_all(dir)?;
+    }
+    let started = Instant::now();
+    let (mut read, mut full) = (0u32, 0u32);
+    let mut skipped: std::collections::BTreeMap<String, u32> = Default::default();
+    for index in (from..pool.len()).take(count.unwrap_or(usize::MAX)) {
+        let d = *pool.descriptor(index).context("texture")?;
+        let texture = match pool.texture(index, max_side) {
+            Ok(t) => t,
+            Err(e) => {
+                *skipped.entry(e.to_string()).or_default() += 1;
+                continue;
+            }
+        };
+        read += 1;
+        full += u32::from(texture.width == d.width && texture.height == d.height);
+        let Some(dir) = export else { continue };
+        match texture.to_rgba() {
+            Some(rgba) => fs::write(
+                dir.join(format!("{index:06}.png")),
+                rage_formats::png(texture.width, texture.height, &rgba)?,
+            )?,
+            None => *skipped.entry(format!("no decoder for format {}", texture.format.name())).or_default() += 1,
+        }
+    }
+    outln!("Read: {read} ({full} at full size) in {} ms", started.elapsed().as_millis());
+    for (reason, n) in skipped {
+        outln!("Not read: {n} — {reason}");
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_xml(
     game_dir: &Path,
     path: &str,
@@ -543,15 +607,53 @@ pub(crate) fn cmd_xml(
     Ok(())
 }
 
-pub(crate) fn cmd_media(game_dir: &Path, path: &str, swf: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+pub(crate) fn cmd_media(
+    game_dir: &Path,
+    path: &str,
+    frames: Option<&Path>,
+    every: usize,
+    wav: Option<&Path>,
+    swf: Option<&Path>,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
     let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
     let data = match node {
         Node::ArchiveFile(rpf, id) => rpf.read(id)?,
         Node::PlainFile(p) => fs::read(p)?,
+        Node::Rpf8File(rpf, i) => {
+            rpf.read(rpf.entries().and_then(|e| e.get(i)).context("archive table not readable")?)?
+        }
+        Node::Rpf9File(rpf, i) => rpf.read_at(i)?,
+        Node::Gta4File(a, id) => a.read(id)?,
         _ => bail!("{path} is not a file"),
     };
-    for (k, v) in openrage_app::media::rows(path, &data)? {
+    for (k, v) in openrage_app::media::rows(&data)? {
         outln!("{k:<14}{v}");
+    }
+    if let Some(dir) = frames {
+        let mut player = rage_formats::bink::Player::new(&data)?;
+        fs::create_dir_all(dir)?;
+        let total = player.video.frames();
+        for i in 0..total {
+            player.advance().with_context(|| format!("frame {i}"))?;
+            if i % every.max(1) == 0 {
+                let f = player.frame();
+                fs::write(dir.join(format!("{i:05}.png")), rage_formats::png(f.width, f.height, &f.rgba())?)?;
+            }
+        }
+        outln!("Wrote {} of {total} frames to {}", total.div_ceil(every.max(1)), dir.display());
+    }
+    if let Some(out) = wav {
+        let video = rage_formats::bink::read(&data)?;
+        if video.tracks.is_empty() {
+            bail!("{path} has no sound");
+        }
+        for i in 0..video.tracks.len() {
+            let Some(pcm) = video.sound(&data, i) else { continue };
+            let file = if i == 0 { out.to_path_buf() } else { out.with_extension(format!("{}.wav", i + 1)) };
+            fs::write(&file, pcm?.to_wav())?;
+            outln!("Wrote {}", file.display());
+        }
     }
     if let Some(out) = swf {
         fs::write(out, rage_formats::media::gfx_to_swf(&data)?)?;

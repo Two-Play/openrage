@@ -22,9 +22,9 @@ It contains **no game files and no encryption keys**: keys are taken from your o
 features_title = "Highlights"
 features_intro = "What OpenRAGE can open, show and change today."
 screenshots_title = "Screenshots"
-screenshots_intro = "Click a picture to enlarge it, arrow keys browse. The screenshots show files from the author's own copy of the game."
+screenshots_intro = "Click a picture to enlarge it, arrow keys browse."
 games_title = "Supported games"
-games_intro = "GTA V comes first and Red Dead Redemption 2 can be explored. **GTA VI is next:** support follows as fast as possible once it comes to PC. GTA IV can be explored and modded too: archives, textures, models, collisions, animations, texts, maps in 3D and whole cutscenes."
+games_intro = "GTA V comes first and Red Dead Redemption 2 can be explored. GTA VI can be explored (read-only preview). GTA IV can be explored and modded too: archives, textures, models, collisions, animations, texts, maps in 3D and whole cutscenes."
 details_summary = "Checked against the whole game"
 download_intro = "Unpack the archive and run `openrage-gui` (or `openrage` for the command line). On first start the GUI detects your game and sets up the keys."
 why_title = "Why switch from OpenIV"
@@ -35,6 +35,12 @@ OpenIV supports more games and imports more kinds of models; both tools share th
 Out of date? [Open an issue](https://github.com/Two-Play/openrage/issues).
 """
 
+
+# A short section that points to the GTA VI page (content/gta-vi.md).
+[extra.gta6]
+title = "GTA VI"
+text = "OpenRAGE opens GTA VI's archives: the map in 3D, models, textures, animations, sounds and videos. A read-only preview, with your own copy of the game."
+link_text = "What works in GTA VI"
 
 [extra.hero]
 light = "overview-light.png"
@@ -167,9 +173,11 @@ formats = "textures, models (viewer, glTF export), texts, metadata, audio and an
 
 [[extra.games]]
 name = "GTA VI"
-archives_status = "planned"
-archives = "as fast as possible once GTA VI comes to PC"
-formats_status = "none"
+variant = "preview"
+archives_status = "partial"
+archives = "RPF9 read, incl. nested archives, with your own copy of the game (Xbox Series build)"
+formats_status = "partial"
+formats = "models, animations, textures, maps in 3D, collisions, navigation meshes, metadata, game text, audio and videos (read-only)"
 
 [[extra.games]]
 name = "GTA IV"
@@ -194,7 +202,7 @@ text = "Native on both, Steam and Proton installs included."
 [[extra.reasons]]
 icon = "🛠️"
 title = "Actively developed"
-text = "Supports GTA V Enhanced, GTA VI follows as fast as possible. OpenIV's last release, 4.1, is from January 2022."
+text = "Supports GTA V Enhanced, GTA VI can be explored. OpenIV's last release, 4.1, is from January 2022."
 
 [[extra.reasons]]
 icon = "↩️"
@@ -245,7 +253,7 @@ edge = "openrage"
 [[extra.compare]]
 feature = "Other games"
 openiv = "GTA IV, EFLC, Max Payne 3"
-openrage = "RDR2 archives, textures, models, texts, metadata, audio and animations; GTA IV archives, textures, models, texts, placements and cutscenes; GTA VI as soon as it is on PC"
+openrage = "RDR2 archives, textures, models, texts, metadata, audio and animations; GTA IV archives, textures, models, texts, placements and cutscenes; GTA VI read-only (preview)"
 edge = "openiv"
 
 [[extra.compare]]

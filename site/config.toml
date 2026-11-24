@@ -40,7 +40,7 @@ pages = [
 
 [[extra.docs]]
 title = "Games"
-pages = [["gta-iv.md", "GTA IV"], ["rdr2.md", "Red Dead Redemption 2"]]
+pages = [["gta-vi.md", "GTA VI"], ["gta-iv.md", "GTA IV"], ["rdr2.md", "Red Dead Redemption 2"]]
 
 [[extra.docs]]
 title = "Develop"

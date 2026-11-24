@@ -57,6 +57,7 @@ pub(crate) fn load_ytd(
                 .with_context(|| format!("{path} is not a file inside an archive or an RSC8 resource"))?;
             Ok(rage_formats::ytd::parse_rdr2(&res)?)
         }
+        Node::Rpf9File(rpf, i) => openrage_app::textures::gta6_dictionary(&rpf, i),
         _ => bail!("{path} is not a file inside an archive"),
     }
 }

@@ -6,13 +6,14 @@
 //! * a hash dictionary of identifiers found in the game's text data, so a bare
 //!   hash like `0xB779A091` can be turned back into a name;
 //! * a full-text index (FTS5, contentless) over text files, audio name tables
-//!   and GXT2 string tables.
+//!   and GXT2 string tables, and over the metadata of GTA VI as XML.
 //!
 //! The index is updated incrementally: only top-level archives whose size or
 //! modification time changed are re-read.
 #![forbid(unsafe_code)]
 
 mod content;
+mod gta6;
 mod schema;
 mod search;
 mod update;
@@ -21,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
-pub use content::{content_for, snippet};
+pub use content::{content_for, node_text, snippet};
 pub use search::{Hit, HitReason, LANGUAGES, SearchResults, language_of, parse_hash};
 pub use update::{Progress, UpdateStats};
 
@@ -135,6 +136,11 @@ impl Index {
             file_bytes: std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0),
             updated_at: schema::get_meta(&self.conn, "updated_at")?.and_then(|v| v.parse().ok()),
         })
+    }
+
+    /// Whether an update has run to its end.
+    pub fn is_complete(&self) -> Result<bool, IndexError> {
+        Ok(schema::get_meta(&self.conn, "updated_at")?.is_some())
     }
 
     /// Unix time the indexed archives last changed (added, changed or

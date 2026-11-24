@@ -4,7 +4,7 @@ use crate::*;
 
 /// The games set up so far that are still installed.
 pub(crate) fn installed_games(cfg: &Config) -> Vec<PathBuf> {
-    cfg.known_games().into_iter().filter(|d| detect::is_gta5_dir(d) || is_rdr2_dir(d) || is_gta4_dir(d)).collect()
+    cfg.known_games().into_iter().filter(|d| detect::is_game_dir(d)).collect()
 }
 
 thread_local! {
@@ -112,6 +112,8 @@ pub(crate) fn open_game(ui: &AppWindow, index: usize, remember: bool) {
         register_rdr2(&dir)
     } else if is_gta4_dir(&dir) {
         openrage_app::gta4::register(&dir).is_ok()
+    } else if detect::is_gta6_dir(&dir) {
+        true
     } else {
         with_app(|a| a.keys.is_some())
     };
@@ -154,11 +156,15 @@ pub(crate) fn show_setup(ui: &AppWindow, can_cancel: bool) {
         // A key blob that is gone (moved, or a temporary copy) is not offered again.
         let magic = a.cfg.magic_path.as_ref().filter(|p| p.is_file());
         ui.set_setup_magic_path(magic.map(|p| p.display().to_string()).unwrap_or_default().into());
-        ui.set_setup_can_cancel(
-            can_cancel
-                && (a.keys.is_some() || rage_rpf::rpf8::has_default_keys() || rage_rpf::gta4::default_key().is_some())
-                && a.game_dir.is_some(),
-        );
+        // Closing goes back to a game that is open and readable.
+        let open = a.game_dir.as_deref().is_some_and(|d| {
+            detect::is_gta6_dir(d)
+                || a.keys.is_some()
+                || rage_rpf::rpf8::has_default_keys()
+                || rage_rpf::gta4::default_key().is_some()
+        });
+        ui.set_setup_can_cancel(can_cancel && open);
+        ui.set_setup_has_games(!installed_games(&a.cfg).is_empty());
     });
     let model: Vec<SharedString> = detected.into_iter().map(Into::into).collect();
     ui.set_setup_detected(ModelRc::new(VecModel::from(model)));
@@ -173,12 +179,15 @@ pub(crate) fn show_folder_hint(ui: &AppWindow) {
     let hint = if text.trim().is_empty() {
         String::new()
     } else if let Some(name) = detect::game_name(&dir) {
-        format!("Found {name}. Press Set up to continue.")
+        if detect::is_gta6_dir(&dir) {
+            format!(
+                "Found {name}. RPF9 archives open read-only in recovery view: original names and encrypted files are unavailable. The first scan can take several minutes. Press Open to continue."
+            )
+        } else {
+            format!("Found {name}. Press Open to continue.")
+        }
     } else if dir.is_dir() {
-        format!(
-            "No supported game in {}: the folder must contain GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe or RDR2.exe.",
-            dir.display()
-        )
+        format!("No supported game in {}. {NO_GAME}", dir.display())
     } else {
         format!("{} does not exist.", dir.display())
     };
@@ -195,8 +204,42 @@ pub(crate) fn pick_path(w: Weak<AppWindow>, file: bool, title: &'static str, app
     });
 }
 
+/// What a game folder must hold.
+const NO_GAME: &str = "The folder must contain GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe, RDR2.exe or game_scarlett_master.exe, or RPF9 archives of GTA VI.";
+
+/// Leaves a setup that cannot be closed: back to the list of games when there
+/// is one, otherwise out of OpenRAGE.
+pub(crate) fn leave_setup(ui: &AppWindow) {
+    if with_app(|a| installed_games(&a.cfg).is_empty()) {
+        let _ = slint::quit_event_loop();
+    } else {
+        ui.set_setup_visible(false);
+        ui.invoke_open_game_chooser(false);
+    }
+}
+
+/// Opens a game that needs no keys.
+fn open_without_keys(ui: &AppWindow, game_dir: PathBuf) {
+    let saved = with_app(|a| {
+        a.cfg.remember_game(&game_dir);
+        a.game_dir = Some(game_dir.clone());
+        a.cfg.game_dir = Some(game_dir);
+        a.cfg.save()
+    });
+    ui.set_setup_visible(false);
+    refresh_games(ui);
+    start_browsing(ui);
+    if let Err(e) = saved {
+        show_error(ui, format!("Could not save the settings: {e}"));
+    }
+}
+
 pub(crate) fn run_setup(ui: &AppWindow) {
     let game_dir = openrage_app::gta4::normalize_dir(&PathBuf::from(ui.get_setup_game_dir().trim()));
+    if detect::is_gta6_dir(&game_dir) {
+        open_without_keys(ui, game_dir);
+        return;
+    }
     if is_gta4_dir(&game_dir) {
         ui.set_setup_running(true);
         ui.set_setup_log("Looking for the archive key in GTAIV.exe…".into());
@@ -235,25 +278,11 @@ pub(crate) fn run_setup(ui: &AppWindow) {
             );
             return;
         }
-        let saved = with_app(|a| {
-            a.cfg.remember_game(&game_dir);
-            a.game_dir = Some(game_dir.clone());
-            a.cfg.game_dir = Some(game_dir);
-            a.cfg.save()
-        });
-        ui.set_setup_visible(false);
-        refresh_games(ui);
-        start_browsing(ui);
-        if let Err(e) = saved {
-            show_error(ui, format!("Could not save the settings: {e}"));
-        }
+        open_without_keys(ui, game_dir);
         return;
     }
     if !detect::is_gta5_dir(&game_dir) {
-        ui.set_setup_log(
-            format!("{} does not contain GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe or RDR2.exe.", game_dir.display())
-                .into(),
-        );
+        ui.set_setup_log(format!("No supported game in {}. {NO_GAME}", game_dir.display()).into());
         return;
     }
     // Keys set up before that open this game: no scan, no key blob needed.

@@ -7,7 +7,12 @@ pub(crate) fn read_file(ui: &AppWindow, vpath: &str) -> anyhow::Result<Vec<u8>> 
     let _ = ui;
     let (game_dir, keys) = with_app(|a| (a.game_dir.clone(), a.keys.clone()));
     let game_dir = game_dir.ok_or_else(|| anyhow::anyhow!("no game folder"))?;
-    match rage_mods::resolve(&game_dir, vpath, keys)?.0 {
+    read_vpath(&game_dir, vpath, keys)
+}
+
+/// Reads a file off the UI thread.
+pub(crate) fn read_vpath(game_dir: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> anyhow::Result<Vec<u8>> {
+    match rage_mods::resolve(game_dir, vpath, keys)?.0 {
         Node::ArchiveFile(rpf, id) => Ok(rpf.read(id)?),
         Node::PlainFile(p) => Ok(std::fs::read(p)?),
         Node::Rpf8File(rpf, i) => {
@@ -16,6 +21,7 @@ pub(crate) fn read_file(ui: &AppWindow, vpath: &str) -> anyhow::Result<Vec<u8>> 
             Ok(rpf.read(entry)?)
         }
         Node::Gta4File(a, id) => Ok(a.read(id)?),
+        Node::Rpf9File(rpf, i) => Ok(rpf.read_at(i)?),
         _ => anyhow::bail!("{vpath} is not a file"),
     }
 }
@@ -53,8 +59,25 @@ pub(crate) fn open_text_file(ui: &AppWindow, vpath: String) {
     open_text_data(ui, vpath, &data);
 }
 
+/// A table of strings that each end with a zero byte (GTA VI keeps texts
+/// that way), one string per line; `None` for anything else.
+pub(crate) fn zero_ended_strings(data: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(data).ok()?;
+    let plain = |c: char| !c.is_control() || matches!(c, '\0' | '\t' | '\r' | '\n');
+    (text.contains('\0') && text.chars().all(plain)).then(|| {
+        let lines: Vec<String> = text.trim_end_matches('\0').split('\0').map(|s| s.replace('\n', "\\n")).collect();
+        lines.join("\n").into_bytes()
+    })
+}
+
 pub(crate) fn open_text_data(ui: &AppWindow, vpath: String, data: &[u8]) {
-    match editor::Document::from_file(vpath.clone(), data) {
+    let opened = editor::Document::from_file(vpath.clone(), data).or_else(|e| {
+        let mut doc =
+            zero_ended_strings(data).and_then(|lines| editor::Document::from_bytes(vpath.clone(), &lines)).ok_or(e)?;
+        doc.locked_reason = "A table of strings, shown one per line for reading.".into();
+        Ok::<_, String>(doc)
+    });
+    match opened {
         Ok(doc) => {
             editor::open(ui, doc);
             ui.set_status(SharedString::new());
@@ -146,10 +169,10 @@ pub(crate) fn open_script_view(ui: &AppWindow, vpath: String) {
 
 /// Reads a metadata file and converts it to XML.
 pub(crate) fn read_xml(ui: &AppWindow, vpath: &str) -> anyhow::Result<openrage_app::metadata::Xml> {
-    // RDR2 keeps much of its metadata as resources, which the game's own
+    // RDR2 and GTA VI keep much of their metadata as resources, which the game's own
     // resolution reads; GTA V files are read like any other file.
     if let Some((dir, keys)) = with_app(|a| a.game_dir.clone().map(|d| (d, a.keys.clone())))
-        && is_rdr2_dir(&dir)
+        && (is_rdr2_dir(&dir) || detect::is_gta6_dir(&dir))
     {
         return openrage_app::metadata::load(&dir, keys, vpath);
     }

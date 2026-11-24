@@ -1,4 +1,4 @@
-//! `openrage verify`: every file of a kind in the whole GTA V game.
+//! `openrage verify`: archive data and game-specific formats.
 
 use crate::*;
 
@@ -183,10 +183,14 @@ pub(crate) fn cmd_verify_media(game_dir: &Path, within: &str, keys: Option<Arc<G
                 return;
             }
             let result = a.read(id).map_err(anyhow::Error::from).and_then(|d| {
-                if name.ends_with(".bik") {
-                    let b = media::bink(&d)?;
+                if rage_formats::bink::is_bink(&d) {
+                    let mut player = rage_formats::bink::Player::new(&d)?;
+                    let first_second = player.video.frames_per_second().ceil() as usize;
+                    for _ in 0..player.video.frames().min(first_second) {
+                        player.advance()?;
+                    }
                     c.1 += 1;
-                    c.2 += b.duration();
+                    c.2 += player.video.duration() as f32;
                 } else {
                     let g = media::gfx(&d)?;
                     c.0 += 1;
@@ -1028,7 +1032,108 @@ pub(crate) fn hex(b: &[u8]) -> String {
 /// Per archive: files, clips, animations, frame-count mismatches, bad values, errors.
 pub(crate) type AnimStats = (usize, usize, usize, usize, usize, Vec<String>);
 
+/// Reads every GTA VI clip dictionary (`.#cd`) below a path, archives inside
+/// included, and checks its values. An animation that does not add up is an
+/// error of the reader already.
+fn verify_gta6_animations(node: Node, within: &str) -> Result<()> {
+    use rayon::prelude::*;
+    let started = Instant::now();
+    /// The clip dictionaries of an archive and the archives inside.
+    fn collect(
+        rpf: Arc<rage_rpf::Rpf9>,
+        dir: &str,
+        out: &mut Vec<(Arc<rage_rpf::Rpf9>, usize)>,
+        errors: &mut Vec<String>,
+    ) {
+        let entries = match rpf.entries() {
+            Ok(entries) => entries,
+            Err(e) => return errors.push(format!("{}: {e}", rpf.display_name())),
+        };
+        let prefix = if dir.is_empty() { String::new() } else { format!("{}/", dir.to_ascii_lowercase()) };
+        for (i, e) in entries.iter().enumerate() {
+            let name = rpf.entry_name(e).to_ascii_lowercase();
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            if name.ends_with(".#cd") {
+                out.push((Arc::clone(&rpf), i));
+            } else if rpf.is_archive(e) {
+                match rpf.open_child(e) {
+                    Ok(child) => collect(Arc::new(child), "", out, errors),
+                    Err(e) => errors.push(e.to_string()),
+                }
+            }
+        }
+    }
+    let (mut files, mut errors) = (Vec::new(), Vec::new());
+    match node {
+        Node::Rpf9Dir(rpf, dir) => collect(rpf, &dir, &mut files, &mut errors),
+        Node::Rpf9File(rpf, i) => files.push((rpf, i)),
+        _ => bail!("{within}: not a GTA VI archive"),
+    }
+    let check = |(rpf, i): &(Arc<rage_rpf::Rpf9>, usize)| -> Result<(usize, usize, usize, usize, usize)> {
+        let (system, graphics) = openrage_app::rpf9::resource(rpf, *i)?;
+        let dict = rage_formats::clip6::parse(&rage_resource::Resource { version: 0, system, graphics })?;
+        let (mut tracks, mut values, mut bad) = (0, 0, 0);
+        for a in &dict.animations {
+            tracks += a.tracks.len();
+            for (t, track) in a.tracks.iter().enumerate() {
+                for f in (0..a.frames).step_by(7) {
+                    let Some(v) = a.value(t, f as f32) else { bail!("a track without values") };
+                    values += 1;
+                    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    if v.iter().any(|x| !x.is_finite()) || (track.format == 1 && !(0.99..=1.01).contains(&norm)) {
+                        bad += 1;
+                    }
+                }
+            }
+        }
+        Ok((dict.clips.len(), dict.animations.len(), tracks, values, bad))
+    };
+    let results: Vec<_> = files
+        .par_iter()
+        .map(|file| {
+            check(file).map_err(|e| {
+                let name = file.0.entries().ok().and_then(|es| es.get(file.1).map(|e| file.0.entry_name(e)));
+                format!("{}/{}: {e:#}", file.0.display_name(), name.unwrap_or_default())
+            })
+        })
+        .collect();
+    let mut total = [0usize; 5];
+    for r in results {
+        match r {
+            Ok((clips, animations, tracks, values, bad)) => {
+                for (sum, n) in total.iter_mut().zip([clips, animations, tracks, values, bad]) {
+                    *sum += n;
+                }
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    for e in errors.iter().take(40) {
+        outln!("FAIL {e}");
+    }
+    outln!(
+        "{} clip dictionaries, {} clips, {} animations, {} tracks; {} values checked, {} bad; {} errors ({:.1}s)",
+        files.len(),
+        total[0],
+        total[1],
+        total[2],
+        total[3],
+        total[4],
+        errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    if !errors.is_empty() || total[4] > 0 {
+        bail!("verification found {} errors", errors.len() + total[4]);
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_verify_animations(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    if let node @ (Node::Rpf9Dir(..) | Node::Rpf9File(..)) = vfs::resolve(game_dir, within, keys.clone())? {
+        return verify_gta6_animations(node, within);
+    }
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     let (all, nested) = for_each_entry_parallel(
@@ -1414,6 +1519,11 @@ pub(crate) struct VerifyStats {
 }
 
 pub(crate) fn cmd_verify(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    match vfs::resolve(game_dir, within, keys.clone())? {
+        node @ (Node::Rpf9Dir(..) | Node::Rpf9File(..)) => return verify_rpf9(node, within),
+        node @ Node::Dir(_) if openrage_app::detect::is_gta6_dir(game_dir) => return verify_rpf9(node, within),
+        _ => {}
+    }
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     let (stats, nested) = for_each_entry_parallel_reporting(
@@ -1464,4 +1574,145 @@ pub(crate) fn cmd_verify(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKey
         bail!("verification found {} errors", total.errors.len());
     }
     Ok(())
+}
+
+/// Checks that the files of RPF9 archives can be read. Where the archive's
+/// own table is not read, only what the recovery scan finds is checked.
+fn verify_rpf9(node: Node, within: &str) -> Result<()> {
+    let started = Instant::now();
+    let mut total = VerifyStats::default();
+    match node {
+        Node::Rpf9Dir(rpf, dir) => verify_rpf9_archive(&rpf, &dir, None, &mut total)?,
+        Node::Rpf9File(rpf, i) => verify_rpf9_archive(&rpf, "", Some(i), &mut total)?,
+        Node::Dir(dir) => {
+            let mut found = Vec::new();
+            collect_rpfs(&dir, &mut found);
+            for path in found.into_iter().filter(|p| rage_rpf::Rpf9::file_is_rpf9(p)) {
+                match rage_rpf::Rpf9::open(&path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|rpf| verify_rpf9_archive(&rpf, "", None, &mut total))
+                {
+                    Ok(()) => {}
+                    Err(e) => total.errors.push(format!("{}: {e:#}", path.display())),
+                }
+            }
+        }
+        _ => bail!("{within}: not an RPF9 recovery path"),
+    }
+    if total.archives == 0 && total.errors.is_empty() {
+        bail!("{within}: no RPF9 archives found");
+    }
+    for error in &total.errors {
+        outln!("FAIL {error}");
+    }
+    outln!(
+        "{} RPF9 archives, {} files checked, {} decoded, {} errors ({:.1}s)",
+        total.archives,
+        total.files,
+        human(total.bytes),
+        total.errors.len(),
+        started.elapsed().as_secs_f32()
+    );
+    outln!(
+        "For archives whose own table is not read, this checks zlib decoding, entry bounds and unpacked sizes. Original names, encrypted table of contents and undiscovered data are not verified; raw audio/video checks do not validate their media contents."
+    );
+    if !total.errors.is_empty() {
+        bail!("verification found {} errors", total.errors.len());
+    }
+    Ok(())
+}
+
+fn verify_rpf9_archive(rpf: &rage_rpf::Rpf9, dir: &str, file: Option<usize>, total: &mut VerifyStats) -> Result<()> {
+    let entries = rpf.entries()?;
+    total.archives += 1;
+    let coverage = openrage_app::rpf9::coverage(rpf, &entries);
+    outln!(
+        "{}: {}: {} files, {} stored of {} data, {} unread (includes padding)",
+        rpf.display_name(),
+        if rpf.is_native() { "archive table" } else { "recovery coverage" },
+        coverage.files,
+        human(coverage.stored),
+        human(rpf.data_len()),
+        human(coverage.unread)
+    );
+    if file.is_some_and(|i| i >= entries.len()) {
+        bail!("invalid recovery entry index");
+    }
+    let prefix =
+        if dir.is_empty() { String::new() } else { format!("{}/", dir.trim_matches('/').to_ascii_lowercase()) };
+    for (i, entry) in entries.iter().enumerate() {
+        let name = rpf.entry_name(entry);
+        if file.map_or_else(|| !name.to_ascii_lowercase().starts_with(&prefix), |selected| selected != i) {
+            continue;
+        }
+        total.files += 1;
+        match rpf.copy_to(entry, &mut std::io::sink()) {
+            Ok(bytes) if bytes == entry.size => total.bytes += bytes,
+            Ok(bytes) => total.errors.push(format!(
+                "{}/{name}: expected {} unpacked bytes, read {bytes}",
+                rpf.display_name(),
+                entry.size
+            )),
+            Err(error) => total.errors.push(format!("{}/{name}: {error}", rpf.display_name())),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod rpf9_tests {
+    use super::*;
+
+    fn archive(name: &str) -> (PathBuf, rage_rpf::Rpf9) {
+        let dir = std::env::temp_dir().join(format!("openrage-cli-rpf9-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut bytes = vec![0u8; 64];
+        bytes[..4].copy_from_slice(b"9FPR");
+        bytes[4..8].copy_from_slice(&64u32.to_le_bytes());
+        // A complete zlib stream containing "hello", followed by alignment.
+        bytes.extend_from_slice(b"\x78\x9c\xcb\x48\xcd\xc9\xc9\x07\x00\x06\x2c\x02\x15");
+        bytes.resize(80, 0);
+        let path = dir.join("common.rpf");
+        fs::write(&path, bytes).unwrap();
+        (dir, rage_rpf::Rpf9::open(&path).unwrap())
+    }
+
+    #[test]
+    fn verifies_recovered_paths_and_skips_other_archive_formats() {
+        let (dir, rpf) = archive("paths");
+        fs::write(dir.join(openrage_app::detect::GTA6_EXE), b"MZ").unwrap();
+        fs::write(dir.join("other.rpf"), b"not RPF9").unwrap();
+        fs::create_dir(dir.join("empty")).unwrap();
+        assert!(cmd_verify(&dir, "empty", None).is_err());
+        let entries = rpf.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, 5);
+        let name = rpf.entry_name(&entries[0]);
+        assert!(cmd_verify(&dir, "", None).is_ok());
+        assert!(cmd_verify(&dir, "common.rpf", None).is_ok());
+        assert!(cmd_verify(&dir, "common.rpf/txt", None).is_ok());
+        assert!(cmd_verify(&dir, &format!("common.rpf/{name}"), None).is_ok());
+        let mut stats = VerifyStats::default();
+        verify_rpf9_archive(&rpf, "txt", None, &mut stats).unwrap();
+        assert_eq!((stats.archives, stats.files, stats.bytes), (1, 1, 5));
+        assert!(stats.errors.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn detects_corrupted_data_against_a_recovery_index() {
+        let (dir, rpf) = archive("corrupt");
+        let entries = rpf.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        // Keep the already-recovered index, then break the stream checksum.
+        let mut bytes = fs::read(rpf.path()).unwrap();
+        bytes[76] ^= 1;
+        fs::write(rpf.path(), bytes).unwrap();
+        let mut stats = VerifyStats::default();
+        verify_rpf9_archive(&rpf, "", Some(0), &mut stats).unwrap();
+        assert_eq!((stats.files, stats.errors.len()), (1, 1));
+        assert!(verify_rpf9(Node::Rpf9Dir(Arc::new(rpf), String::new()), "common.rpf").is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }
