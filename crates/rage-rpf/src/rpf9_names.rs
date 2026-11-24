@@ -94,73 +94,62 @@ fn fmix(mut value: u64) -> u64 {
     value ^ (value >> 33)
 }
 
-/// The built-in native extension type for a lower-case extension without `.`.
-///
-/// Only the observed static mapping is represented. Additional types can be
-/// registered by the game; this function returns `None` for unknown types.
-/// The z/i/# families are aliases for each numeric type. In particular the
-/// GTA V `y` family is not assumed to be an alias.
+/// The extensions of the built-in types, by number, after their family
+/// prefix: `z`, `i` and `#` are aliases for each. 0 is `rpf`, without one.
+const BUILT_IN: [&str; 19] = [
+    "rpf", "mf", "dr", "ft", "dd", "td", "bn", "bd", "pd", "bs", "sd", "mt", "sc", "cs", "datb", "bdr", "bdd", "bft",
+    "vert",
+];
+/// The number of the first type the game registers.
+const REGISTERED_FROM: u8 = 64;
+/// The extensions of the registered types, in the order of the executable's
+/// table (pointers at VA 0x14618dd20 for the `#` family). Those that start
+/// with `.` here have no family prefix.
+const REGISTERED: [&str; 52] = [
+    ".mrf", ".cut", ".gfx", "cd", "ld", "pmd", "pm", "ed", "pt", "map", "typ", "ch", "ldb", "jd", "ad", "nv", "nvs",
+    "pl", "nd", "vr", "wr", "nh", "fd", "as", "sm", "script", "ascript", "sma", ".iasf", "fc", "lfc", "cg", "asd",
+    ".rdb", "fbs", "cps", "sp", "tsl", "mmd", "fid", "msk", "hdat", "nmd", "smm", "ascd", "rd", "smam", "ldbmt", "nmd",
+    "kit", "cgc", "cov",
+];
+
+/// The type of a lower-case extension without `.`; `None` for extensions that
+/// stay in a file's name. The `y` family of GTA V is not an alias. Of the two
+/// types with the extension `nmd` this is the first.
 pub fn extension_type(extension: &str) -> Option<u8> {
     if extension == "rpf" {
         return Some(0);
     }
-    let rest = extension.strip_prefix(['z', 'i', '#'])?;
-    Some(match rest {
-        "mf" => 1,
-        "dr" => 2,
-        "ft" => 3,
-        "dd" => 4,
-        "td" => 5,
-        "bn" => 6,
-        "bd" => 7,
-        "pd" => 8,
-        "bs" => 9,
-        "sd" => 10,
-        "mt" => 11,
-        "sc" => 12,
-        "cs" => 13,
-        "datb" => 14,
-        "bdr" => 15,
-        "bdd" => 16,
-        "bft" => 17,
-        "vert" => 18,
-        _ => return None,
-    })
+    let rest = extension.strip_prefix(['z', 'i', '#']);
+    let built_in = || BUILT_IN.iter().skip(1).position(|e| Some(*e) == rest).map(|i| i as u8 + 1);
+    let registered = || {
+        let found = REGISTERED.iter().position(|e| match e.strip_prefix('.') {
+            Some(whole) => whole == extension,
+            None => Some(*e) == rest,
+        });
+        found.map(|i| i as u8 + REGISTERED_FROM)
+    };
+    built_in().or_else(registered)
 }
 
-/// The canonical extension for a built-in native type, the inverse of
-/// [`extension_type`] over its `#` family. `None` for an unknown type.
-/// Used to name an entry whose path is not recovered.
-pub fn extension_for_type(type_id: u8) -> Option<&'static str> {
-    Some(match type_id {
-        0 => "rpf",
-        1 => "#mf",
-        2 => "#dr",
-        3 => "#ft",
-        4 => "#dd",
-        5 => "#td",
-        6 => "#bn",
-        7 => "#bd",
-        8 => "#pd",
-        9 => "#bs",
-        10 => "#sd",
-        11 => "#mt",
-        12 => "#sc",
-        13 => "#cs",
-        14 => "#datb",
-        15 => "#bdr",
-        16 => "#bdd",
-        17 => "#bft",
-        18 => "#vert",
-        _ => return None,
+/// The extension of a type, of the `#` family; the inverse of
+/// [`extension_type`]. `None` for an unknown type. Used to name entries.
+pub fn extension_for_type(type_id: u8) -> Option<String> {
+    let extension = match type_id.checked_sub(REGISTERED_FROM) {
+        Some(index) => REGISTERED.get(usize::from(index))?,
+        None => BUILT_IN.get(usize::from(type_id))?,
+    };
+    Some(match extension.strip_prefix('.') {
+        Some(whole) => whole.to_owned(),
+        None if type_id == 0 => (*extension).to_owned(),
+        None => format!("#{extension}"),
     })
 }
 
 /// The extension an entry of this type is shown with when its own is not
-/// known: the canonical one, or `type<number>` for types the game registers.
+/// known: the canonical one, or `type<number>` for an unknown type.
 pub fn type_extension(type_id: u8) -> String {
     match extension_for_type(type_id) {
-        Some(ext) => ext.to_owned(),
+        Some(ext) => ext,
         None if type_id == u8::MAX => "bin".to_owned(),
         None => format!("type{type_id}"),
     }
@@ -217,11 +206,16 @@ impl Dictionary {
         if hash32.is_some_and(|expected| expected != self::hash32(name.as_bytes())) {
             return None;
         }
-        // Texts differ in how they write folders; hashes ignore case.
-        let folder = name.rfind('/').map_or(0, |at| at + 1);
-        let name = name[..folder].to_ascii_lowercase() + &name[folder..];
-        Some(if type_id == u8::MAX { name } else { format!("{name}.{}", type_extension(type_id)) })
+        Some(with_type(name, type_id))
     }
+}
+
+/// The path of an entry with this name and type.
+pub fn with_type(name: &str, type_id: u8) -> String {
+    // Texts differ in how they write folders; hashes ignore case.
+    let folder = name.rfind('/').map_or(0, |at| at + 1);
+    let name = name[..folder].to_ascii_lowercase() + &name[folder..];
+    if type_id == u8::MAX { name } else { format!("{name}.{}", type_extension(type_id)) }
 }
 
 fn is_relative(path: &str) -> bool {
@@ -229,6 +223,50 @@ fn is_relative(path: &str) -> bool {
         && !path.contains([':', '%'])
         && path.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
 }
+
+/// What follows a name in the name of a file that belongs to it.
+const VARIANTS: [&str; 10] = ["", "_hi", "+hi", "_lod", "_b", "_c", "_decals", "_cloth", "_occl", "_metadata"];
+
+/// Calls `try_name` with the names that files near the one called `name`
+/// may have: its variants, and those of what it starts with.
+pub fn related(name: &str, try_name: &mut dyn FnMut(&str)) {
+    let mut stem = name;
+    loop {
+        for variant in VARIANTS {
+            try_name(&format!("{stem}{variant}"));
+        }
+        let Some((shorter, _)) = stem.rsplit_once('_') else { break };
+        stem = shorter;
+    }
+}
+
+/// Calls `try_name` with the numbered names files of a type may have, in a
+/// part of them: `part` is below [`GRID_PARTS`]. Navigation meshes and cover
+/// are named by their cell of the world, collisions of the terrain by its
+/// cell (`s09_w04_55`), height data by its tile.
+pub fn numbered(type_id: u8, part: u32, try_name: &mut dyn FnMut(&str)) {
+    match type_id {
+        79 | 100 | 115 => {
+            let name = if type_id == 115 { "coverregion" } else { "navmesh" };
+            (0..GRID_PARTS).for_each(|y| try_name(&format!("{name}[{part}][{y}]")));
+        }
+        104 | 105 if part < 100 => {
+            let name = if type_id == 104 { "moverdeepsurfacetype" } else { "minmaxheight" };
+            (0..100).for_each(|y| try_name(&format!("{name}/tile_{part}_{y}")));
+        }
+        6 if part < 80 => {
+            let row = format!("{}{:02}", if part < 40 { 'n' } else { 's' }, part % 40);
+            for column in 0..80 {
+                let cell = format!("{row}_{}{:02}", if column < 40 { 'e' } else { 'w' }, column % 40);
+                (0..300).for_each(|i| try_name(&format!("{cell}_{i}")));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Number of parts of [`numbered`]: more than the world has cells one way.
+pub const GRID_PARTS: u32 = 512;
 
 /// The texts in a file's data that may be paths or names of files.
 pub fn tokens(data: &[u8]) -> Vec<String> {
@@ -369,6 +407,13 @@ mod tests {
         assert_eq!(extension_type("idr"), Some(2));
         assert_eq!(extension_type("#dr"), Some(2));
         assert_eq!(extension_type("ydr"), None);
+        assert_eq!((extension_type("vert"), extension_type("#vert"), extension_type("xml")), (None, Some(18), None));
+        assert_eq!((extension_type("gfx"), extension_type("#gfx"), extension_type("zcd")), (Some(66), None, Some(67)));
+        assert_eq!((extension_type("#script"), extension_type("#cov")), (Some(89), Some(115)));
+        for id in (0..=18).chain(64..=115).filter(|id| *id != 112) {
+            assert_eq!(extension_type(&extension_for_type(id).unwrap()), Some(id));
+        }
+        assert_eq!([19, 63, 116, 255].map(extension_for_type), [const { None }; 4]);
         let recognized = path_hashes("Models\\Example.ZDR");
         assert_eq!(
             recognized,
@@ -389,12 +434,27 @@ mod tests {
         let find = |name: &str, ty| names.find(hash64(name.as_bytes()), Some(hash32(name.as_bytes())), ty);
         assert_eq!(find("levels/props/barrel", 0).as_deref(), Some("levels/props/barrel.rpf"));
         assert_eq!(find("props/barrel", 2).as_deref(), Some("props/barrel.#dr"));
-        assert_eq!(find("barrel", 74).as_deref(), Some("barrel.type74"));
+        assert_eq!(find("barrel", 74).as_deref(), Some("barrel.#typ"));
         assert_eq!(find("movies/intro.bk2", 255).as_deref(), Some("movies/Intro.bk2"));
         assert_eq!(find("secret/file.xml", 255).as_deref(), Some("secret/file.xml"));
         assert!(find("../secret/file.xml", 255).is_none());
         assert!(names.find(hash64(b"barrel"), Some(1), 0).is_none());
         assert_eq!(tokens(b"\x01ab\0data\\x.xml\xff123 name"), ["data/x.xml", "name"]);
+    }
+
+    #[test]
+    fn generates_numbered_and_related_names() {
+        let has = |type_id, part, wanted: &str| {
+            let mut found = false;
+            numbered(type_id, part, &mut |name| found |= name == wanted);
+            found
+        };
+        assert!(has(79, 204, "navmesh[204][293]") && has(115, 0, "coverregion[0][511]"));
+        assert!(has(104, 36, "moverdeepsurfacetype/tile_36_34") && has(105, 1, "minmaxheight/tile_1_41"));
+        assert!(has(6, 49, "s09_w04_55") && has(6, 1, "n01_e00_0") && !has(2, 1, "n01_e00_0"));
+        let mut names = Vec::new();
+        related("sandking_4dr", &mut |name| names.push(name.to_owned()));
+        assert!(["sandking_4dr_hi", "sandking", "sandking+hi"].iter().all(|n| names.iter().any(|m| m == n)));
     }
 
     #[test]

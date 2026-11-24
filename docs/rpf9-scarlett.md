@@ -116,14 +116,16 @@ executable and in the files of `common.rpf` and `data.rpf`, checked against
 the hashes. They cover most top-level files. Inside nested archives, drawables, fragments,
 clip dictionaries and some other types hold their own name, which is checked
 against the hash the same way (over 99% of drawables and fragments in a sample
-of 1,826 archives). Files without a name are listed as
+of 1,826 archives). Some names follow a pattern: navigation meshes
+(`navmesh[204][293]`), cover (`coverregion[199][257]`), height and surface
+tiles, the terrain's collisions (`s09_w04_55`) and variants of other files
+(`_hi`, `+hi`, `_lod`). Files without a name are listed as
 `entries/<slot>_<hash>`.
 
 ## Remaining work
 
-Names of the other types inside nested archives (textures, collisions, maps),
-the extensions of types the game registers at
-run time (shown as `type<number>`), signature checks and archive writing.
+Names of the other types inside nested archives (most textures, maps and the
+collisions of buildings) and of the audio archives, signature checks and archive writing.
 
 ## Local recovery validation
 

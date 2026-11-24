@@ -1,6 +1,6 @@
 //! Executable-backed native RPF9 indexes. The executable is parsed as data.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -142,8 +142,11 @@ impl NativeArchive {
         }
         let mut archive = Self::open(path, base, extent, materials(path)?).ok()?;
         let learned = archive.learn_names(path, base);
-        if !learned.is_empty() {
-            archive.name_entries(&learned);
+        archive.name_entries(&learned);
+        let mut guessed = archive.guess_names();
+        if !guessed.is_empty() {
+            guessed.extend(learned);
+            archive.name_entries(&guessed);
         }
         let archive = Arc::new(archive);
         let mut opened = OPENED.lock().ok()?;
@@ -176,15 +179,59 @@ impl NativeArchive {
         }
     }
 
+    fn unnamed(&self) -> impl Iterator<Item = &NativeEntry> {
+        self.catalog
+            .entries
+            .iter()
+            .filter(|e| self.paths[e.slot].strip_prefix(UNNAMED).is_some_and(|rest| rest.starts_with('/')))
+    }
+
+    /// Names of unnamed entries that follow from a pattern or from the names
+    /// of others in the archive; checked against the hashes in the table.
+    fn guess_names(&self) -> HashMap<usize, String> {
+        let mut wanted: HashMap<u64, Vec<&NativeEntry>> = HashMap::new();
+        let mut types = BTreeSet::new();
+        for e in self.unnamed() {
+            if let Some(hash) = e.name_hash64 {
+                wanted.entry(hash).or_default().push(e);
+                types.insert(e.type_id);
+            }
+        }
+        let matching = |name: &str, found: &mut Vec<(usize, String)>| {
+            for e in wanted.get(&rpf9_names::hash64(name.as_bytes())).into_iter().flatten() {
+                if e.name_hash32.is_none_or(|hash| hash == rpf9_names::hash32(name.as_bytes())) {
+                    found.push((e.slot, rpf9_names::with_type(name, e.type_id)));
+                }
+            }
+        };
+        let mut found: Vec<(usize, String)> = types
+            .into_par_iter()
+            .flat_map(|type_id| (0..rpf9_names::GRID_PARTS).into_par_iter().map(move |part| (type_id, part)))
+            .flat_map_iter(|(type_id, part)| {
+                let mut found = Vec::new();
+                rpf9_names::numbered(type_id, part, &mut |name| matching(name, &mut found));
+                found
+            })
+            .collect();
+        if !wanted.is_empty() {
+            found.par_extend(self.paths.par_iter().flat_map_iter(|path| {
+                let mut found = Vec::new();
+                let stem = path.rsplit_once('.').map_or(path.as_str(), |(stem, _)| stem);
+                rpf9_names::related(stem, &mut |name| matching(name, &mut found));
+                found
+            }));
+        }
+        found.into_iter().collect()
+    }
+
     /// Names of unnamed entries, found in their own data: models, clip
     /// dictionaries and some others hold their name. What is found is
     /// checked against the hash in the table.
     fn learn_names(&self, path: &Path, base: u64) -> HashMap<usize, String> {
-        self.catalog
-            .entries
-            .par_iter()
-            .filter(|e| SELF_NAMED.contains(&e.type_id) && e.size <= LEARN_MAX)
-            .filter(|e| self.paths[e.slot].strip_prefix(UNNAMED).is_some_and(|rest| rest.starts_with('/')))
+        let candidates: Vec<&NativeEntry> =
+            self.unnamed().filter(|e| SELF_NAMED.contains(&e.type_id) && e.size <= LEARN_MAX).collect();
+        candidates
+            .into_par_iter()
             .filter_map(|e| {
                 let wanted = e.name_hash64?;
                 let mut data = Vec::new();

@@ -92,11 +92,14 @@ families, with prefixes `z`, `i`, and `#`:
 | 18 | vert |
 
 The dispatcher uses the imported C `strcmp` and can consult additional
-registered callbacks. `y`-prefixed GTA V extensions are not assumed to be
+registered callbacks. The registered types are numbered from 64 in the order
+of three more pointer tables of 52 strings each, before VA `0x14618dec0` (the
+`#` family; the `z` and `i` families precede it): `mrf`, `cut`, `gfx`, `#cd`,
+`#ld`, … `#cov`. The numbers agree with the content of the archives (66
+Scaleform, 67 clips, 72 particles, 79 navigation meshes, 89 scripts). `y`-prefixed GTA V extensions are not assumed to be
 aliases. The Rust candidate helper lowercases extensions before matching as
 an explicit candidate-generation convention, rather than claiming that the
-native `strcmp` itself ignores case. Runtime extension registrations and
-their complete type dictionary remain unobserved.
+native `strcmp` itself ignores case.
 
 ## Candidate collection
 
