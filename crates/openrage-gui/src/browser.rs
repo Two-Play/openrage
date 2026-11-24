@@ -110,6 +110,11 @@ pub enum Location {
     },
 }
 
+/// Whether a file name is a video the preview plays.
+pub fn is_video(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".bk2")
+}
+
 /// Whether a file name is an audio container that can be opened like a folder.
 pub fn is_audio(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".awc")

@@ -57,6 +57,24 @@ Opus audio (GTA VI) is decoded with opus-rs
 (https://github.com/restsend/opus-rs), a port of libopus, licensed under the
 BSD 3-Clause licence.
 
+## Librempeg
+
+The Bink 2 video and audio decoder in `crates/rage-formats/src/bink2` is a port
+to Rust of the one in Librempeg (https://github.com/librempeg/librempeg;
+`libavcodec/bink2.c`, `bink2.h`, `bink2g.h`, `libavcodec/binkaudio.c` and
+`libavformat/bink.c`), which is licensed under the GNU General Public License
+version 3 or later and used here under version 3:
+
+```
+Copyright (c) 2014 Konstantin Shishkov
+Copyright (c) 2019 Paul B Mahol
+Copyright (c) 2007-2011 Peter Ross
+Copyright (c) 2009 Daniel Verkamp
+```
+
+Bink is a trademark of Epic Games Tools LLC (RAD Game Tools). OpenRAGE is not
+affiliated with them and contains none of their code.
+
 ## Leonida
 
 What is known about GTA VI's formats (RPF9 archives, audio containers, PSIN

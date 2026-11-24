@@ -86,7 +86,8 @@ pub(crate) enum Command {
         /// Instead of archives, disassemble every script (.ysc) and check every jump.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths"])]
         scripts: bool,
-        /// Instead of archives, read the header of every Scaleform movie (.gfx) and Bink video (.bik).
+        /// Instead of archives, read the header of every Scaleform movie (.gfx) and Bink video (.bik, .bk2),
+        /// and decode the first second of every .bk2.
         #[arg(long, conflicts_with_all = ["textures", "models", "audio", "animations", "meta", "text", "particles", "collisions", "paths", "scripts"])]
         media: bool,
         /// Instead of archives, read every GTA IV cutscene (.cut): its sections, the clips of
@@ -232,9 +233,18 @@ pub(crate) enum Command {
         #[arg(long, conflicts_with_all = ["textures", "models", "text", "meta", "audio"])]
         anims: bool,
     },
-    /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik).
+    /// Show facts about a Scaleform movie (.gfx) or a Bink video (.bik, .bk2).
     Media {
         path: String,
+        /// For a .bk2: write its pictures as PNG files into this directory.
+        #[arg(long)]
+        frames: Option<PathBuf>,
+        /// Only write every n-th picture.
+        #[arg(long, default_value_t = 1, requires = "frames")]
+        every: usize,
+        /// For a .bk2: write its sound as a WAV file (the second track and on as `name.2.wav` …).
+        #[arg(long)]
+        wav: Option<PathBuf>,
         /// For a .gfx: write it as a Flash file (.swf) for Flash tools such as JPEXS or Ruffle.
         #[arg(long)]
         swf: Option<PathBuf>,

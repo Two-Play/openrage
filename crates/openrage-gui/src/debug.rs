@@ -56,6 +56,10 @@ pub(crate) fn debug_snapshot(ui: &AppWindow) {
             });
             if let Some(row) = row {
                 select_row(&ui, row);
+                // `OPENRAGE_PLAY=1` plays the selected sound or video.
+                if std::env::var("OPENRAGE_PLAY").is_ok() {
+                    with_app(|a| a.play_when_ready = true);
+                }
                 // `OPENRAGE_PLUGIN_RUN=<n>` runs the selected file's n-th plugin action.
                 if let Ok(i) = std::env::var("OPENRAGE_PLUGIN_RUN") {
                     row_action(&ui, row, &format!("plugin:{i}"));
