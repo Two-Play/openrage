@@ -61,6 +61,8 @@ pub(crate) struct NativeArchive {
     pub paths: Vec<String>,
     /// Lower-case path to slot.
     by_path: HashMap<String, usize>,
+    /// Extensions of unnamed entries without a type, from their content.
+    sniffed: HashMap<usize, String>,
 }
 
 fn u16_at(b: &[u8], at: usize) -> Option<usize> {
@@ -126,7 +128,8 @@ impl NativeArchive {
         file.read_exact(&mut bytes[64..]).map_err(|e| e.to_string())?;
         decode_header(&materials.cipher, &mut bytes).ok_or("unsupported or damaged native header transform")?;
         let catalog = Catalog::parse(bytes, extent)?;
-        let mut archive = Self { catalog, materials, paths: Vec::new(), by_path: HashMap::new() };
+        let mut archive =
+            Self { catalog, materials, paths: Vec::new(), by_path: HashMap::new(), sniffed: HashMap::new() };
         archive.name_entries(&HashMap::new());
         Ok(archive)
     }
@@ -142,6 +145,7 @@ impl NativeArchive {
         }
         let mut archive = Self::open(path, base, extent, materials(path)?).ok()?;
         let learned = archive.learn_names(path, base);
+        archive.sniffed = archive.sniff(path, base);
         archive.name_entries(&learned);
         let mut guessed = archive.guess_names();
         if !guessed.is_empty() {
@@ -171,7 +175,8 @@ impl NativeArchive {
                 })
                 .filter(|name| !self.by_path.contains_key(&name.to_ascii_lowercase()));
             let path = name.unwrap_or_else(|| {
-                let ext = rpf9_names::type_extension(entry.type_id);
+                let sniffed = self.sniffed.get(&entry.slot).cloned();
+                let ext = sniffed.unwrap_or_else(|| rpf9_names::type_extension(entry.type_id));
                 format!("{UNNAMED}/{:06}_{:016x}.{ext}", entry.slot, entry.name_hash64.unwrap_or(0))
             });
             self.by_path.insert(path.to_ascii_lowercase(), entry.slot);
@@ -222,6 +227,35 @@ impl NativeArchive {
             }));
         }
         found.into_iter().collect()
+    }
+
+    /// The extensions of unnamed entries without a type, by how they start.
+    fn sniff(&self, path: &Path, base: u64) -> HashMap<usize, String> {
+        /// Takes the first bytes, then ends the unpacking.
+        struct Head(Vec<u8>);
+        impl Write for Head {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.0.len() >= 16 {
+                    return Err(std::io::ErrorKind::WriteZero.into());
+                }
+                let n = buf.len().min(16 - self.0.len());
+                self.0.extend_from_slice(&buf[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let unnamed: Vec<&NativeEntry> = self.unnamed().filter(|e| e.type_id == u8::MAX).collect();
+        unnamed
+            .into_par_iter()
+            .filter_map(|e| {
+                let mut head = Head(Vec::new());
+                // Fails when the head is full, which is fine.
+                let _ = self.copy_to(path, base, e, &mut head);
+                Some((e.slot, crate::rpf9::extension_of(&head.0)?))
+            })
+            .collect()
     }
 
     /// Names of unnamed entries, found in their own data: models, clip

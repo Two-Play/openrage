@@ -149,23 +149,29 @@ impl Entry {
         if self.is_resource() {
             return "res".into();
         }
-        let head = self.head();
-        let text = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
-        // Text only when all of the first bytes are: binary files start with
-        // `<` and a letter often enough (an offset table, for instance).
-        let printable = |b: &u8| b.is_ascii_graphic() || matches!(b, b' ' | b'\t' | b'\r' | b'\n');
-        if !text.is_empty() && text.iter().all(printable) {
-            let markup = text.starts_with(b"<?xml")
-                || (text.first() == Some(&b'<') && text.get(1).is_some_and(u8::is_ascii_alphabetic));
-            return if markup { "xml" } else { "txt" }.into();
-        }
-        if let Some(magic) = head.get(..4)
-            && MAGICS.iter().any(|m| m == &magic)
-        {
-            return String::from_utf8_lossy(magic).to_ascii_lowercase();
-        }
-        "bin".into()
+        extension_of(self.head()).unwrap_or_else(|| "bin".into())
     }
+}
+
+/// An extension for a file that starts with these bytes (its first 16).
+pub(crate) fn extension_of(head: &[u8]) -> Option<String> {
+    if head.starts_with(b"ADAT") {
+        return Some("awc".into());
+    }
+    if head.starts_with(b"KB2") {
+        return Some("bk2".into());
+    }
+    let text = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    // Text only when all of the first bytes are: binary files start with
+    // `<` and a letter often enough (an offset table, for instance).
+    let printable = |b: &u8| b.is_ascii_graphic() || matches!(b, b' ' | b'\t' | b'\r' | b'\n');
+    if !text.is_empty() && text.iter().all(printable) {
+        let markup = text.starts_with(b"<?xml")
+            || (text.first() == Some(&b'<') && text.get(1).is_some_and(u8::is_ascii_alphabetic));
+        return Some(if markup { "xml" } else { "txt" }.into());
+    }
+    let magic = head.get(..4).filter(|magic| MAGICS.iter().any(|m| m == magic))?;
+    Some(String::from_utf8_lossy(magic).to_ascii_lowercase())
 }
 
 /// A stream as the scanner finds it, before chunks are joined.
