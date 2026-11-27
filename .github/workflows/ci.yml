@@ -74,10 +74,9 @@ jobs:
   # Test coverage (Linux), reported to Codacy. Runs the same tests as `test`
   # with coverage instrumentation; the upload needs the CODACY_PROJECT_TOKEN
   # secret, which pull requests from forks do not get, so it is skipped there.
+  # The upload action is pinned to the commit of its v1.3.0 tag.
   coverage:
     runs-on: ubuntu-latest
-    env:
-      CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
     steps:
       - uses: actions/checkout@v5
       - name: Install system libraries for the GUI (Slint, audio output)
@@ -97,10 +96,17 @@ jobs:
             . -> target
             plugins -> target
       - run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
-      - uses: codacy/codacy-coverage-reporter-action@v1.3.0
-        if: env.CODACY_PROJECT_TOKEN != ''
+      # The token only reaches the upload: the tests and the build scripts of
+      # the dependencies run without it.
+      - name: Is there a Codacy token?
+        id: codacy
+        env:
+          TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
+        run: echo "present=$([ -n "$TOKEN" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: codacy/codacy-coverage-reporter-action@89d6c85cfafaec52c72b6c5e8b2878d33104c699 # v1.3.0
+        if: steps.codacy.outputs.present == 'true'
         with:
-          project-token: ${{ env.CODACY_PROJECT_TOKEN }}
+          project-token: ${{ secrets.CODACY_PROJECT_TOKEN }}
           coverage-reports: lcov.info
 
   # Every dependency must come under a GPL-3-compatible licence (deny.toml),
