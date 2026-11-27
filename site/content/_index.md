@@ -37,6 +37,10 @@ Out of date? [Open an issue](https://github.com/Two-Play/openrage/issues).
 
 
 # A short section that points to the GTA VI page (content/gta-vi.md).
+[extra.community]
+title = "Community"
+intro = "OpenRAGE is made by its community. Ask questions, share what you made, report bugs or help with the code."
+
 [extra.gta6]
 title = "GTA VI"
 text = "OpenRAGE opens GTA VI's archives: the map in 3D, models, textures, animations, sounds and videos. A read-only preview, with your own copy of the game."

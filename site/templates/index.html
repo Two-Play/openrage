@@ -174,5 +174,32 @@
       </p>
     </div>
   </section>
+
+  {%- if x?.community %}
+
+  <section id="community" class="alt" aria-labelledby="community-title">
+    <div class="wrap">
+      <h2 id="community-title">{{ x.community.title }}</h2>
+      <p class="section-intro">{{ x.community.intro | markdown(inline=true) | safe }}</p>
+      <div class="downloads">
+        <div class="card reveal">
+          <h3>Chat on Matrix</h3>
+          <p>Questions, help with the setup, ideas and development: <code>#openRAGE:nope.chat</code>.</p>
+          <a class="btn btn-primary" href="{{ config.extra.matrix }}">Join the chat</a>
+        </div>
+        <div class="card reveal">
+          <h3>Report a bug</h3>
+          <p>Something does not work, or you miss a feature? Tell us on GitHub.</p>
+          <a class="btn btn-secondary" href="{{ config.extra.repo }}/issues/new/choose">Open an issue</a>
+        </div>
+        <div class="card reveal">
+          <h3>Contribute</h3>
+          <p>Code, documentation, notes on file formats and testing on your own game.</p>
+          <a class="btn btn-secondary" href="{{ get_url(path='@/community.md') }}">How to contribute</a>
+        </div>
+      </div>
+    </div>
+  </section>
+  {%- endif %}
 </main>
 {% endblock main %}
