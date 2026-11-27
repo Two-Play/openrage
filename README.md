@@ -18,6 +18,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 
 [![Website](https://img.shields.io/badge/website-two--play.github.io%2Fopenrage-c2410c.svg)](https://two-play.github.io/openrage/)
 [![CI](https://github.com/Two-Play/openrage/actions/workflows/ci.yml/badge.svg)](https://github.com/Two-Play/openrage/actions/workflows/ci.yml)
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/b51832dcb1464119ab0f48db6835ecbf)](https://app.codacy.com/gh/Two-Play/openrage/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
 [![Dev environment](https://github.com/Two-Play/openrage/actions/workflows/dev-env.yml/badge.svg)](https://github.com/Two-Play/openrage/actions/workflows/dev-env.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust 1.99](https://img.shields.io/badge/rust-1.99-orange.svg?logo=rust)](rust-toolchain.toml)
