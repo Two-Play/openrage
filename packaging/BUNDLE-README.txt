@@ -1,11 +1,11 @@
-OpenRAGE {VERSION} - Linux and Windows
-=====================================
+OpenRAGE {VERSION} - Linux, Windows and macOS
+=============================================
 
 OpenRAGE is a free, open-source explorer and mod tool for RAGE engine games
 (GTA V Legacy and Enhanced, GTA IV, Red Dead Redemption 2), the successor to
 OpenIV. It works with OpenIV's "mods" folder and .oiv packages.
 
-This archive contains both versions:
+This archive contains the version for each system:
 
   windows/   OpenRAGE for Windows 10/11 (x86_64)
              Start openrage-gui.exe. No installation needed.
@@ -14,7 +14,11 @@ This archive contains both versions:
              Start ./openrage-gui. openrage.desktop and openrage.png add it
              to the application menu if you like.
 
-Both folders also contain "openrage", the command-line tool, and "plugins"
+  macos/     OpenRAGE for macOS (Apple silicon), a preview
+             See README-macOS.txt: macOS blocks the unsigned programs
+             until you run "xattr -dr com.apple.quarantine ." there.
+
+Every folder also contains "openrage", the command-line tool, and "plugins"
 with three example plugins ("strings", "gxt2-patch" and "obj-tools"; MIT OR
 Apache-2.0).
 Plugins stay off until you turn them on in Settings > Plugins.

@@ -96,10 +96,11 @@ A release: open a pull request from `develop` into `main`, merge it, then tag `m
 
 ## Releases
 
-Releases are made by pushing a version tag on `main` (`git tag v0.2.0 && git push origin v0.2.0`, matching the version in `Cargo.toml`); the *Release* workflow builds both systems and publishes the release. It can also be run by hand from the Actions tab to build the archives without publishing.
+Releases are made by pushing a version tag on `main` (`git tag v0.2.0 && git push origin v0.2.0`, matching the version in `Cargo.toml`); the *Release* workflow builds Linux, Windows and macOS (a preview: a failed macOS build does not stop the release) and publishes the release. It can also be run by hand from the Actions tab to build the archives without publishing.
 
-Once a release is published, the *Release bundle* workflow adds `openrage-<tag>-linux-windows.zip`: both versions in one
-download (`linux/`, `windows/`, a short `README.txt` and the license files), for mod sites that host one file per release.
+Once a release is published, the *Release bundle* workflow adds `openrage-<tag>-all-platforms.zip`: every system's version
+in one download (`linux/`, `windows/`, `macos/` if the release has a macOS build, a short `README.txt` and the license
+files), for mod sites that host one file per release.
 It reuses the release's archives instead of building again and adds its checksum to `SHA256SUMS.txt`. Run it by hand
 (*Actions → Release bundle → Run workflow*) with a tag to make the bundle for an older release; with *upload* off it is
 only kept as a workflow artifact.

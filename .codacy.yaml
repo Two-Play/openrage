@@ -1,0 +1,13 @@
+# Codacy (https://app.codacy.com): what it analyses. Rust lints (clippy, rustfmt)
+# run in CI (.github/workflows/ci.yml) and block merges there; Codacy adds the
+# overview, duplication, complexity, the other languages and test coverage.
+exclude_paths:
+  # Generated from Cargo.lock (dev/third_party_licenses.py, checked in CI).
+  - "THIRD_PARTY_LICENSES.md"
+  - "crates/openrage-app/src/third_party_licenses.json"
+  # Name lists and lookup data, not code.
+  - "crates/rage-formats/src/meta_names.txt"
+  - "**/*.txt"
+  # Build output.
+  - "target/**"
+  - "plugins/target/**"
