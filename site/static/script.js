@@ -118,12 +118,13 @@
 
   // The visitor's operating system: shown first in downloads and guides.
   var OS_KEY = "openrage-os";
-  var OS_NAMES = { linux: "Linux", windows: "Windows" };
+  var OS_NAMES = { linux: "Linux", windows: "Windows", macos: "macOS" };
   function detectOS() {
     var p = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
     var ua = navigator.userAgent || "";
     if (/win/i.test(p) || /Windows/.test(ua)) return "windows";
-    if (/android/i.test(ua)) return null;
+    if (/android|iphone|ipad/i.test(ua)) return null;
+    if (/mac/i.test(p) || /Macintosh/.test(ua)) return "macos";
     if (/linux/i.test(p) || /Linux|X11|CrOS/.test(ua)) return "linux";
     return null;
   }
@@ -269,6 +270,7 @@
       var byKind = {
         linux: find(/linux.*\.tar\.gz$/i),
         windows: find(/windows.*\.zip$/i),
+        macos: find(/macos.*\.tar\.gz$/i),
         sums: find(/SHA256SUMS/i)
       };
       targets.forEach(function (el) {

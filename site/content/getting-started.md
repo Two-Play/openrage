@@ -1,6 +1,6 @@
 +++
 title = "Getting started"
-description = "Switch from OpenIV in minutes: download OpenRAGE for Linux or Windows and set up GTA V, GTA IV or Red Dead Redemption 2 with keys from your own copy."
+description = "Switch from OpenIV in minutes: download OpenRAGE for Linux, Windows or macOS and set up GTA V, GTA IV or Red Dead Redemption 2 with keys from your own copy."
 
 [extra]
 docs = true
@@ -10,8 +10,8 @@ toc = true
 
 ## Download a release
 
-Ready-made builds for **Linux** (x86-64, glibc 2.35 or newer) and **Windows** (x86-64) are on the
-[releases page](https://github.com/Two-Play/openrage/releases/latest).
+Ready-made builds for **Linux** (x86-64, glibc 2.35 or newer), **Windows** (x86-64) and, as a preview, **macOS**
+(Apple silicon) are on the [releases page](https://github.com/Two-Play/openrage/releases/latest).
 
 {{ <downloads /> }}
 
@@ -59,6 +59,34 @@ Get-FileHash .\openrage-*-windows-x86_64.zip -Algorithm SHA256
 ```
 
 </div>
+<div class="os-panel" data-os="macos">
+
+### macOS
+
+> [!NOTE]
+> The macOS build is a preview: it is built and tested automatically, but has seen little use on real
+> Macs yet. Please [report problems](https://github.com/Two-Play/openrage/issues/new/choose).
+
+Unpack the archive. The programs are not signed by an Apple developer account, so macOS blocks them the first time;
+remove the download mark in Terminal, then start the GUI, or `openrage` for the command line:
+
+```
+tar -xzf openrage-*-macos-arm64.tar.gz
+cd openrage-*-macos-arm64
+xattr -dr com.apple.quarantine .
+./openrage-gui
+```
+
+The games do not run on macOS themselves, so OpenRAGE cannot find them on its own: choose the game folder by hand,
+for example a copy from a Windows PC, an external drive, or the folder inside CrossOver or Whisky.
+
+To check the download, compare its hash with the line in `SHA256SUMS.txt`:
+
+```
+shasum -a 256 openrage-*-macos-arm64.tar.gz
+```
+
+</div>
 </div>
 
 ## Set up your game
@@ -75,7 +103,8 @@ your own copy of the game: check the game folder and click **Derive keys**. For 
 - **GTA V Enhanced** (`GTA5_Enhanced.exe`) no longer stores all keys in the executable. In the setup dialog, choose a
   CodeWalker key blob (`magic.dat`) you obtained yourself under *Key blob*. It is decrypted with the key from *your*
   executable and checked against `common.rpf` before it is used.
-- The keys are cached once, at `~/.config/openrage/gtav.keys` (Linux) or `%APPDATA%\openrage\gtav.keys` (Windows),
+- The keys are cached once, at `~/.config/openrage/gtav.keys` (Linux), `%APPDATA%\openrage\gtav.keys` (Windows) or
+  `~/Library/Application Support/openrage/gtav.keys` (macOS),
   and the game folder is remembered. To add or switch games later: **File → Switch game…**
 
 > [!WARNING]

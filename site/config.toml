@@ -23,6 +23,7 @@ external_level = "warn"
 [extra]
 repo = "https://github.com/Two-Play/openrage"
 releases = "https://github.com/Two-Play/openrage/releases"
+matrix = "https://matrix.to/#/#openRAGE:nope.chat"
 
 # Documentation sidebar: groups of pages, in order.
 [[extra.docs]]
@@ -49,4 +50,8 @@ pages = [
   ["development.md", "Development"],
   ["licenses.md", "Licenses"],
 ]
+
+[[extra.docs]]
+title = "Community"
+pages = [["community.md", "Community and contributing"]]
 

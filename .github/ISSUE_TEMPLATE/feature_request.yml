@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest a new feature, format or game for OpenRAGE.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea! Rough ideas can also be discussed first in the [Matrix room](https://matrix.to/#/#openRAGE:nope.chat).
+  - type: textarea
+    id: problem
+    attributes:
+      label: What do you want to do?
+      description: Describe the task or the problem, not only the solution. For example "I want to replace the textures of a weapon in RDR2".
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: How could OpenRAGE help?
+      description: "How you imagine it working: a button, a command, a new format, …"
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game
+      multiple: true
+      options:
+        - GTA V
+        - GTA VI
+        - Red Dead Redemption 2
+        - GTA IV
+        - Not game-specific
+  - type: textarea
+    id: openiv
+    attributes:
+      label: How do other tools do it?
+      description: If OpenIV, CodeWalker or another tool already does this, say how. Links to formats or documentation help a lot.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before sending
+      options:
+        - label: I searched the existing issues and did not find this idea.
+          required: true

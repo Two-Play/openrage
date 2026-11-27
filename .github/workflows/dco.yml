@@ -1,0 +1,50 @@
+name: DCO
+
+# Every commit of a pull request must be signed off under the Developer
+# Certificate of Origin (https://developercertificate.org/), with a
+# "Signed-off-by:" line that names the commit's author (`git commit -s`).
+# See CONTRIBUTING.md. Merge commits and bots are skipped.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  sign-off:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Check the sign-off of every commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          failed=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            author_name=$(git log -1 --format='%an' "$c")
+            author_mail=$(git log -1 --format='%ae' "$c")
+            subject=$(git log -1 --format='%h %s' "$c")
+            case "$author_mail" in
+              *'[bot]@users.noreply.github.com') echo "skip (bot): $subject"; continue ;;
+            esac
+            # The sign-off must carry the author's e-mail address.
+            if git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$c" \
+                 | grep -qiF "<$author_mail>"; then
+              echo "ok: $subject"
+            else
+              echo "::error::Commit $subject has no 'Signed-off-by: $author_name <$author_mail>' line."
+              failed=1
+            fi
+          done
+          if [ "$failed" = 1 ]; then
+            echo
+            echo "Sign off your commits under the Developer Certificate of Origin (see CONTRIBUTING.md):"
+            echo "  last commit:          git commit --amend -s --no-edit"
+            echo "  all commits:          git rebase --signoff ${{ github.event.pull_request.base.ref }}"
+            echo "then push again (git push --force-with-lease)."
+            exit 1
+          fi
