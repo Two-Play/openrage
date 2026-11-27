@@ -1,0 +1,99 @@
+name: Bug report
+description: Something in OpenRAGE does not work as it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug!
+        For quick questions or help with the setup, the [Matrix room](https://matrix.to/#/#openRAGE:nope.chat) is often faster.
+
+        **Please do not attach game files, executables or encryption keys.** OpenRAGE takes them from your own copy of the game.
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game
+      options:
+        - GTA V Legacy
+        - GTA V Enhanced
+        - GTA VI
+        - Red Dead Redemption 2
+        - GTA IV
+        - Not game-specific
+    validations:
+      required: true
+  - type: input
+    id: game-version
+    attributes:
+      label: Game version and store
+      description: For example "1.0.3725, Steam" or "Rockstar Launcher, July 2026 update".
+  - type: input
+    id: version
+    attributes:
+      label: OpenRAGE version
+      description: Shown under Help → About OpenRAGE, or with `openrage --version`.
+      placeholder: "0.6.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - Linux (Steam Deck)
+        - Windows
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install OpenRAGE?
+      options:
+        - AppImage
+        - Flatpak
+        - .tar.gz (Linux)
+        - .zip (Windows)
+        - Built from source
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, and what went wrong? Error messages as text help more than screenshots alone.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: If you know them, the steps that lead to the problem.
+      placeholder: |
+        1. Open …
+        2. Click …
+        3. See the error
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+  - type: textarea
+    id: mods
+    attributes:
+      label: Mods in the game folder
+      description: ASI loaders, Script Hook, SHVDN, LML, `dinput8.dll`, `xinput1_4.dll` and the like can change what OpenRAGE detects. List what you have installed, if anything.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output or logs
+      description: If you started OpenRAGE from a terminal, paste what it printed. This is shown as code, no backticks needed.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before sending
+      options:
+        - label: I searched the existing issues and did not find this bug.
+          required: true
+        - label: I did not attach game files, executables or keys.
+          required: true

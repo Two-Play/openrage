@@ -100,6 +100,14 @@ cargo build --release      # target/release/openrage-gui and target/release/open
 
 The website lives in [`site/`](site/) and is built from Markdown.
 
+## Community
+
+Questions, ideas, or want to show what you made? Join us on **Matrix**: **[#openRAGE:nope.chat](https://matrix.to/#/#openRAGE:nope.chat)**
+
+New to Matrix? Open the link and pick a client, for example [Element](https://element.io/download); creating an account is free.
+
+Found a bug or have a feature request? [Open an issue](https://github.com/Two-Play/openrage/issues/new/choose). Want to contribute code? See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 GPL-3.0-only, except `crates/rage-tfit2` (the RDR2 archive cipher, ported from an AGPL-3.0 project), which is AGPL-3.0-only, and the plugin interface and SDK (`crates/openrage-plugins/wit`, `plugins/`), which are MIT OR Apache-2.0 so that plugins may use any licence. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for third-party attributions, and [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for the licenses of all third-party crates in the programs (generated from `Cargo.lock`, checked in CI). The same is in the app under **Help → About OpenRAGE**, via `openrage licenses` and on the [licenses page](https://two-play.github.io/openrage/licenses/).

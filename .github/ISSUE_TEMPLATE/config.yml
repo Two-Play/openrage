@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Help and questions (Matrix)
+    url: https://matrix.to/#/#openRAGE:nope.chat
+    about: Help with installing, setting up your game and using OpenRAGE.
+  - name: Documentation
+    url: https://two-play.github.io/openrage/guide/
+    about: Getting started, the explorer, modding and every command.
