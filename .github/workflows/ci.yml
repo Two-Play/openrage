@@ -34,7 +34,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        include:
+          # macOS (Apple silicon) is a preview: its result is shown but does not block.
+          - os: macos-latest
+            experimental: true
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental || false }}
     steps:
       - uses: actions/checkout@v5
       - name: Install system libraries for the GUI (Slint, audio output)

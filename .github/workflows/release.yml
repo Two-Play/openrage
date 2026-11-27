@@ -1,8 +1,8 @@
 name: Release
 
 # Pushing a tag such as v0.2.0 builds OpenRAGE for Linux (.tar.gz, AppImage
-# and Flatpak) and Windows (.zip) and publishes a GitHub release with them and
-# their SHA-256 checksums.
+# and Flatpak), Windows (.zip) and macOS (Apple silicon, .tar.gz; preview) and
+# publishes a GitHub release with them and their SHA-256 checksums.
 # "Run workflow" (manual) builds the same archives without publishing, to
 # try a release first. Tests are not repeated here: CI runs them on every
 # change to main, which is where release tags are cut from.
@@ -28,7 +28,12 @@ jobs:
             name: linux-x86_64
           - os: windows-latest
             name: windows-x86_64
+          # Preview: a failed macOS build does not hold up the release.
+          - os: macos-latest
+            name: macos-arm64
+            experimental: true
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental || false }}
     steps:
       - uses: actions/checkout@v5
       - name: Check that the tag matches the version in Cargo.toml
@@ -75,6 +80,10 @@ jobs:
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp target/release/openrage.exe target/release/openrage-gui.exe "$dir/"
             7z a -tzip "out/$dir.zip" "$dir" > /dev/null
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            cp target/release/openrage target/release/openrage-gui packaging/openrage.png "$dir/"
+            cp packaging/macos/README-macOS.txt "$dir/"
+            tar czf "out/$dir.tar.gz" "$dir"
           else
             cp target/release/openrage target/release/openrage-gui "$dir/"
             cp packaging/openrage.desktop packaging/openrage.png packaging/openrage-mime.xml "$dir/"

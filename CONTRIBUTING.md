@@ -54,7 +54,7 @@ This adds a line with your name and e-mail address to the commit message:
 Signed-off-by: Your Name <you@example.com>
 ```
 
-Use a name you are known by; a pseudonym is fine. Forgot it? `git commit --amend -s` fixes the last commit, `git rebase --signoff develop` all commits of your branch.
+A check on every pull request makes sure each commit carries a sign-off with its author's e-mail address. Use a name you are known by; a pseudonym is fine. Forgot it? `git commit --amend -s` fixes the last commit, `git rebase --signoff develop` all commits of your branch.
 
 ### Code from elsewhere
 

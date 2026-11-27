@@ -4,7 +4,7 @@
 
 # OpenRAGE
 
-**The open-source successor to OpenIV — mod GTA V and Red Dead Redemption 2, and explore GTA VI, on Linux and Windows.**
+**The open-source successor to OpenIV — mod GTA V and Red Dead Redemption 2, and explore GTA VI, on Linux, Windows and macOS.**
 
 ### 🌴 New: GTA VI works!
 
@@ -21,7 +21,7 @@ edit game text and install `.oiv` packages — compatible with OpenIV's `mods` f
 [![Dev environment](https://github.com/Two-Play/openrage/actions/workflows/dev-env.yml/badge.svg)](https://github.com/Two-Play/openrage/actions/workflows/dev-env.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust 1.99](https://img.shields.io/badge/rust-1.99-orange.svg?logo=rust)](rust-toolchain.toml)
-[![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey.svg)](#installation)
+[![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)](#installation)
 [![GUI: Slint](https://img.shields.io/badge/GUI-Slint-2379F4.svg)](https://slint.dev)
 [![GPU: wgpu](https://img.shields.io/badge/GPU-wgpu-8A2BE2.svg)](https://wgpu.rs)
 
@@ -74,7 +74,7 @@ More screenshots and all features: **[two-play.github.io/openrage](https://two-p
 
 ## Installation
 
-Download the [latest release](https://github.com/Two-Play/openrage/releases/latest) for Linux (AppImage, Flatpak or `.tar.gz`) or Windows (`.zip`) and start `openrage-gui`. On first start it finds your game and sets up the keys. Step by step: **[Getting started](https://two-play.github.io/openrage/getting-started/)**.
+Download the [latest release](https://github.com/Two-Play/openrage/releases/latest) for Linux (AppImage, Flatpak or `.tar.gz`), Windows (`.zip`) or macOS (Apple silicon, `.tar.gz`, preview) and start `openrage-gui`. On first start it finds your game and sets up the keys. Step by step: **[Getting started](https://two-play.github.io/openrage/getting-started/)**.
 
 For the GTA VI preview, choose the folder containing `game_scarlett_master.exe` or RPF9 archives. With the supported executable beside the archives, OpenRAGE reads their tables of contents with the keys in it (the keys are not stored), so archives open at once. Names are matched to the hashes in the tables; files without a match are listed under `entries/`. Without the executable, or with another build, the explorer indexes the archives in the background and caches the results, which can take several minutes for large archives; recovered entries are then grouped by file type and offset, with model names recovered from their data where possible. Editing RPF9 archives is not supported.
 
