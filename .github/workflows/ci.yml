@@ -71,6 +71,38 @@ jobs:
         if: runner.os == 'Linux'
       - run: cargo test
 
+  # Test coverage (Linux), reported to Codacy. Runs the same tests as `test`
+  # with coverage instrumentation; the upload needs the CODACY_PROJECT_TOKEN
+  # secret, which pull requests from forks do not get, so it is skipped there.
+  coverage:
+    runs-on: ubuntu-latest
+    env:
+      CODACY_PROJECT_TOKEN: ${{ secrets.CODACY_PROJECT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install system libraries for the GUI (Slint, audio output)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libudev-dev libasound2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      # rust-toolchain.toml pins the version; add the coverage tools to it.
+      - run: rustup component add llvm-tools
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.9.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+          workspaces: |
+            . -> target
+            plugins -> target
+      - run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+      - uses: codacy/codacy-coverage-reporter-action@v1.3.0
+        if: env.CODACY_PROJECT_TOKEN != ''
+        with:
+          project-token: ${{ env.CODACY_PROJECT_TOKEN }}
+          coverage-reports: lcov.info
+
   # Every dependency must come under a GPL-3-compatible licence (deny.toml),
   # and the generated licence list (THIRD_PARTY_LICENSES.md and the data the
   # app shows) must match Cargo.lock.

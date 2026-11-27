@@ -1,13 +1,14 @@
 name: Release bundle
 
-# One download with both the Linux and the Windows version, for mod sites
-# that host a single file per release (GTA5-Mods, Nexus Mods, …).
+# One download with every system's version, for mod sites that host a single
+# file per release (GTA5-Mods, Nexus Mods, …).
 #
 # It runs after the Release workflow has published a tag's release: it takes
-# that release's Linux .tar.gz and Windows .zip, unpacks them into `linux/`
-# and `windows/` next to a short README and the license files, and attaches
-# `openrage-<tag>-linux-windows.zip` to the same release (its checksum is
-# added to SHA256SUMS.txt). Nothing is built again.
+# that release's Linux .tar.gz, Windows .zip and, if there is one, the macOS
+# .tar.gz (a preview, so it may be missing), unpacks them into `linux/`,
+# `windows/` and `macos/` next to a short README and the license files, and
+# attaches `openrage-<tag>-all-platforms.zip` to the same release (its
+# checksum is added to SHA256SUMS.txt). Nothing is built again.
 #
 # "Run workflow" (manual) makes the bundle for an existing release tag; with
 # "upload" off it is only kept as a workflow artifact, to check it first.
@@ -44,7 +45,7 @@ jobs:
     steps:
       # The default branch: it has the bundle README also for older tags.
       - uses: actions/checkout@v5
-      - name: Download the Linux and Windows archives of the release
+      - name: Download the archives of the release
         run: |
           gh release view "$TAG" > /dev/null
           mkdir -p dl
@@ -52,32 +53,43 @@ jobs:
             --pattern "openrage-${TAG}-linux-x86_64.tar.gz" \
             --pattern "openrage-${TAG}-windows-x86_64.zip" \
             --pattern SHA256SUMS.txt
+          # macOS is a preview build and may be missing from a release.
+          gh release download "$TAG" --dir dl --pattern "openrage-${TAG}-macos-arm64.tar.gz" || true
           (cd dl && sha256sum --check --ignore-missing SHA256SUMS.txt)
-      - name: Put both into one archive
+      - name: Put them into one archive
         run: |
-          bundle="openrage-${TAG}-linux-windows"
+          bundle="openrage-${TAG}-all-platforms"
           mkdir -p "$bundle" unpacked out
           tar xzf "dl/openrage-${TAG}-linux-x86_64.tar.gz" -C unpacked
           unzip -q "dl/openrage-${TAG}-windows-x86_64.zip" -d unpacked
           mv "unpacked/openrage-${TAG}-linux-x86_64" "$bundle/linux"
           mv "unpacked/openrage-${TAG}-windows-x86_64" "$bundle/windows"
+          systems="linux windows"
+          if [ -f "dl/openrage-${TAG}-macos-arm64.tar.gz" ]; then
+            tar xzf "dl/openrage-${TAG}-macos-arm64.tar.gz" -C unpacked
+            mv "unpacked/openrage-${TAG}-macos-arm64" "$bundle/macos"
+            systems="$systems macos"
+          fi
           # The license files and README once, at the top.
           for f in LICENSE LICENSE-AGPL-3.0 NOTICE.md README.md; do
             mv "$bundle/linux/$f" "$bundle/$f"
-            rm -f "$bundle/windows/$f"
+            for s in $systems; do rm -f "$bundle/$s/$f"; done
           done
           # Releases before 0.3 have no THIRD_PARTY_LICENSES.md.
           if [ -f "$bundle/linux/THIRD_PARTY_LICENSES.md" ]; then
             mv "$bundle/linux/THIRD_PARTY_LICENSES.md" "$bundle/THIRD_PARTY_LICENSES.md"
-            rm -f "$bundle/windows/THIRD_PARTY_LICENSES.md"
+            for s in $systems; do rm -f "$bundle/$s/THIRD_PARTY_LICENSES.md"; done
           fi
           # Every file the archives held, and nothing else, ends up in the bundle.
-          for f in "$bundle"/linux/* "$bundle"/windows/*; do test -s "$f"; done
+          for s in $systems; do for f in "$bundle/$s"/*; do test -s "$f"; done; done
           test -x "$bundle/linux/openrage-gui" && test -f "$bundle/windows/openrage-gui.exe"
+          if [ -d "$bundle/macos" ]; then test -x "$bundle/macos/openrage-gui"; fi
           sed "s/{VERSION}/${TAG}/" packaging/BUNDLE-README.txt > "$bundle/README.txt"
+          # Without a macOS build, leave its part out of the README.
+          if [ ! -d "$bundle/macos" ]; then sed -i '/^  macos\//,/^$/d' "$bundle/README.txt"; fi
           # Windows users open README.txt in Notepad: CRLF line ends.
           sed -i 's/$/\r/' "$bundle/README.txt"
-          # -X: no Unix owner fields; Unix permissions stay, so the Linux files remain executable.
+          # -X: no Unix owner fields; Unix permissions stay, so the Linux and macOS files remain executable.
           zip -q -r -X -9 "out/${bundle}.zip" "$bundle"
           (cd out && sha256sum "${bundle}.zip" | tee "${bundle}.zip.sha256")
           unzip -l "out/${bundle}.zip"
@@ -89,7 +101,7 @@ jobs:
       - name: Attach the bundle to the release
         if: env.UPLOAD == 'true'
         run: |
-          bundle="openrage-${TAG}-linux-windows.zip"
+          bundle="openrage-${TAG}-all-platforms.zip"
           grep -v " ${bundle}\$" dl/SHA256SUMS.txt > SHA256SUMS.txt || true
           cat "out/${bundle}.sha256" >> SHA256SUMS.txt
           gh release upload "$TAG" "out/${bundle}" SHA256SUMS.txt --clobber

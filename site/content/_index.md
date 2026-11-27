@@ -3,7 +3,7 @@
 # TOML note: plain keys must stay above the first [table] / [[list]] entry.
 # Strings are Markdown (links, `code`, **bold**). Images are file names in docs/images/.
 title = "OpenRAGE – the open-source OpenIV successor"
-description = "OpenRAGE is the free, open-source successor to OpenIV: mod GTA V (Legacy and Enhanced) and explore Red Dead Redemption 2 on Linux and Windows, with OpenIV's mods folder and .oiv packages, plus undo."
+description = "OpenRAGE is the free, open-source successor to OpenIV: mod GTA V (Legacy and Enhanced) and explore Red Dead Redemption 2 on Linux, Windows and macOS, with OpenIV's mods folder and .oiv packages, plus undo."
 
 [extra]
 # Small line above the headline.
@@ -11,7 +11,7 @@ eyebrow = "The open-source OpenIV successor"
 # **bold** parts are shown in the accent colour.
 headline = "The open modding toolkit for **RAGE engine** games"
 # One short line under the headline; the longer description belongs in features_intro.
-lead = "OpenIV's last release was in 2022. OpenRAGE picks up where it left off: same `mods` folder and `.oiv` packages, now open source, on Linux and Windows, ready for GTA V Enhanced and RDR2."
+lead = "OpenIV's last release was in 2022. OpenRAGE picks up where it left off: same `mods` folder and `.oiv` packages, now open source, on Linux, Windows and macOS, ready for GTA V Enhanced and RDR2."
 notice = """
 OpenRAGE is an independent community project. It is not affiliated with or endorsed by Rockstar Games or Take-Two Interactive.
 It is not made by or affiliated with the OpenIV team either.
@@ -200,8 +200,8 @@ text = "GPL-3.0: read, check and improve the code."
 
 [[extra.reasons]]
 icon = "🐧"
-title = "Linux and Windows"
-text = "Native on both, Steam and Proton installs included."
+title = "Linux, Windows and macOS"
+text = "Native on Linux and Windows, Steam and Proton installs included; macOS as a preview."
 
 [[extra.reasons]]
 icon = "🛠️"
@@ -239,7 +239,7 @@ edge = "openrage"
 [[extra.compare]]
 feature = "Operating systems"
 openiv = "Windows"
-openrage = "Linux and Windows"
+openrage = "Linux, Windows and macOS (preview)"
 edge = "openrage"
 
 [[extra.compare]]

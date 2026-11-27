@@ -7,7 +7,7 @@ template = "gta-vi.html"
 # **bold** parts are shown in the accent colour.
 eyebrow = "Read-only preview"
 headline = "Explore **GTA VI**"
-lead = "Open RPF9 archives like folders, search the whole game and look at what is inside, on Linux and Windows."
+lead = "Open RPF9 archives like folders, search the whole game and look at what is inside, on Linux, Windows and macOS."
 features_title = "What you can do"
 features_intro = "Everything is read from your own copy of the game. Nothing in it is changed."
 screenshots_title = "Screenshots"

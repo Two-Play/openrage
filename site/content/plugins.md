@@ -11,7 +11,7 @@ toc = true
 A plugin is a folder with a manifest (`plugin.toml`) and a WebAssembly component (`.wasm`). OpenRAGE runs it with
 [wasmtime](https://wasmtime.dev/). The plugin sees only the files the user hands it, plus the game's files if the user
 grants that (read-only). It has no access to other files, the network or the environment, and every call has a
-memory and a time limit. The same `.wasm` runs on Linux and Windows.
+memory and a time limit. The same `.wasm` runs on Linux, Windows and macOS.
 
 > [!NOTE]
 > The plugin API is at version **0.3** and may still change: plugins name the version they were built for and
