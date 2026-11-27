@@ -318,8 +318,9 @@ pub(crate) fn run_setup(ui: &AppWindow) {
                 let _ = weak.upgrade_in_event_loop(move |ui| finish_setup(&ui, game_dir, magic, keys));
             }
             Err(e) => {
-                if e.downcast_ref::<KeyBlobRequired>().is_some() {
-                    push("This is GTA V Enhanced: its executable no longer contains the NG keys in plain form.");
+                if let Some(required) = e.downcast_ref::<KeyBlobRequired>() {
+                    push(&format!("{} does not contain the NG keys in plain form.", required.exe_name()));
+                    push("This is so for GTA V Enhanced, and for some updates of GTA V Legacy.");
                     push("Select a CodeWalker key blob (magic.dat) and try again.");
                 } else {
                     push(&format!("Error: {e:#}"));

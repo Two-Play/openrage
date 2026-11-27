@@ -24,8 +24,9 @@ pub(crate) enum Command {
         /// Game executable to scan (default: GTA5_Enhanced.exe or GTA5.exe in the game directory).
         #[arg(long)]
         exe: Option<PathBuf>,
-        /// CodeWalker key blob (magic.dat); required for GTA V Enhanced, whose
-        /// executable no longer contains the NG keys in plain form.
+        /// CodeWalker key blob (magic.dat); required when the executable does not
+        /// contain the NG keys in plain form: GTA V Enhanced, and some GTA V
+        /// Legacy updates.
         #[arg(long)]
         magic: Option<PathBuf>,
     },

@@ -45,14 +45,29 @@ pub struct SetupReport {
 }
 
 /// Error raised when the executable lacks the NG keys and no key blob was given.
+///
+/// GTA V Enhanced never has them in plain form; some updates of GTA V Legacy
+/// do not either, so this says nothing about the edition.
 #[derive(Debug)]
-pub struct KeyBlobRequired;
+pub struct KeyBlobRequired {
+    /// The executable that was scanned.
+    pub exe: PathBuf,
+}
+
+impl KeyBlobRequired {
+    /// The executable's file name, for messages.
+    pub fn exe_name(&self) -> String {
+        self.exe.file_name().map_or_else(|| self.exe.display().to_string(), |n| n.to_string_lossy().into_owned())
+    }
+}
 
 impl std::fmt::Display for KeyBlobRequired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "this executable (GTA V Enhanced) does not contain the NG keys in plain form; \
-             a CodeWalker key blob (magic.dat) is required",
+        write!(
+            f,
+            "{} does not contain the NG keys in plain form (GTA V Enhanced never does, some GTA V Legacy \
+             updates do not either); a CodeWalker key blob (magic.dat) is required",
+            self.exe_name()
         )
     }
 }
@@ -90,7 +105,7 @@ pub fn derive_keys(
         }
         (GtaVKeys::from_magic(aes, &contents).context("key blob has an unexpected layout")?, KeySource::KeyBlob)
     } else {
-        return Err(KeyBlobRequired.into());
+        return Err(KeyBlobRequired { exe }.into());
     };
 
     let keys = Arc::new(keys);
@@ -115,4 +130,20 @@ pub fn derive_keys(
         cache_path,
     };
     Ok((keys, report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_blob_message_names_the_executable_not_an_edition() {
+        let legacy = KeyBlobRequired { exe: PathBuf::from("/games/Grand Theft Auto V/GTA5.exe") };
+        assert_eq!(legacy.exe_name(), "GTA5.exe");
+        let message = legacy.to_string();
+        assert!(message.starts_with("GTA5.exe does not contain the NG keys"), "{message}");
+        assert!(message.contains("magic.dat"), "{message}");
+        let enhanced = KeyBlobRequired { exe: PathBuf::from("GTA5_Enhanced.exe") };
+        assert!(enhanced.to_string().starts_with("GTA5_Enhanced.exe "));
+    }
 }
