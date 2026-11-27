@@ -28,6 +28,36 @@ OpenRAGE contains no game files and no encryption keys, and it has to stay that 
 
 Large generated files, such as name dictionaries, should be discussed first; they may be better shipped separately.
 
-## Licence
+## Licences and sign-off
 
-By contributing you agree that your contribution is licensed under the licence of the part of the project you change (see [LICENSE](LICENSE) and the licence section of the [README](README.md#license)).
+OpenRAGE has three licences, depending on the part of the project:
+
+| Part | Licence |
+|---|---|
+| Everything not listed below | GPL-3.0-only |
+| `crates/rage-tfit2` | AGPL-3.0-only |
+| Plugin interface and SDK (`crates/openrage-plugins/wit`, `plugins/`) | MIT OR Apache-2.0 |
+
+**Your contribution is licensed under the licence of the files you change** ("inbound = outbound"). You keep your copyright; there is no contributor licence agreement (CLA).
+
+### Developer Certificate of Origin
+
+Every commit has to be signed off under the [Developer Certificate of Origin 1.1](https://developercertificate.org/). With the sign-off you confirm that you wrote the change yourself, or otherwise have the right to submit it under the project's licence. Add it with `-s`:
+
+```sh
+git commit -s -m "Your message"
+```
+
+This adds a line with your name and e-mail address to the commit message:
+
+```
+Signed-off-by: Your Name <you@example.com>
+```
+
+Use a name you are known by; a pseudonym is fine. Forgot it? `git commit --amend -s` fixes the last commit, `git rebase --signoff develop` all commits of your branch.
+
+### Code from elsewhere
+
+- Code from other projects is welcome if its licence is compatible with the part you add it to. Keep its copyright notice, name the source in the commit message and add it to [NOTICE.md](NOTICE.md).
+- Do not copy code whose licence is unknown or incompatible, and no code decompiled or copied from a game or from closed-source tools. Findings from reverse engineering (how a format is laid out) are fine; describe them in your own code.
+- New dependencies must pass the licence check (`cargo deny check licenses`, also run in CI).

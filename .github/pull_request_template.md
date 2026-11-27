@@ -11,6 +11,8 @@
 ## Checklist
 
 - [ ] The pull request targets `develop`.
+- [ ] Every commit is signed off (`git commit -s`, see [CONTRIBUTING.md](https://github.com/Two-Play/openrage/blob/develop/CONTRIBUTING.md#licences-and-sign-off)).
+- [ ] Code from other projects has a compatible licence and is listed in `NOTICE.md`.
 - [ ] `cargo fmt --all --check` and `cargo test` pass locally.
 - [ ] No game files, executables, encryption keys or extracted game assets are included.
 - [ ] Large generated files (dictionaries, test data) are left out or discussed first.
