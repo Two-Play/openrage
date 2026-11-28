@@ -8,6 +8,10 @@
 //! down to the dictionary, so they work for unnamed files too. It is built
 //! once (a few minutes) and cached next to the file names.
 
+pub mod install;
+pub mod metaped;
+pub mod tint;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
