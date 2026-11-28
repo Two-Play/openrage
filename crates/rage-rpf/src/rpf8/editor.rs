@@ -35,12 +35,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::RpfError;
-use crate::editor::{Backup, CommitStats};
+use crate::rpf7::editor::{Backup, CommitStats};
+use crate::rpf8::names::NameIndex;
 use crate::rpf8::{
     Compression, ENTRY_LEN, Entry, HEADER_LEN, MAGIC, PLAINTEXT, Rdr2Keys, Rpf8, SIGNATURE_LEN, extension, path_hash,
     resource_file_flags,
 };
-use crate::rpf8_names::NameIndex;
 
 fn err(msg: impl Into<String>) -> RpfError {
     RpfError::CorruptToc { archive: "RPF8 editor".into(), reason: msg.into() }

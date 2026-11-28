@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use rage_crypto::GtaVKeys;
 
-use crate::toc::{self, BLOCK, Meta, TocFile, err};
-use crate::writer::{RawEntry, existing_meta};
+use crate::rpf7::toc::{self, BLOCK, Meta, TocFile, err};
+use crate::rpf7::writer::{RawEntry, existing_meta};
 use crate::{Encryption, EntryId, EntryKind, Rpf7, RpfError, vfs};
 
 /// The bytes a commit overwrites, enough to restore the previous state.

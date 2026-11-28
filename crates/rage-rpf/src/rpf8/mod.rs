@@ -14,6 +14,11 @@
 //! the user provides. Without keys, the header is still readable and
 //! plaintext archives open fully.
 
+pub mod editor;
+pub mod exe;
+pub mod keys;
+pub mod names;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -300,7 +305,7 @@ pub fn plausible_table(table: &[u8], archive_size: u64) -> bool {
 /// This is process-wide state: one set of keys and names for every archive
 /// the process opens with [`Rpf8::open_default`]. Set it once at start-up;
 /// code that knows its keys should call [`Rpf8::open_with_keys`] instead.
-type Defaults = (Option<Arc<Rdr2Keys>>, Option<Arc<crate::rpf8_names::NameIndex>>);
+type Defaults = (Option<Arc<Rdr2Keys>>, Option<Arc<crate::rpf8::names::NameIndex>>);
 
 fn defaults() -> &'static std::sync::RwLock<Defaults> {
     static DEFAULTS: std::sync::OnceLock<std::sync::RwLock<Defaults>> = std::sync::OnceLock::new();
@@ -309,7 +314,7 @@ fn defaults() -> &'static std::sync::RwLock<Defaults> {
 
 /// Registers the keys and names [`Rpf8::open_default`] uses, for the whole
 /// process. Set it once at start-up.
-pub fn set_defaults(keys: Option<Arc<Rdr2Keys>>, names: Option<Arc<crate::rpf8_names::NameIndex>>) {
+pub fn set_defaults(keys: Option<Arc<Rdr2Keys>>, names: Option<Arc<crate::rpf8::names::NameIndex>>) {
     if let Ok(mut d) = defaults().write() {
         *d = (keys, names);
     }
@@ -321,7 +326,7 @@ pub fn default_keys() -> Option<Arc<Rdr2Keys>> {
 }
 
 /// The names registered with [`set_defaults`].
-pub fn default_names() -> Option<Arc<crate::rpf8_names::NameIndex>> {
+pub fn default_names() -> Option<Arc<crate::rpf8::names::NameIndex>> {
     defaults().read().ok()?.1.clone()
 }
 
@@ -344,7 +349,7 @@ pub struct Rpf8 {
     entries: Option<Vec<Entry>>,
     keys: Option<Arc<Rdr2Keys>>,
     /// Names found in the game's files, handed on to nested archives.
-    names: Option<Arc<crate::rpf8_names::NameIndex>>,
+    names: Option<Arc<crate::rpf8::names::NameIndex>>,
     /// 0 for a file on disk, 1 for an archive inside it, and so on.
     depth: u8,
 }
@@ -480,7 +485,7 @@ impl Rpf8 {
 
     /// Names entries that the archive's own name table left unnamed; nested
     /// archives opened afterwards get the names too.
-    pub fn set_names(&mut self, names: Arc<crate::rpf8_names::NameIndex>) {
+    pub fn set_names(&mut self, names: Arc<crate::rpf8::names::NameIndex>) {
         let platform = self.header.platform;
         if let Some(entries) = &mut self.entries {
             for e in entries.iter_mut().filter(|e| e.path.is_none()) {

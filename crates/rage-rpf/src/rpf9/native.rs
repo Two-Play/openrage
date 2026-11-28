@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use rayon::prelude::*;
 
-use crate::rpf9_cipher::Cipher;
-use crate::rpf9_index::{Catalog, Chunk, ENCRYPTION, NativeEntry, Storage};
-use crate::rpf9_names;
+use crate::rpf9::cipher::Cipher;
+use crate::rpf9::index::{Catalog, Chunk, ENCRYPTION, NativeEntry, Storage};
+use crate::rpf9::names as rpf9_names;
 
 pub(crate) struct Materials {
     pub cipher: Cipher,

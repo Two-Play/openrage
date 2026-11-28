@@ -1,6 +1,6 @@
 //! Editing GTA IV packages (`.rpf`, RPF2 and RPF3) in place.
 //!
-//! Like [`crate::gta4_editor`] for image archives: new and changed files are
+//! Like [`crate::gta4::img_editor`] for image archives: new and changed files are
 //! appended at 2048-byte boundaries and the table of contents at 0x800 is
 //! rewritten — encrypted again when it was, as is the data of archives that
 //! encrypt their files (`game.rpf`). Entries in the way of a grown table move

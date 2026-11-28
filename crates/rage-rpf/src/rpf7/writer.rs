@@ -16,7 +16,7 @@ use std::sync::Arc;
 use flate2::Compression;
 use flate2::write::DeflateEncoder;
 
-use crate::toc::{self, BLOCK, MAX_U24, Meta, TocFile, err};
+use crate::rpf7::toc::{self, BLOCK, MAX_U24, Meta, TocFile, err};
 use crate::{Encryption, EntryId, EntryKind, Rpf7, RpfError};
 
 const RSC7_MAGIC: u32 = 0x3743_5352;

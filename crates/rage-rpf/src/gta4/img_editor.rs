@@ -1,6 +1,6 @@
 //! Editing a GTA IV image archive (`.img`, IMG3) in place.
 //!
-//! Like [`crate::editor`] for RPF7: new and changed entries are appended at
+//! Like [`crate::rpf7::editor`] for RPF7: new and changed entries are appended at
 //! the end (2048-byte blocks), and the table of contents after the 20-byte
 //! header is rewritten — unencrypted, as in the few plain archives the game
 //! ships. When the new table no longer fits in front of the first data block,
