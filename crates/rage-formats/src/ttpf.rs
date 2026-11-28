@@ -48,6 +48,10 @@ pub enum TtpfError {
     Invalid(String),
     #[error("{0}")]
     Unsupported(String),
+    /// Reading the texture would take more memory than the pool's limit
+    /// ([`Pool::with_decode_limit`]).
+    #[error("reading it would take {needed} bytes, more than the limit of {limit}")]
+    TooLarge { needed: u64, limit: usize },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -64,6 +68,11 @@ const ETPF_VERSION: u32 = 634;
 /// No chunk unpacks to more than this.
 const MAX_CHUNK: usize = 256 << 20;
 const MAX_TEXTURES: usize = 250_000;
+/// How many bytes reading one texture may take by default; see
+/// [`Pool::with_decode_limit`]. In the Scarlett 1.0.2.1 pools a texture with
+/// all its mip levels takes at most 22 MB, and a chunk at most 8 MB packed
+/// and unpacked.
+pub const DEFAULT_DECODE_LIMIT: usize = 512 << 20;
 
 /// One chunk of the pool's virtual space.
 #[derive(Debug, Clone, Copy)]
@@ -329,6 +338,7 @@ pub struct Pool {
     chunks: Vec<Chunk>,
     descriptors: Vec<Descriptor>,
     keys: Vec<u64>,
+    decode_limit: usize,
 }
 
 impl Pool {
@@ -391,7 +401,18 @@ impl Pool {
         let mut keys = vec![0u8; textures * 8];
         file.read_exact(&mut keys).map_err(|_| invalid("the texture keys are cut off"))?;
         let keys = keys.as_chunks::<8>().0.iter().map(|k| u64::from_le_bytes(*k)).collect();
-        Ok(Pool { file: Mutex::new(file), virtual_size, chunks, descriptors, keys })
+        Ok(Pool { file: Mutex::new(file), virtual_size, chunks, descriptors, keys, decode_limit: DEFAULT_DECODE_LIMIT })
+    }
+
+    /// Sets how many bytes reading one texture may take, so that a broken or
+    /// hostile pool cannot make a reader allocate huge amounts of memory: the
+    /// pixels a read returns, and separately each chunk it unpacks on the way
+    /// (its packed and unpacked bytes and the range being read). A read that
+    /// would take more fails with [`TtpfError::TooLarge`] before anything is
+    /// allocated. The default is [`DEFAULT_DECODE_LIMIT`].
+    pub fn with_decode_limit(mut self, bytes: usize) -> Pool {
+        self.decode_limit = bytes;
+        self
     }
 
     /// The keys of the textures, in their order: the materials of models
@@ -447,6 +468,12 @@ impl Pool {
 
     fn read_range(&self, start: u64, size: usize) -> Result<Vec<u8>, TtpfError> {
         let chunks = self.chunks_for(start, size).ok_or_else(|| invalid("a texture outside the pool's chunks"))?;
+        for c in chunks {
+            let needed = size as u64 + c.packed as u64 + c.size as u64;
+            if needed > self.decode_limit as u64 {
+                return Err(TtpfError::TooLarge { needed, limit: self.decode_limit });
+            }
+        }
         let mut out = vec![0u8; size];
         let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
         for c in chunks {
@@ -559,23 +586,33 @@ impl Pool {
             .or_else(|| all.rev().filter(|i| !fits(i)).find(readable))
             .ok_or_else(|| unsupported("packed with BCPack for BC6H or BC7, which is not read yet"))?;
         let level = &layout.levels[chosen];
+        let smaller: Vec<usize> = if mips && d.depth == 1 {
+            (chosen + 1..layout.levels.len())
+                .take_while(|i| layout.levels[*i].pixels.0.min(layout.levels[*i].pixels.1) >= 4 && readable(i))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Checked before anything is read.
+        let needed = smaller
+            .iter()
+            .map(|i| layout.levels[*i].region as u64)
+            .fold((level.region as u64).saturating_mul(slices), |sum, region| sum.saturating_add(region));
+        if needed > self.decode_limit as u64 {
+            return Err(TtpfError::TooLarge { needed, limit: self.decode_limit });
+        }
         let mut data = Vec::new();
         for s in 0..slices {
             let stored = self.read_range(slice_at(chosen, s), level.region)?;
             data.extend(layout.untile(level, &stored).ok_or_else(|| invalid("a mip level outside its allocation"))?);
         }
         let mut levels = 1;
-        if mips && d.depth == 1 {
-            for i in chosen + 1..layout.levels.len() {
-                let next = &layout.levels[i];
-                if next.pixels.0.min(next.pixels.1) < 4 || !readable(&i) {
-                    break;
-                }
-                let stored = self.read_range(slice_at(i, 0), next.region)?;
-                let Some(rows) = layout.untile(next, &stored) else { break };
-                data.extend(rows);
-                levels += 1;
-            }
+        for i in smaller {
+            let next = &layout.levels[i];
+            let stored = self.read_range(slice_at(i, 0), next.region)?;
+            let Some(rows) = layout.untile(next, &stored) else { break };
+            data.extend(rows);
+            levels += 1;
         }
         Ok(Texture {
             name: format!("{index:06}"),
@@ -713,6 +750,13 @@ mod tests {
         }
         assert!(matches!(pool.texture(1, None), Err(TtpfError::Unsupported(_))));
         assert!(pool.texture(2, None).is_err());
+        // The decode limit: first for the pixels, then for the chunk that is
+        // unpacked on the way.
+        let region = level.region as u64;
+        let limited = |limit: usize| Pool::open(&path).unwrap().with_decode_limit(limit).texture(0, None);
+        assert!(matches!(limited(1024), Err(TtpfError::TooLarge { needed, limit: 1024 }) if needed == region));
+        assert!(matches!(limited(region as usize), Err(TtpfError::TooLarge { needed, .. }) if needed > region));
+        assert!(limited(2 * region as usize + packed.len()).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
