@@ -6,7 +6,7 @@ exclude_paths:
   - "THIRD_PARTY_LICENSES.md"
   - "crates/openrage-app/src/third_party_licenses.json"
   # Name lists and lookup data, not code.
-  - "crates/rage-formats/src/meta_names.txt"
+  - "crates/rage-formats/src/meta/meta_names.txt"
   - "**/*.txt"
   # Build output.
   - "target/**"

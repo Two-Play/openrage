@@ -3,6 +3,14 @@
 //! Formats are expressed as DXGI format codes. GTA V Enhanced stores them
 //! directly; the Direct3D 9 codes of GTA V Legacy are mapped on load.
 
+pub mod bcpack;
+pub mod dds;
+pub mod td6;
+pub mod ttpf;
+pub mod wtd_write;
+pub mod ytd;
+pub mod ytd_write;
+
 use rage_core::bytes::f16_to_f32 as half;
 
 /// A DXGI pixel format code.
