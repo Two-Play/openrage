@@ -1209,6 +1209,8 @@ export component AppWindow inherits Window {
     /// The question before downloading CodeWalker's key blob is shown.
     in-out property <bool> setup-magic-ask;
     callback setup-pick-detected(string);
+    /// The detected install that matches the game directory ("" if none).
+    in-out property <string> setup-detected-value;
     callback setup-run();
     callback setup-leave();
     callback theme-changed(int);
@@ -3779,7 +3781,7 @@ export component AppWindow inherits Window {
     if root.setup-visible: Dialog {
         title: @tr("Set up OpenRAGE");
         panel-width: 660px;
-        panel-height: 520px;
+        panel-height: 600px;
         closable: root.setup-can-cancel && !root.setup-running;
         close => { root.setup-visible = false; }
         Image {
@@ -3802,6 +3804,7 @@ export component AppWindow inherits Window {
             ComboBox {
                 horizontal-stretch: 1;
                 model: root.setup-detected;
+                current-value <=> root.setup-detected-value;
                 selected(value) => { root.setup-pick-detected(value); }
             }
         }
@@ -3829,10 +3832,19 @@ export component AppWindow inherits Window {
         }
         VerticalLayout {
             spacing: Theme.space-xs;
-            Text {
-                text: @tr("Key blob (needed for GTA V Enhanced and some GTA V Legacy updates)");
-                font-weight: 600;
-                color: Theme.text;
+            HorizontalLayout {
+                spacing: Theme.space-s;
+                Text {
+                    text: @tr("Key blob");
+                    font-weight: 600;
+                    color: Theme.text;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: @tr("only for GTA V Enhanced and some GTA V Legacy updates");
+                    overflow: elide;
+                    color: Theme.text-muted;
+                }
             }
             HorizontalLayout {
                 spacing: Theme.space-s;
@@ -3847,45 +3859,17 @@ export component AppWindow inherits Window {
                     clicked => { root.setup-browse-magic(); }
                 }
                 Button {
-                    text: @tr("Download from CodeWalker…");
-                    enabled: !root.setup-running && !root.setup-magic-ask;
+                    text: @tr("Download…");
+                    accessible-label: @tr("Download magic.dat from CodeWalker");
+                    enabled: !root.setup-running;
                     clicked => { root.setup-magic-ask = true; }
-                }
-            }
-            if root.setup-magic-ask: Rectangle {
-                border-radius: Theme.radius;
-                background: Theme.surface-raised;
-                border-width: 1px;
-                border-color: Theme.border;
-                VerticalLayout {
-                    padding: Theme.space-m;
-                    spacing: Theme.space-s;
-                    Text {
-                        wrap: word-wrap;
-                        color: Theme.text;
-                        text: @tr("OpenRAGE ships no keys. This downloads magic.dat from the CodeWalker project on GitHub: CodeWalker's key blob, which holds Rockstar's archive keys in obfuscated form and opens GTA V Legacy and Enhanced. It is saved in OpenRAGE's settings folder and only used on this computer.");
-                    }
-                    HorizontalLayout {
-                        alignment: end;
-                        spacing: Theme.space-s;
-                        Button {
-                            text: @tr("Cancel");
-                            clicked => { root.setup-magic-ask = false; }
-                        }
-                        Button {
-                            text: @tr("Download");
-                            primary: true;
-                            clicked => {
-                                root.setup-magic-ask = false;
-                                root.setup-download-magic();
-                            }
-                        }
-                    }
                 }
             }
         }
         Rectangle {
             vertical-stretch: 1;
+            min-height: 72px;
+            clip: true;
             background: Theme.surface-raised;
             border-radius: Theme.radius;
             Text {
@@ -3921,6 +3905,37 @@ export component AppWindow inherits Window {
                 primary: true;
                 enabled: !root.setup-running && root.setup-game-dir != "";
                 clicked => { root.setup-run(); }
+            }
+        }
+    }
+
+    // Asks before downloading CodeWalker's key blob; shown above the setup dialog.
+    if root.setup-visible && root.setup-magic-ask: Dialog {
+        title: @tr("Download the key blob?");
+        subtitle: @tr("magic.dat from the CodeWalker project on GitHub");
+        panel-width: 480px;
+        panel-height: 270px;
+        close => { root.setup-magic-ask = false; }
+        Text {
+            vertical-stretch: 1;
+            wrap: word-wrap;
+            color: Theme.text;
+            text: @tr("OpenRAGE ships no keys. magic.dat is CodeWalker's key blob: it holds Rockstar's archive keys in obfuscated form and opens GTA V Legacy and Enhanced. It is saved in OpenRAGE's settings folder and only used on this computer.");
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: Theme.space-s;
+            Button {
+                text: @tr("Cancel");
+                clicked => { root.setup-magic-ask = false; }
+            }
+            Button {
+                text: @tr("Download");
+                primary: true;
+                clicked => {
+                    root.setup-magic-ask = false;
+                    root.setup-download-magic();
+                }
             }
         }
     }

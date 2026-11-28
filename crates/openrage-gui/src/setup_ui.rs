@@ -1,6 +1,7 @@
 //! Games: choosing one, and the first-run setup that finds the keys.
 
 use crate::*;
+use slint::Model as _;
 
 /// The games set up so far that are still installed.
 pub(crate) fn installed_games(cfg: &Config) -> Vec<PathBuf> {
@@ -192,6 +193,13 @@ pub(crate) fn show_folder_hint(ui: &AppWindow) {
         format!("{} does not exist.", dir.display())
     };
     ui.set_setup_log(hint.into());
+    // The "Detected" list shows the folder above, or nothing when it is not one of them.
+    let matching = ui
+        .get_setup_detected()
+        .iter()
+        .find(|d| !text.trim().is_empty() && openrage_app::gta4::normalize_dir(&PathBuf::from(d.as_str())) == dir)
+        .unwrap_or_default();
+    ui.set_setup_detected_value(matching);
 }
 
 pub(crate) fn pick_path(w: Weak<AppWindow>, file: bool, title: &'static str, apply: fn(&AppWindow, PathBuf)) {
@@ -218,7 +226,7 @@ pub(crate) fn download_magic(w: Weak<AppWindow>) {
             match result {
                 Ok(path) => {
                     ui.set_setup_magic_path(path.display().to_string().into());
-                    ui.set_setup_log(format!("Saved {}. Click Derive keys to use it.", path.display()).into());
+                    ui.set_setup_log(format!("Saved {}. Press Open to use it.", path.display()).into());
                 }
                 Err(e) => ui.set_setup_log(
                     format!(
