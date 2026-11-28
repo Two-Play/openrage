@@ -111,50 +111,73 @@ pub fn parse_otd(src: Source, path: &str) -> Result<Vec<OfTexture>, ResourceErro
 fn drawable(src: Source, dir: &str, node: &Node) -> Result<OfDrawable, ResourceError> {
     let mut d = OfDrawable::default();
     if let Some(shaders) = node.get("Shaders") {
-        for s in shaders.children() {
-            let name = s.key();
-            let name = name.strip_suffix(".sps").or_else(|| name.strip_suffix(".SPS")).unwrap_or(name);
-            d.shaders.push(OfShader { name: name.to_owned(), params: s.children().iter().map(param).collect() });
-        }
+        d.shaders.extend(shaders.children().iter().map(shader));
     }
-    if let Some(t) = node.get("TextureDictionary")
-        && let Some(p) = t.args().first().filter(|p| !p.eq_ignore_ascii_case("null"))
-    {
+    if let Some(p) = linked_path(node, "TextureDictionary") {
         d.textures = parse_otd(src, &resolve(dir, p))?;
     }
-    if let Some(s) = node.get("Skeleton")
-        && let Some(p) = s.args().first().filter(|p| !p.eq_ignore_ascii_case("null"))
-    {
-        let path = resolve(dir, p);
-        let doc = document(src, &path)?;
-        d.skeleton = Some(in_file(&path, skeleton(&doc.root))?);
+    if let Some(p) = linked_path(node, "Skeleton") {
+        d.skeleton = Some(skeleton_file(src, &resolve(dir, p))?);
     }
     let lods = node.get("LodGroup").ok_or_else(|| bad("no LodGroup"))?;
+    read_lods(src, dir, lods, &mut d)?;
+    read_bounds(lods, &mut d)?;
+    Ok(d)
+}
+
+fn skeleton_file(src: Source, path: &str) -> Result<OfSkeleton, ResourceError> {
+    let doc = document(src, path)?;
+    in_file(path, skeleton(&doc.root))
+}
+
+fn read_lods(src: Source, dir: &str, lods: &Node, d: &mut OfDrawable) -> Result<(), ResourceError> {
     for (k, name) in LOD_NAMES.iter().enumerate() {
         let Some(level) = lods.get(name) else { continue };
         if let Some(w) = level.args().first() {
             d.lods[k].distance = text::parse_f32(w, level.line)?;
         }
         for m in level.children() {
-            if m.key().eq_ignore_ascii_case("none") || m.key().eq_ignore_ascii_case("null") {
-                continue;
+            if let Some(model) = lod_model(src, dir, m)? {
+                d.lods[k].models.push(model);
             }
-            let path = resolve(dir, m.key());
-            let doc = document(src, &path)?;
-            let mut model = in_file(&path, mesh(&doc.root))?;
-            model.bone = match m.args().first() {
-                Some(b) => b.parse().map_err(|_| bad(format!("line {}: bad bone index {b}", m.line)))?,
-                None => 0,
-            };
-            d.lods[k].models.push(model);
         }
     }
+    Ok(())
+}
+
+fn read_bounds(lods: &Node, d: &mut OfDrawable) -> Result<(), ResourceError> {
     let v3 = |key: &str| lods.get(key).map(Node::vec3).transpose();
     d.center = v3("Center")?.unwrap_or_default();
     d.aabb_min = v3("AABBMin")?.unwrap_or_default();
     d.aabb_max = v3("AABBMax")?.unwrap_or_default();
     d.radius = lods.get("Radius").map(Node::float).transpose()?.unwrap_or_default();
-    Ok(d)
+    Ok(())
+}
+
+fn shader(s: &Node) -> OfShader {
+    let name = s.key();
+    let name = name.strip_suffix(".sps").or_else(|| name.strip_suffix(".SPS")).unwrap_or(name);
+    OfShader { name: name.to_owned(), params: s.children().iter().map(param).collect() }
+}
+
+/// The file a block links to in its first argument, unless it is `null`.
+fn linked_path<'a>(node: &'a Node, key: &str) -> Option<&'a String> {
+    node.get(key)?.args().first().filter(|p| !p.eq_ignore_ascii_case("null"))
+}
+
+/// The model of one entry of a LOD level; `None` for the `none`/`null` placeholders.
+fn lod_model(src: Source, dir: &str, m: &Node) -> Result<Option<OfModel>, ResourceError> {
+    if m.key().eq_ignore_ascii_case("none") || m.key().eq_ignore_ascii_case("null") {
+        return Ok(None);
+    }
+    let path = resolve(dir, m.key());
+    let doc = document(src, &path)?;
+    let mut model = in_file(&path, mesh(&doc.root))?;
+    model.bone = match m.args().first() {
+        Some(b) => b.parse().map_err(|_| bad(format!("line {}: bad bone index {b}", m.line)))?,
+        None => 0,
+    };
+    Ok(Some(model))
 }
 
 fn param(n: &Node) -> (String, OfValue) {
@@ -249,18 +272,48 @@ fn mesh(root: &Node) -> Result<OfModel, ResourceError> {
 fn geometry(g: &Node) -> Result<OfGeometry, ResourceError> {
     let shader = g.get("ShaderIndex").ok_or_else(|| bad(format!("line {}: no ShaderIndex", g.line)))?.int()?;
     let code = g.get("VertexDeclaration").ok_or_else(|| bad(format!("line {}: no VertexDeclaration", g.line)))?;
-    let decl = VertexDecl::from_code(code.arg(0)?)
-        .ok_or_else(|| bad(format!("line {}: vertex declaration {} is not known", code.line, code.args().join(" "))))?;
+    let decl = vertex_decl(code)?;
     let indices_node = g.get("Indices").ok_or_else(|| bad(format!("line {}: no Indices", g.line)))?;
-    let mut indices = Vec::with_capacity(indices_node.int::<usize>().unwrap_or(0));
-    for row in indices_node.children() {
+    let indices = geometry_indices(indices_node)?;
+    let vertices = g.get("Vertices").ok_or_else(|| bad(format!("line {}: no Vertices", g.line)))?;
+    let attributes = geometry_attributes(vertices, &decl)?;
+    check_indices(&indices, vertices.children().len(), indices_node.line)?;
+    Ok(OfGeometry { shader, decl, indices, attributes })
+}
+
+fn vertex_decl(code: &Node) -> Result<VertexDecl, ResourceError> {
+    VertexDecl::from_code(code.arg(0)?)
+        .ok_or_else(|| bad(format!("line {}: vertex declaration {} is not known", code.line, code.args().join(" "))))
+}
+
+/// The indices (read at `line`) must be whole triangles of the `n` vertices.
+fn check_indices(indices: &[u32], n: usize, line: usize) -> Result<(), ResourceError> {
+    if let Some(&bad_index) = indices.iter().find(|&&i| i as usize >= n) {
+        return Err(bad(format!("line {line}: index {bad_index} with {n} vertices")));
+    }
+    if !indices.len().is_multiple_of(3) {
+        return Err(bad(format!("line {line}: {} indices are not whole triangles", indices.len())));
+    }
+    Ok(())
+}
+
+/// Per vertex component: its index and the value of every vertex.
+type Attributes = Vec<(usize, Vec<[f32; 4]>)>;
+
+fn geometry_indices(node: &Node) -> Result<Vec<u32>, ResourceError> {
+    let mut indices = Vec::with_capacity(node.int::<usize>().unwrap_or(0));
+    for row in node.children() {
         for w in &row.words {
             indices.push(w.parse().map_err(|_| bad(format!("line {}: {w} is not an index", row.line)))?);
         }
     }
-    let vertices = g.get("Vertices").ok_or_else(|| bad(format!("line {}: no Vertices", g.line)))?;
+    Ok(indices)
+}
+
+/// The vertex rows as one attribute list per component of the declaration.
+fn geometry_attributes(vertices: &Node, decl: &VertexDecl) -> Result<Attributes, ResourceError> {
     let components: Vec<(usize, u8)> = decl.components().collect();
-    let mut attributes: Vec<(usize, Vec<[f32; 4]>)> =
+    let mut attributes: Attributes =
         components.iter().map(|&(k, _)| (k, Vec::with_capacity(vertices.children().len()))).collect();
     for v in vertices.children() {
         let groups: Vec<&[String]> = v.words.split(|w| w == "/").collect();
@@ -273,28 +326,19 @@ fn geometry(g: &Node) -> Result<OfGeometry, ResourceError> {
             )));
         }
         for (i, (&(k, ty), words)) in components.iter().zip(groups).enumerate() {
-            let width = VertexDecl::width(k, ty);
-            if words.len() != width {
-                return Err(bad(format!(
-                    "line {}: component {} has {} numbers, not {width}",
-                    v.line,
-                    i + 1,
-                    words.len()
-                )));
-            }
-            let mut value = [0.0f32; 4];
-            for (x, w) in value.iter_mut().zip(words) {
-                *x = text::parse_f32(w, v.line)?;
-            }
-            attributes[i].1.push(value);
+            attributes[i].1.push(component_value(v, i, VertexDecl::width(k, ty), words)?);
         }
     }
-    let n = vertices.children().len();
-    if let Some(&bad_index) = indices.iter().find(|&&i| i as usize >= n) {
-        return Err(bad(format!("line {}: index {bad_index} with {n} vertices", indices_node.line)));
+    Ok(attributes)
+}
+
+fn component_value(v: &Node, i: usize, width: usize, words: &[String]) -> Result<[f32; 4], ResourceError> {
+    if words.len() != width {
+        return Err(bad(format!("line {}: component {} has {} numbers, not {width}", v.line, i + 1, words.len())));
     }
-    if indices.len() % 3 != 0 {
-        return Err(bad(format!("line {}: {} indices are not whole triangles", indices_node.line, indices.len())));
+    let mut value = [0.0f32; 4];
+    for (x, w) in value.iter_mut().zip(words) {
+        *x = text::parse_f32(w, v.line)?;
     }
-    Ok(OfGeometry { shader, decl, indices, attributes })
+    Ok(value)
 }

@@ -19,71 +19,92 @@ pub(crate) fn debug_snapshot(ui: &AppWindow) {
     slint::Timer::single_shot(Duration::from_secs(delay), move || {
         let Some(ui) = weak.upgrade() else { return };
         debug_viewer(&ui);
-        if std::env::var("OPENRAGE_FLY").is_ok()
-            && let Some(v) = viewer::newest()
-        {
-            v.invoke_toggle_fly();
-        }
-        if std::env::var("OPENRAGE_EDIT").is_ok() {
-            ui.set_edit_mode(true);
-        }
-        if let Ok(i) = std::env::var("OPENRAGE_PICK_GAME") {
-            ui.set_game_chooser_visible(false);
-            ui.invoke_game_chosen(i.parse().unwrap_or(0), false);
-        }
-        // `OPENRAGE_CONFIRM_PLUGIN=1`: press Install in the plugin package dialog.
-        if std::env::var("OPENRAGE_CONFIRM_PLUGIN").is_ok() && ui.get_plugin_pkg_visible() {
-            ui.invoke_plugin_pkg_confirm();
-        }
-        // `OPENRAGE_FIELD=search|filter`: unfold that field.
-        match std::env::var("OPENRAGE_FIELD").as_deref() {
-            Ok("search") => ui.invoke_open_search(),
-            Ok("filter") => ui.invoke_open_filter(),
-            _ => {}
-        }
-        if let Ok(page) = std::env::var("OPENRAGE_SETTINGS") {
-            let tab = ["appearance", "game", "behaviour", "plugins"].iter().position(|t| *t == page).unwrap_or(0);
-            ui.invoke_open_settings_at(tab as i32);
-        }
-        // `OPENRAGE_ABOUT=<tab>` opens the About dialog on that tab (0–2).
-        if let Ok(tab) = std::env::var("OPENRAGE_ABOUT") {
-            ui.invoke_about_open();
-            ui.set_about_tab(tab.parse().unwrap_or(0));
-        }
-        if let Ok(name) = std::env::var("OPENRAGE_SELECT") {
-            let row = with_app(|a| {
-                let l = a.listing.as_ref()?;
-                a.visible.iter().position(|&i| l.items[i].name.eq_ignore_ascii_case(&name))
-            });
-            if let Some(row) = row {
-                select_row(&ui, row);
-                // `OPENRAGE_PLAY=1` plays the selected sound or video.
-                if std::env::var("OPENRAGE_PLAY").is_ok() {
-                    with_app(|a| a.play_when_ready = true);
-                }
-                // `OPENRAGE_PLUGIN_RUN=<n>` runs the selected file's n-th plugin action.
-                if let Ok(i) = std::env::var("OPENRAGE_PLUGIN_RUN") {
-                    row_action(&ui, row, &format!("plugin:{i}"));
-                }
-            }
-        }
+        debug_set_state(&ui);
+        debug_open_dialogs(&ui);
+        debug_select_file(&ui);
         // `OPENRAGE_CLICK=x,y[,right]` clicks there, e.g. to capture a context menu.
         debug_click(ui.window(), "OPENRAGE_CLICK");
-        // Wait (up to a minute) until the models for a clip dictionary are found.
-        let waiting = std::rc::Rc::new(slint::Timer::default());
-        let started = Instant::now();
-        let (weak, timer) = (ui.as_weak(), std::rc::Rc::clone(&waiting));
-        waiting.start(slint::TimerMode::Repeated, Duration::from_millis(250), move || {
-            let loading =
-                std::env::var("OPENRAGE_NO_WAIT").is_err() && weak.upgrade().is_some_and(|ui| ui.get_preview_loading());
-            if (with_app(|a| a.suggest_pending || a.busy) || loading) && started.elapsed() < Duration::from_secs(60) {
-                return;
-            }
-            timer.stop();
-            if let Some(ui) = weak.upgrade() {
-                debug_snapshot_rest(&ui, path.clone());
-            }
-        });
+        debug_wait_then_snapshot(&ui, path);
+    });
+}
+
+/// `OPENRAGE_FLY`, `OPENRAGE_EDIT`, `OPENRAGE_PICK_GAME` and `OPENRAGE_CONFIRM_PLUGIN`.
+#[cfg(debug_assertions)]
+fn debug_set_state(ui: &AppWindow) {
+    if std::env::var("OPENRAGE_FLY").is_ok()
+        && let Some(v) = viewer::newest()
+    {
+        v.invoke_toggle_fly();
+    }
+    if std::env::var("OPENRAGE_EDIT").is_ok() {
+        ui.set_edit_mode(true);
+    }
+    if let Ok(i) = std::env::var("OPENRAGE_PICK_GAME") {
+        ui.set_game_chooser_visible(false);
+        ui.invoke_game_chosen(i.parse().unwrap_or(0), false);
+    }
+    // `OPENRAGE_CONFIRM_PLUGIN=1`: press Install in the plugin package dialog.
+    if std::env::var("OPENRAGE_CONFIRM_PLUGIN").is_ok() && ui.get_plugin_pkg_visible() {
+        ui.invoke_plugin_pkg_confirm();
+    }
+}
+
+/// `OPENRAGE_FIELD`, `OPENRAGE_SETTINGS` and `OPENRAGE_ABOUT`.
+#[cfg(debug_assertions)]
+fn debug_open_dialogs(ui: &AppWindow) {
+    // `OPENRAGE_FIELD=search|filter`: unfold that field.
+    match std::env::var("OPENRAGE_FIELD").as_deref() {
+        Ok("search") => ui.invoke_open_search(),
+        Ok("filter") => ui.invoke_open_filter(),
+        _ => {}
+    }
+    if let Ok(page) = std::env::var("OPENRAGE_SETTINGS") {
+        let tab = ["appearance", "game", "behaviour", "plugins"].iter().position(|t| *t == page).unwrap_or(0);
+        ui.invoke_open_settings_at(tab as i32);
+    }
+    // `OPENRAGE_ABOUT=<tab>` opens the About dialog on that tab (0–2).
+    if let Ok(tab) = std::env::var("OPENRAGE_ABOUT") {
+        ui.invoke_about_open();
+        ui.set_about_tab(tab.parse().unwrap_or(0));
+    }
+}
+
+/// `OPENRAGE_SELECT=<name>` selects that file, then `OPENRAGE_PLAY` / `OPENRAGE_PLUGIN_RUN` act on it.
+#[cfg(debug_assertions)]
+fn debug_select_file(ui: &AppWindow) {
+    let Ok(name) = std::env::var("OPENRAGE_SELECT") else { return };
+    let row = with_app(|a| {
+        let l = a.listing.as_ref()?;
+        a.visible.iter().position(|&i| l.items[i].name.eq_ignore_ascii_case(&name))
+    });
+    let Some(row) = row else { return };
+    select_row(ui, row);
+    // `OPENRAGE_PLAY=1` plays the selected sound or video.
+    if std::env::var("OPENRAGE_PLAY").is_ok() {
+        with_app(|a| a.play_when_ready = true);
+    }
+    // `OPENRAGE_PLUGIN_RUN=<n>` runs the selected file's n-th plugin action.
+    if let Ok(i) = std::env::var("OPENRAGE_PLUGIN_RUN") {
+        row_action(ui, row, &format!("plugin:{i}"));
+    }
+}
+
+/// Wait (up to a minute) until the models for a clip dictionary are found, then take the snapshot.
+#[cfg(debug_assertions)]
+fn debug_wait_then_snapshot(ui: &AppWindow, path: String) {
+    let waiting = std::rc::Rc::new(slint::Timer::default());
+    let started = Instant::now();
+    let (weak, timer) = (ui.as_weak(), std::rc::Rc::clone(&waiting));
+    waiting.start(slint::TimerMode::Repeated, Duration::from_millis(250), move || {
+        let loading =
+            std::env::var("OPENRAGE_NO_WAIT").is_err() && weak.upgrade().is_some_and(|ui| ui.get_preview_loading());
+        if (with_app(|a| a.suggest_pending || a.busy) || loading) && started.elapsed() < Duration::from_secs(60) {
+            return;
+        }
+        timer.stop();
+        if let Some(ui) = weak.upgrade() {
+            debug_snapshot_rest(&ui, path.clone());
+        }
     });
 }
 

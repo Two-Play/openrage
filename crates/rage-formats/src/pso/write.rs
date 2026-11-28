@@ -86,6 +86,56 @@ fn int(s: &str) -> R<i128> {
     parsed.map_err(|_| format!("\"{s}\" is not a number"))
 }
 
+/// The 32-bit word and bit that flag `bit` of a field of `n_words` words lives in.
+fn flag_bit(bit: i32, n_words: usize) -> Option<usize> {
+    usize::try_from(bit).ok().filter(|b| b / 32 < n_words)
+}
+
+/// Sets the words of a flags field that names its bits.
+fn flag_words_named(content: &str, values: &[(u32, i32)], words: &mut [u32]) -> R<()> {
+    let n_words = words.len();
+    // The reader joins the names of the set bits in the enum's
+    // order with single spaces (unnamed values give empty names):
+    // matched in that order, whatever it wrote comes back exactly.
+    // Other text (edited by hand) is taken name by name.
+    let mut tokens = content.split(' ').peekable();
+    for (n, bit) in values {
+        if let Some(b) = flag_bit(*bit, n_words)
+            && tokens.peek().is_some_and(|t| *t == names::field(*n))
+        {
+            words[b / 32] |= 1 << (b % 32);
+            tokens.next();
+        }
+    }
+    if tokens.next().is_some() || content.is_empty() {
+        words.iter_mut().for_each(|w| *w = 0);
+        for name in content.split_whitespace() {
+            let b = values
+                .iter()
+                .find(|(n, _)| names::field(*n) == name)
+                .and_then(|(_, bit)| flag_bit(*bit, n_words))
+                .ok_or_else(|| format!("\"{name}\" is not a flag of this field"))?;
+            words[b / 32] |= 1 << (b % 32);
+        }
+    }
+    Ok(())
+}
+
+/// Sets the words of a flags field without names: a number, or hex words.
+fn flag_words_plain(content: &str, words: &mut [u32]) -> R<()> {
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    if words.len() == 1 {
+        words[0] = int(content)? as u32;
+        return Ok(());
+    }
+    for (w, hex) in words.iter_mut().zip(content.split_whitespace()) {
+        *w = u32::from_str_radix(hex, 16).map_err(|_| format!("\"{hex}\" is not hex"))?;
+    }
+    Ok(())
+}
+
 fn float(s: &str) -> R<f32> {
     s.trim().parse::<f32>().map_err(|_| format!("\"{s}\" is not a number"))
 }
@@ -509,40 +559,8 @@ impl<'a> Builder<'a> {
         let mut words = vec![0u32; n_words];
         let content = node.attribute("value").map(str::to_owned).unwrap_or_else(|| text(node));
         match flags {
-            Some(values) => {
-                // The reader joins the names of the set bits in the enum's
-                // order with single spaces (unnamed values give empty names):
-                // matched in that order, whatever it wrote comes back exactly.
-                // Other text (edited by hand) is taken name by name.
-                let bit_of = |bit: i32| usize::try_from(bit).ok().filter(|b| b / 32 < n_words);
-                let mut tokens = content.split(' ').peekable();
-                for (n, bit) in values {
-                    if let Some(b) = bit_of(*bit)
-                        && tokens.peek().is_some_and(|t| *t == names::field(*n))
-                    {
-                        words[b / 32] |= 1 << (b % 32);
-                        tokens.next();
-                    }
-                }
-                if tokens.next().is_some() || content.is_empty() {
-                    words.iter_mut().for_each(|w| *w = 0);
-                    for name in content.split_whitespace() {
-                        let b = values
-                            .iter()
-                            .find(|(n, _)| names::field(*n) == name)
-                            .and_then(|(_, bit)| bit_of(*bit))
-                            .ok_or_else(|| format!("\"{name}\" is not a flag of this field"))?;
-                        words[b / 32] |= 1 << (b % 32);
-                    }
-                }
-            }
-            None if content.trim().is_empty() => {}
-            None if n_words == 1 => words[0] = int(&content)? as u32,
-            None => {
-                for (w, hex) in words.iter_mut().zip(content.split_whitespace()) {
-                    *w = u32::from_str_radix(hex, 16).map_err(|_| format!("\"{hex}\" is not hex"))?;
-                }
-            }
+            Some(values) => flag_words_named(&content, values, &mut words)?,
+            None => flag_words_plain(&content, &mut words)?,
         }
         match e.sub {
             0 => self.put(bi, at, &words[0].to_be_bytes()),

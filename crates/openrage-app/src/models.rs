@@ -1653,10 +1653,36 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
     }
     crate::progress::set("Reading the model", 0, 0);
     let res = rpf.read_resource(entry)?;
-    let drawables: Vec<(String, Drawable)> = if lower.ends_with(".ydr") {
-        vec![(stem.clone(), drawable::parse_ydr_rdr2(&res)?)]
+    let mut drawables = rdr2_drawables(&res, &name, &lower, &stem)?;
+    // A ped's parts (".ydd" of a metaped) are bound to its base skeleton,
+    // kept in a fragment of its own; they then stand on one spot.
+    let base = (lower.ends_with(".ydd")).then(|| rdr2_base_skeleton(rpf, &stem)).flatten();
+    if let Some(sk) = &base {
+        fit_to_skeleton(&mut drawables, sk);
+    }
+    let parts = rdr2_parts(&mut drawables, &res, &lower, &stem, base.is_some())?;
+    let mut external = rdr2_folder_textures(rpf, entries, &full, &stem);
+    // The rest from shared dictionaries elsewhere, through the texture index.
+    if let Some(game) = crate::rdr2::game_folder(rpf.path()) {
+        rdr2_shared_textures(&game, &drawables, &mut external, 32);
+        // Palette shaders: colours from the palettes (vehicles: their first variation).
+        crate::palette::apply(&crate::palette::carvariations(&game), &stem, &mut drawables, &mut external);
+    }
+    let skeleton = base.or_else(|| drawables.iter().find_map(|(_, d)| d.skeleton.clone()));
+    Ok(assembled_model((drawables, parts), external, skeleton))
+}
+
+/// The drawables of an RDR2 model file by its kind (a fragment has none of its own).
+fn rdr2_drawables(
+    res: &rage_resource::Resource,
+    name: &str,
+    lower: &str,
+    stem: &str,
+) -> Result<Vec<(String, Drawable)>> {
+    Ok(if lower.ends_with(".ydr") {
+        vec![(stem.to_owned(), drawable::parse_ydr_rdr2(res)?)]
     } else if lower.ends_with(".ydd") {
-        drawable::parse_ydd_rdr2(&res)?
+        drawable::parse_ydd_rdr2(res)?
             .into_iter()
             .enumerate()
             .map(|(k, (hash, d))| {
@@ -1669,40 +1695,47 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
         Vec::new()
     } else {
         bail!("{name}: only .ydr, .ydd and .yft models of Red Dead Redemption 2 can be shown so far");
-    };
-    // A ped's parts (".ydd" of a metaped) are bound to its base skeleton,
-    // kept in a fragment of its own; they then stand on one spot.
-    let mut drawables = drawables;
-    let base = (lower.ends_with(".ydd")).then(|| rdr2_base_skeleton(rpf, &stem)).flatten();
-    if let Some(sk) = &base {
-        fit_to_skeleton(&mut drawables, sk);
-    }
-    let parts = if lower.ends_with(".yft") {
+    })
+}
+
+/// The parts of an RDR2 model; a fragment replaces `drawables` with its own.
+fn rdr2_parts(
+    drawables: &mut Vec<(String, Drawable)>,
+    res: &rage_resource::Resource,
+    lower: &str,
+    stem: &str,
+    has_base: bool,
+) -> Result<Vec<Part>> {
+    if lower.ends_with(".yft") {
         // Fragments: the body and its children (wheels) on their bones.
-        let (d, p) = fragment_parts(drawable::parse_fragment_rdr2(&res)?, &stem);
-        drawables = d;
-        p
-    } else {
-        let layout = if drawables.len() > 1 && base.is_none() {
-            grid_layout(&drawables)
-        } else {
-            vec![math::IDENTITY; drawables.len()]
-        };
-        drawables
-            .iter()
-            .enumerate()
-            .map(|(k, (n, _))| Part {
-                name: n.clone(),
-                group: String::new(),
-                drawable: k,
-                transform: layout[k],
-                visible: true,
-                bone: None,
-            })
-            .collect()
-    };
-    // Texture dictionaries in the same folder: `<stem>.ytd` first, then those
-    // whose name shares the model's prefix, then the rest; at most eight.
+        let (d, p) = fragment_parts(drawable::parse_fragment_rdr2(res)?, stem);
+        *drawables = d;
+        return Ok(p);
+    }
+    let layout =
+        if drawables.len() > 1 && !has_base { grid_layout(drawables) } else { vec![math::IDENTITY; drawables.len()] };
+    Ok(drawables
+        .iter()
+        .enumerate()
+        .map(|(k, (n, _))| Part {
+            name: n.clone(),
+            group: String::new(),
+            drawable: k,
+            transform: layout[k],
+            visible: true,
+            bone: None,
+        })
+        .collect())
+}
+
+/// Texture dictionaries in the same folder: `<stem>.ytd` first, then those
+/// whose name shares the model's prefix, then the rest; at most eight.
+fn rdr2_folder_textures(
+    rpf: &rage_rpf::Rpf8,
+    entries: &[rage_rpf::rpf8::Entry],
+    full: &str,
+    stem: &str,
+) -> Vec<(String, TextureDictionary)> {
     let dir = full.rsplit_once('/').map_or("", |(d, _)| d).to_owned();
     let (_, files) = rpf.list_dir(&dir);
     let prefix: String = stem.chars().take_while(|c| *c != '_').collect();
@@ -1739,26 +1772,7 @@ fn load_rdr2(rpf: &Arc<rage_rpf::Rpf8>, i: usize) -> Result<LoadedModel> {
             external.push((base, dict));
         }
     }
-    // The rest from shared dictionaries elsewhere, through the texture index.
-    if let Some(game) = crate::rdr2::game_folder(rpf.path()) {
-        rdr2_shared_textures(&game, &drawables, &mut external, 32);
-        // Palette shaders: colours from the palettes (vehicles: their first variation).
-        crate::palette::apply(&crate::palette::carvariations(&game), &stem, &mut drawables, &mut external);
-    }
-    let skeleton = base.or_else(|| drawables.iter().find_map(|(_, d)| d.skeleton.clone()));
-    let mut model = LoadedModel {
-        drawables,
-        parts,
-        external,
-        materials: Vec::new(),
-        shared: Vec::new(),
-        shader_material: Vec::new(),
-        skeleton,
-        expressions: Vec::new(),
-        ped: None,
-    };
-    model.collect_materials();
-    Ok(model)
+    external
 }
 
 /// Adds the shared texture dictionaries the drawables' shaders need (at most

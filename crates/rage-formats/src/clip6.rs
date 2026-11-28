@@ -81,41 +81,39 @@ fn float(res: &Resource, at: u64) -> Result<f32, ResourceError> {
     if v.is_finite() { Ok(v) } else { Err(bad("a number that is none")) }
 }
 
-fn read_animation(res: &Resource, ptr: u64) -> Result<Animation, ResourceError> {
+/// Where an animation's blocks and tracks are, and how many of each.
+struct Header {
+    frames: usize,
+    duration: f32,
+    blocks_at: u64,
+    block_count: u64,
+    tracks_at: u64,
+    track_count: u64,
+}
+
+fn read_header(res: &Resource, ptr: u64) -> Result<Header, ResourceError> {
     let frames = usize::from(res.u16(ptr + 0x24)?);
     let duration = float(res, ptr + 0x28)?;
     let (blocks_at, block_count) = (res.u64(ptr + 0x50)?, u64::from(res.u16(ptr + 0x58)?));
     let (tracks_at, track_count) = (res.u64(ptr + 0x60)?, u64::from(res.u16(ptr + 0x68)?));
-    if frames == 0 || !(0.0..1e5).contains(&duration) || block_count == 0 || block_count > 4096 || track_count > 4096 {
-        return Err(bad("implausible animation"));
+    let header = Header { frames, duration, blocks_at, block_count, tracks_at, track_count };
+    if header.is_plausible() { Ok(header) } else { Err(bad("implausible animation")) }
+}
+
+impl Header {
+    fn is_plausible(&self) -> bool {
+        self.frames != 0
+            && (0.0..1e5).contains(&self.duration)
+            && self.block_count != 0
+            && self.block_count <= 4096
+            && self.track_count <= 4096
     }
-    let tracks: Vec<BoneTrack> = (0..track_count)
-        .map(|i| {
-            let at = tracks_at + i * 12;
-            let kind_hash = res.u32(at + 4)?;
-            let format = match res.u32(at + 8)? {
-                0 => 1,
-                2..=4 => 0,
-                f => return Err(bad(format!("a track of unknown format {f}"))),
-            };
-            let track = match kind_hash {
-                BONE_TRANSLATION => TRACK_BONE_TRANSLATION,
-                BONE_ROTATION => TRACK_BONE_ROTATION,
-                BONE_SCALE => TRACK_BONE_SCALE,
-                _ => TRACK_OTHER,
-            };
-            Ok(BoneTrack { bone: 0, format, track, bone_hash: res.u32(at)?, kind_hash })
-        })
-        .collect::<Result<_, ResourceError>>()?;
-    // The frames a block holds are in its header; what they add up to is
-    // checked before any is decoded.
-    let mut stored = 0;
-    for i in 0..block_count {
-        stored += usize::from(res.u16(res.u64(blocks_at + i * 8)? + BLOCK_FRAMES)?);
-    }
-    if stored != frames + block_count as usize - 1 {
-        return Err(bad("an animation whose blocks have another number of frames"));
-    }
+}
+
+fn read_animation(res: &Resource, ptr: u64) -> Result<Animation, ResourceError> {
+    let Header { frames, duration, blocks_at, block_count, tracks_at, track_count } = read_header(res, ptr)?;
+    let tracks = (0..track_count).map(|i| read_track(res, tracks_at + i * 12)).collect::<Result<Vec<_>, _>>()?;
+    check_stored_frames(res, blocks_at, block_count, frames)?;
     let blocks = (0..block_count)
         .map(|i| read_block(res, res.u64(blocks_at + i * 8)?, tracks.len(), Layout::GtaVi))
         .collect::<Result<Vec<_>, _>>()?;
@@ -126,6 +124,35 @@ fn read_animation(res: &Resource, ptr: u64) -> Result<Animation, ResourceError> 
         return Err(bad("an animation whose blocks have another number of frames"));
     }
     Ok(animation)
+}
+
+fn read_track(res: &Resource, at: u64) -> Result<BoneTrack, ResourceError> {
+    let kind_hash = res.u32(at + 4)?;
+    let format = match res.u32(at + 8)? {
+        0 => 1,
+        2..=4 => 0,
+        f => return Err(bad(format!("a track of unknown format {f}"))),
+    };
+    let track = match kind_hash {
+        BONE_TRANSLATION => TRACK_BONE_TRANSLATION,
+        BONE_ROTATION => TRACK_BONE_ROTATION,
+        BONE_SCALE => TRACK_BONE_SCALE,
+        _ => TRACK_OTHER,
+    };
+    Ok(BoneTrack { bone: 0, format, track, bone_hash: res.u32(at)?, kind_hash })
+}
+
+/// The frames a block holds are in its header; what they add up to is
+/// checked before any is decoded.
+fn check_stored_frames(res: &Resource, blocks_at: u64, block_count: u64, frames: usize) -> Result<(), ResourceError> {
+    let mut stored = 0;
+    for i in 0..block_count {
+        stored += usize::from(res.u16(res.u64(blocks_at + i * 8)? + BLOCK_FRAMES)?);
+    }
+    if stored != frames + block_count as usize - 1 {
+        return Err(bad("an animation whose blocks have another number of frames"));
+    }
+    Ok(())
 }
 
 /// A clip's name: a pointer, or text in place. Without path and extension.

@@ -239,58 +239,72 @@ fn parse_commands(source: &str, node: roxmltree::Node<'_, '_>) -> Result<Vec<Com
     let mut out = Vec::new();
     for c in node.children().filter(|c| c.is_element()) {
         let tag = c.tag_name().name().to_ascii_lowercase();
-        let cmd = match tag.as_str() {
-            "add" => {
-                Command::Add { source: attr(c, "source").context("<add> without source")?, target: text_of(Some(c)) }
-            }
-            "delete" => Command::Delete { target: text_of(Some(c)) },
-            "archive" => Command::Archive {
-                path: attr(c, "path").context("<archive> without path")?,
-                create: flag(c, "createIfNotExist"),
-                kind: attr(c, "type").unwrap_or_else(|| "RPF7".into()),
-                commands: parse_commands(source, c)?,
-            },
-            "text" => {
-                let mut commands = Vec::new();
-                for t in c.children().filter(|t| t.is_element()) {
-                    let value = text_of(Some(t));
-                    commands.push(match t.tag_name().name().to_ascii_lowercase().as_str() {
-                        "add" => TextCmd::Add(value),
-                        "insert" => TextCmd::Insert {
-                            before: attr(t, "where").is_some_and(|w| w.eq_ignore_ascii_case("before")),
-                            line: attr(t, "line").unwrap_or_default(),
-                            condition: condition(t)?,
-                            text: value,
-                        },
-                        "replace" => TextCmd::Replace {
-                            line: attr(t, "line").unwrap_or_default(),
-                            condition: condition(t)?,
-                            text: value,
-                        },
-                        "delete" => TextCmd::Delete { line: value, condition: condition(t)? },
-                        other => bail!("unknown text command <{other}>"),
-                    });
-                }
-                Command::Text {
-                    path: attr(c, "path").context("<text> without path")?,
-                    create: flag(c, "createIfNotExist"),
-                    commands,
-                }
-            }
-            "xml" => Command::Xml {
-                path: attr(c, "path").context("<xml> without path")?,
-                commands: xml_commands(source, c)?,
-            },
-            "pso" => Command::Pso {
-                path: attr(c, "path").context("<pso> without path")?,
-                commands: xml_commands(source, c)?,
-            },
-            "defragmentation" => Command::Defragment { archive: attr(c, "archive").unwrap_or_default() },
-            other => bail!("unknown package command <{other}>"),
-        };
-        out.push(cmd);
+        out.push(parse_command(source, c, &tag)?);
     }
     Ok(out)
+}
+
+fn parse_command(source: &str, c: roxmltree::Node<'_, '_>, tag: &str) -> Result<Command> {
+    match tag {
+        "add" => add_command(c),
+        "delete" => Ok(Command::Delete { target: text_of(Some(c)) }),
+        "archive" => archive_command(source, c),
+        "text" => text_block(c),
+        "xml" | "pso" => xml_block(source, c, tag),
+        "defragmentation" => Ok(Command::Defragment { archive: attr(c, "archive").unwrap_or_default() }),
+        other => bail!("unknown package command <{other}>"),
+    }
+}
+
+fn add_command(c: roxmltree::Node<'_, '_>) -> Result<Command> {
+    Ok(Command::Add { source: attr(c, "source").context("<add> without source")?, target: text_of(Some(c)) })
+}
+
+/// An `<xml>` or `<pso>` command: its path and edits.
+fn xml_block(source: &str, c: roxmltree::Node<'_, '_>, tag: &str) -> Result<Command> {
+    let path = attr(c, "path").with_context(|| format!("<{tag}> without path"))?;
+    let commands = xml_commands(source, c)?;
+    Ok(if tag == "xml" { Command::Xml { path, commands } } else { Command::Pso { path, commands } })
+}
+
+fn archive_command(source: &str, c: roxmltree::Node<'_, '_>) -> Result<Command> {
+    Ok(Command::Archive {
+        path: attr(c, "path").context("<archive> without path")?,
+        create: flag(c, "createIfNotExist"),
+        kind: attr(c, "type").unwrap_or_else(|| "RPF7".into()),
+        commands: parse_commands(source, c)?,
+    })
+}
+
+fn text_block(c: roxmltree::Node<'_, '_>) -> Result<Command> {
+    let mut commands = Vec::new();
+    for t in c.children().filter(|t| t.is_element()) {
+        commands.push(text_command(t)?);
+    }
+    Ok(Command::Text {
+        path: attr(c, "path").context("<text> without path")?,
+        create: flag(c, "createIfNotExist"),
+        commands,
+    })
+}
+
+/// One edit inside a `<text>` command.
+fn text_command(t: roxmltree::Node<'_, '_>) -> Result<TextCmd> {
+    let value = text_of(Some(t));
+    Ok(match t.tag_name().name().to_ascii_lowercase().as_str() {
+        "add" => TextCmd::Add(value),
+        "insert" => TextCmd::Insert {
+            before: attr(t, "where").is_some_and(|w| w.eq_ignore_ascii_case("before")),
+            line: attr(t, "line").unwrap_or_default(),
+            condition: condition(t)?,
+            text: value,
+        },
+        "replace" => {
+            TextCmd::Replace { line: attr(t, "line").unwrap_or_default(), condition: condition(t)?, text: value }
+        }
+        "delete" => TextCmd::Delete { line: value, condition: condition(t)? },
+        other => bail!("unknown text command <{other}>"),
+    })
 }
 
 /// The XML edits inside an `<xml>` or `<pso>` command.

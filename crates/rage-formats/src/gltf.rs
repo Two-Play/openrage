@@ -6,7 +6,7 @@
 
 use std::fmt::Write;
 
-use crate::drawable::Drawable;
+use crate::drawable::{Drawable, Mesh, Shader};
 use crate::math::Mat4;
 use crate::texture::Texture;
 
@@ -117,11 +117,8 @@ pub fn write_glb_scene<'a>(
     lookup: &dyn Fn(usize, &str) -> Option<&'a Texture>,
     material: &dyn Fn(usize, usize) -> Option<[f32; 4]>,
 ) -> Vec<u8> {
-    let mut b = Builder::default();
-    let mut materials = Vec::new();
-    let mut images = Vec::new();
-    let mut textures = Vec::new();
-    let mut image_of: Vec<(String, usize)> = Vec::new();
+    let inputs = Inputs { lookup, material };
+    let mut parts = SceneParts::default();
     let mut meshes_json = Vec::new();
     // glTF mesh index per drawable (only drawables that nodes use).
     let mut mesh_of: Vec<Option<usize>> = vec![None; drawables.len()];
@@ -130,75 +127,12 @@ pub fn write_glb_scene<'a>(
         if !nodes.iter().any(|n| n.mesh == di) {
             continue;
         }
-        let first_material = materials.len();
+        let first_material = parts.materials.len();
         for (si, shader) in d.shaders.iter().enumerate() {
-            let tex_name = shader.base_texture().map(str::to_owned);
-            let mut pbr = String::from("\"metallicFactor\":0,\"roughnessFactor\":0.8");
-            if let Some(tint) = material(di, si).filter(|t| *t != [1.0; 4]) {
-                let [r, g, b, a] = tint.map(finite);
-                pbr.push_str(&format!(",\"baseColorFactor\":[{r},{g},{b},{a}]"));
-            }
-            if let Some(tn) = &tex_name {
-                let existing = image_of.iter().find(|(n, _)| n.eq_ignore_ascii_case(tn)).map(|(_, i)| *i);
-                let tex_index = existing.or_else(|| {
-                    let t = lookup(di, tn)?;
-                    let rgba = t.to_rgba()?;
-                    let png = crate::png(t.width, t.height, &rgba).ok()?;
-                    let view = b.view(&png, None);
-                    images
-                        .push(format!("{{\"name\":\"{}\",\"bufferView\":{view},\"mimeType\":\"image/png\"}}", esc(tn)));
-                    textures.push(format!("{{\"source\":{},\"sampler\":0}}", images.len() - 1));
-                    image_of.push((tn.clone(), textures.len() - 1));
-                    Some(textures.len() - 1)
-                });
-                if let Some(ti) = tex_index {
-                    pbr.push_str(&format!(",\"baseColorTexture\":{{\"index\":{ti}}}"));
-                }
-            }
-            let label = tex_name.unwrap_or_else(|| format!("{dname}_shader_{si}"));
-            // Skin shaders keep other data in the texture's alpha.
-            let alpha = if crate::shaders::alpha_is_not_opacity(shader.name_hash) {
-                "\"alphaMode\":\"OPAQUE\""
-            } else {
-                "\"alphaMode\":\"MASK\",\"alphaCutoff\":0.3"
-            };
-            materials.push(format!(
-                "{{\"name\":\"{}\",\"pbrMetallicRoughness\":{{{pbr}}},{alpha},\"doubleSided\":true}}",
-                esc(&label)
-            ));
+            let json = parts.material_json(&inputs, (di, dname), (si, shader));
+            parts.materials.push(json);
         }
-
-        let mut primitives = Vec::new();
-        for mesh in &d.meshes {
-            if mesh.positions.is_empty() || mesh.indices.is_empty() || material(di, mesh.shader as usize).is_none() {
-                continue;
-            }
-            let mut attrs = format!("\"POSITION\":{}", b.floats(&mesh.positions, "VEC3", true));
-            if mesh.normals.len() == mesh.positions.len() {
-                let normals: Vec<[f32; 3]> = mesh
-                    .normals
-                    .iter()
-                    .map(|n| {
-                        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-                        if len > 1e-6 { [n[0] / len, n[1] / len, n[2] / len] } else { [0.0, 0.0, 1.0] }
-                    })
-                    .collect();
-                attrs.push_str(&format!(",\"NORMAL\":{}", b.floats(&normals, "VEC3", false)));
-            }
-            if mesh.uvs.len() == mesh.positions.len() {
-                attrs.push_str(&format!(",\"TEXCOORD_0\":{}", b.floats(&mesh.uvs, "VEC2", false)));
-            }
-            if mesh.colors.len() == mesh.positions.len() {
-                attrs.push_str(&format!(",\"COLOR_0\":{}", b.floats(&mesh.colors, "VEC4", false)));
-            }
-            let idx = b.indices(&mesh.indices);
-            let material = if (mesh.shader as usize) < d.shaders.len() {
-                format!(",\"material\":{}", first_material + mesh.shader as usize)
-            } else {
-                String::new()
-            };
-            primitives.push(format!("{{\"attributes\":{{{attrs}}},\"indices\":{idx}{material}}}"));
-        }
+        let primitives = parts.primitives(&inputs, di, d, first_material);
         if primitives.is_empty() {
             continue;
         }
@@ -224,60 +158,170 @@ pub fn write_glb_scene<'a>(
         matrix_json(&Z_UP_TO_Y_UP),
         children.join(",")
     );
+    let json = parts.scene_json(&root, &nodes_json, &meshes_json);
+    glb_container(&json, &parts.b.bin)
+}
 
-    let mut json = String::new();
-    let _ = write!(
-        json,
-        "{{\"asset\":{{\"version\":\"2.0\",\"generator\":\"OpenRAGE\"}},\"scene\":0,\"scenes\":[{{\"nodes\":[0]}}],\
-         \"nodes\":[{root}{}{}],\"meshes\":[{}]",
-        if nodes_json.is_empty() { "" } else { "," },
-        nodes_json.join(","),
-        meshes_json.join(",")
-    );
-    if !materials.is_empty() {
-        let _ = write!(json, ",\"materials\":[{}]", materials.join(","));
+/// What the caller of [`write_glb_scene`] provides: texture and material lookups.
+struct Inputs<'s, 'a> {
+    lookup: &'s dyn Fn(usize, &str) -> Option<&'a Texture>,
+    material: &'s dyn Fn(usize, usize) -> Option<[f32; 4]>,
+}
+
+/// The binary data and the JSON fragments of the scene's materials and textures.
+#[derive(Default)]
+struct SceneParts {
+    b: Builder,
+    materials: Vec<String>,
+    images: Vec<String>,
+    textures: Vec<String>,
+    /// Texture index per image name.
+    image_of: Vec<(String, usize)>,
+}
+
+impl SceneParts {
+    /// The material of shader `si` of drawable `di`.
+    fn material_json(&mut self, inputs: &Inputs, (di, dname): (usize, &str), (si, shader): (usize, &Shader)) -> String {
+        let tex_name = shader.base_texture().map(str::to_owned);
+        let mut pbr = String::from("\"metallicFactor\":0,\"roughnessFactor\":0.8");
+        if let Some(tint) = (inputs.material)(di, si).filter(|t| *t != [1.0; 4]) {
+            let [r, g, b, a] = tint.map(finite);
+            pbr.push_str(&format!(",\"baseColorFactor\":[{r},{g},{b},{a}]"));
+        }
+        if let Some(tn) = &tex_name
+            && let Some(ti) = self.texture_index(inputs, di, tn)
+        {
+            pbr.push_str(&format!(",\"baseColorTexture\":{{\"index\":{ti}}}"));
+        }
+        let label = tex_name.unwrap_or_else(|| format!("{dname}_shader_{si}"));
+        // Skin shaders keep other data in the texture's alpha.
+        let alpha = if crate::shaders::alpha_is_not_opacity(shader.name_hash) {
+            "\"alphaMode\":\"OPAQUE\""
+        } else {
+            "\"alphaMode\":\"MASK\",\"alphaCutoff\":0.3"
+        };
+        format!("{{\"name\":\"{}\",\"pbrMetallicRoughness\":{{{pbr}}},{alpha},\"doubleSided\":true}}", esc(&label))
     }
-    if !textures.is_empty() {
+
+    /// The texture `tn` of drawable `di`, embedded on first use.
+    fn texture_index(&mut self, inputs: &Inputs, di: usize, tn: &str) -> Option<usize> {
+        let existing = self.image_of.iter().find(|(n, _)| n.eq_ignore_ascii_case(tn)).map(|(_, i)| *i);
+        existing.or_else(|| self.embed_texture(inputs, di, tn))
+    }
+
+    fn embed_texture(&mut self, inputs: &Inputs, di: usize, tn: &str) -> Option<usize> {
+        let t = (inputs.lookup)(di, tn)?;
+        let rgba = t.to_rgba()?;
+        let png = crate::png(t.width, t.height, &rgba).ok()?;
+        let view = self.b.view(&png, None);
+        self.images.push(format!("{{\"name\":\"{}\",\"bufferView\":{view},\"mimeType\":\"image/png\"}}", esc(tn)));
+        self.textures.push(format!("{{\"source\":{},\"sampler\":0}}", self.images.len() - 1));
+        self.image_of.push((tn.to_owned(), self.textures.len() - 1));
+        Some(self.textures.len() - 1)
+    }
+
+    /// The primitives of the meshes of drawable `di` that are drawn.
+    fn primitives(&mut self, inputs: &Inputs, di: usize, d: &Drawable, first_material: usize) -> Vec<String> {
+        let mut primitives = Vec::new();
+        for mesh in &d.meshes {
+            if mesh.positions.is_empty()
+                || mesh.indices.is_empty()
+                || (inputs.material)(di, mesh.shader as usize).is_none()
+            {
+                continue;
+            }
+            let material = ((mesh.shader as usize) < d.shaders.len()).then(|| first_material + mesh.shader as usize);
+            primitives.push(primitive_json(&mut self.b, mesh, material));
+        }
+        primitives
+    }
+
+    /// The glTF JSON, padded to a multiple of 4 bytes with spaces. Pads the binary data as well.
+    fn scene_json(&mut self, root: &str, nodes_json: &[String], meshes_json: &[String]) -> Vec<u8> {
+        let mut json = String::new();
         let _ = write!(
             json,
-            ",\"textures\":[{}],\"images\":[{}],\"samplers\":[{{\"magFilter\":9729,\"minFilter\":9987,\"wrapS\":10497,\"wrapT\":10497}}]",
-            textures.join(","),
-            images.join(",")
+            "{{\"asset\":{{\"version\":\"2.0\",\"generator\":\"OpenRAGE\"}},\"scene\":0,\"scenes\":[{{\"nodes\":[0]}}],\
+             \"nodes\":[{root}{}{}],\"meshes\":[{}]",
+            if nodes_json.is_empty() { "" } else { "," },
+            nodes_json.join(","),
+            meshes_json.join(",")
         );
+        if !self.materials.is_empty() {
+            let _ = write!(json, ",\"materials\":[{}]", self.materials.join(","));
+        }
+        if !self.textures.is_empty() {
+            let _ = write!(
+                json,
+                ",\"textures\":[{}],\"images\":[{}],\"samplers\":[{{\"magFilter\":9729,\"minFilter\":9987,\"wrapS\":10497,\"wrapT\":10497}}]",
+                self.textures.join(","),
+                self.images.join(",")
+            );
+        }
+        while !self.b.bin.len().is_multiple_of(4) {
+            self.b.bin.push(0);
+        }
+        let _ = write!(
+            json,
+            ",\"accessors\":[{}],\"bufferViews\":[{}],\"buffers\":[{{\"byteLength\":{}}}]}}",
+            self.b.accessors.join(","),
+            self.b.views.join(","),
+            self.b.bin.len()
+        );
+        let mut json = json.into_bytes();
+        while !json.len().is_multiple_of(4) {
+            json.push(b' ');
+        }
+        json
     }
-    while !b.bin.len().is_multiple_of(4) {
-        b.bin.push(0);
-    }
-    let _ = write!(
-        json,
-        ",\"accessors\":[{}],\"bufferViews\":[{}],\"buffers\":[{{\"byteLength\":{}}}]}}",
-        b.accessors.join(","),
-        b.views.join(","),
-        b.bin.len()
-    );
-    let mut json = json.into_bytes();
-    while !json.len().is_multiple_of(4) {
-        json.push(b' ');
-    }
+}
 
-    let total = 12 + 8 + json.len() + 8 + b.bin.len();
+/// One primitive of `mesh`: its attributes and indices go to `b`.
+fn primitive_json(b: &mut Builder, mesh: &Mesh, material: Option<usize>) -> String {
+    let mut attrs = format!("\"POSITION\":{}", b.floats(&mesh.positions, "VEC3", true));
+    if mesh.normals.len() == mesh.positions.len() {
+        attrs.push_str(&format!(",\"NORMAL\":{}", b.floats(&unit_normals(&mesh.normals), "VEC3", false)));
+    }
+    if mesh.uvs.len() == mesh.positions.len() {
+        attrs.push_str(&format!(",\"TEXCOORD_0\":{}", b.floats(&mesh.uvs, "VEC2", false)));
+    }
+    if mesh.colors.len() == mesh.positions.len() {
+        attrs.push_str(&format!(",\"COLOR_0\":{}", b.floats(&mesh.colors, "VEC4", false)));
+    }
+    let idx = b.indices(&mesh.indices);
+    let material = material.map(|m| format!(",\"material\":{m}")).unwrap_or_default();
+    format!("{{\"attributes\":{{{attrs}}},\"indices\":{idx}{material}}}")
+}
+
+fn unit_normals(normals: &[[f32; 3]]) -> Vec<[f32; 3]> {
+    normals
+        .iter()
+        .map(|n| {
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if len > 1e-6 { [n[0] / len, n[1] / len, n[2] / len] } else { [0.0, 0.0, 1.0] }
+        })
+        .collect()
+}
+
+/// The `.glb` file: header, JSON chunk and binary chunk.
+fn glb_container(json: &[u8], bin: &[u8]) -> Vec<u8> {
+    let total = 12 + 8 + json.len() + 8 + bin.len();
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(b"glTF");
     out.extend_from_slice(&2u32.to_le_bytes());
     out.extend_from_slice(&(total as u32).to_le_bytes());
     out.extend_from_slice(&(json.len() as u32).to_le_bytes());
     out.extend_from_slice(b"JSON");
-    out.extend_from_slice(&json);
-    out.extend_from_slice(&(b.bin.len() as u32).to_le_bytes());
+    out.extend_from_slice(json);
+    out.extend_from_slice(&(bin.len() as u32).to_le_bytes());
     out.extend_from_slice(b"BIN\0");
-    out.extend_from_slice(&b.bin);
+    out.extend_from_slice(bin);
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drawable::{Mesh, Shader};
 
     #[test]
     fn writes_valid_glb_structure() {

@@ -78,49 +78,69 @@ fn group(rpf: &Rpf8, ops: &[(String, Op)]) -> Result<(Vec<(String, Op)>, BTreeMa
     Ok((local, nested))
 }
 
+/// What editing a nested archive needs besides the archive itself.
+struct EditCtx<'a> {
+    keys: &'a Option<Arc<Rdr2Keys>>,
+    names: &'a Option<Arc<NameIndex>>,
+    temp_root: &'a Path,
+}
+
 /// Applies ops to an archive opened for editing; deeper nested archives are
 /// rebuilt through temporary files.
-fn edit(
-    editor: &mut Rpf8Editor,
-    ops: &[(String, Op)],
-    keys: &Option<Arc<Rdr2Keys>>,
-    names: &Option<Arc<NameIndex>>,
-    temp_root: &Path,
-    added: &mut Vec<String>,
-) -> Result<()> {
+fn edit(editor: &mut Rpf8Editor, ops: &[(String, Op)], ctx: &EditCtx, added: &mut Vec<String>) -> Result<()> {
     let (local, nested) = group(editor.archive(), ops)?;
     for (archive, sub_ops) in nested {
-        let rpf = editor.archive();
-        let entry = &rpf.entries().context("entry table")?[rpf.find(&archive).context("nested archive")?];
-        let bytes = rpf.read(entry)?;
-        let dir = temp_root.join(format!("{}-{}", std::process::id(), TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)));
-        fs::create_dir_all(&dir)?;
-        let tmp = dir.join("nested.rpf");
-        fs::write(&tmp, bytes)?;
-        let result = (|| -> Result<Vec<u8>> {
-            let mut sub = Rpf8Editor::open(&tmp, keys.clone(), names.clone())?;
-            edit(&mut sub, &sub_ops, keys, names, temp_root, added)?;
-            added.extend(sub.added_names().iter().cloned());
-            sub.commit(&mut |_| Ok(()))?;
-            Ok(fs::read(&tmp)?)
-        })();
-        let _ = fs::remove_dir_all(&dir);
-        editor.set(&archive, result.with_context(|| format!("editing {archive}"))?)?;
+        edit_nested(editor, &archive, &sub_ops, ctx, added)?;
     }
     for (path, op) in local {
-        match op {
-            Op::Set(data) => editor.set(&path, data)?,
-            Op::SetRaw(_) => bail!("{path}: stored GTA V entries cannot go into an RDR2 archive"),
-            Op::Remove => {
-                if editor.remove(&path) == 0 {
-                    bail!("{path}: no such entry");
-                }
-            }
-            Op::Rename(to) => editor.rename(&path, &to)?,
-            Op::CreateDir => bail!("{path}: RDR2 archives have no folders of their own; import a file there instead"),
-        }
+        edit_local(editor, &path, op)?;
     }
     added.extend(editor.added_names().iter().cloned());
+    Ok(())
+}
+
+/// Rebuilds the nested archive `archive` through a temporary copy and puts it back.
+fn edit_nested(
+    editor: &mut Rpf8Editor,
+    archive: &str,
+    sub_ops: &[(String, Op)],
+    ctx: &EditCtx,
+    added: &mut Vec<String>,
+) -> Result<()> {
+    let rpf = editor.archive();
+    let entry = &rpf.entries().context("entry table")?[rpf.find(archive).context("nested archive")?];
+    let bytes = rpf.read(entry)?;
+    let dir = ctx.temp_root.join(format!("{}-{}", std::process::id(), TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)));
+    fs::create_dir_all(&dir)?;
+    let tmp = dir.join("nested.rpf");
+    fs::write(&tmp, bytes)?;
+    let result = edit_copy(&tmp, sub_ops, ctx, added);
+    let _ = fs::remove_dir_all(&dir);
+    editor.set(archive, result.with_context(|| format!("editing {archive}"))?)?;
+    Ok(())
+}
+
+/// Edits the archive file `tmp` in place and returns its new bytes.
+fn edit_copy(tmp: &Path, sub_ops: &[(String, Op)], ctx: &EditCtx, added: &mut Vec<String>) -> Result<Vec<u8>> {
+    let mut sub = Rpf8Editor::open(tmp, ctx.keys.clone(), ctx.names.clone())?;
+    edit(&mut sub, sub_ops, ctx, added)?;
+    added.extend(sub.added_names().iter().cloned());
+    sub.commit(&mut |_| Ok(()))?;
+    Ok(fs::read(tmp)?)
+}
+
+fn edit_local(editor: &mut Rpf8Editor, path: &str, op: Op) -> Result<()> {
+    match op {
+        Op::Set(data) => editor.set(path, data)?,
+        Op::SetRaw(_) => bail!("{path}: stored GTA V entries cannot go into an RDR2 archive"),
+        Op::Remove => {
+            if editor.remove(path) == 0 {
+                bail!("{path}: no such entry");
+            }
+        }
+        Op::Rename(to) => editor.rename(path, &to)?,
+        Op::CreateDir => bail!("{path}: RDR2 archives have no folders of their own; import a file there instead"),
+    }
     Ok(())
 }
 
@@ -145,51 +165,80 @@ pub(crate) fn apply(
     let (local, nested) = group(&top, ops)?;
     let mut last: Option<Applied> = None;
     let mut added = Vec::new();
+    let target = Target { top: &top, archive: &archive, mods, description, journal };
 
     for (path, op) in local {
-        check_named(&archive, &path)?;
-        let rel = rdr2_rel(&archive, &path);
-        let target = mods.join(vfs::safe_relative_path(&rel).with_context(|| format!("{rel}: not a valid path"))?);
-        match op {
-            Op::Set(data) => {
-                check_kind(&top, &path, &data)?;
-                let written = journal.write_file(false, &rel, &data, description)?;
-                last = Some(Applied { path: written, created: false, stats: changed() });
-            }
-            Op::Remove if vfs::find_case_insensitive(mods, &rel).is_some_and(|p| p.is_file()) => {
-                journal.delete_file(&rel, description)?;
-                last = Some(Applied { path: target, created: false, stats: changed() });
-            }
-            Op::Remove => bail!(
-                "{path}: Lenny's Mod Loader cannot remove a file from the game's archives; only files in \
-                 lml/replace (and entries of nested archives) can be removed"
-            ),
-            Op::Rename(_) => bail!(
-                "{path}: Lenny's Mod Loader cannot rename a file of the game's archives; only entries of \
-                 nested archives can be renamed"
-            ),
-            Op::CreateDir => bail!("{path}: RDR2 archives have no folders of their own; import a file there instead"),
-            Op::SetRaw(_) => bail!("{path}: stored GTA V entries cannot go into an RDR2 archive"),
-        }
+        last = Some(apply_local(&target, &path, op)?);
     }
 
     let temp_root = mods.join(rage_mods::overlay::OPENRAGE_FOLDER).join("tmp");
+    let ctx = EditCtx { keys: &keys, names: &names, temp_root: &temp_root };
     for (nested_path, sub_ops) in nested {
-        check_named(&archive, &nested_path)?;
-        let rel = rdr2_rel(&archive, &nested_path);
-        let (path, created) = ensure_copied(&top, &nested_path, mods, &rel, journal)?;
-        let mut editor = Rpf8Editor::open(&path, keys.clone(), names.clone())?;
-        edit(&mut editor, &sub_ops, &keys, &names, &temp_root, &mut added)?;
-        let stats = editor.commit(&mut |backup| {
-            journal
-                .record_edit(&rel, description, backup)
-                .map(|_| ())
-                .map_err(|e| rage_rpf::RpfError::Io(std::io::Error::other(e.to_string())))
-        })?;
-        last = Some(Applied { path, created, stats });
+        last = Some(apply_nested(&target, &nested_path, &sub_ops, &ctx, &mut added)?);
     }
     remember_names(mods, top.platform(), &added)?;
     last.context("nothing to do")
+}
+
+/// The game archive being changed and where the changes are journaled.
+struct Target<'a> {
+    top: &'a Rpf8,
+    archive: &'a str,
+    mods: &'a Path,
+    description: &'a str,
+    journal: &'a Journal,
+}
+
+/// Writes one op on a file directly inside the game archive as a loose file.
+fn apply_local(t: &Target, path: &str, op: Op) -> Result<Applied> {
+    check_named(t.archive, path)?;
+    let rel = rdr2_rel(t.archive, path);
+    let target = t.mods.join(vfs::safe_relative_path(&rel).with_context(|| format!("{rel}: not a valid path"))?);
+    match op {
+        Op::Set(data) => local_set(t, path, &rel, &data),
+        Op::Remove if vfs::find_case_insensitive(t.mods, &rel).is_some_and(|p| p.is_file()) => {
+            t.journal.delete_file(&rel, t.description)?;
+            Ok(Applied { path: target, created: false, stats: changed() })
+        }
+        Op::Remove => bail!(
+            "{path}: Lenny's Mod Loader cannot remove a file from the game's archives; only files in \
+             lml/replace (and entries of nested archives) can be removed"
+        ),
+        Op::Rename(_) => bail!(
+            "{path}: Lenny's Mod Loader cannot rename a file of the game's archives; only entries of \
+             nested archives can be renamed"
+        ),
+        Op::CreateDir => bail!("{path}: RDR2 archives have no folders of their own; import a file there instead"),
+        Op::SetRaw(_) => bail!("{path}: stored GTA V entries cannot go into an RDR2 archive"),
+    }
+}
+
+fn local_set(t: &Target, path: &str, rel: &str, data: &[u8]) -> Result<Applied> {
+    check_kind(t.top, path, data)?;
+    let written = t.journal.write_file(false, rel, data, t.description)?;
+    Ok(Applied { path: written, created: false, stats: changed() })
+}
+
+/// Copies the nested archive into `lml/replace` (once) and edits the copy.
+fn apply_nested(
+    t: &Target,
+    nested_path: &str,
+    sub_ops: &[(String, Op)],
+    ctx: &EditCtx,
+    added: &mut Vec<String>,
+) -> Result<Applied> {
+    check_named(t.archive, nested_path)?;
+    let rel = rdr2_rel(t.archive, nested_path);
+    let (path, created) = ensure_copied(t.top, nested_path, t.mods, &rel, t.journal)?;
+    let mut editor = Rpf8Editor::open(&path, ctx.keys.clone(), ctx.names.clone())?;
+    edit(&mut editor, sub_ops, ctx, added)?;
+    let stats = editor.commit(&mut |backup| {
+        t.journal
+            .record_edit(&rel, t.description, backup)
+            .map(|_| ())
+            .map_err(|e| rage_rpf::RpfError::Io(std::io::Error::other(e.to_string())))
+    })?;
+    Ok(Applied { path, created, stats })
 }
 
 /// LML finds a replacement by the file's real path: refuse paths that are

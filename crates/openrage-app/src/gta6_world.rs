@@ -174,64 +174,118 @@ impl Placements {
 /// What a map file places. The XML is read by lines: there is a lot of it,
 /// and it is our own.
 fn read_map(xml: &str) -> Placements {
-    let mut map = Placements::default();
-    let (mut lo, mut hi) = (None, None);
-    let mut now = Object { model: 0, position: [0.0; 3], rotation: [0.0, 0.0, 0.0, 1.0], scale: [1.0; 2] };
-    // The files with the objects that stand for this one's.
-    let mut parents: Vec<u32> = Vec::new();
-    let (mut in_parents, mut in_entities, mut in_extensions) = (false, false, false);
-    let (mut reach, mut parent_index) = (0.0, -1.0);
-    let value = |line: &str| attributes(line, ["value"]).map(|[v]| v);
+    let mut reader = MapReader {
+        map: Placements::default(),
+        lo: None,
+        hi: None,
+        now: Object { model: 0, position: [0.0; 3], rotation: [0.0, 0.0, 0.0, 1.0], scale: [1.0; 2] },
+        parents: Vec::new(),
+        in_parents: false,
+        in_entities: false,
+        in_extensions: false,
+        reach: 0.0,
+        parent_index: -1.0,
+    };
     for line in xml.lines().map(str::trim) {
-        if in_extensions {
-            in_extensions = line != "</extensions>";
-        } else if in_entities {
-            if line == "<extensions>" || line.starts_with("<extensions ") && !line.ends_with("/>") {
-                in_extensions = true;
-            } else if line == "</entities>" {
-                in_entities = false;
-            } else if let Some(name) = between(line, "<archetypeName>", "<") {
-                now.model = name_hash(name);
-            } else if line.starts_with("<position ") {
-                now.position = attributes(line, ["x", "y", "z"]).unwrap_or_default();
-            } else if line.starts_with("<rotation ") {
-                now.rotation = attributes(line, ["x", "y", "z", "w"]).unwrap_or([0.0, 0.0, 0.0, 1.0]);
-            } else if line.starts_with("<scaleXY ") {
-                now.scale[0] = value(line).unwrap_or(1.0);
-            } else if line.starts_with("<scaleZ ") {
-                now.scale[1] = value(line).unwrap_or(1.0);
-            } else if line.starts_with("<parentIndex ") {
-                parent_index = value(line).unwrap_or(-1.0);
-            } else if line.starts_with("<childLodDist ") {
-                reach = value(line).unwrap_or(0.0);
-            } else if line.starts_with("<lodLevel ") {
-                let level = value(line).map_or(u8::MAX, |v| v as u8);
-                map.entries.push(Entry { level, parent: None, reach, object: now.clone() });
-            } else if line.starts_with("<hash_84799847 ")
-                && let (Some(entry), Some(file)) = (map.entries.last_mut(), value(line))
-                && parent_index >= 0.0
-                && file >= 0.0
-            {
-                entry.parent = parents.get(file as usize).map(|file| (*file, parent_index as u32));
-            }
-        } else if line.starts_with("<entities>") || line.starts_with("<entities ") {
-            in_entities = !line.ends_with("/>");
-        } else if line == "<hash_75D16ADF>" {
-            in_parents = true;
-        } else if line == "</hash_75D16ADF>" {
-            in_parents = false;
-        } else if let Some(name) = between(line, "<Item>", "<").filter(|_| in_parents) {
-            parents.push(name_hash(name));
-        } else if let Some(name) = between(line, "<name>", "<").filter(|_| map.name == 0) {
-            map.name = name_hash(name);
-        } else if line.starts_with("<entitiesExtentsMin") {
-            lo = attributes(line, ["x", "y", "z"]);
-        } else if line.starts_with("<entitiesExtentsMax") {
-            hi = attributes(line, ["x", "y", "z"]);
+        reader.line(line);
+    }
+    reader.map.extent = reader.lo.zip(reader.hi).map(|(lo, hi)| [lo, hi]);
+    reader.map
+}
+
+/// The `value` attribute of a line.
+fn value(line: &str) -> Option<f32> {
+    attributes(line, ["value"]).map(|[v]| v)
+}
+
+/// State of [`read_map`] between the lines of a map file.
+struct MapReader {
+    map: Placements,
+    lo: Option<[f32; 3]>,
+    hi: Option<[f32; 3]>,
+    now: Object,
+    /// The files with the objects that stand for this one's.
+    parents: Vec<u32>,
+    in_parents: bool,
+    in_entities: bool,
+    in_extensions: bool,
+    reach: f32,
+    parent_index: f32,
+}
+
+impl MapReader {
+    fn line(&mut self, line: &str) {
+        if self.in_extensions {
+            self.in_extensions = line != "</extensions>";
+        } else if self.in_entities {
+            self.entity_line(line);
+        } else {
+            self.outer_line(line);
         }
     }
-    map.extent = lo.zip(hi).map(|(lo, hi)| [lo, hi]);
-    map
+
+    /// A line between `<entities>` and `</entities>`.
+    fn entity_line(&mut self, line: &str) {
+        if line == "<extensions>" || line.starts_with("<extensions ") && !line.ends_with("/>") {
+            self.in_extensions = true;
+        } else if line == "</entities>" {
+            self.in_entities = false;
+        } else if let Some(name) = between(line, "<archetypeName>", "<") {
+            self.now.model = name_hash(name);
+        } else {
+            self.entity_field(line);
+        }
+    }
+
+    fn entity_field(&mut self, line: &str) {
+        if line.starts_with("<position ") {
+            self.now.position = attributes(line, ["x", "y", "z"]).unwrap_or_default();
+        } else if line.starts_with("<rotation ") {
+            self.now.rotation = attributes(line, ["x", "y", "z", "w"]).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+        } else if line.starts_with("<scaleXY ") {
+            self.now.scale[0] = value(line).unwrap_or(1.0);
+        } else if line.starts_with("<scaleZ ") {
+            self.now.scale[1] = value(line).unwrap_or(1.0);
+        } else if line.starts_with("<parentIndex ") {
+            self.parent_index = value(line).unwrap_or(-1.0);
+        } else if line.starts_with("<childLodDist ") {
+            self.reach = value(line).unwrap_or(0.0);
+        } else {
+            self.entity_lod(line);
+        }
+    }
+
+    fn entity_lod(&mut self, line: &str) {
+        if line.starts_with("<lodLevel ") {
+            let level = value(line).map_or(u8::MAX, |v| v as u8);
+            self.map.entries.push(Entry { level, parent: None, reach: self.reach, object: self.now.clone() });
+        } else if line.starts_with("<hash_84799847 ")
+            && let (Some(entry), Some(file)) = (self.map.entries.last_mut(), value(line))
+            && self.parent_index >= 0.0
+            && file >= 0.0
+        {
+            entry.parent = self.parents.get(file as usize).map(|file| (*file, self.parent_index as u32));
+        }
+    }
+
+    /// A line outside the entities and their extensions.
+    fn outer_line(&mut self, line: &str) {
+        if line.starts_with("<entities>") || line.starts_with("<entities ") {
+            self.in_entities = !line.ends_with("/>");
+        } else if line == "<hash_75D16ADF>" {
+            self.in_parents = true;
+        } else if line == "</hash_75D16ADF>" {
+            self.in_parents = false;
+        } else if let Some(name) = between(line, "<Item>", "<").filter(|_| self.in_parents) {
+            self.parents.push(name_hash(name));
+        } else if let Some(name) = between(line, "<name>", "<").filter(|_| self.map.name == 0) {
+            self.map.name = name_hash(name);
+        } else if line.starts_with("<entitiesExtentsMin") {
+            self.lo = attributes(line, ["x", "y", "z"]);
+        } else if line.starts_with("<entitiesExtentsMax") {
+            self.hi = attributes(line, ["x", "y", "z"]);
+        }
+    }
 }
 
 /// The hashes of the names of a dictionary's models.
@@ -346,36 +400,11 @@ fn encode(map: &Map, stamp: i64) -> Vec<u8> {
 
 fn decode(data: &[u8], stamp: i64) -> Option<Map> {
     let rest = data.strip_prefix(MAGIC)?.strip_prefix(&stamp.to_le_bytes())?;
-    fn floats<const N: usize>(number: &mut impl FnMut() -> Option<u32>) -> Option<[f32; N]> {
-        let mut out = [0.0; N];
-        for f in &mut out {
-            *f = f32::from_bits(number()?);
-        }
-        Some(out)
-    }
     let mut reader = Reader { data: rest, at: 0 };
     let mut map = Map::default();
-    for _ in 0..reader.number()? {
-        let path = reader.text()?;
-        let (lo, hi) = (floats(&mut || reader.number())?, floats(&mut || reader.number())?);
-        map.files.push((path, lo, hi));
-    }
-    for _ in 0..reader.number()? {
-        let mut next = || reader.number();
-        let (key, parent) = ((next()?, next()?), (next()?, next()?));
-        let (level, model) = (next()? as u8, next()?);
-        let [reach] = floats(&mut next)?;
-        let object =
-            Object { model, position: floats(&mut next)?, rotation: floats(&mut next)?, scale: floats(&mut next)? };
-        map.nodes.push(Node { key, parent: (parent.0 != u32::MAX).then_some(parent), level, reach, object });
-    }
-    for _ in 0..reader.number()? {
-        let path = reader.text()?;
-        for _ in 0..reader.number()? {
-            let (name, k) = (reader.number()?, reader.number()?);
-            map.children.insert(name, (path.clone(), k as u16));
-        }
-    }
+    reader.read_files(&mut map)?;
+    reader.read_nodes(&mut map)?;
+    reader.read_dictionaries(&mut map)?;
     Some(map)
 }
 
@@ -385,6 +414,57 @@ struct Reader<'a> {
 }
 
 impl Reader<'_> {
+    fn floats<const N: usize>(&mut self) -> Option<[f32; N]> {
+        let mut out = [0.0; N];
+        for f in &mut out {
+            *f = f32::from_bits(self.number()?);
+        }
+        Some(out)
+    }
+
+    fn read_files(&mut self, map: &mut Map) -> Option<()> {
+        for _ in 0..self.number()? {
+            let path = self.text()?;
+            let (lo, hi) = (self.floats()?, self.floats()?);
+            map.files.push((path, lo, hi));
+        }
+        Some(())
+    }
+
+    fn read_nodes(&mut self, map: &mut Map) -> Option<()> {
+        for _ in 0..self.number()? {
+            map.nodes.push(self.read_node()?);
+        }
+        Some(())
+    }
+
+    fn read_node(&mut self) -> Option<Node> {
+        let (key, parent) = (self.pair()?, self.pair()?);
+        let (level, model) = (self.number()? as u8, self.number()?);
+        let [reach] = self.floats()?;
+        let object = self.read_object(model)?;
+        Some(Node { key, parent: (parent.0 != u32::MAX).then_some(parent), level, reach, object })
+    }
+
+    fn pair(&mut self) -> Option<(u32, u32)> {
+        Some((self.number()?, self.number()?))
+    }
+
+    fn read_object(&mut self, model: u32) -> Option<Object> {
+        Some(Object { model, position: self.floats()?, rotation: self.floats()?, scale: self.floats()? })
+    }
+
+    fn read_dictionaries(&mut self, map: &mut Map) -> Option<()> {
+        for _ in 0..self.number()? {
+            let path = self.text()?;
+            for _ in 0..self.number()? {
+                let (name, k) = (self.number()?, self.number()?);
+                map.children.insert(name, (path.clone(), k as u16));
+            }
+        }
+        Some(())
+    }
+
     fn number(&mut self) -> Option<u32> {
         let v = self.data.u32_at(self.at)?;
         self.at += 4;

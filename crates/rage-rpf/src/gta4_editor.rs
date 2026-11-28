@@ -141,68 +141,119 @@ pub fn commit_img_with(
     edits: &[ImgEdit],
     before: &mut dyn FnMut(&Backup) -> Result<(), RpfError>,
 ) -> Result<CommitStats, RpfError> {
-    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    let old_len = file.metadata()?.len();
+    let (mut file, old_len) = open_img(path)?;
     let (mut items, old_toc_end) = read_items(&file, path, key)?;
-    let find = |items: &[Item], name: &str| items.iter().position(|i| i.name.eq_ignore_ascii_case(name));
     for edit in edits {
-        match edit {
-            ImgEdit::Set { name, data } => {
-                let new = item_for(name, data.clone())?;
-                match find(&items, name) {
-                    Some(i) => items[i] = Item { name: items[i].name.clone(), ..new },
-                    None => items.push(new),
-                }
-            }
-            ImgEdit::Remove { name } => {
-                let i = find(&items, name).ok_or_else(|| RpfError::NotFound(name.clone()))?;
-                items.remove(i);
-            }
-            ImgEdit::Rename { from, to } => {
-                if find(&items, to).is_some() {
-                    return Err(RpfError::BadPath(format!("{to} already exists").into()));
-                }
-                let i = find(&items, from).ok_or_else(|| RpfError::NotFound(from.clone()))?;
-                items[i].name = to.clone();
+        apply_edit(&mut items, edit)?;
+    }
+    let mut stats = CommitStats { changed: !edits.is_empty(), ..Default::default() };
+    let backup = place_items(&file, &mut items, old_len, old_toc_end, &mut stats)?;
+    before(&backup)?;
+    stats.appended = write_new_data(&mut file, &mut items)?;
+    write_header_and_table(&mut file, &items, backup.new_len)?;
+    stats.new_len = backup.new_len;
+    Ok(stats)
+}
+
+fn open_img(path: &Path) -> Result<(File, u64), RpfError> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    let old_len = file.metadata()?.len();
+    Ok((file, old_len))
+}
+
+/// Makes room for the table (entries starting before its end move to the end), places the new data and
+/// reads the start region that the write will overwrite.
+fn place_items(
+    file: &File,
+    items: &mut [Item],
+    old_len: u64,
+    old_toc_end: u64,
+    stats: &mut CommitStats,
+) -> Result<Backup, RpfError> {
+    stats.relocated = relocate_in_the_way(file, items)?;
+    let new_toc_end = HEADER + table(items).len() as u64;
+    let end = place_new_data(items, old_len.max(new_toc_end));
+    let new_len = end.max(new_toc_end);
+    // Back up the start region before writing anything.
+    let region_len = old_toc_end.max(new_toc_end).min(old_len);
+    let mut region = vec![0u8; region_len as usize];
+    read_exact_at(file, &mut region, 0)?;
+    Ok(Backup { old_len, new_len, region })
+}
+
+fn find_item(items: &[Item], name: &str) -> Option<usize> {
+    items.iter().position(|i| i.name.eq_ignore_ascii_case(name))
+}
+
+fn apply_edit(items: &mut Vec<Item>, edit: &ImgEdit) -> Result<(), RpfError> {
+    match edit {
+        ImgEdit::Set { name, data } => {
+            let new = item_for(name, data.clone())?;
+            match find_item(items, name) {
+                Some(i) => items[i] = Item { name: items[i].name.clone(), ..new },
+                None => items.push(new),
             }
         }
+        ImgEdit::Remove { name } => {
+            let i = find_item(items, name).ok_or_else(|| RpfError::NotFound(name.clone()))?;
+            items.remove(i);
+        }
+        ImgEdit::Rename { from, to } => {
+            if find_item(items, to).is_some() {
+                return Err(RpfError::BadPath(format!("{to} already exists").into()));
+            }
+            let i = find_item(items, from).ok_or_else(|| RpfError::NotFound(from.clone()))?;
+            items[i].name = to.clone();
+        }
     }
-    // Make room for the table: entries starting before its end move to the end.
-    let mut stats = CommitStats { changed: !edits.is_empty(), ..Default::default() };
+    Ok(())
+}
+
+/// Reads the data of every entry that starts before the end of the table and unplaces it; returns how many.
+fn relocate_in_the_way(file: &File, items: &mut [Item]) -> Result<usize, RpfError> {
+    let mut relocated = 0;
     loop {
-        let toc_end = HEADER + table(&items).len() as u64;
+        let toc_end = HEADER + table(items).len() as u64;
         let in_the_way = items.iter().position(|i| i.block.is_some_and(|b| (b as u64) * BLOCK < toc_end));
         let Some(i) = in_the_way else { break };
         let len = items[i].blocks as u64 * BLOCK;
         let mut data = vec![0u8; len as usize];
-        read_exact_at(&file, &mut data, items[i].block.expect("placed") as u64 * BLOCK)?;
+        read_exact_at(file, &mut data, items[i].block.expect("placed") as u64 * BLOCK)?;
         items[i].data = Some(data);
         items[i].block = None;
-        stats.relocated += 1;
+        relocated += 1;
     }
-    let new_toc_end = HEADER + table(&items).len() as u64;
-    // New data goes at block boundaries behind both the old data and the new table.
-    let mut end = old_len.max(new_toc_end).div_ceil(BLOCK) * BLOCK;
+    Ok(relocated)
+}
+
+/// New data goes at block boundaries behind both the old data and the new table; returns the end.
+fn place_new_data(items: &mut [Item], start: u64) -> u64 {
+    let mut end = start.div_ceil(BLOCK) * BLOCK;
     for it in items.iter_mut().filter(|i| i.data.is_some()) {
         let padded = (it.data.as_ref().expect("filtered").len() as u64).div_ceil(BLOCK).max(1) * BLOCK;
         it.block = Some((end / BLOCK) as u32);
         end += padded;
     }
-    let new_len = end.max(new_toc_end);
-    // Back up the start region before writing anything.
-    let region_len = old_toc_end.max(new_toc_end).min(old_len);
-    let mut region = vec![0u8; region_len as usize];
-    read_exact_at(&file, &mut region, 0)?;
-    before(&Backup { old_len, new_len, region })?;
+    end
+}
+
+/// Writes the data of all placed entries, padded to whole blocks; returns the bytes written.
+fn write_new_data(file: &mut File, items: &mut [Item]) -> Result<u64, RpfError> {
+    let mut appended = 0;
     for it in items.iter_mut().filter(|i| i.data.is_some()) {
         let data = it.data.take().expect("filtered");
         file.seek(SeekFrom::Start(it.block.expect("placed") as u64 * BLOCK))?;
         file.write_all(&data)?;
         let padded = (data.len() as u64).div_ceil(BLOCK).max(1) * BLOCK;
         file.write_all(&vec![0u8; (padded - data.len() as u64) as usize])?;
-        stats.appended += padded;
+        appended += padded;
     }
-    let toc = table(&items);
+    Ok(appended)
+}
+
+/// Writes the header and the table of contents, then cuts or extends the file to `new_len`.
+fn write_header_and_table(file: &mut File, items: &[Item], new_len: u64) -> Result<(), RpfError> {
+    let toc = table(items);
     let mut head = Vec::with_capacity(HEADER as usize);
     head.extend(MAGIC.to_le_bytes());
     head.extend(3u32.to_le_bytes());
@@ -215,8 +266,7 @@ pub fn commit_img_with(
     file.write_all(&toc)?;
     file.set_len(new_len)?;
     file.sync_all()?;
-    stats.new_len = new_len;
-    Ok(stats)
+    Ok(())
 }
 
 /// Like [`commit_img_with`], returning the backup.

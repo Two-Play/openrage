@@ -763,91 +763,25 @@ pub fn animation(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Result<Animate
     let name = archive.entry(id).name.clone();
     let stem = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_owned();
     let actors = cut.actors();
-    let mut out = ClipDictionary { clips: Vec::new(), animations: vec![Animation::empty()] };
     let lights = cut.lights();
-    let mut parts: Vec<Vec<ClipPart>> = vec![Vec::new(); actors.len() + 1 + lights.len()];
-    let mut problems = Vec::new();
+    let mut asm = Assembly {
+        out: ClipDictionary { clips: Vec::new(), animations: vec![Animation::empty()] },
+        parts: vec![Vec::new(); actors.len() + 1 + lights.len()],
+        problems: Vec::new(),
+    };
     for (n, section) in cut.sections.iter().enumerate() {
-        let file = [format!("{}.wad", section.anim), format!("{stem}_{n}.wad")]
-            .into_iter()
-            .find_map(|f| archive.find_child(dir, &f));
-        let dict = match file {
-            Some(f) => Some(rage_formats::wad::parse_wad(&archive.read_resource(f)?)?),
-            None => {
-                problems.push(format!("section {n}: no {}.wad", section.anim.to_ascii_lowercase()));
-                None
-            }
-        };
-        let clip = |name: &str| -> Option<&Animation> {
-            let dict = dict.as_ref()?;
-            let c = dict.clips.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
-            dict.animations.get(c.parts.first()?.animation)
-        };
-        let longest = dict.as_ref().map_or(0.0, |d| d.animations.iter().map(|a| a.duration).fold(0.0, f32::max));
-        let length = if section.duration > 0.0 { section.duration } else { longest };
-        let part = |animation| ClipPart { animation, start: 0.0, end: length, rate: 1.0 };
+        let dict = asm.section_dictionary(&archive, dir, &stem, n, section)?;
         // Every section in the first one's frame (a few move to another place).
         let origin = cut.sections[0].offset;
         let shift: [f32; 3] = std::array::from_fn(|k| section.offset[k] - origin[k]);
-        for (k, (key, _)) in actors.iter().enumerate() {
-            let animation = section.models.iter().find(|m| m.actor() == *key).and_then(|m| {
-                let Some(body) = clip(&m.anim) else {
-                    if dict.is_some() {
-                        problems.push(format!("section {n}: no clip {}", m.anim));
-                    }
-                    return None;
-                };
-                let face = m.face.as_deref().and_then(|f| {
-                    let found = clip(f);
-                    if found.is_none() {
-                        problems.push(format!("section {n}: no facial clip {f}"));
-                    }
-                    found
-                });
-                Some(actor_animation(body, face, shift))
-            });
-            let index = match animation {
-                Some(a) => {
-                    out.animations.push(a);
-                    out.animations.len() - 1
-                }
-                None => 0,
-            };
-            parts[k].push(part(index));
-        }
-        let camera = section.camera.as_deref().unwrap_or("camera_0");
-        let index = match clip(camera) {
-            Some(a) => {
-                out.animations.push(actor_animation(a, None, shift));
-                out.animations.len() - 1
-            }
-            None => {
-                if dict.is_some() {
-                    problems.push(format!("section {n}: no camera clip {camera}"));
-                }
-                0
-            }
-        };
-        parts[actors.len()].push(part(index));
-        for (k, key) in lights.iter().enumerate() {
-            let index = match section.lights.iter().find(|l| actor_key(l) == *key) {
-                Some(name) => match clip(name) {
-                    Some(a) => {
-                        out.animations.push(actor_animation(a, None, shift));
-                        out.animations.len() - 1
-                    }
-                    None => {
-                        if dict.is_some() {
-                            problems.push(format!("section {n}: no light clip {name}"));
-                        }
-                        0
-                    }
-                },
-                None => 0,
-            };
-            parts[actors.len() + 1 + k].push(part(index));
-        }
+        let longest = dict.as_ref().map_or(0.0, |d| d.animations.iter().map(|a| a.duration).fold(0.0, f32::max));
+        let length = if section.duration > 0.0 { section.duration } else { longest };
+        let at = SectionAnims { n, dict, shift, length };
+        asm.add_actors(&at, section, &actors);
+        asm.add_camera(&at, section, actors.len());
+        asm.add_lights(&at, section, &lights, actors.len() + 1);
     }
+    let Assembly { mut out, parts, problems } = asm;
     let names = actors
         .iter()
         .map(|(k, _)| k.clone())
@@ -856,6 +790,120 @@ pub fn animation(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> Result<Animate
     out.clips = names.zip(parts).map(|(name, parts)| Clip { name, parts, sequential: true }).collect();
     let lights = (actors.len() + 1..out.clips.len()).collect();
     Ok(Animated { dict: out, lights, problems })
+}
+
+/// The animation being put together by [`animation`].
+struct Assembly {
+    out: ClipDictionary,
+    /// Per clip, one part per section.
+    parts: Vec<Vec<ClipPart>>,
+    problems: Vec<String>,
+}
+
+/// One section's animation dictionary and where its clips go.
+struct SectionAnims {
+    n: usize,
+    dict: Option<ClipDictionary>,
+    shift: [f32; 3],
+    length: f32,
+}
+
+impl SectionAnims {
+    fn clip(&self, name: &str) -> Option<&Animation> {
+        let dict = self.dict.as_ref()?;
+        let c = dict.clips.iter().find(|c| c.name.eq_ignore_ascii_case(name))?;
+        dict.animations.get(c.parts.first()?.animation)
+    }
+
+    fn part(&self, animation: usize) -> ClipPart {
+        ClipPart { animation, start: 0.0, end: self.length, rate: 1.0 }
+    }
+}
+
+impl Assembly {
+    /// Reads the section's `.wad`; a missing one is a problem, not an error.
+    fn section_dictionary(
+        &mut self,
+        archive: &rage_rpf::Gta4Archive,
+        dir: usize,
+        stem: &str,
+        n: usize,
+        section: &Section,
+    ) -> Result<Option<ClipDictionary>> {
+        let file = [format!("{}.wad", section.anim), format!("{stem}_{n}.wad")]
+            .into_iter()
+            .find_map(|f| archive.find_child(dir, &f));
+        match file {
+            Some(f) => Ok(Some(rage_formats::wad::parse_wad(&archive.read_resource(f)?)?)),
+            None => {
+                self.problems.push(format!("section {n}: no {}.wad", section.anim.to_ascii_lowercase()));
+                Ok(None)
+            }
+        }
+    }
+
+    /// Adds an animation; its index.
+    fn push_animation(&mut self, animation: Animation) -> usize {
+        self.out.animations.push(animation);
+        self.out.animations.len() - 1
+    }
+
+    fn add_actors(&mut self, at: &SectionAnims, section: &Section, actors: &[(String, String)]) {
+        for (k, (key, _)) in actors.iter().enumerate() {
+            let index = match section.models.iter().find(|m| m.actor() == *key) {
+                Some(m) => self.actor_clip(at, m),
+                None => 0,
+            };
+            self.parts[k].push(at.part(index));
+        }
+    }
+
+    /// The index of an actor's animation in the section; 0 (none) when its clip is missing.
+    fn actor_clip(&mut self, at: &SectionAnims, m: &CutModel) -> usize {
+        let Some(body) = at.clip(&m.anim) else {
+            if at.dict.is_some() {
+                self.problems.push(format!("section {}: no clip {}", at.n, m.anim));
+            }
+            return 0;
+        };
+        let face = m.face.as_deref().and_then(|f| {
+            let found = at.clip(f);
+            if found.is_none() {
+                self.problems.push(format!("section {}: no facial clip {f}", at.n));
+            }
+            found
+        });
+        self.push_animation(actor_animation(body, face, at.shift))
+    }
+
+    fn add_camera(&mut self, at: &SectionAnims, section: &Section, slot: usize) {
+        let camera = section.camera.as_deref().unwrap_or("camera_0");
+        let index = self.clip_index(at, camera, "camera clip");
+        self.parts[slot].push(at.part(index));
+    }
+
+    fn add_lights(&mut self, at: &SectionAnims, section: &Section, lights: &[String], first_slot: usize) {
+        for (k, key) in lights.iter().enumerate() {
+            let index = match section.lights.iter().find(|l| actor_key(l) == *key) {
+                Some(name) => self.clip_index(at, name, "light clip"),
+                None => 0,
+            };
+            self.parts[first_slot + k].push(at.part(index));
+        }
+    }
+
+    /// The index of the animation made from clip `name`; 0 (none) with a problem noted when it is missing.
+    fn clip_index(&mut self, at: &SectionAnims, name: &str, what: &str) -> usize {
+        match at.clip(name) {
+            Some(a) => self.push_animation(actor_animation(a, None, at.shift)),
+            None => {
+                if at.dict.is_some() {
+                    self.problems.push(format!("section {}: no {what} {name}", at.n));
+                }
+                0
+            }
+        }
+    }
 }
 
 /// An actor's (or the camera's) animation in a section: its body clip with

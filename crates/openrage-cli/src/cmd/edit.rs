@@ -37,29 +37,47 @@ pub(crate) fn load_ytd(
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<rage_formats::ytd::TextureDictionary> {
     match vfs::resolve(game_dir, path, keys)? {
-        Node::ArchiveFile(rpf, id) if openrage_app::textures::gta5_model_ext(path).is_some() => {
-            openrage_app::textures::gta5_model_textures(&rpf.read_resource(id)?, path)
-                .with_context(|| format!("{path} has no textures of its own"))
-        }
-        Node::ArchiveFile(rpf, id) => Ok(rage_formats::ytd::parse(&rpf.read_resource(id)?)?),
-        Node::Rpf8File(rpf, i) => {
-            let entry = &rpf.entries().context("no entries")?[i];
-            Ok(rage_formats::ytd::parse_rdr2(&rpf.read_resource(entry)?)?)
-        }
-        Node::Gta4File(a, id) if openrage_app::textures::is_gta4_model(path) => {
-            openrage_app::textures::gta4_model_textures(&a.read_resource(id)?)
-                .with_context(|| format!("{path} has no textures of its own"))
-        }
-        Node::Gta4File(a, id) => Ok(rage_formats::ytd::parse_gta4(&a.read_resource(id)?)?),
+        Node::ArchiveFile(rpf, id) => gta5_ytd(&rpf, id, path),
+        Node::Rpf8File(rpf, i) => rdr2_ytd(&rpf, i),
+        Node::Gta4File(a, id) => gta4_ytd(&a, id, path),
         // An RDR2 dictionary replaced in lml/replace (an RSC8 file).
-        Node::PlainFile(p) => {
-            let res = rage_rpf::rpf8::parse_resource_file(&std::fs::read(&p)?)
-                .with_context(|| format!("{path} is not a file inside an archive or an RSC8 resource"))?;
-            Ok(rage_formats::ytd::parse_rdr2(&res)?)
-        }
+        Node::PlainFile(p) => rsc8_ytd(&p, path),
         Node::Rpf9File(rpf, i) => openrage_app::textures::gta6_dictionary(&rpf, i),
         _ => bail!("{path} is not a file inside an archive"),
     }
+}
+
+fn rdr2_ytd(rpf: &rage_rpf::rpf8::Rpf8, i: usize) -> Result<rage_formats::ytd::TextureDictionary> {
+    let entry = &rpf.entries().context("no entries")?[i];
+    Ok(rage_formats::ytd::parse_rdr2(&rpf.read_resource(entry)?)?)
+}
+
+fn rsc8_ytd(p: &Path, path: &str) -> Result<rage_formats::ytd::TextureDictionary> {
+    let res = rage_rpf::rpf8::parse_resource_file(&std::fs::read(p)?)
+        .with_context(|| format!("{path} is not a file inside an archive or an RSC8 resource"))?;
+    Ok(rage_formats::ytd::parse_rdr2(&res)?)
+}
+
+/// A `.ytd`, or the textures of a GTA V model of its own.
+fn gta5_ytd(rpf: &Rpf7, id: EntryId, path: &str) -> Result<rage_formats::ytd::TextureDictionary> {
+    if openrage_app::textures::gta5_model_ext(path).is_some() {
+        return openrage_app::textures::gta5_model_textures(&rpf.read_resource(id)?, path)
+            .with_context(|| format!("{path} has no textures of its own"));
+    }
+    Ok(rage_formats::ytd::parse(&rpf.read_resource(id)?)?)
+}
+
+/// A GTA IV texture dictionary, or the textures of a model of its own.
+fn gta4_ytd(
+    a: &rage_rpf::Gta4Archive,
+    id: rage_rpf::Gta4EntryId,
+    path: &str,
+) -> Result<rage_formats::ytd::TextureDictionary> {
+    if openrage_app::textures::is_gta4_model(path) {
+        return openrage_app::textures::gta4_model_textures(&a.read_resource(id)?)
+            .with_context(|| format!("{path} has no textures of its own"));
+    }
+    Ok(rage_formats::ytd::parse_gta4(&a.read_resource(id)?)?)
 }
 
 pub(crate) fn cmd_textures(

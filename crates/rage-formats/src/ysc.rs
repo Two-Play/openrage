@@ -252,36 +252,61 @@ fn pages(res: &Resource, table: u64, size: usize) -> Result<Vec<u8>, ResourceErr
     Ok(out)
 }
 
-pub fn parse(res: &Resource) -> Result<Script, ResourceError> {
+/// Sizes in a script's header.
+struct Sizes {
+    code: usize,
+    statics: u64,
+    natives: u64,
+    strings: usize,
+}
+
+fn read_sizes(res: &Resource) -> Result<Sizes, ResourceError> {
     let root = Resource::ROOT;
-    let code_len = res.u32(root + 0x1C)? as usize;
-    let statics_count = res.u32(root + 0x24)? as u64;
-    let natives_count = res.u32(root + 0x2C)? as u64;
-    let strings_len = res.u32(root + 0x70)? as usize;
-    if code_len > 64 << 20 || natives_count > 1 << 16 || statics_count > 1 << 20 || strings_len > 64 << 20 {
-        return Err(ResourceError::Format(format!("implausible script header (code {code_len} bytes)")));
+    let code = res.u32(root + 0x1C)? as usize;
+    let statics = res.u32(root + 0x24)? as u64;
+    let natives = res.u32(root + 0x2C)? as u64;
+    let strings = res.u32(root + 0x70)? as usize;
+    if code > 64 << 20 || natives > 1 << 16 || statics > 1 << 20 || strings > 64 << 20 {
+        return Err(ResourceError::Format(format!("implausible script header (code {code} bytes)")));
     }
+    Ok(Sizes { code, statics, natives, strings })
+}
+
+/// The native hashes (undone from their rotation) and the statics, and the pointer to the name.
+fn read_lists(res: &Resource, sizes: &Sizes) -> Result<(Vec<u64>, Vec<i64>, u64), ResourceError> {
+    let root = Resource::ROOT;
     let name_ptr = res.u64(root + 0x60)?;
     let statics_at = res.u64(root + 0x30)?;
     let natives_at = res.u64(root + 0x40)?;
-    let natives = (0..natives_count)
-        .map(|i| Ok(res.u64(natives_at + i * 8)?.rotate_left(((code_len as u64 + i) % 64) as u32)))
+    let natives = (0..sizes.natives)
+        .map(|i| Ok(res.u64(natives_at + i * 8)?.rotate_left(((sizes.code as u64 + i) % 64) as u32)))
         .collect::<Result<Vec<_>, ResourceError>>()?;
-    let statics = (0..statics_count)
+    let statics = (0..sizes.statics)
         .map(|i| Ok(res.u64(statics_at + i * 8)? as i64))
         .collect::<Result<Vec<_>, ResourceError>>()?;
+    Ok((natives, statics, name_ptr))
+}
+
+pub fn parse(res: &Resource) -> Result<Script, ResourceError> {
+    let root = Resource::ROOT;
+    let sizes = read_sizes(res)?;
+    let (natives, statics, name_ptr) = read_lists(res, &sizes)?;
     let mut script = Script {
         name: if name_ptr != 0 { res.string(name_ptr)? } else { String::new() },
         name_hash: res.u32(root + 0x58)?,
-        code: pages(res, res.u64(root + 0x10)?, code_len)?,
+        code: pages(res, res.u64(root + 0x10)?, sizes.code)?,
         parameters: res.u32(root + 0x20)?,
         statics,
         natives,
-        strings: if strings_len > 0 { pages(res, res.u64(root + 0x68)?, strings_len)? } else { Vec::new() },
+        strings: read_strings(res, sizes.strings)?,
         table: None,
     };
     script.table = script.detect_table();
     Ok(script)
+}
+
+fn read_strings(res: &Resource, len: usize) -> Result<Vec<u8>, ResourceError> {
+    if len > 0 { pages(res, res.u64(Resource::ROOT + 0x68)?, len) } else { Ok(Vec::new()) }
 }
 
 /// The instruction being decoded: its opcode is at `pc`, its operands follow.

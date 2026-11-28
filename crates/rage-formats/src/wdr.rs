@@ -26,7 +26,8 @@
 use rage_resource::{Resource, ResourceError};
 
 use crate::drawable::{
-    Bone, Drawable, Encoding, Fragment, FragmentChild, Mesh, Shader, Skeleton, VertexLayout, bad, legacy_layout, vec3,
+    Bone, Drawable, Encoding, Fragment, FragmentChild, Mesh, Shader, Skeleton, VertexLayout, bad, floats,
+    legacy_layout, vec3,
 };
 use crate::ytd;
 
@@ -232,6 +233,30 @@ pub fn shader_name(res: &Resource, shader: u64) -> Option<String> {
 
 const BONE_SIZE: u64 = 0xE0;
 
+/// The index of a bone's parent from its pointer: `-1` unless it is an earlier bone of the list at `bones`.
+fn parent_index(parent: u64, bones: u64, i: u64) -> i16 {
+    if parent >= bones && (parent - bones).is_multiple_of(BONE_SIZE) && (parent - bones) / BONE_SIZE < i {
+        ((parent - bones) / BONE_SIZE) as i16
+    } else {
+        -1
+    }
+}
+
+/// Bone `i` of the list at `bones`.
+fn read_bone(res: &Resource, bones: u64, i: u64) -> Result<Bone, ResourceError> {
+    let b = bones + i * BONE_SIZE;
+    let parent = parent_index(ptr(res, b + 0x10)?, bones, i);
+    let name_ptr = ptr(res, b)?;
+    Ok(Bone {
+        name: if valid(res, name_ptr) { res.string(name_ptr).unwrap_or_default() } else { String::new() },
+        tag: res.u16(b + 0x16)?,
+        parent,
+        translation: floats(res, b + 0x20)?,
+        rotation: floats(res, b + 0x40)?,
+        scale: [1.0; 3],
+    })
+}
+
 fn read_skeleton(res: &Resource, s: u64) -> Result<Skeleton, ResourceError> {
     let bones = ptr(res, s)?;
     let count = res.u16(s + 0x14)? as u64;
@@ -240,23 +265,7 @@ fn read_skeleton(res: &Resource, s: u64) -> Result<Skeleton, ResourceError> {
     }
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let b = bones + i * BONE_SIZE;
-        let f = |o: u64| -> Result<f32, ResourceError> { Ok(f32::from_bits(res.u32(b + o)?)) };
-        let parent = ptr(res, b + 0x10)?;
-        let parent = if parent >= bones && (parent - bones) % BONE_SIZE == 0 && (parent - bones) / BONE_SIZE < i {
-            ((parent - bones) / BONE_SIZE) as i16
-        } else {
-            -1
-        };
-        let name_ptr = ptr(res, b)?;
-        out.push(Bone {
-            name: if valid(res, name_ptr) { res.string(name_ptr).unwrap_or_default() } else { String::new() },
-            tag: res.u16(b + 0x16)?,
-            parent,
-            translation: [f(0x20)?, f(0x24)?, f(0x28)?],
-            rotation: [f(0x40)?, f(0x44)?, f(0x48)?, f(0x4C)?],
-            scale: [1.0; 3],
-        });
+        out.push(read_bone(res, bones, i)?);
     }
     Ok(Skeleton { bones: out })
 }

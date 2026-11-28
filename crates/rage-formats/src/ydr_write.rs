@@ -608,32 +608,8 @@ pub fn bones_with_own_models(template: &Resource) -> Vec<String> {
     let Some(skeleton) = crate::drawable::read_drawable(template, d, true).ok().and_then(|d| d.skeleton) else {
         return Vec::new();
     };
-    // Every child, also those sharing a model (the four wheels share one).
-    let tags = || -> Result<Vec<u16>, ResourceError> {
-        let group = template.u64(SYS + 0xF0)?;
-        if group == 0 {
-            return Ok(Vec::new());
-        }
-        let Some(lod) = (0..3).map(|i| template.u64(group + 0x10 + i * 8)).find_map(|p| p.ok().filter(|&p| p != 0))
-        else {
-            return Ok(Vec::new());
-        };
-        let list = template.u64(lod + 0xD0)?;
-        let mut tags = Vec::new();
-        for i in 0..template.u8(lod + 0x11E)? as u64 {
-            let child = template.u64(list + i * 8)?;
-            if child == 0 {
-                continue;
-            }
-            let drawable = template.u64(child + 0xA0)?;
-            if drawable != 0 && template.u64(drawable + 0x50)? != 0 {
-                tags.push(template.u16(child + 0x12)?);
-            }
-        }
-        Ok(tags)
-    };
     let mut out: Vec<String> = Vec::new();
-    for tag in tags().unwrap_or_default() {
+    for tag in fragment_child_tags(template).unwrap_or_default() {
         if let Some(k) = skeleton.find_tag(tag) {
             let name = &skeleton.bones[k].name;
             if !name.is_empty() && !out.contains(name) {
@@ -641,8 +617,45 @@ pub fn bones_with_own_models(template: &Resource) -> Vec<String> {
             }
         }
     }
-    // The game puts a vehicle's wheel model on every wheel bone, also those
-    // without a child of their own (usually only `wheel_lf` has one).
+    add_wheel_bones(&skeleton, &mut out);
+    out
+}
+
+/// The bone tags of every child of a fragment that has a model, also those
+/// sharing a model (the four wheels share one).
+fn fragment_child_tags(template: &Resource) -> Result<Vec<u16>, ResourceError> {
+    let Some(lod) = first_physics_lod(template)? else { return Ok(Vec::new()) };
+    let list = template.u64(lod + 0xD0)?;
+    let mut tags = Vec::new();
+    for i in 0..template.u8(lod + 0x11E)? as u64 {
+        tags.extend(child_tag(template, template.u64(list + i * 8)?)?);
+    }
+    Ok(tags)
+}
+
+fn first_physics_lod(template: &Resource) -> Result<Option<u64>, ResourceError> {
+    let group = template.u64(SYS + 0xF0)?;
+    if group == 0 {
+        return Ok(None);
+    }
+    Ok((0..3).map(|i| template.u64(group + 0x10 + i * 8)).find_map(|p| p.ok().filter(|&p| p != 0)))
+}
+
+/// The bone tag of a fragment child, if it has a model.
+fn child_tag(template: &Resource, child: u64) -> Result<Option<u16>, ResourceError> {
+    if child == 0 {
+        return Ok(None);
+    }
+    let drawable = template.u64(child + 0xA0)?;
+    if drawable == 0 || template.u64(drawable + 0x50)? == 0 {
+        return Ok(None);
+    }
+    template.u16(child + 0x12).map(Some)
+}
+
+/// The game puts a vehicle's wheel model on every wheel bone, also those
+/// without a child of their own (usually only `wheel_lf` has one).
+fn add_wheel_bones(skeleton: &crate::drawable::Skeleton, out: &mut Vec<String>) {
     let is_wheel = |n: &str| {
         let n = n.to_ascii_lowercase();
         n.starts_with("wheel_") && !n.contains("mesh")
@@ -654,7 +667,6 @@ pub fn bones_with_own_models(template: &Resource) -> Vec<String> {
             }
         }
     }
-    out
 }
 
 /// Reads the drawable at `place` of an Enhanced resource (a fragment
@@ -1551,33 +1563,7 @@ fn add_materials(
     // Materials sharing a texture (same name) share its one embedded copy.
     let mut new_textures: Vec<(Texture, BlockId)> = Vec::new();
     for (k, mat) in materials.iter().enumerate() {
-        let src = template.u64(old_list + u64::from(mat.shader) * 8)?;
-        let shader = b.add(Segment::System, template.bytes(src, SHADER_SIZE)?.to_vec());
-        let infos = template.u64(src + 0x20)?;
-        let slots = if infos != 0 { template.u8(infos + 1)? as usize } else { 0 };
-        let refs_at = template.u64(src + 0x10)?;
-        if slots > 0 && refs_at != 0 {
-            let refs = b.add(Segment::System, template.bytes(refs_at, slots * 8)?.to_vec());
-            b.pointer(shader, 0x10, refs, 0);
-            if let Some(tex) = &mat.texture {
-                let slot = colour_slot(template, src).map_err(|e| bad(format!("material {k}: {e}")))?;
-                let old_ref = template.u64(refs_at + slot as u64 * 8)?;
-                if old_ref == 0 {
-                    return Err(bad(format!("material {k}: the shader's colour slot is empty")));
-                }
-                let reference = b.add(Segment::System, template.bytes(old_ref, TEXTURE_REF_SIZE)?.to_vec());
-                let mut name = tex.name.clone().into_bytes();
-                name.push(0);
-                let name = b.add(Segment::System, name);
-                b.pointer(reference, 0x28, name, 0);
-                b.pointer(refs, slot * 8, reference, 0);
-                if !new_textures.iter().any(|(t, _)| t.name.eq_ignore_ascii_case(&tex.name)) {
-                    new_textures.push((tex.clone(), name));
-                }
-            }
-        } else if mat.texture.is_some() {
-            return Err(bad(format!("material {k}: the shader takes no textures")));
-        }
+        let shader = add_material_shader(b, template, old_list, k, mat, &mut new_textures)?;
         b.pointer(list, (old_count + k) * 8, shader, 0);
     }
     let group_at = (group - SYS) as usize;
@@ -1589,6 +1575,94 @@ fn add_materials(
         add_textures(b, sys, template, group, new_textures, donor)?;
     }
     Ok(())
+}
+
+/// A copy of a template shader in the builder, with where its texture references are in the template.
+struct ShaderCopy {
+    shader: BlockId,
+    /// The template shader.
+    src: u64,
+    /// The template's texture references and how many there are.
+    refs_at: u64,
+    slots: usize,
+}
+
+impl ShaderCopy {
+    fn new(b: &mut Builder, template: &Resource, src: u64) -> Result<Self, ResourceError> {
+        let shader = b.add(Segment::System, template.bytes(src, SHADER_SIZE)?.to_vec());
+        let infos = template.u64(src + 0x20)?;
+        let slots = if infos != 0 { template.u8(infos + 1)? as usize } else { 0 };
+        let refs_at = template.u64(src + 0x10)?;
+        Ok(Self { shader, src, refs_at, slots })
+    }
+}
+
+/// The copy of a template shader for material `k`, with its texture references and, when the material has
+/// a texture, the reference bound to it (added to `new_textures` unless one of that name is).
+fn add_material_shader(
+    b: &mut Builder,
+    template: &Resource,
+    old_list: u64,
+    k: usize,
+    mat: &NewMaterial,
+    new_textures: &mut Vec<(Texture, BlockId)>,
+) -> Result<BlockId, ResourceError> {
+    let src = template.u64(old_list + u64::from(mat.shader) * 8)?;
+    let copy = ShaderCopy::new(b, template, src)?;
+    if copy.slots > 0 && copy.refs_at != 0 {
+        add_texture_refs(b, template, &copy, (k, mat), new_textures)?;
+    } else if mat.texture.is_some() {
+        return Err(bad(format!("material {k}: the shader takes no textures")));
+    }
+    Ok(copy.shader)
+}
+
+fn add_texture_refs(
+    b: &mut Builder,
+    template: &Resource,
+    copy: &ShaderCopy,
+    (k, mat): (usize, &NewMaterial),
+    new_textures: &mut Vec<(Texture, BlockId)>,
+) -> Result<(), ResourceError> {
+    let refs = b.add(Segment::System, template.bytes(copy.refs_at, copy.slots * 8)?.to_vec());
+    b.pointer(copy.shader, 0x10, refs, 0);
+    if let Some(tex) = &mat.texture {
+        let name = bind_material_texture(b, template, copy, refs, k, tex)?;
+        if !new_textures.iter().any(|(t, _)| t.name.eq_ignore_ascii_case(&tex.name)) {
+            new_textures.push((tex.clone(), name));
+        }
+    }
+    Ok(())
+}
+
+/// Gives the colour slot of a shader copy, whose references are copied to `refs`, a reference named
+/// after `tex`; the block of that name.
+fn bind_material_texture(
+    b: &mut Builder,
+    template: &Resource,
+    copy: &ShaderCopy,
+    refs: BlockId,
+    k: usize,
+    tex: &Texture,
+) -> Result<BlockId, ResourceError> {
+    let slot = colour_slot(template, copy.src).map_err(|e| bad(format!("material {k}: {e}")))?;
+    let old_ref = template.u64(copy.refs_at + slot as u64 * 8)?;
+    if old_ref == 0 {
+        return Err(bad(format!("material {k}: the shader's colour slot is empty")));
+    }
+    let reference = b.add(Segment::System, template.bytes(old_ref, TEXTURE_REF_SIZE)?.to_vec());
+    let mut name = tex.name.clone().into_bytes();
+    name.push(0);
+    let name = b.add(Segment::System, name);
+    b.pointer(reference, 0x28, name, 0);
+    b.pointer(refs, slot * 8, reference, 0);
+    Ok(name)
+}
+
+/// An entry of an embedded dictionary: an existing texture pointer or a new block.
+enum Entry {
+    Old(u64),
+    New(BlockId),
 }
 
 /// A new embedded dictionary: the template's textures (kept where they are)
@@ -1608,43 +1682,59 @@ fn add_textures(
         .or_else(|| texture_templates(template))
         .or_else(|| donor.and_then(texture_templates))
         .ok_or_else(|| bad("no texture structure to copy: the model has no embedded textures (give a donor)"))?;
-    // (hash, existing pointer or new block)
-    enum Entry {
-        Old(u64),
-        New(BlockId),
-    }
-    let mut entries: Vec<(u32, Entry)> = Vec::new();
-    let old = template.u64(group + 0x08)?;
     let new_hashes: Vec<u32> = textures.iter().map(|(t, _)| name_hash(&t.name)).collect();
-    if old != 0 {
-        let list = template.u64(old + 0x30)?;
-        let hashes = template.u64(old + 0x20)?;
-        for i in 0..template.u16(old + 0x38)? as u64 {
-            let hash = template.u32(hashes + i * 4)?;
-            // A new texture of the same name replaces the old one.
-            if !new_hashes.contains(&hash) {
-                entries.push((hash, Entry::Old(template.u64(list + i * 8)?)));
-            }
-        }
-    }
+    let mut entries = if own != 0 { old_entries(template, own, &new_hashes)? } else { Vec::new() };
     for ((tex, name), hash) in textures.into_iter().zip(new_hashes) {
-        let size = tex.expected_size().ok_or_else(|| bad(format!("{}: unsupported format", tex.name)))?;
-        let mut t = texture_template.clone();
-        write_fields(DictLayout::Enhanced, &mut t, &tex, true)?;
-        let block = b.add(Segment::System, t);
-        let data = b.add(Segment::Graphics, tex.data[..size].to_vec());
-        b.pointer(block, 0x28, name, 0);
-        b.pointer(block, 0x30, block, 0x58);
-        b.pointer(block, 0x38, data, 0);
+        let block = add_texture_block(b, &texture_template, &tex, name)?;
         entries.push((hash, Entry::New(block)));
     }
     entries.sort_by_key(|(h, _)| *h);
-    let mut root = if old != 0 { template.bytes(old, DICTIONARY_ROOT_SIZE)?.to_vec() } else { root_template };
+    let mut root = if own != 0 { template.bytes(own, DICTIONARY_ROOT_SIZE)?.to_vec() } else { root_template };
     root[0x08..0x10].fill(0); // no pages info inside a drawable
     let count = entries.len() as u16;
     for at in [0x28, 0x2A, 0x38, 0x3A] {
         put_u16(&mut root, at, count);
     }
+    write_dictionary(b, sys, (group - SYS) as usize + 0x08, root, &entries);
+    Ok(())
+}
+
+/// The textures of the dictionary at `old` that no new texture replaces (same name hash).
+fn old_entries(template: &Resource, old: u64, new_hashes: &[u32]) -> Result<Vec<(u32, Entry)>, ResourceError> {
+    let mut entries = Vec::new();
+    let list = template.u64(old + 0x30)?;
+    let hashes = template.u64(old + 0x20)?;
+    for i in 0..template.u16(old + 0x38)? as u64 {
+        let hash = template.u32(hashes + i * 4)?;
+        // A new texture of the same name replaces the old one.
+        if !new_hashes.contains(&hash) {
+            entries.push((hash, Entry::Old(template.u64(list + i * 8)?)));
+        }
+    }
+    Ok(entries)
+}
+
+/// The texture structure of `tex` (a copy of `texture_template` with its fields, name and data).
+fn add_texture_block(
+    b: &mut Builder,
+    texture_template: &[u8],
+    tex: &Texture,
+    name: BlockId,
+) -> Result<BlockId, ResourceError> {
+    let size = tex.expected_size().ok_or_else(|| bad(format!("{}: unsupported format", tex.name)))?;
+    let mut t = texture_template.to_vec();
+    write_fields(DictLayout::Enhanced, &mut t, tex, true)?;
+    let block = b.add(Segment::System, t);
+    let data = b.add(Segment::Graphics, tex.data[..size].to_vec());
+    b.pointer(block, 0x28, name, 0);
+    b.pointer(block, 0x30, block, 0x58);
+    b.pointer(block, 0x38, data, 0);
+    Ok(block)
+}
+
+/// Adds the dictionary root with its hash and pointer arrays and points the
+/// shader group (its field at `at` in `sys`) at it.
+fn write_dictionary(b: &mut Builder, sys: BlockId, at: usize, root: Vec<u8>, entries: &[(u32, Entry)]) {
     let hashes: Vec<u8> = entries.iter().flat_map(|(h, _)| h.to_le_bytes()).collect();
     let mut pointers = vec![0u8; 8 * entries.len()];
     for (i, (_, e)) in entries.iter().enumerate() {
@@ -1662,8 +1752,7 @@ fn add_textures(
     let root = b.add(Segment::System, root);
     b.pointer(root, 0x20, hashes, 0);
     b.pointer(root, 0x30, pointers, 0);
-    b.pointer(sys, (group - SYS) as usize + 0x08, root, 0);
-    Ok(())
+    b.pointer(sys, at, root, 0);
 }
 
 #[cfg(test)]

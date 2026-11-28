@@ -152,42 +152,10 @@ pub(crate) fn cmd_map(
 ) -> Result<()> {
     use openrage_app::world;
     let started = Instant::now();
-    let show = |what: &str, done: usize, total: usize| {
-        if done.is_multiple_of(25) || done == total {
-            eprint!("\r{what}: {done}/{total}    ");
-        }
-    };
-    let scene = if openrage_app::detect::is_gta6_dir(game_dir) {
-        if check {
-            bail!("--check is not supported for GTA VI yet");
-        }
-        match path {
-            Some(path) => openrage_app::gta6_world::place(game_dir, path, openrage_app::gta6_world::AROUND, &show)?,
-            None => openrage_app::gta6_world::overview(game_dir, &show)?,
-        }
-    } else {
-        let w = world::load(game_dir, keys.clone())?;
-        let files = world::files(game_dir)?;
-        if check {
-            return check_maps(game_dir, &w, &files, keys, started);
-        }
-        let path = path.context("which map file? (or --check for all)")?;
-        world::load_map(&w, &files, game_dir, keys, path, &|done, total| show("loading models", done, total))?
-    };
+    let Some(scene) = load_map_scene(game_dir, path, check, keys, started)? else { return Ok(()) };
     let path = path.unwrap_or("map");
     eprintln!();
-    let placed: usize = scene.models.iter().map(|(_, _, t)| t.len()).sum();
-    outln!(
-        "{}: {} objects, {} models loaded ({placed} placed), {} archetypes without a model ({:.1}s)",
-        path,
-        scene.objects,
-        scene.models.len(),
-        scene.missing.len(),
-        started.elapsed().as_secs_f32()
-    );
-    for (name, n) in scene.missing.iter().take(10) {
-        outln!("  no model: {n:>3} × {name}");
-    }
+    print_map_summary(path, &scene, started);
     let looks: Vec<openrage_app::models::Look> = scene.models.iter().map(|(_, m, _)| m.default_look()).collect();
     let items: Vec<(&openrage_app::models::LoadedModel, &openrage_app::models::Look, &[rage_formats::math::Mat4])> =
         scene.models.iter().zip(&looks).map(|((_, m, t), l)| (m, l, t.as_slice())).collect();
@@ -209,20 +177,86 @@ pub(crate) fn cmd_map(
         outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
     }
     if let Some(out) = render {
-        use openrage_app::render;
-        let materials: Vec<render::Materials> =
-            scene.models.iter().map(|(_, m, _)| render::Materials::new(m)).collect();
-        let mut soft = Vec::new();
-        for (((_, m, ts), l), mat) in scene.models.iter().zip(&looks).zip(&materials) {
-            for t in ts {
-                soft.push(render::SceneItem { model: m, look: l, materials: mat, transform: *t, skin: None });
-            }
-        }
-        let camera = render::orbit_camera(lo, hi, render::View { yaw: yaw.to_radians(), ..Default::default() });
-        let rgba = render::render_scene(&soft, &camera, 1280, 800);
-        fs::write(out, rage_formats::png(1280, 800, &rgba)?)?;
-        outln!("Rendered {}", out.display());
+        render_map(out, &scene, &looks, (lo, hi), yaw)?;
     }
+    Ok(())
+}
+
+/// Loads the scene of a map file (GTA VI: around it or the overview); `None` after `--check` has run.
+fn load_map_scene(
+    game_dir: &Path,
+    path: Option<&str>,
+    check: bool,
+    keys: Option<Arc<GtaVKeys>>,
+    started: Instant,
+) -> Result<Option<openrage_app::world::MapScene>> {
+    use openrage_app::world;
+    if openrage_app::detect::is_gta6_dir(game_dir) {
+        return gta6_map_scene(game_dir, path, check).map(Some);
+    }
+    let w = world::load(game_dir, keys.clone())?;
+    let files = world::files(game_dir)?;
+    if check {
+        check_maps(game_dir, &w, &files, keys, started)?;
+        return Ok(None);
+    }
+    let path = path.context("which map file? (or --check for all)")?;
+    let scene =
+        world::load_map(&w, &files, game_dir, keys, path, &|done, total| show_progress("loading models", done, total))?;
+    Ok(Some(scene))
+}
+
+fn show_progress(what: &str, done: usize, total: usize) {
+    if done.is_multiple_of(25) || done == total {
+        eprint!("\r{what}: {done}/{total}    ");
+    }
+}
+
+fn gta6_map_scene(game_dir: &Path, path: Option<&str>, check: bool) -> Result<openrage_app::world::MapScene> {
+    if check {
+        bail!("--check is not supported for GTA VI yet");
+    }
+    match path {
+        Some(path) => openrage_app::gta6_world::place(game_dir, path, openrage_app::gta6_world::AROUND, &show_progress),
+        None => openrage_app::gta6_world::overview(game_dir, &show_progress),
+    }
+}
+
+fn print_map_summary(path: &str, scene: &openrage_app::world::MapScene, started: Instant) {
+    let placed: usize = scene.models.iter().map(|(_, _, t)| t.len()).sum();
+    outln!(
+        "{}: {} objects, {} models loaded ({placed} placed), {} archetypes without a model ({:.1}s)",
+        path,
+        scene.objects,
+        scene.models.len(),
+        scene.missing.len(),
+        started.elapsed().as_secs_f32()
+    );
+    for (name, n) in scene.missing.iter().take(10) {
+        outln!("  no model: {n:>3} × {name}");
+    }
+}
+
+/// Software-renders the whole scene to a PNG.
+fn render_map(
+    out: &Path,
+    scene: &openrage_app::world::MapScene,
+    looks: &[openrage_app::models::Look],
+    (lo, hi): ([f32; 3], [f32; 3]),
+    yaw: f32,
+) -> Result<()> {
+    use openrage_app::render;
+    let materials: Vec<render::Materials> = scene.models.iter().map(|(_, m, _)| render::Materials::new(m)).collect();
+    let mut soft = Vec::new();
+    for (((_, m, ts), l), mat) in scene.models.iter().zip(looks).zip(&materials) {
+        for t in ts {
+            soft.push(render::SceneItem { model: m, look: l, materials: mat, transform: *t, skin: None });
+        }
+    }
+    let camera = render::orbit_camera(lo, hi, render::View { yaw: yaw.to_radians(), ..Default::default() });
+    let rgba = render::render_scene(&soft, &camera, 1280, 800);
+    fs::write(out, rage_formats::png(1280, 800, &rgba)?)?;
+    outln!("Rendered {}", out.display());
     Ok(())
 }
 
@@ -838,42 +872,50 @@ fn gta4_particles(game_dir: &Path, path: &str) -> Result<()> {
 }
 
 pub(crate) fn cmd_text(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
-    use openrage_app::texttable::{self, Kind};
     if path.to_ascii_lowercase().ends_with(".wpl") {
-        let data = match rage_mods::resolve(game_dir, path, keys)?.0 {
-            Node::Gta4File(a, id) => a.read(id)?,
-            Node::PlainFile(p) => fs::read(p)?,
-            _ => bail!("{path} is not a file"),
-        };
-        let (text, count) = openrage_app::gta4::wpl_to_text(Some(game_dir), &data)?;
-        return match out {
-            Some(file) => {
-                fs::write(file, &text)?;
-                outln!("Wrote {} ({count} records)", file.display());
-                Ok(())
-            }
-            None => {
-                outln!("{}", text.trim_end());
-                Ok(())
-            }
-        };
+        return text_wpl(game_dir, path, out, keys);
     }
+    text_table(game_dir, path, out, keys)
+}
+
+fn text_table(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    use openrage_app::texttable::{self, Kind};
     let kind = Kind::of(path).context("not a text table (.gxt2, .nametable, .gxt) or placement file (.wpl)")?;
     if let Ok(names) = open_index(game_dir).and_then(|i| Ok(i.known_names()?)) {
         rage_formats::names::register(names);
     }
+    let data = read_text_source(game_dir, path, keys)?;
+    let (text, count) = texttable::to_text(kind, &data)?;
+    write_or_print(out, &text, count, "entries")
+}
+
+fn read_text_source(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<Vec<u8>> {
     let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
-    let data = match node {
+    Ok(match node {
         Node::ArchiveFile(rpf, id) => rpf.read(id)?,
         Node::Gta4File(a, id) => a.read(id)?,
         Node::PlainFile(p) => fs::read(p)?,
         _ => bail!("{path} is not a file"),
+    })
+}
+
+/// A GTA IV placement file as text.
+fn text_wpl(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+    let data = match rage_mods::resolve(game_dir, path, keys)?.0 {
+        Node::Gta4File(a, id) => a.read(id)?,
+        Node::PlainFile(p) => fs::read(p)?,
+        _ => bail!("{path} is not a file"),
     };
-    let (text, count) = texttable::to_text(kind, &data)?;
+    let (text, count) = openrage_app::gta4::wpl_to_text(Some(game_dir), &data)?;
+    write_or_print(out, &text, count, "records")
+}
+
+/// Writes the text to `out`, or prints it.
+fn write_or_print(out: Option<&Path>, text: &str, count: impl std::fmt::Display, noun: &str) -> Result<()> {
     match out {
         Some(file) => {
-            fs::write(file, &text)?;
-            outln!("Wrote {} ({count} entries)", file.display());
+            fs::write(file, text)?;
+            outln!("Wrote {} ({count} {noun})", file.display());
         }
         None => outln!("{}", text.trim_end()),
     }

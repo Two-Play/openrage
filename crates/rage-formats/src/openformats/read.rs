@@ -34,13 +34,23 @@ pub fn read_yft(res: &Resource, name: &str) -> Result<OfFragment, ResourceError>
     let mut drawable = read_drawable_at(res, main, enhanced)?;
     drawable.name = name.to_owned();
     let mut out = OfFragment { drawable, children: Vec::new() };
+    if let Some(lod) = fragment_lod(res)? {
+        read_fragment_children(res, lod, enhanced, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// The first physics LOD of a fragment, if it has one.
+fn fragment_lod(res: &Resource) -> Result<Option<u64>, ResourceError> {
     let group = res.u64(SYS + 0xF0)?;
     if group == 0 {
-        return Ok(out);
+        return Ok(None);
     }
-    let Some(lod) = (0..3).map(|i| res.u64(group + 0x10 + i * 8)).find_map(|p| p.ok().filter(|&p| p != 0)) else {
-        return Ok(out);
-    };
+    Ok((0..3).map(|i| res.u64(group + 0x10 + i * 8)).find_map(|p| p.ok().filter(|&p| p != 0)))
+}
+
+/// Adds the parts of the physics LOD that have models, each drawable once.
+fn read_fragment_children(res: &Resource, lod: u64, enhanced: bool, out: &mut OfFragment) -> Result<(), ResourceError> {
     let list = res.u64(lod + 0xD0)?;
     let mut seen = Vec::new();
     for i in 0..res.u8(lod + 0x11E)? as u64 {
@@ -48,16 +58,26 @@ pub fn read_yft(res: &Resource, name: &str) -> Result<OfFragment, ResourceError>
         if child == 0 {
             continue;
         }
-        let ptr = res.u64(child + 0xA0)?;
-        if ptr == 0 || seen.contains(&ptr) || res.u64(ptr + 0x50)? == 0 {
-            continue;
-        }
-        seen.push(ptr);
-        let mut d = read_drawable_at(res, ptr, enhanced)?;
-        d.name = format!("{name}_child{}", out.children.len());
+        let Some(mut d) = fragment_child_drawable(res, child, &mut seen, enhanced)? else { continue };
+        d.name = format!("{}_child{}", out.drawable.name, out.children.len());
         out.children.push((res.u16(child + 0x12)?, d));
     }
-    Ok(out)
+    Ok(())
+}
+
+/// The drawable of a fragment child, unless it has no model or an earlier child already read it.
+fn fragment_child_drawable(
+    res: &Resource,
+    child: u64,
+    seen: &mut Vec<u64>,
+    enhanced: bool,
+) -> Result<Option<OfDrawable>, ResourceError> {
+    let ptr = res.u64(child + 0xA0)?;
+    if ptr == 0 || seen.contains(&ptr) || res.u64(ptr + 0x50)? == 0 {
+        return Ok(None);
+    }
+    seen.push(ptr);
+    read_drawable_at(res, ptr, enhanced).map(Some)
 }
 
 /// A `.ydd` file: its drawables, named after their hashes where the name is known.
@@ -94,48 +114,70 @@ fn f(res: &Resource, at: u64) -> Result<f32, ResourceError> {
 
 /// The drawable structure at `ptr` (a `.ydr`'s root, a fragment's drawable, …).
 pub fn read_drawable_at(res: &Resource, ptr: u64, enhanced: bool) -> Result<OfDrawable, ResourceError> {
-    let mut d = OfDrawable {
-        center: vec3(res, ptr + 0x20)?,
-        radius: f(res, ptr + 0x2C)?,
-        aabb_min: vec3(res, ptr + 0x30)?,
-        aabb_max: vec3(res, ptr + 0x40)?,
-        ..Default::default()
-    };
+    let mut d = read_drawable_bounds(res, ptr)?;
     let group = res.u64(ptr + 0x10)?;
     if group != 0 {
-        d.shaders = read_shaders(res, group, enhanced)?;
-        let txd = res.u64(group + 0x08)?;
-        // A few of the game's models have broken embedded dictionaries (the
-        // game does not use them either): what can be read is exported.
-        if txd != 0
-            && let Ok(dict) = ytd::parse_at(res, txd, enhanced)
-        {
-            d.textures = dict.textures.into_iter().map(|texture| OfTexture { texture }).collect();
-        }
+        read_shaders_and_textures(res, group, enhanced, &mut d)?;
     }
     let skel = res.u64(ptr + 0x18)?;
     if skel != 0 {
         d.skeleton = Some(read_skeleton(res, skel)?);
     }
     for (k, lod) in d.lods.iter_mut().enumerate() {
-        let k = k as u64;
-        lod.distance = f(res, ptr + 0x70 + k * 4)?;
-        let mask = (res.u32(ptr + 0x80 + k * 4)? >> 8 & 0xFF) as u8;
-        let list = res.u64(ptr + 0x50 + k * 8)?;
-        if list == 0 {
-            continue;
-        }
-        let models = res.u64(list)?;
-        for m in 0..res.u16(list + 8)? as u64 {
-            let model = res.u64(models + m * 8)?;
-            if model != 0 {
-                let mut model = read_model(res, model, enhanced)?;
-                model.mask = mask;
-                lod.models.push(model);
-            }
-        }
+        read_lod(res, ptr, k as u64, enhanced, lod)?;
     }
     Ok(d)
+}
+
+fn read_drawable_bounds(res: &Resource, ptr: u64) -> Result<OfDrawable, ResourceError> {
+    Ok(OfDrawable {
+        center: vec3(res, ptr + 0x20)?,
+        radius: f(res, ptr + 0x2C)?,
+        aabb_min: vec3(res, ptr + 0x30)?,
+        aabb_max: vec3(res, ptr + 0x40)?,
+        ..Default::default()
+    })
+}
+
+fn read_shaders_and_textures(
+    res: &Resource,
+    group: u64,
+    enhanced: bool,
+    d: &mut OfDrawable,
+) -> Result<(), ResourceError> {
+    d.shaders = read_shaders(res, group, enhanced)?;
+    let txd = res.u64(group + 0x08)?;
+    // A few of the game's models have broken embedded dictionaries (the
+    // game does not use them either): what can be read is exported.
+    if txd != 0
+        && let Ok(dict) = ytd::parse_at(res, txd, enhanced)
+    {
+        d.textures = dict.textures.into_iter().map(|texture| OfTexture { texture }).collect();
+    }
+    Ok(())
+}
+
+/// Level `k` of the drawable at `ptr`: its distance and models.
+fn read_lod(res: &Resource, ptr: u64, k: u64, enhanced: bool, lod: &mut OfLod) -> Result<(), ResourceError> {
+    lod.distance = f(res, ptr + 0x70 + k * 4)?;
+    let mask = (res.u32(ptr + 0x80 + k * 4)? >> 8 & 0xFF) as u8;
+    let list = res.u64(ptr + 0x50 + k * 8)?;
+    if list == 0 {
+        return Ok(());
+    }
+    read_lod_models(res, list, mask, enhanced, lod)
+}
+
+/// The models of the list at `list`, all with `mask`.
+fn read_lod_models(res: &Resource, list: u64, mask: u8, enhanced: bool, lod: &mut OfLod) -> Result<(), ResourceError> {
+    let models = res.u64(list)?;
+    for m in 0..res.u16(list + 8)? as u64 {
+        let model = res.u64(models + m * 8)?;
+        if model != 0 {
+            lod.models.push(OfModel { mask, ..read_model(res, model, enhanced)? });
+        }
+    }
+    Ok(())
 }
 
 fn read_skeleton(res: &Resource, ptr: u64) -> Result<OfSkeleton, ResourceError> {
@@ -224,13 +266,9 @@ fn legacy_layout(res: &Resource, decl: u64) -> Result<Layout, ResourceError> {
     Ok(Layout { decl, slots })
 }
 
-/// Enhanced declarations: 52 slots with offsets and DXGI formats. Each slot
-/// that holds something becomes the matching Legacy component with its
-/// usual type.
-fn enhanced_layout(res: &Resource, decl: u64) -> Result<Layout, ResourceError> {
-    let offsets = res.bytes(decl, 52 * 4)?;
-    let formats = res.bytes(decl + 52 * 4 + 52, 52)?;
-    let component = |slot: usize| match slot {
+/// The Legacy component an Enhanced vertex slot stands for.
+fn enhanced_component(slot: usize) -> Option<usize> {
+    match slot {
         0 => Some(component::POSITION),
         4 => Some(component::NORMAL),
         8 => Some(component::TANGENT),
@@ -241,8 +279,11 @@ fn enhanced_layout(res: &Resource, decl: u64) -> Result<Layout, ResourceError> {
         25 => Some(component::COLOUR1),
         28..=35 => Some(component::TEXCOORD0 + slot - 28),
         _ => None,
-    };
-    let encoding = |format: u8| match format {
+    }
+}
+
+fn enhanced_encoding(format: u8) -> Option<Encoding> {
+    match format {
         2 => Some(Encoding::Float4),
         6 => Some(Encoding::Float3),
         10 => Some(Encoding::Half4),
@@ -252,7 +293,15 @@ fn enhanced_layout(res: &Resource, decl: u64) -> Result<Layout, ResourceError> {
         30 => Some(Encoding::Uint8x4),
         34 => Some(Encoding::Half2),
         _ => None,
-    };
+    }
+}
+
+/// Enhanced declarations: 52 slots with offsets and DXGI formats. Each slot
+/// that holds something becomes the matching Legacy component with its
+/// usual type.
+fn enhanced_layout(res: &Resource, decl: u64) -> Result<Layout, ResourceError> {
+    let offsets = res.bytes(decl, 52 * 4)?;
+    let formats = res.bytes(decl + 52 * 4 + 52, 52)?;
     let mut slots = Vec::new();
     let mut flags = 0u32;
     for slot in 0..52 {
@@ -260,8 +309,8 @@ fn enhanced_layout(res: &Resource, decl: u64) -> Result<Layout, ResourceError> {
         if format == 0 {
             continue;
         }
-        let Some(k) = component(slot) else { continue };
-        let enc = encoding(format).ok_or_else(|| bad(format!("vertex slot {slot} has format {format}")))?;
+        let Some(k) = enhanced_component(slot) else { continue };
+        let enc = enhanced_encoding(format).ok_or_else(|| bad(format!("vertex slot {slot} has format {format}")))?;
         let off = u32::from_le_bytes(offsets[slot * 4..slot * 4 + 4].try_into().expect("4 bytes")) as usize;
         flags |= 1 << k;
         slots.push((k, off, enc));

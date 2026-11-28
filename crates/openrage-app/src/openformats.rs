@@ -379,6 +379,14 @@ fn import_drawable(
     Ok(Imported { file, notes })
 }
 
+/// What converting the files' geometries into meshes of the template needs.
+struct MeshCtx<'a> {
+    skinned_template: bool,
+    world: &'a [math::Mat4],
+    shader_map: &'a [u16],
+    bone_map: &'a dyn Fn(usize) -> Option<usize>,
+}
+
 /// The files' detail levels written onto the template.
 fn write_meshes(
     template: &Resource,
@@ -390,100 +398,13 @@ fn write_meshes(
 ) -> Result<Vec<u8>> {
     let skinned_template = ydr_write::skinned_bones(template)?.is_some();
     let world = tpl.skeleton.as_ref().map(|s| skeleton(s).world_transforms()).unwrap_or_default();
+    let ctx = MeshCtx { skinned_template, world: &world, shader_map, bone_map };
     let mut levels: Vec<Vec<NewMesh>> = Vec::new();
     for (k, lod) in d.lods.iter().enumerate() {
         if lod.models.is_empty() {
             continue;
         }
-        // The bone the game file's model of this level is attached to: the
-        // written model is a copy of it.
-        let target = tpl.lods.get(k).and_then(|l| l.models.first()).or_else(|| tpl.lods[0].models.first());
-        let target_bone = target.map_or(0, |m| m.bone as usize);
-        let mut meshes = Vec::new();
-        for m in &lod.models {
-            let bone = bone_map(m.bone as usize)
-                .with_context(|| format!("model on bone {}, which the game file's skeleton does not have", m.bone))?;
-            // Fixed models: from their bone's space to the target bone's. A
-            // model on bone 0 is in model space (as the game's models are read).
-            let space = |b: usize| if b == 0 { Some(&math::IDENTITY) } else { world.get(b) };
-            let to_target = (!skinned_template && bone != target_bone)
-                .then(|| {
-                    let (a, b) = (space(bone)?, space(target_bone)?);
-                    Some(math::mul(&math::inverse_affine(b), a))
-                })
-                .flatten();
-            for g in &m.geometries {
-                let shader = *shader_map
-                    .get(g.shader as usize)
-                    .with_context(|| format!("a geometry uses shader {}, which the files do not have", g.shader))?;
-                let xyz = |c: usize| -> Vec<[f32; 3]> {
-                    g.attribute(c).map(|v| v.iter().map(|p| [p[0], p[1], p[2]]).collect()).unwrap_or_default()
-                };
-                let mut mesh = NewMesh {
-                    shader,
-                    positions: xyz(component::POSITION),
-                    normals: xyz(component::NORMAL),
-                    uvs: g
-                        .attribute(component::TEXCOORD0)
-                        .map(|v| v.iter().map(|t| [t[0], t[1]]).collect())
-                        .unwrap_or_default(),
-                    colors: g
-                        .attribute(component::COLOUR0)
-                        .map(|v| v.iter().map(|c| c.map(|x| x / 255.0)).collect())
-                        .unwrap_or_default(),
-                    indices: g.indices.clone(),
-                    bones: Vec::new(),
-                    blend: Vec::new(),
-                };
-                if let Some(t) = &to_target {
-                    mesh.positions.iter_mut().for_each(|p| *p = math::transform_point(t, *p));
-                    mesh.normals.iter_mut().for_each(|n| *n = math::transform_dir(t, *n));
-                }
-                if skinned_template {
-                    mesh.bones = match (g.attribute(component::BLEND_INDICES), g.attribute(component::BLEND_WEIGHTS)) {
-                        (Some(idx), Some(w)) => idx
-                            .iter()
-                            .zip(w)
-                            .map(|(i, w)| {
-                                let k = (0..4).max_by(|&a, &b| w[a].total_cmp(&w[b])).unwrap_or(0);
-                                bone_map(i[k] as usize).map(|b| b as u16).with_context(|| {
-                                    format!(
-                                        "a vertex moves with bone {}, which the game file's skeleton does not have",
-                                        i[k]
-                                    )
-                                })
-                            })
-                            .collect::<Result<_>>()?,
-                        _ => vec![bone as u16; mesh.positions.len()],
-                    };
-                    // All four bones with their weights (peds, clothing).
-                    if let (Some(idx), Some(w)) =
-                        (g.attribute(component::BLEND_INDICES), g.attribute(component::BLEND_WEIGHTS))
-                    {
-                        mesh.blend = idx
-                            .iter()
-                            .zip(w)
-                            .map(|(i, w)| {
-                                let mut b = ydr_write::Blend::default();
-                                for k in 0..4 {
-                                    if w[k] > 0.0 {
-                                        b.bones[k] = bone_map(i[k] as usize).unwrap_or(0) as u16;
-                                        b.weights[k] = w[k];
-                                    }
-                                }
-                                let sum: f32 = b.weights.iter().sum();
-                                if sum > 0.0 {
-                                    b.weights.iter_mut().for_each(|x| *x /= sum);
-                                }
-                                b
-                            })
-                            .collect();
-                    }
-                }
-                meshes.extend(crate::obj::split(mesh));
-            }
-        }
-        levels.push(meshes);
+        levels.push(lod_meshes(&ctx, tpl, k, lod)?);
     }
     if levels.is_empty() {
         bail!("the files have no meshes");
@@ -496,4 +417,104 @@ fn write_meshes(
     let vertices: usize = levels.iter().flatten().map(|m| m.positions.len()).sum();
     notes.push(format!("meshes written: {} detail level(s), {vertices} vertices", levels.len()));
     Ok(file)
+}
+
+/// The meshes of one detail level of the files.
+fn lod_meshes(ctx: &MeshCtx, tpl: &OfDrawable, k: usize, lod: &of::OfLod) -> Result<Vec<NewMesh>> {
+    // The bone the game file's model of this level is attached to: the
+    // written model is a copy of it.
+    let target = tpl.lods.get(k).and_then(|l| l.models.first()).or_else(|| tpl.lods[0].models.first());
+    let target_bone = target.map_or(0, |m| m.bone as usize);
+    let mut meshes = Vec::new();
+    for m in &lod.models {
+        let bone = (ctx.bone_map)(m.bone as usize)
+            .with_context(|| format!("model on bone {}, which the game file's skeleton does not have", m.bone))?;
+        let to_target = (!ctx.skinned_template && bone != target_bone)
+            .then(|| bone_to_target(ctx.world, bone, target_bone))
+            .flatten();
+        for g in &m.geometries {
+            let mesh = geometry_mesh(ctx, g, bone, to_target.as_ref())?;
+            meshes.extend(crate::obj::split(mesh));
+        }
+    }
+    Ok(meshes)
+}
+
+/// Fixed models: from their bone's space to the target bone's. A model on
+/// bone 0 is in model space (as the game's models are read).
+fn bone_to_target(world: &[math::Mat4], bone: usize, target_bone: usize) -> Option<math::Mat4> {
+    let space = |b: usize| if b == 0 { Some(&math::IDENTITY) } else { world.get(b) };
+    let (a, b) = (space(bone)?, space(target_bone)?);
+    Some(math::mul(&math::inverse_affine(b), a))
+}
+
+/// A geometry of the files as a mesh of the template, on `bone`.
+fn geometry_mesh(ctx: &MeshCtx, g: &OfGeometry, bone: usize, to_target: Option<&math::Mat4>) -> Result<NewMesh> {
+    let shader = *ctx
+        .shader_map
+        .get(g.shader as usize)
+        .with_context(|| format!("a geometry uses shader {}, which the files do not have", g.shader))?;
+    let xyz = |c: usize| -> Vec<[f32; 3]> {
+        g.attribute(c).map(|v| v.iter().map(|p| [p[0], p[1], p[2]]).collect()).unwrap_or_default()
+    };
+    let mut mesh = NewMesh {
+        shader,
+        positions: xyz(component::POSITION),
+        normals: xyz(component::NORMAL),
+        uvs: g.attribute(component::TEXCOORD0).map(|v| v.iter().map(|t| [t[0], t[1]]).collect()).unwrap_or_default(),
+        colors: g
+            .attribute(component::COLOUR0)
+            .map(|v| v.iter().map(|c| c.map(|x| x / 255.0)).collect())
+            .unwrap_or_default(),
+        indices: g.indices.clone(),
+        bones: Vec::new(),
+        blend: Vec::new(),
+    };
+    if let Some(t) = to_target {
+        mesh.positions.iter_mut().for_each(|p| *p = math::transform_point(t, *p));
+        mesh.normals.iter_mut().for_each(|n| *n = math::transform_dir(t, *n));
+    }
+    if ctx.skinned_template {
+        skin_mesh(ctx.bone_map, g, bone, &mut mesh)?;
+    }
+    Ok(mesh)
+}
+
+/// Gives a mesh for a skinned template its bones and blend weights.
+fn skin_mesh(bone_map: &dyn Fn(usize) -> Option<usize>, g: &OfGeometry, bone: usize, mesh: &mut NewMesh) -> Result<()> {
+    let blend_attributes = (g.attribute(component::BLEND_INDICES), g.attribute(component::BLEND_WEIGHTS));
+    mesh.bones = match blend_attributes {
+        (Some(idx), Some(w)) => idx
+            .iter()
+            .zip(w)
+            .map(|(i, w)| {
+                let k = (0..4).max_by(|&a, &b| w[a].total_cmp(&w[b])).unwrap_or(0);
+                bone_map(i[k] as usize).map(|b| b as u16).with_context(|| {
+                    format!("a vertex moves with bone {}, which the game file's skeleton does not have", i[k])
+                })
+            })
+            .collect::<Result<_>>()?,
+        _ => vec![bone as u16; mesh.positions.len()],
+    };
+    // All four bones with their weights (peds, clothing).
+    if let (Some(idx), Some(w)) = blend_attributes {
+        mesh.blend = idx.iter().zip(w).map(|(i, w)| vertex_blend(bone_map, i, w)).collect();
+    }
+    Ok(())
+}
+
+/// The four bones of a vertex with their weights, normalised.
+fn vertex_blend(bone_map: &dyn Fn(usize) -> Option<usize>, i: &[f32; 4], w: &[f32; 4]) -> ydr_write::Blend {
+    let mut b = ydr_write::Blend::default();
+    for k in 0..4 {
+        if w[k] > 0.0 {
+            b.bones[k] = bone_map(i[k] as usize).unwrap_or(0) as u16;
+            b.weights[k] = w[k];
+        }
+    }
+    let sum: f32 = b.weights.iter().sum();
+    if sum > 0.0 {
+        b.weights.iter_mut().for_each(|x| *x /= sum);
+    }
+    b
 }

@@ -230,10 +230,11 @@ fn looks_like_oodle(b: &[u8]) -> bool {
     b.len() >= 2 && b[0] & 0x3F == 0x0C && b[1] & 0x7F <= 13
 }
 
+/// Entries whose key is not known yet, by key id, with the file of the archive they are in.
+type Wanted = BTreeMap<u8, Vec<(PathBuf, Entry)>>;
+
 /// Finds the cipher tables, IV and keys among the candidates by trying them on the archives.
 pub fn identify(c: &Candidates, archive_files: &[PathBuf]) -> Result<Found, IdentifyError> {
-    use rayon::prelude::*;
-
     let archives = read_encrypted_tables(archive_files)?;
     let keys: Vec<(usize, Key)> =
         c.keys.iter().enumerate().filter_map(|(i, k)| Some((i, Key::from_bytes(k)?))).collect();
@@ -241,55 +242,99 @@ pub fn identify(c: &Candidates, archive_files: &[PathBuf]) -> Result<Found, Iden
     for a in &archives {
         by_tag.entry(a.tag).or_default().push(a);
     }
+    let search = Search { c, archives: &archives, keys: &keys, by_tag: &by_tag };
 
     for ctx_bytes in &c.contexts {
         let Some(ctx) = Context::from_bytes(ctx_bytes) else { continue };
-        // Table keys: one archive per tag is enough to find, all are checked below.
-        let found: Vec<(u8, usize)> = by_tag
-            .par_iter()
-            .filter_map(|(tag, list)| keys.iter().find(|(_, k)| opens_table(&ctx, k, list[0])).map(|(i, _)| (*tag, *i)))
-            .collect();
-        if found.is_empty() {
-            continue;
+        if let Some(found) = search.with_context(ctx_bytes, &ctx)? {
+            return Ok(found);
         }
-        let mut store = KeyStore { context: ctx_bytes.clone(), iv: [0; 16], keys: BTreeMap::new() };
+    }
+    if c.contexts.iter().any(|b| Context::from_bytes(b).is_some()) {
+        Err(IdentifyError::NoTableKey(c.keys.len()))
+    } else {
+        Err(IdentifyError::NoContext)
+    }
+}
+
+/// The candidates and archives [`identify`] tries against each other.
+struct Search<'a> {
+    c: &'a Candidates,
+    archives: &'a [Archive],
+    /// The candidate keys that parse, with their index in `c.keys`.
+    keys: &'a [(usize, Key)],
+    by_tag: &'a HashMap<u8, Vec<&'a Archive>>,
+}
+
+impl Search<'_> {
+    /// Tries one cipher-table candidate; `None` when no key opens a table with it.
+    fn with_context(&self, ctx_bytes: &[u8], ctx: &Context) -> Result<Option<Found>, IdentifyError> {
+        let found = self.table_keys(ctx);
+        if found.is_empty() {
+            return Ok(None);
+        }
+        let mut store = KeyStore { context: ctx_bytes.to_vec(), iv: [0; 16], keys: BTreeMap::new() };
         for (tag, i) in &found {
-            store.keys.insert(*tag, c.keys[*i].clone());
+            store.keys.insert(*tag, self.c.keys[*i].clone());
         }
 
-        // The IV: block 0 of every table must then be plausible too.
-        let iv = c.ivs.iter().find(|iv| {
+        let Some(iv) = self.find_iv(ctx, &found) else { return Err(IdentifyError::NoIv) };
+        store.iv = *iv;
+        self.add_short_table_keys(ctx, iv, &mut store);
+
+        // Whole tables, and the keys their files name.
+        let keyset = store.to_keys().expect("valid store");
+        let (opened, wanted) = self.wanted_keys(&keyset, &store);
+        let missing = self.add_file_keys(&keyset, &wanted, &mut store);
+        Ok(Some(Found { store, tables: (opened, self.archives.len()), missing }))
+    }
+
+    /// Table keys: one archive per tag is enough to find, all are checked later.
+    fn table_keys(&self, ctx: &Context) -> Vec<(u8, usize)> {
+        use rayon::prelude::*;
+        self.by_tag
+            .par_iter()
+            .filter_map(|(tag, list)| {
+                self.keys.iter().find(|(_, k)| opens_table(ctx, k, list[0])).map(|(i, _)| (*tag, *i))
+            })
+            .collect()
+    }
+
+    /// The IV: block 0 of every table must then be plausible too.
+    fn find_iv(&self, ctx: &Context, found: &[(u8, usize)]) -> Option<&[u8; IV_LEN]> {
+        self.c.ivs.iter().find(|iv| {
             found.iter().take(8).all(|(tag, i)| {
-                let a = by_tag[tag][0];
-                let key = Key::from_bytes(&c.keys[*i]).expect("key");
+                let a = self.by_tag[tag][0];
+                let key = Key::from_bytes(&self.c.keys[*i]).expect("key");
                 let mut t = a.table[..a.table.len().min(96)].to_vec();
-                rage_tfit2::Cbc::new(&ctx, &key, **iv).decrypt(&mut t);
+                rage_tfit2::Cbc::new(ctx, &key, **iv).decrypt(&mut t);
                 plausible_table(&t[..t.len() / 24 * 24], a.size)
             })
-        });
-        let Some(iv) = iv else { return Err(IdentifyError::NoIv) };
-        store.iv = *iv;
+        })
+    }
 
-        // Tags whose archives are too short for the IV-free test (one or two entries).
-        for (tag, list) in &by_tag {
+    /// Tags whose archives are too short for the IV-free test (one or two entries).
+    fn add_short_table_keys(&self, ctx: &Context, iv: &[u8; IV_LEN], store: &mut KeyStore) {
+        for (tag, list) in self.by_tag {
             if store.keys.contains_key(tag) {
                 continue;
             }
             let a = list[0];
-            if let Some((i, _)) = keys.iter().find(|(_, k)| {
+            if let Some((i, _)) = self.keys.iter().find(|(_, k)| {
                 let mut t = a.table.clone();
-                rage_tfit2::Cbc::new(&ctx, k, *iv).decrypt(&mut t);
+                rage_tfit2::Cbc::new(ctx, k, *iv).decrypt(&mut t);
                 plausible_table(&t, a.size)
             }) {
-                store.keys.insert(*tag, c.keys[*i].clone());
+                store.keys.insert(*tag, self.c.keys[*i].clone());
             }
         }
+    }
 
-        // Whole tables, and the keys their files name.
-        let keyset = store.to_keys().expect("valid store");
+    /// Counts the tables that decrypt and collects the entries whose key is not in `store`.
+    fn wanted_keys(&self, keyset: &Rdr2Keys, store: &KeyStore) -> (usize, Wanted) {
         let mut opened = 0;
-        let mut wanted: BTreeMap<u8, Vec<(PathBuf, Entry)>> = BTreeMap::new();
-        for a in &archives {
+        let mut wanted = Wanted::new();
+        for a in self.archives {
             let Some(key) = keyset.keys.get(&a.tag) else { continue };
             let mut t = a.table.clone();
             rage_tfit2::Cbc::new(&keyset.context, key, keyset.iv).decrypt(&mut t);
@@ -303,54 +348,65 @@ pub fn identify(c: &Candidates, archive_files: &[PathBuf]) -> Result<Found, Iden
                 }
             }
         }
+        (opened, wanted)
+    }
 
-        // File-only keys: the files that name them must start like Oodle data.
+    /// File-only keys: the files that name them must start like Oodle data.
+    /// Returns the key ids that stay unknown.
+    fn add_file_keys(&self, keyset: &Rdr2Keys, wanted: &Wanted, store: &mut KeyStore) -> Vec<u8> {
         let mut missing = Vec::new();
-        for (id, entries) in &wanted {
-            let samples: Vec<Vec<u8>> = entries
-                .iter()
-                .filter(|(_, e)| e.compression == Compression::Oodle && !e.signed)
-                .filter(|(_, e)| {
-                    let start = u64::from(e.is_resource) * 16;
-                    let chunk = rage_tfit2::chunk_size(e.is_resource, true, e.size());
-                    rage_tfit2::strided_ranges(e.encryption_config, e.size_on_disk - start, chunk, start)
-                        .first()
-                        .is_some_and(|r| r.0 == 0)
-                })
-                .take(4)
-                .filter_map(|(file, e)| {
-                    let mut f = File::open(file).ok()?;
-                    f.seek(SeekFrom::Start(e.offset + u64::from(e.is_resource) * 16)).ok()?;
-                    let mut b = [0u8; 16];
-                    f.read_exact(&mut b).ok()?;
-                    Some(b.to_vec())
-                })
-                .collect();
-            let hit = (!samples.is_empty())
-                .then(|| {
-                    keys.par_iter().find_any(|(_, k)| {
-                        samples.iter().all(|s| {
-                            let mut b = s.clone();
-                            rage_tfit2::Cbc::new(&keyset.context, k, keyset.iv).decrypt(&mut b);
-                            looks_like_oodle(&b)
-                        })
-                    })
-                })
-                .flatten();
-            match hit {
-                Some((i, _)) => {
-                    store.keys.insert(*id, c.keys[*i].clone());
+        for (id, entries) in wanted {
+            let samples = oodle_samples(entries);
+            match self.key_for_samples(keyset, &samples) {
+                Some(i) => {
+                    store.keys.insert(*id, self.c.keys[i].clone());
                 }
                 None => missing.push(*id),
             }
         }
-        return Ok(Found { store, tables: (opened, archives.len()), missing });
+        missing
     }
-    if c.contexts.iter().any(|b| Context::from_bytes(b).is_some()) {
-        Err(IdentifyError::NoTableKey(c.keys.len()))
-    } else {
-        Err(IdentifyError::NoContext)
+
+    /// The index of a candidate key under which all `samples` start like Oodle data.
+    fn key_for_samples(&self, keyset: &Rdr2Keys, samples: &[Vec<u8>]) -> Option<usize> {
+        use rayon::prelude::*;
+        if samples.is_empty() {
+            return None;
+        }
+        self.keys
+            .par_iter()
+            .find_any(|(_, k)| {
+                samples.iter().all(|s| {
+                    let mut b = s.clone();
+                    rage_tfit2::Cbc::new(&keyset.context, k, keyset.iv).decrypt(&mut b);
+                    looks_like_oodle(&b)
+                })
+            })
+            .map(|(i, _)| *i)
     }
+}
+
+/// The first 16 bytes of up to four Oodle-compressed files among `entries` whose encrypted data begins at byte 0.
+fn oodle_samples(entries: &[(PathBuf, Entry)]) -> Vec<Vec<u8>> {
+    entries
+        .iter()
+        .filter(|(_, e)| e.compression == Compression::Oodle && !e.signed)
+        .filter(|(_, e)| {
+            let start = u64::from(e.is_resource) * 16;
+            let chunk = rage_tfit2::chunk_size(e.is_resource, true, e.size());
+            rage_tfit2::strided_ranges(e.encryption_config, e.size_on_disk - start, chunk, start)
+                .first()
+                .is_some_and(|r| r.0 == 0)
+        })
+        .take(4)
+        .filter_map(|(file, e)| {
+            let mut f = File::open(file).ok()?;
+            f.seek(SeekFrom::Start(e.offset + u64::from(e.is_resource) * 16)).ok()?;
+            let mut b = [0u8; 16];
+            f.read_exact(&mut b).ok()?;
+            Some(b.to_vec())
+        })
+        .collect()
 }
 
 #[cfg(test)]

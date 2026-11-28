@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rage_formats::math::{self, Mat4};
-use rage_formats::wpfl::{self, EffectList, Keyframes, ParticleKind, prop};
+use rage_formats::wpfl::{self, EffectList, EmitterRule, Keyframes, ParticleKind, ParticleRule, prop};
 
 /// The effect lists an episode's cutscenes use, the episode's own first.
 const LISTS: [&str; 3] =
@@ -195,116 +195,186 @@ pub fn sprites_at(lib: &Library, instances: &[Instance], time: f32) -> Vec<Sprit
         if time < inst.start || time > inst.start + inst.length(lib) {
             continue;
         }
-        let list = &lib.lists[inst.list];
-        let fx = &list.effects[inst.effect];
-        for (e, ev) in fx.events.iter().enumerate() {
-            let em = &list.emitters[ev.emitter];
-            let pr = &list.particles[ev.particle];
-            if pr.kind != ParticleKind::Sprite {
-                continue;
-            }
-            let Some(texture) = pr.texture.as_deref().and_then(|t| lib.texture(t)) else { continue };
-            let seed = inst.seed ^ (e as u32).wrapping_mul(0x2545_F491);
-            let duration = em.duration.max(0.01);
-            let window = (inst.end - inst.start).max(0.0);
-            // Spawn times: one-shot emitters fire every run; others spawn
-            // steadily over the runs.
-            // (number, time, emitter life 0..1)
-            let mut spawns: Vec<(u32, f32, f32)> = Vec::new();
-            let runs = ((window / duration).floor() as u32 + 1).min(1000);
-            if em.one_shot {
-                for run in 0..runs {
-                    let at = inst.start + run as f32 * duration;
-                    let n = range(&em.spawn_rate, 0.0, random(seed, run, 0, 1)).round().clamp(0.0, 200.0) as u32;
-                    let first = spawns.len() as u32;
-                    spawns.extend((0..n).map(|i| (first + i, at, 0.0)));
-                }
-            } else {
-                let v = em.spawn_rate.at(0.0);
-                let rate = (v[0] + v[1]) / 2.0;
-                if rate <= 0.0 {
-                    continue;
-                }
-                let n = (runs as f32 * duration * rate) as u32;
-                let life_max = em.life.0.iter().map(|k| k.value[0].max(k.value[1])).fold(0.0, f32::max);
-                // Only the particles that can be alive now.
-                let from = (((time - life_max - inst.start) * rate).floor().max(0.0) as u32).min(n);
-                let to = ((((time - inst.start) * rate).ceil().max(0.0) as u32) + 1).min(n);
-                for k in from.max(to.saturating_sub(MAX_PER_EMITTER))..to {
-                    let at = inst.start + k as f32 / rate;
-                    spawns.push((k, at, ((at - inst.start) % duration) / duration));
-                }
-            }
-            for &(k, born, run_t) in &spawns {
-                if born > time {
-                    continue;
-                }
-                let r = |c: u32| random(seed, k, c, 7);
-                let life = range(&em.life, run_t, r(0)).max(0.01);
-                let age = time - born;
-                if age > life {
-                    continue;
-                }
-                let place = inst.at(born);
-                let start =
-                    math::transform_point(&place, domain_point(em.creation.as_ref(), run_t, [r(1), r(2), r(3)]));
-                // Towards a point of the target domain, as fast as the speed says.
-                let speed = range(&em.speed, run_t, r(4));
-                let from = domain_point(em.creation.as_ref(), run_t, [0.5; 3]);
-                let to = domain_point(em.target.as_ref(), run_t, [r(5), r(6), r(7)]);
-                let dir = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-                let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-                let v0 = if len > 1e-6 { dir.map(|c| c / len * speed) } else { [0.0; 3] };
-                let mut vel = math::transform_dir(&place, v0);
-                let mut pos = start;
-                // Move from birth to now.
-                let (amin, amax) = (pr.property(prop::ACCELERATION_MIN), pr.property(prop::ACCELERATION_MAX));
-                let (dmin, dmax) = (pr.property(prop::DAMPING_MIN), pr.property(prop::DAMPING_MAX));
-                let (ra, rd) = (r(8), r(9));
-                let mut t = 0.0;
-                while t < age {
-                    let dt = STEP.min(age - t);
-                    let f = t / life;
-                    let (a0, a1, d0, d1) = (amin.at(f), amax.at(f), dmin.at(f), dmax.at(f));
-                    for c in 0..3 {
-                        let acc = lerp(a0[c], a1[c], ra);
-                        let damp = lerp(d0[c], d1[c], rd).max(0.0);
-                        vel[c] += (acc - vel[c] * damp) * dt;
-                        pos[c] += vel[c] * dt;
-                    }
-                    t += dt;
-                }
-                let f = age / life;
-                let size = pr.property(prop::SIZE).at(f);
-                let scale = em.size_scale.at(run_t)[0] / 100.0;
-                let scale = if scale > 0.0 { scale } else { 1.0 };
-                let rs = r(10);
-                let size = [lerp(size[0], size[2], rs) * scale, lerp(size[1], size[3], rs) * scale];
-                let (c0, c1) = (pr.property(prop::COLOUR_MIN).at(f), pr.property(prop::COLOUR_MAX).at(f));
-                let rc = r(11);
-                let mut colour: [f32; 4] = std::array::from_fn(|c| lerp(c0[c], c1[c], rc).clamp(0.0, 1.0));
-                let alpha = pr.property(prop::ALPHA);
-                if !alpha.0.is_empty() {
-                    colour[3] *= range(alpha, f, r(12)).clamp(0.0, 1.0);
-                }
-                if colour[3] <= 0.002 || size[0] <= 0.0 || size[1] <= 0.0 {
-                    continue;
-                }
-                let rotation = range(pr.property(prop::ROTATION), 0.0, r(13)).to_radians()
-                    + range(pr.property(prop::SPIN), f, r(14)) * age;
-                out.push(Sprite {
-                    position: pos,
-                    size,
-                    rotation,
-                    colour,
-                    uv: frame_uv(&pr.frames, pr.property(prop::FRAME_RATE), age, f, r(15), r(16)),
-                    texture: Arc::clone(texture),
-                    additive: pr.additive,
-                });
-            }
-        }
+        instance_sprites(lib, inst, time, &mut out);
     }
     out
+}
+
+/// Adds the sprites of every sprite event of one effect instance.
+fn instance_sprites(lib: &Library, inst: &Instance, time: f32, out: &mut Vec<Sprite>) {
+    let list = &lib.lists[inst.list];
+    let fx = &list.effects[inst.effect];
+    for (e, ev) in fx.events.iter().enumerate() {
+        let em = &list.emitters[ev.emitter];
+        let pr = &list.particles[ev.particle];
+        if pr.kind != ParticleKind::Sprite {
+            continue;
+        }
+        let Some(texture) = pr.texture.as_deref().and_then(|t| lib.texture(t)) else { continue };
+        let seed = inst.seed ^ (e as u32).wrapping_mul(0x2545_F491);
+        Emission { inst, em, pr, texture, seed, time }.push_sprites(out);
+    }
+}
+
+/// One sprite event of an effect instance at one point in time.
+struct Emission<'a> {
+    inst: &'a Instance,
+    em: &'a EmitterRule,
+    pr: &'a ParticleRule,
+    texture: &'a Arc<Image>,
+    seed: u32,
+    time: f32,
+}
+
+/// A particle's start and the random picks of its acceleration and damping.
+struct Flight {
+    pos: [f32; 3],
+    vel: [f32; 3],
+    life: f32,
+    age: f32,
+    acceleration_pick: f32,
+    damping_pick: f32,
+}
+
+impl Emission<'_> {
+    fn push_sprites(&self, out: &mut Vec<Sprite>) {
+        for (k, born, run_t) in self.spawns() {
+            if born > self.time {
+                continue;
+            }
+            out.extend(self.sprite(k, born, run_t));
+        }
+    }
+
+    /// Spawn times: one-shot emitters fire every run; others spawn steadily
+    /// over the runs. Each is (number, time, emitter life 0..1).
+    fn spawns(&self) -> Vec<(u32, f32, f32)> {
+        let (inst, em) = (self.inst, self.em);
+        let duration = em.duration.max(0.01);
+        let window = (inst.end - inst.start).max(0.0);
+        let runs = ((window / duration).floor() as u32 + 1).min(1000);
+        if em.one_shot { self.one_shot_spawns(runs, duration) } else { self.steady_spawns(runs, duration) }
+    }
+
+    fn one_shot_spawns(&self, runs: u32, duration: f32) -> Vec<(u32, f32, f32)> {
+        let mut spawns: Vec<(u32, f32, f32)> = Vec::new();
+        for run in 0..runs {
+            let at = self.inst.start + run as f32 * duration;
+            let n = range(&self.em.spawn_rate, 0.0, random(self.seed, run, 0, 1)).round().clamp(0.0, 200.0) as u32;
+            let first = spawns.len() as u32;
+            spawns.extend((0..n).map(|i| (first + i, at, 0.0)));
+        }
+        spawns
+    }
+
+    fn steady_spawns(&self, runs: u32, duration: f32) -> Vec<(u32, f32, f32)> {
+        let (inst, em, time) = (self.inst, self.em, self.time);
+        let v = em.spawn_rate.at(0.0);
+        let rate = (v[0] + v[1]) / 2.0;
+        if rate <= 0.0 {
+            return Vec::new();
+        }
+        let n = (runs as f32 * duration * rate) as u32;
+        let life_max = em.life.0.iter().map(|k| k.value[0].max(k.value[1])).fold(0.0, f32::max);
+        // Only the particles that can be alive now.
+        let from = (((time - life_max - inst.start) * rate).floor().max(0.0) as u32).min(n);
+        let to = ((((time - inst.start) * rate).ceil().max(0.0) as u32) + 1).min(n);
+        (from.max(to.saturating_sub(MAX_PER_EMITTER))..to)
+            .map(|k| {
+                let at = inst.start + k as f32 / rate;
+                (k, at, ((at - inst.start) % duration) / duration)
+            })
+            .collect()
+    }
+
+    fn rnd(&self, k: u32, channel: u32) -> f32 {
+        random(self.seed, k, channel, 7)
+    }
+
+    /// The sprite of particle `k`, unless it is dead or invisible.
+    fn sprite(&self, k: u32, born: f32, run_t: f32) -> Option<Sprite> {
+        let (em, pr) = (self.em, self.pr);
+        let r = |c: u32| self.rnd(k, c);
+        let life = range(&em.life, run_t, r(0)).max(0.01);
+        let age = self.time - born;
+        if age > life {
+            return None;
+        }
+        let place = self.inst.at(born);
+        let start = math::transform_point(&place, domain_point(em.creation.as_ref(), run_t, [r(1), r(2), r(3)]));
+        let vel = math::transform_dir(&place, self.launch_velocity(k, run_t));
+        let pos = self.drift(Flight { pos: start, vel, life, age, acceleration_pick: r(8), damping_pick: r(9) });
+        let f = age / life;
+        let size = self.size_at(f, run_t, r(10));
+        let colour = self.colour_at(f, k);
+        if colour[3] <= 0.002 || size[0] <= 0.0 || size[1] <= 0.0 {
+            return None;
+        }
+        let rotation = range(pr.property(prop::ROTATION), 0.0, r(13)).to_radians()
+            + range(pr.property(prop::SPIN), f, r(14)) * age;
+        Some(Sprite {
+            position: pos,
+            size,
+            rotation,
+            colour,
+            uv: frame_uv(&pr.frames, pr.property(prop::FRAME_RATE), age, f, r(15), r(16)),
+            texture: Arc::clone(self.texture),
+            additive: pr.additive,
+        })
+    }
+
+    /// Towards a point of the target domain, as fast as the speed says.
+    fn launch_velocity(&self, k: u32, run_t: f32) -> [f32; 3] {
+        let em = self.em;
+        let r = |c: u32| self.rnd(k, c);
+        let speed = range(&em.speed, run_t, r(4));
+        let from = domain_point(em.creation.as_ref(), run_t, [0.5; 3]);
+        let to = domain_point(em.target.as_ref(), run_t, [r(5), r(6), r(7)]);
+        let dir = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        if len > 1e-6 { dir.map(|c| c / len * speed) } else { [0.0; 3] }
+    }
+
+    /// Moves from birth to now.
+    fn drift(&self, flight: Flight) -> [f32; 3] {
+        let Flight { mut pos, mut vel, life, age, acceleration_pick: ra, damping_pick: rd } = flight;
+        let pr = self.pr;
+        let (amin, amax) = (pr.property(prop::ACCELERATION_MIN), pr.property(prop::ACCELERATION_MAX));
+        let (dmin, dmax) = (pr.property(prop::DAMPING_MIN), pr.property(prop::DAMPING_MAX));
+        let mut t = 0.0;
+        while t < age {
+            let dt = STEP.min(age - t);
+            let f = t / life;
+            let (a0, a1, d0, d1) = (amin.at(f), amax.at(f), dmin.at(f), dmax.at(f));
+            for c in 0..3 {
+                let acc = lerp(a0[c], a1[c], ra);
+                let damp = lerp(d0[c], d1[c], rd).max(0.0);
+                vel[c] += (acc - vel[c] * damp) * dt;
+                pos[c] += vel[c] * dt;
+            }
+            t += dt;
+        }
+        pos
+    }
+
+    fn size_at(&self, f: f32, run_t: f32, rs: f32) -> [f32; 2] {
+        let size = self.pr.property(prop::SIZE).at(f);
+        let scale = self.em.size_scale.at(run_t)[0] / 100.0;
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        [lerp(size[0], size[2], rs) * scale, lerp(size[1], size[3], rs) * scale]
+    }
+
+    fn colour_at(&self, f: f32, k: u32) -> [f32; 4] {
+        let pr = self.pr;
+        let (c0, c1) = (pr.property(prop::COLOUR_MIN).at(f), pr.property(prop::COLOUR_MAX).at(f));
+        let rc = self.rnd(k, 11);
+        let mut colour: [f32; 4] = std::array::from_fn(|c| lerp(c0[c], c1[c], rc).clamp(0.0, 1.0));
+        let alpha = pr.property(prop::ALPHA);
+        if !alpha.0.is_empty() {
+            colour[3] *= range(alpha, f, self.rnd(k, 12)).clamp(0.0, 1.0);
+        }
+        colour
+    }
 }
 
 /// The part of the texture sheet a particle shows at `age`.

@@ -565,6 +565,72 @@ impl Psin<'_> {
         w.close(level, name);
     }
 
+    /// The offset of a map's value within a pair, and the size of a pair. The
+    /// value starts where its alignment allows; the pair is rounded up to the
+    /// larger alignment.
+    fn map_layout(&self, key: &Member, value: &Member, key_size: usize, value_size: usize) -> (usize, usize) {
+        let value_at = key_size.next_multiple_of(self.align_of(value));
+        let pair = (value_at + value_size).next_multiple_of(self.align_of(key).max(self.align_of(value)));
+        (value_at, pair)
+    }
+
+    /// Where the pairs of a map are, or `None` if it does not fit its block.
+    fn map_pairs(&self, kind: u8, at: usize, pair: usize, key_size: usize) -> Option<Vec<usize>> {
+        match kind {
+            0x71 => self.sorted_map_pairs(at, pair),
+            0x75 => self.grouped_map_pairs(at, pair),
+            _ => self.slot_map_pairs(at, pair, key_size),
+        }
+    }
+
+    /// Pairs sorted by key.
+    fn sorted_map_pairs(&self, at: usize, pair: usize) -> Option<Vec<usize>> {
+        let count = self.data.u16_at(at + 16).map(usize::from)?;
+        if count == 0 {
+            return Some(Vec::new());
+        }
+        let (_, start, end) = self.pointer(at + 8)?;
+        if start + count * pair > end.next_multiple_of(16) {
+            return None;
+        }
+        Some((0..count).map(|i| start + i * pair).collect())
+    }
+
+    /// Groups of 16 control bytes and 16 pairs; bit 7 marks a free one.
+    fn grouped_map_pairs(&self, at: usize, pair: usize) -> Option<Vec<usize>> {
+        let d = self.data;
+        let (groups, count) = (d.u32_at(at)?, d.u32_at(at + 4)?);
+        let mut pairs = Vec::new();
+        if count > 0 {
+            let group = 16 + 16 * pair;
+            let (_, start, end) = self.pointer(at + 8)?;
+            if start + groups as usize * group > end.next_multiple_of(16) {
+                return None;
+            }
+            for g in 0..groups as usize {
+                let base = start + g * group;
+                pairs.extend((0..16).filter(|i| d[base + i] & 0x80 == 0).map(|i| base + 16 + i * pair));
+            }
+        }
+        Some(pairs)
+    }
+
+    /// Slots; a key of zeros marks a free one.
+    fn slot_map_pairs(&self, at: usize, pair: usize, key_size: usize) -> Option<Vec<usize>> {
+        let d = self.data;
+        let (capacity, count) = (d.u32_at(at)?, d.u32_at(at + 4)?);
+        let mut pairs = Vec::new();
+        if count > 0 {
+            let (_, start, end) = self.pointer(at + 8)?;
+            if start + capacity as usize * pair > end.next_multiple_of(16) {
+                return None;
+            }
+            let used = |slot: &usize| d[*slot..*slot + key_size].iter().any(|b| *b != 0);
+            pairs.extend((0..capacity as usize).map(|i| start + i * pair).filter(used));
+        }
+        Some(pairs)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn map(
         &self,
@@ -576,7 +642,6 @@ impl Psin<'_> {
         at: usize,
         open: &mut HashSet<(u32, usize)>,
     ) {
-        let d = self.data;
         let part = |i: u32| members.get(i as usize).filter(|e| e.name == ELEMENT);
         let (Some(key), Some(value)) = (part(m.reference & 0xFFFF), part(m.reference >> 16)) else {
             return w.error(level, format!("{name}: a map without a description of its entries"));
@@ -584,53 +649,10 @@ impl Psin<'_> {
         let (Some(key_size), Some(value_size)) = (self.size_of(key), self.size_of(value)) else {
             return w.error(level, format!("{name}: a map of types that are not understood"));
         };
-        // The value starts where its alignment allows; the pair is rounded
-        // up to the larger alignment.
-        let value_at = key_size.next_multiple_of(self.align_of(value));
-        let pair = (value_at + value_size).next_multiple_of(self.align_of(key).max(self.align_of(value)));
+        let (value_at, pair) = self.map_layout(key, value, key_size, value_size);
         let bad = |w: &mut Writer| w.error(level, format!("{name}: map outside its block"));
-        let mut pairs = Vec::new();
-        match m.kind {
-            // Pairs sorted by key.
-            0x71 => {
-                let Some(count) = d.u16_at(at + 16).map(usize::from) else { return bad(w) };
-                if count > 0 {
-                    let Some((_, start, end)) = self.pointer(at + 8) else { return bad(w) };
-                    if start + count * pair > end.next_multiple_of(16) {
-                        return bad(w);
-                    }
-                    pairs.extend((0..count).map(|i| start + i * pair));
-                }
-            }
-            // Groups of 16 control bytes and 16 pairs; bit 7 marks a free one.
-            0x75 => {
-                let (Some(groups), Some(count)) = (d.u32_at(at), d.u32_at(at + 4)) else { return bad(w) };
-                if count > 0 {
-                    let group = 16 + 16 * pair;
-                    let Some((_, start, end)) = self.pointer(at + 8) else { return bad(w) };
-                    if start + groups as usize * group > end.next_multiple_of(16) {
-                        return bad(w);
-                    }
-                    for g in 0..groups as usize {
-                        let base = start + g * group;
-                        pairs.extend((0..16).filter(|i| d[base + i] & 0x80 == 0).map(|i| base + 16 + i * pair));
-                    }
-                }
-            }
-            // Slots; a key of zeros marks a free one.
-            _ => {
-                let (Some(capacity), Some(count)) = (d.u32_at(at), d.u32_at(at + 4)) else { return bad(w) };
-                if count > 0 {
-                    let Some((_, start, end)) = self.pointer(at + 8) else { return bad(w) };
-                    if start + capacity as usize * pair > end.next_multiple_of(16) {
-                        return bad(w);
-                    }
-                    let used = |slot: &usize| d[*slot..*slot + key_size].iter().any(|b| *b != 0);
-                    pairs.extend((0..capacity as usize).map(|i| start + i * pair).filter(used));
-                }
-            }
-        }
-        if pairs.iter().any(|p| p + pair > d.len()) {
+        let Some(pairs) = self.map_pairs(m.kind, at, pair, key_size) else { return bad(w) };
+        if pairs.iter().any(|p| p + pair > self.data.len()) {
             return bad(w);
         }
         if pairs.is_empty() {

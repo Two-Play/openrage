@@ -6,7 +6,7 @@
 //! from the original structures (used as templates, so fields OpenRAGE does
 //! not interpret are preserved) with a fresh page layout.
 
-use rage_resource::builder::{Builder, Segment};
+use rage_resource::builder::{BlockId, Builder, Segment};
 use rage_resource::{Resource, ResourceError};
 
 use crate::texture::Texture;
@@ -143,7 +143,29 @@ fn apply_inner(
     if !dict.errors.is_empty() {
         return Err(bad(format!("dictionary has unreadable textures ({}); refusing to rewrite it", dict.errors[0])));
     }
-    let find = |name: &str| dict.textures.iter().position(|t| t.name.eq_ignore_ascii_case(name));
+    check_edits(edits)?;
+    // In place: only same-shape replacements.
+    if !force_rebuild && is_in_place(dict, edits) {
+        let file = write_in_place(res, system_flags, graphics_flags, dict, edits)?;
+        return Ok(EditResult { file, in_place: true, replaced: edits.len(), added: 0, removed: 0 });
+    }
+    // Rebuild: final texture list with templates.
+    let mut merged = Merged { list: Vec::new(), replaced: 0, added: 0, removed: 0 };
+    merged.list.extend(dict.textures.iter().zip(&dict.stored).map(|(t, s)| (t.clone(), s.template.clone(), false)));
+    for e in edits {
+        merged.apply(dict, e)?;
+    }
+    // The game looks textures up by binary search over the sorted hash list.
+    merged.list.sort_by_key(|(t, _, _)| name_hash(&t.name));
+    let file = build_dictionary(dict, &merged.list)?;
+    Ok(EditResult { file, in_place: false, replaced: merged.replaced, added: merged.added, removed: merged.removed })
+}
+
+fn find_texture(dict: &TextureDictionary, name: &str) -> Option<usize> {
+    dict.textures.iter().position(|t| t.name.eq_ignore_ascii_case(name))
+}
+
+fn check_edits(edits: &[Edit]) -> Result<(), ResourceError> {
     for e in edits {
         if let Edit::Set(t) = e
             && t.expected_size().is_none_or(|n| n > t.data.len())
@@ -151,60 +173,81 @@ fn apply_inner(
             return Err(bad(format!("{}: pixel data is shorter than its format and size require", t.name)));
         }
     }
+    Ok(())
+}
 
-    // In place: only same-shape replacements.
-    let in_place = !force_rebuild
-        && edits.iter().all(|e| match e {
-            Edit::Set(t) => find(&t.name).is_some_and(|i| same_shape(&dict.textures[i], t)),
-            Edit::Remove(_) => false,
-        });
-    if in_place {
-        let mut out = res.clone();
-        for e in edits {
-            let Edit::Set(t) = e else { unreachable!() };
-            let i = find(&t.name).expect("checked");
-            out.bytes_mut(dict.stored[i].data_ptr, t.data.len())?.copy_from_slice(&t.data);
-        }
-        let file = rage_resource::builder::repack(&out, system_flags, graphics_flags)?;
-        return Ok(EditResult { file, in_place: true, replaced: edits.len(), added: 0, removed: 0 });
-    }
+fn is_in_place(dict: &TextureDictionary, edits: &[Edit]) -> bool {
+    edits.iter().all(|e| match e {
+        Edit::Set(t) => find_texture(dict, &t.name).is_some_and(|i| same_shape(&dict.textures[i], t)),
+        Edit::Remove(_) => false,
+    })
+}
 
-    // Rebuild: final texture list with templates.
-    let mut list: Vec<(Texture, Vec<u8>, bool)> =
-        dict.textures.iter().zip(&dict.stored).map(|(t, s)| (t.clone(), s.template.clone(), false)).collect();
-    let (mut replaced, mut added, mut removed) = (0, 0, 0);
+/// Overwrites the pixel data of the replaced textures, the layout untouched; the repacked file.
+fn write_in_place(
+    res: &Resource,
+    system_flags: u32,
+    graphics_flags: u32,
+    dict: &TextureDictionary,
+    edits: &[Edit],
+) -> Result<Vec<u8>, ResourceError> {
+    let mut out = res.clone();
     for e in edits {
+        let Edit::Set(t) = e else { unreachable!() };
+        let i = find_texture(dict, &t.name).expect("checked");
+        out.bytes_mut(dict.stored[i].data_ptr, t.data.len())?.copy_from_slice(&t.data);
+    }
+    rage_resource::builder::repack(&out, system_flags, graphics_flags)
+}
+
+/// The textures of the rebuilt dictionary (texture, template structure, whether it is new)
+/// and how many edits replaced, added and removed one.
+struct Merged {
+    list: Vec<(Texture, Vec<u8>, bool)>,
+    replaced: usize,
+    added: usize,
+    removed: usize,
+}
+
+impl Merged {
+    fn apply(&mut self, dict: &TextureDictionary, e: &Edit) -> Result<(), ResourceError> {
         match e {
-            Edit::Remove(name) => {
-                let before = list.len();
-                list.retain(|(t, _, _)| !t.name.eq_ignore_ascii_case(name));
-                if list.len() == before {
-                    return Err(bad(format!("{name}: no such texture")));
-                }
-                removed += 1;
-            }
-            Edit::Set(new) => match list.iter_mut().find(|(t, _, _)| t.name.eq_ignore_ascii_case(&new.name)) {
-                Some(slot) => {
-                    let usage = if new.usage == 0 { slot.0.usage } else { new.usage };
-                    slot.0 = Texture { usage, name: slot.0.name.clone(), ..new.clone() };
-                    replaced += 1;
-                }
-                None => {
-                    let template = dict
-                        .stored
-                        .first()
-                        .map(|s| s.template.clone())
-                        .ok_or_else(|| bad("cannot add a texture to an empty dictionary (no template texture)"))?;
-                    let usage = if new.usage == 0 { guess_usage(&new.name) } else { new.usage };
-                    list.push((Texture { usage, ..new.clone() }, template, true));
-                    added += 1;
-                }
-            },
+            Edit::Remove(name) => self.remove(name),
+            Edit::Set(new) => self.set(dict, new),
         }
     }
-    // The game looks textures up by binary search over the sorted hash list.
-    list.sort_by_key(|(t, _, _)| name_hash(&t.name));
 
+    fn remove(&mut self, name: &str) -> Result<(), ResourceError> {
+        let before = self.list.len();
+        self.list.retain(|(t, _, _)| !t.name.eq_ignore_ascii_case(name));
+        if self.list.len() == before {
+            return Err(bad(format!("{name}: no such texture")));
+        }
+        self.removed += 1;
+        Ok(())
+    }
+
+    fn set(&mut self, dict: &TextureDictionary, new: &Texture) -> Result<(), ResourceError> {
+        if let Some(slot) = self.list.iter_mut().find(|(t, _, _)| t.name.eq_ignore_ascii_case(&new.name)) {
+            let usage = if new.usage == 0 { slot.0.usage } else { new.usage };
+            slot.0 = Texture { usage, name: slot.0.name.clone(), ..new.clone() };
+            self.replaced += 1;
+            return Ok(());
+        }
+        let template = dict
+            .stored
+            .first()
+            .map(|s| s.template.clone())
+            .ok_or_else(|| bad("cannot add a texture to an empty dictionary (no template texture)"))?;
+        let usage = if new.usage == 0 { guess_usage(&new.name) } else { new.usage };
+        self.list.push((Texture { usage, ..new.clone() }, template, true));
+        self.added += 1;
+        Ok(())
+    }
+}
+
+/// The resource of a dictionary with the textures of `list`, in a fresh layout.
+fn build_dictionary(dict: &TextureDictionary, list: &[(Texture, Vec<u8>, bool)]) -> Result<Vec<u8>, ResourceError> {
     let mut b = Builder::new();
     let mut root_bytes = dict.root.clone();
     root_bytes.resize(64, 0);
@@ -225,30 +268,40 @@ fn apply_inner(
     }
     b.pointer(root, 0x20, hash_block, 0);
     b.pointer(root, 0x30, ptr_block, 0);
-
     for (i, (tex, template, is_new)) in list.iter().enumerate() {
-        let mut t = template.clone();
-        t.resize(dict.layout.texture_size(), 0);
-        let size = tex.expected_size().ok_or_else(|| bad(format!("{}: unsupported format", tex.name)))?;
-        write_fields(dict.layout, &mut t, tex, *is_new)?;
-        let tex_block = b.add(Segment::System, t);
-        let mut name = tex.name.clone().into_bytes();
-        name.push(0);
-        let name_block = b.add(Segment::System, name);
-        let data_block = b.add(Segment::Graphics, tex.data[..size].to_vec());
-        b.pointer(ptr_block, i * 8, tex_block, 0);
-        b.pointer(tex_block, 0x28, name_block, 0);
-        match dict.layout {
-            Layout::Legacy => b.pointer(tex_block, 0x70, data_block, 0),
-            Layout::Rdr2 | Layout::Gta4 => unreachable!("rejected above"),
-            Layout::Enhanced => {
-                b.pointer(tex_block, 0x30, tex_block, 0x58); // embedded shader resource view
-                b.pointer(tex_block, 0x38, data_block, 0);
-            }
+        add_texture(&mut b, dict.layout, ptr_block, i, (tex, template, *is_new))?;
+    }
+    b.build(dict.version)
+}
+
+/// Adds texture `i` of the dictionary (its structure, name and pixels) and points entry `i` of `ptr_block` at it.
+fn add_texture(
+    b: &mut Builder,
+    layout: Layout,
+    ptr_block: BlockId,
+    i: usize,
+    (tex, template, is_new): (&Texture, &[u8], bool),
+) -> Result<(), ResourceError> {
+    let mut t = template.to_vec();
+    t.resize(layout.texture_size(), 0);
+    let size = tex.expected_size().ok_or_else(|| bad(format!("{}: unsupported format", tex.name)))?;
+    write_fields(layout, &mut t, tex, is_new)?;
+    let tex_block = b.add(Segment::System, t);
+    let mut name = tex.name.clone().into_bytes();
+    name.push(0);
+    let name_block = b.add(Segment::System, name);
+    let data_block = b.add(Segment::Graphics, tex.data[..size].to_vec());
+    b.pointer(ptr_block, i * 8, tex_block, 0);
+    b.pointer(tex_block, 0x28, name_block, 0);
+    match layout {
+        Layout::Legacy => b.pointer(tex_block, 0x70, data_block, 0),
+        Layout::Rdr2 | Layout::Gta4 => unreachable!("rejected above"),
+        Layout::Enhanced => {
+            b.pointer(tex_block, 0x30, tex_block, 0x58); // embedded shader resource view
+            b.pointer(tex_block, 0x38, data_block, 0);
         }
     }
-    let file = b.build(dict.version)?;
-    Ok(EditResult { file, in_place: false, replaced, added, removed })
+    Ok(())
 }
 
 /// Writes a texture's shape (size, format, levels, usage) into its structure

@@ -174,60 +174,99 @@ const NAMES: [&str; 80] = [
     "ABORT",
 ];
 
+/// The instruction being decoded: its opcode is at `pc`, its operands follow.
+struct Site<'a> {
+    code: &'a [u8],
+    pc: usize,
+}
+
+impl<'a> Site<'a> {
+    /// The next `n` bytes after the opcode.
+    fn need(&self, n: usize) -> Result<&'a [u8], ScriptError> {
+        self.code
+            .get(self.pc + 1..self.pc + 1 + n)
+            .ok_or_else(|| ScriptError::PastEnd { name: "instruction".into(), at: self.pc })
+    }
+}
+
+/// An instruction's name, operands and targets, and its length in bytes.
+struct Decoded {
+    name: String,
+    operands: String,
+    targets: Vec<usize>,
+    len: usize,
+}
+
+impl Decoded {
+    fn new(name: &str, operands: String, targets: Vec<usize>, len: usize) -> Self {
+        Self { name: name.into(), operands, targets, len }
+    }
+}
+
+fn word(b: &[u8], o: usize) -> u32 {
+    b.u32_at(o).unwrap_or(0)
+}
+
+/// Jumps and calls: an absolute address.
+fn decode_jump(site: &Site, op: u8) -> Result<Decoded, ScriptError> {
+    let t = word(site.need(4)?, 0) as usize;
+    Ok(Decoded::new(NAMES[op as usize], format!("@{t:#x}"), vec![t], 5))
+}
+
+/// Operands of a fixed size, as text.
+fn decode_fixed(site: &Site, op: u8) -> Result<Decoded, ScriptError> {
+    let n = match op {
+        40 | 48 => 2,
+        47 => 3,
+        45 => 6,
+        _ => 4,
+    };
+    let b = site.need(n)?;
+    let text = match op {
+        40 => i16::from_le_bytes([b[0], b[1]]).to_string(),
+        41 => word(b, 0).to_string(),
+        42 => format!("{:?}", f32::from_bits(word(b, 0))),
+        45 => format!("0x{:08X} {} {}", word(b, 2), b[0], b[1]),
+        47 => format!("{} {}", b[0], u16::from_le_bytes([b[1], b[2]])),
+        _ => format!("{} {}", b[0], b[1]),
+    };
+    Ok(Decoded::new(NAMES[op as usize], text, Vec::new(), n + 1))
+}
+
+fn decode_switch(site: &Site) -> Result<Decoded, ScriptError> {
+    let count = site.need(1)?[0] as usize;
+    let b = site.need(1 + count * 8)?;
+    let cases: Vec<(u32, usize)> = (0..count).map(|k| (word(b, 1 + k * 8), word(b, 5 + k * 8) as usize)).collect();
+    let text: Vec<String> = cases.iter().map(|(v, t)| format!("{v}:@{t:#x}")).collect();
+    Ok(Decoded::new("SWITCH", text.join(" "), cases.iter().map(|c| c.1).collect(), 2 + count * 8))
+}
+
+fn decode_string(site: &Site) -> Result<Decoded, ScriptError> {
+    let len = site.need(1)?[0] as usize;
+    let b = site.need(1 + len)?;
+    let text = String::from_utf8_lossy(&b[1..]).trim_end_matches('\0').to_owned();
+    Ok(Decoded::new("STRING", format!("\"{}\"", text.escape_default()), Vec::new(), 2 + len))
+}
+
+fn decode(site: &Site, op: u8) -> Result<Decoded, ScriptError> {
+    match op {
+        34..=36 | 46 => decode_jump(site, op),
+        40..=42 | 45 | 47 | 48 => decode_fixed(site, op),
+        66 => decode_switch(site),
+        67 => decode_string(site),
+        69..=72 => Ok(Decoded::new(NAMES[op as usize], site.need(1)?[0].to_string(), Vec::new(), 2)),
+        80.. => Ok(Decoded::new("PUSH_CONST", (op as i32 - 96).to_string(), Vec::new(), 1)),
+        _ => Ok(Decoded::new(NAMES[op as usize], String::new(), Vec::new(), 1)),
+    }
+}
+
 impl Sco {
     /// Decodes every instruction.
     pub fn disassemble(&self) -> Result<Vec<Instruction>, ScriptError> {
-        let c = &self.code;
         let mut out = Vec::new();
         let mut pc = 0;
-        while pc < c.len() {
-            let op = c[pc];
-            let need = |n: usize| -> Result<&[u8], ScriptError> {
-                c.get(pc + 1..pc + 1 + n).ok_or_else(|| ScriptError::PastEnd { name: "instruction".into(), at: pc })
-            };
-            let u32_at = |b: &[u8], o: usize| b.u32_at(o).unwrap_or(0);
-            let (name, operands, targets, len): (String, String, Vec<usize>, usize) = match op {
-                34..=36 | 46 => {
-                    let b = need(4)?;
-                    let t = u32_at(b, 0) as usize;
-                    (NAMES[op as usize].into(), format!("@{t:#x}"), vec![t], 5)
-                }
-                40 => {
-                    let b = need(2)?;
-                    ("PUSH_CONST_S16".into(), i16::from_le_bytes([b[0], b[1]]).to_string(), Vec::new(), 3)
-                }
-                41 => ("PUSH_CONST_U32".into(), u32_at(need(4)?, 0).to_string(), Vec::new(), 5),
-                42 => ("PUSH_CONST_F".into(), format!("{:?}", f32::from_bits(u32_at(need(4)?, 0))), Vec::new(), 5),
-                45 => {
-                    let b = need(6)?;
-                    ("NATIVE".into(), format!("0x{:08X} {} {}", u32_at(b, 2), b[0], b[1]), Vec::new(), 7)
-                }
-                47 => {
-                    let b = need(3)?;
-                    ("ENTER".into(), format!("{} {}", b[0], u16::from_le_bytes([b[1], b[2]])), Vec::new(), 4)
-                }
-                48 => {
-                    let b = need(2)?;
-                    ("LEAVE".into(), format!("{} {}", b[0], b[1]), Vec::new(), 3)
-                }
-                66 => {
-                    let count = need(1)?[0] as usize;
-                    let b = need(1 + count * 8)?;
-                    let cases: Vec<(u32, usize)> =
-                        (0..count).map(|k| (u32_at(b, 1 + k * 8), u32_at(b, 5 + k * 8) as usize)).collect();
-                    let text: Vec<String> = cases.iter().map(|(v, t)| format!("{v}:@{t:#x}")).collect();
-                    ("SWITCH".into(), text.join(" "), cases.iter().map(|c| c.1).collect(), 2 + count * 8)
-                }
-                67 => {
-                    let len = need(1)?[0] as usize;
-                    let b = need(1 + len)?;
-                    let text = String::from_utf8_lossy(&b[1..]).trim_end_matches('\0').to_owned();
-                    ("STRING".into(), format!("\"{}\"", text.escape_default()), Vec::new(), 2 + len)
-                }
-                69..=72 => (NAMES[op as usize].into(), need(1)?[0].to_string(), Vec::new(), 2),
-                80.. => ("PUSH_CONST".into(), (op as i32 - 96).to_string(), Vec::new(), 1),
-                _ => (NAMES[op as usize].into(), String::new(), Vec::new(), 1),
-            };
+        while pc < self.code.len() {
+            let Decoded { name, operands, targets, len } = decode(&Site { code: &self.code, pc }, self.code[pc])?;
             out.push(Instruction { offset: pc, name, operands, targets });
             pc += len;
         }

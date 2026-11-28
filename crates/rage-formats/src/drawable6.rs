@@ -88,6 +88,8 @@ const GRAPHICS: u64 = 0x6000_0000;
 const MAX_PART: u64 = 256 << 20;
 const MAX_VERTICES: usize = 1_000_000;
 const MAX_MESHES: usize = 1024;
+/// Most models a level of detail lists.
+const MAX_MODELS: usize = 256;
 /// Slots of the vertex format.
 const POSITION: usize = 0;
 const WEIGHTS: [usize; 2] = [16, 17];
@@ -147,6 +149,32 @@ fn is_drawable(d: &[u8], at: usize, inside: bool) -> bool {
     check().unwrap_or(false)
 }
 
+/// Whether the pointers and counts of a fragment are there; `None` if the bytes end before the counts.
+fn has_fragment_fields(system: &[u8]) -> Option<bool> {
+    let optional = |at| system.u64_at(at) == Some(0) || system_pointer(system, at).is_some();
+    let counts = |at| system.u16_at(at).filter(|n| *n <= 4096);
+    Some(
+        system_pointer(system, 24).is_some()
+            && system_pointer(system, 168).is_some()
+            && [16, 32, 40].into_iter().all(optional)
+            && counts(48)? > 0
+            && counts(50).is_some()
+            && counts(52)? <= counts(54)?,
+    )
+}
+
+/// Whether the root is a drawable dictionary; `None` if the bytes end before its count.
+fn is_dictionary(system: &[u8]) -> Option<bool> {
+    let count = system.u16_at(56)?;
+    let first = || is_drawable(system, system_pointer(system, system_pointer(system, 48)?)?, true).then_some(());
+    Some(
+        count > 0
+            && [40, 42, 58].into_iter().all(|at| system.u16_at(at) == Some(count))
+            && system_pointer(system, 32).is_some()
+            && first().is_some(),
+    )
+}
+
 /// What the resource whose system part starts with these bytes is; `None`
 /// if it is no model, or if the bytes end before the drawable of a fragment
 /// or the first one of a dictionary.
@@ -157,26 +185,12 @@ pub fn root(system: &[u8]) -> Option<Root> {
     if is_drawable(system, 0, false) {
         return Some(Root::Drawable);
     }
-    let optional = |at| system.u64_at(at) == Some(0) || system_pointer(system, at).is_some();
-    let counts = |at| system.u16_at(at).filter(|n| *n <= 4096);
-    if system_pointer(system, 24).is_some()
-        && system_pointer(system, 168).is_some()
-        && [16, 32, 40].into_iter().all(optional)
-        && counts(48)? > 0
-        && counts(50).is_some()
-        && counts(52)? <= counts(54)?
-    {
+    if has_fragment_fields(system)? {
         // Other resources have pointers and small numbers there too: what
         // tells a fragment is the drawable it points to.
         return is_drawable(system, system_pointer(system, 24)?, true).then_some(Root::Fragment);
     }
-    let count = system.u16_at(56)?;
-    let first = || is_drawable(system, system_pointer(system, system_pointer(system, 48)?)?, true).then_some(());
-    (count > 0
-        && [40, 42, 58].into_iter().all(|at| system.u16_at(at) == Some(count))
-        && system_pointer(system, 32).is_some()
-        && first().is_some())
-    .then_some(Root::Dictionary)
+    is_dictionary(system)?.then_some(Root::Dictionary)
 }
 
 /// The name of the model whose system part starts with these bytes: a
@@ -197,6 +211,27 @@ pub fn name(system: &[u8]) -> Option<String> {
             system_pointer(system, 24).and_then(|at| text(at + 168)).or_else(|| text(168).map(|n| format!("{n}.#ft")))
         }
         Root::Dictionary => None,
+    }
+}
+
+/// How the bones of a model's meshes are numbered.
+struct ModelBones {
+    /// The hashes of the names of the model's bones; empty without such a list.
+    hashes: Vec<u32>,
+    /// The number of bones a mesh's bone numbers must stay below.
+    count: usize,
+    /// For each bone of the model, the skeleton's bone with that name, if the skeleton has them all.
+    own: Option<Vec<u16>>,
+}
+
+impl ModelBones {
+    /// Numbers the bones of `mesh` by the skeleton's, or leaves it the hashes to find them by.
+    fn assign(&self, mesh: &mut Mesh) {
+        match &self.own {
+            Some(map) => mesh.bone_indices.iter_mut().flatten().for_each(|b| *b = map[usize::from(*b)]),
+            None if !mesh.bone_indices.is_empty() => mesh.bone_hashes = self.hashes.clone(),
+            None => {}
+        }
     }
 }
 
@@ -241,6 +276,51 @@ impl<'a> Reader<'a> {
         Ok((self.g(at + 24, len.ok_or_else(|| bad("a buffer of an impossible size"))?)?, stride))
     }
 
+    /// The list of the most detailed level's models and their number.
+    fn models(&self, at: usize) -> Result<(usize, usize), ModelError> {
+        let lod = self.s(at + 80, 16)?;
+        let models = self.u16(lod + 8)?;
+        if !(1..=MAX_MODELS).contains(&models) {
+            return Err(bad("an impossible number of models"));
+        }
+        Ok((self.s(lod, models * 8)?, models))
+    }
+
+    /// What a model's bones are called and which of the skeleton's they are.
+    fn model_bones(&self, model: usize, skeleton: Option<&Skeleton>) -> Result<ModelBones, ModelError> {
+        let used = self.u16(model + 20)?;
+        // What its bones are called; a model without such a list has the skeleton's.
+        let hashes: Vec<u32> = match self.s(model + 40, used * 4) {
+            Ok(list) => (0..used).filter_map(|i| self.sys.u32_at(list + i * 4)).collect(),
+            Err(_) => Vec::new(),
+        };
+        let skeleton_bones = skeleton.map_or(0, |s| s.bones.len());
+        let count = if !hashes.is_empty() || used == skeleton_bones { used } else { 0 };
+        // The skeleton's, if it has them all; else those of another one.
+        let own: Option<Vec<u16>> = skeleton
+            .filter(|_| !hashes.is_empty())
+            .and_then(|s| hashes.iter().map(|&h| s.find_hash(h).map(|b| b as u16)).collect());
+        Ok(ModelBones { hashes, count, own })
+    }
+
+    /// The geometries of the model at `model`, added to `meshes`.
+    fn model(&self, model: usize, skeleton: Option<&Skeleton>, meshes: &mut Vec<Mesh>) -> Result<(), ModelError> {
+        let count = self.u16(model + 16)?;
+        if !(1..=MAX_MESHES).contains(&count) || meshes.len() + count > MAX_MESHES {
+            return Err(bad("an impossible number of geometries"));
+        }
+        let geometries = self.s(model + 8, count * 8)?;
+        let shaders = self.s(model + 32, count * 2).ok();
+        let bones = self.model_bones(model, skeleton)?;
+        for g in 0..count {
+            let mut mesh = self.mesh(self.s(geometries + g * 8, 160)?, bones.count)?;
+            bones.assign(&mut mesh);
+            mesh.shader = shaders.and_then(|s| self.sys.u16_at(s + g * 2)).unwrap_or(0);
+            meshes.push(mesh);
+        }
+        Ok(())
+    }
+
     fn drawable(&self, at: usize, fallback_name: &str) -> Result<Drawable, ModelError> {
         if at + 176 > self.sys.len() {
             return Err(bad("a drawable outside the resource"));
@@ -248,45 +328,11 @@ impl<'a> Reader<'a> {
         let name = if self.sys.u64_at(at + 168) == Some(0) { fallback_name.to_owned() } else { self.name(at + 168)? };
         let bounds = |o| vec3(self.sys, at + o).ok_or_else(|| bad("bounds that are no numbers"));
         // The most detailed level.
-        let lod = self.s(at + 80, 16)?;
-        let models = self.u16(lod + 8)?;
-        if !(1..=256).contains(&models) {
-            return Err(bad("an impossible number of models"));
-        }
-        let list = self.s(lod, models * 8)?;
+        let (list, models) = self.models(at)?;
         let skeleton = self.skeleton(at);
-        let bones = skeleton.as_ref().map_or(0, |s| s.bones.len());
         let mut meshes = Vec::new();
         for m in 0..models {
-            let model = self.s(list + m * 8, 56)?;
-            let count = self.u16(model + 16)?;
-            if !(1..=MAX_MESHES).contains(&count) || meshes.len() + count > MAX_MESHES {
-                return Err(bad("an impossible number of geometries"));
-            }
-            let geometries = self.s(model + 8, count * 8)?;
-            let shaders = self.s(model + 32, count * 2).ok();
-            let used = self.u16(model + 20)?;
-            // What its bones are called; a model without such a list has the skeleton's.
-            let hashes: Vec<u32> = match self.s(model + 40, used * 4) {
-                Ok(list) => (0..used).filter_map(|i| self.sys.u32_at(list + i * 4)).collect(),
-                Err(_) => Vec::new(),
-            };
-            let bones = if !hashes.is_empty() || used == bones { used } else { 0 };
-            // The skeleton's, if it has them all; else those of another one.
-            let own: Option<Vec<u16>> = skeleton
-                .as_ref()
-                .filter(|_| !hashes.is_empty())
-                .and_then(|s| hashes.iter().map(|&h| s.find_hash(h).map(|b| b as u16)).collect());
-            for g in 0..count {
-                let mut mesh = self.mesh(self.s(geometries + g * 8, 160)?, bones)?;
-                match &own {
-                    Some(map) => mesh.bone_indices.iter_mut().flatten().for_each(|b| *b = map[usize::from(*b)]),
-                    None if !mesh.bone_indices.is_empty() => mesh.bone_hashes = hashes.clone(),
-                    None => {}
-                }
-                mesh.shader = shaders.and_then(|s| self.sys.u16_at(s + g * 2)).unwrap_or(0);
-                meshes.push(mesh);
-            }
+            self.model(self.s(list + m * 8, 56)?, skeleton.as_ref(), &mut meshes)?;
         }
         Ok(Drawable {
             name,
@@ -553,6 +599,79 @@ impl<'a> VertexData<'a> {
     }
 }
 
+/// The flag of an index buffer with 16-bit vertex references.
+const REFS_16_BIT: u32 = 0x8000_0000;
+
+fn index_word(index: &[u8], at: usize) -> Result<u32, ModelError> {
+    index.u32_at(at).ok_or_else(|| bad("an index buffer that is cut off"))
+}
+
+/// The cut-up index buffer: where its clusters, triangles and vertex references are.
+struct ClusterBuffer<'a> {
+    index: &'a [u8],
+    vertices: usize,
+    cluster_count: usize,
+    triangles: usize,
+    refs: usize,
+    wide: bool,
+    triangles_at: usize,
+    refs_at: usize,
+}
+
+impl<'a> ClusterBuffer<'a> {
+    fn parse(index: &'a [u8], vertices: usize) -> Result<Self, ModelError> {
+        let flags = index_word(index, 0)?;
+        let cluster_count = (flags & if flags & 0x4000_0000 != 0 { 0xFFFF } else { 0x7FFF_FFFF }) as usize;
+        let (triangles, refs) = (index_word(index, 4)? as usize, index_word(index, 8)? as usize);
+        if !(1..=2048).contains(&cluster_count) || !(1..=65535).contains(&triangles) || !(1..=65535).contains(&refs) {
+            return Err(bad("impossible counts in an index buffer"));
+        }
+        let wide = flags & REFS_16_BIT == 0;
+        let triangles_at = 12 + cluster_count * 16;
+        let refs_at = triangles_at + triangles * 4;
+        Ok(Self { index, vertices, cluster_count, triangles, refs, wide, triangles_at, refs_at })
+    }
+
+    fn word(&self, at: usize) -> Result<u32, ModelError> {
+        index_word(self.index, at)
+    }
+
+    /// The vertex the `i`th reference names.
+    fn reference(&self, i: usize) -> Result<u32, ModelError> {
+        let v = if self.wide {
+            self.word(self.refs_at + i * 4)?
+        } else {
+            u32::from(self.index.u16_at(self.refs_at + i * 2).ok_or_else(|| bad("truncated"))?)
+        };
+        if (v as usize) < self.vertices { Ok(v) } else { Err(bad("a triangle with a vertex that does not exist")) }
+    }
+
+    /// The corners of the triangle with word `w`, whose cluster has `own_refs` references from `first_ref` on.
+    fn read_triangle(&self, w: u32, first_ref: usize, own_refs: usize, out: &mut Vec<u32>) -> Result<(), ModelError> {
+        for corner in 0..3 {
+            let local = (w >> (corner * 7) & 127) as usize;
+            if local >= own_refs {
+                return Err(bad("a triangle outside its cluster"));
+            }
+            out.push(self.reference(first_ref + local)?);
+        }
+        Ok(())
+    }
+
+    fn read_cluster(&self, cluster: usize, out: &mut Vec<u32>) -> Result<(), ModelError> {
+        let (counts, starts) = (self.word(12 + cluster * 16)?, self.word(16 + cluster * 16)?);
+        let (own_refs, own_triangles) = ((counts & 127) as usize + 1, (counts >> 7 & 255) as usize + 1);
+        let (first_ref, first_triangle) = ((starts & 0xFFFF) as usize, (starts >> 16) as usize);
+        if first_ref + own_refs > self.refs || first_triangle + own_triangles > self.triangles {
+            return Err(bad("a cluster outside its buffer"));
+        }
+        for t in first_triangle..first_triangle + own_triangles {
+            self.read_triangle(self.word(self.triangles_at + t * 4)?, first_ref, own_refs, out)?;
+        }
+        Ok(())
+    }
+}
+
 /// The triangles of an index buffer: a word of flags and the cluster count,
 /// the triangle count, the count of vertex references; 16 bytes per cluster
 /// (vertices and triangles minus one in 7 and 8 bits, then where its
@@ -560,43 +679,12 @@ impl<'a> VertexData<'a> {
 /// into the cluster's references, the cluster from bit 21); the references
 /// (16 bits each if the top flag is set, else 32).
 fn clusters(index: &[u8], vertices: usize) -> Result<Vec<u32>, ModelError> {
-    let word = |at: usize| index.u32_at(at).ok_or_else(|| bad("an index buffer that is cut off"));
-    let flags = word(0)?;
-    let cluster_count = (flags & if flags & 0x4000_0000 != 0 { 0xFFFF } else { 0x7FFF_FFFF }) as usize;
-    let (triangles, refs) = (word(4)? as usize, word(8)? as usize);
-    if !(1..=2048).contains(&cluster_count) || !(1..=65535).contains(&triangles) || !(1..=65535).contains(&refs) {
-        return Err(bad("impossible counts in an index buffer"));
+    let buffer = ClusterBuffer::parse(index, vertices)?;
+    let mut out = Vec::with_capacity(buffer.triangles * 3);
+    for cluster in 0..buffer.cluster_count {
+        buffer.read_cluster(cluster, &mut out)?;
     }
-    let wide = flags & 0x8000_0000 == 0;
-    let (triangles_at, refs_at) = (12 + cluster_count * 16, 12 + cluster_count * 16 + triangles * 4);
-    let reference = |i: usize| -> Result<u32, ModelError> {
-        let v = if wide {
-            word(refs_at + i * 4)?
-        } else {
-            u32::from(index.u16_at(refs_at + i * 2).ok_or_else(|| bad("truncated"))?)
-        };
-        if (v as usize) < vertices { Ok(v) } else { Err(bad("a triangle with a vertex that does not exist")) }
-    };
-    let mut out = Vec::with_capacity(triangles * 3);
-    for cluster in 0..cluster_count {
-        let (counts, starts) = (word(12 + cluster * 16)?, word(16 + cluster * 16)?);
-        let (own_refs, own_triangles) = ((counts & 127) as usize + 1, (counts >> 7 & 255) as usize + 1);
-        let (first_ref, first_triangle) = ((starts & 0xFFFF) as usize, (starts >> 16) as usize);
-        if first_ref + own_refs > refs || first_triangle + own_triangles > triangles {
-            return Err(bad("a cluster outside its buffer"));
-        }
-        for t in first_triangle..first_triangle + own_triangles {
-            let w = word(triangles_at + t * 4)?;
-            for corner in 0..3 {
-                let local = (w >> (corner * 7) & 127) as usize;
-                if local >= own_refs {
-                    return Err(bad("a triangle outside its cluster"));
-                }
-                out.push(reference(first_ref + local)?);
-            }
-        }
-    }
-    if out.len() != triangles * 3 {
+    if out.len() != buffer.triangles * 3 {
         return Err(bad("clusters that do not add up to the triangle count"));
     }
     Ok(out)
@@ -626,38 +714,52 @@ fn smooth_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
 /// [`ModelError::Graphics`] says the graphics part is too short.
 pub fn parse(system: &[u8], graphics: &[u8]) -> Result<Vec<Drawable>, ModelError> {
     let reader = Reader { sys: system, gfx: graphics };
-    let pages = reader.s(8, 16).map_err(|_| ModelError::NotAModel)?;
-    if !(1..=32).contains(&system[pages + 8]) || !(1..=32).contains(&system[pages + 9]) {
-        return Err(ModelError::NotAModel);
-    }
+    reader.check_pages()?;
     match root(system).ok_or(ModelError::NotAModel)? {
         Root::Drawable => Ok(vec![reader.drawable(0, "")?]),
-        Root::Fragment => {
-            let at = reader.s(24, 176)?;
-            if !is_drawable(system, at, true) {
+        Root::Fragment => reader.fragment(),
+        Root::Dictionary => reader.dictionary(),
+    }
+}
+
+impl Reader<'_> {
+    /// Whether the page counts a model's resource starts with are plausible.
+    fn check_pages(&self) -> Result<(), ModelError> {
+        let pages = self.s(8, 16).map_err(|_| ModelError::NotAModel)?;
+        if !(1..=32).contains(&self.sys[pages + 8]) || !(1..=32).contains(&self.sys[pages + 9]) {
+            return Err(ModelError::NotAModel);
+        }
+        Ok(())
+    }
+
+    /// The drawable of a fragment.
+    fn fragment(&self) -> Result<Vec<Drawable>, ModelError> {
+        let at = self.s(24, 176)?;
+        if !is_drawable(self.sys, at, true) {
+            return Err(ModelError::NotAModel);
+        }
+        Ok(vec![self.drawable(at, &self.name(168)?)?])
+    }
+
+    /// The drawables of a dictionary; those that cannot be read cost only themselves.
+    fn dictionary(&self) -> Result<Vec<Drawable>, ModelError> {
+        let count = self.u16(56)?;
+        let list = self.s(48, count * 8)?;
+        let mut drawables = Vec::with_capacity(count);
+        let mut first_error = None;
+        for i in 0..count {
+            let at = self.s(list + i * 8, 176)?;
+            if !is_drawable(self.sys, at, true) {
                 return Err(ModelError::NotAModel);
             }
-            Ok(vec![reader.drawable(at, &reader.name(168)?)?])
-        }
-        Root::Dictionary => {
-            let count = reader.u16(56)?;
-            let list = reader.s(48, count * 8)?;
-            let mut drawables = Vec::with_capacity(count);
-            let mut first_error = None;
-            for i in 0..count {
-                let at = reader.s(list + i * 8, 176)?;
-                if !is_drawable(system, at, true) {
-                    return Err(ModelError::NotAModel);
-                }
-                match reader.drawable(at, &format!("drawable {i}")) {
-                    Ok(d) => drawables.push(d),
-                    // More graphics data may help; anything else only costs this one.
-                    Err(e @ ModelError::Graphics(_)) => return Err(e),
-                    Err(e) => first_error = first_error.or(Some(e)),
-                }
+            match self.drawable(at, &format!("drawable {i}")) {
+                Ok(d) => drawables.push(d),
+                // More graphics data may help; anything else only costs this one.
+                Err(e @ ModelError::Graphics(_)) => return Err(e),
+                Err(e) => first_error = first_error.or(Some(e)),
             }
-            if drawables.is_empty() { Err(first_error.unwrap_or(ModelError::NotAModel)) } else { Ok(drawables) }
         }
+        if drawables.is_empty() { Err(first_error.unwrap_or(ModelError::NotAModel)) } else { Ok(drawables) }
     }
 }
 

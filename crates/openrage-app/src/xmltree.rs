@@ -152,16 +152,31 @@ pub fn humanize(name: &str) -> String {
         return name.to_owned();
     }
     let chars: Vec<char> = name.chars().collect();
-    // Hungarian prefixes: one lowercase letter before an uppercase one (fValue, iCount, vOffset).
-    let start = if chars.len() > 2
+    let words = split_words(&chars, hungarian_prefix_len(&chars));
+    join_words(&words)
+}
+
+/// Hungarian prefixes: one lowercase letter before an uppercase one (fValue, iCount, vOffset).
+fn hungarian_prefix_len(chars: &[char]) -> usize {
+    let prefixed = chars.len() > 2
         && "fivcbuphsa".contains(chars[0])
         && chars[1].is_ascii_uppercase()
-        && chars.get(2).is_some_and(|c| c.is_ascii_lowercase())
-    {
-        1
-    } else {
-        0
-    };
+        && chars.get(2).is_some_and(|c| c.is_ascii_lowercase());
+    usize::from(prefixed)
+}
+
+/// Whether a new word starts at the uppercase `c`, given its neighbours.
+fn starts_word(c: char, prev: Option<char>, next: Option<&char>) -> bool {
+    c.is_ascii_uppercase()
+        && prev.is_some_and(|p| {
+            p.is_ascii_lowercase()
+                || p.is_ascii_digit()
+                || (p.is_ascii_uppercase() && next.is_some_and(|n| n.is_ascii_lowercase()))
+        })
+}
+
+/// Splits at `_`, spaces and case changes, from `start` on.
+fn split_words(chars: &[char], start: usize) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
     let mut cur = String::new();
     for i in start..chars.len() {
@@ -173,14 +188,7 @@ pub fn humanize(name: &str) -> String {
             continue;
         }
         let prev = (i > start).then(|| chars[i - 1]);
-        let next = chars.get(i + 1);
-        let boundary = c.is_ascii_uppercase()
-            && prev.is_some_and(|p| {
-                p.is_ascii_lowercase()
-                    || p.is_ascii_digit()
-                    || (p.is_ascii_uppercase() && next.is_some_and(|n| n.is_ascii_lowercase()))
-            });
-        if boundary && !cur.is_empty() {
+        if starts_word(c, prev, chars.get(i + 1)) && !cur.is_empty() {
             words.push(std::mem::take(&mut cur));
         }
         cur.push(c);
@@ -188,12 +196,16 @@ pub fn humanize(name: &str) -> String {
     if !cur.is_empty() {
         words.push(cur);
     }
+    words
+}
+
+/// Joins words with spaces. Acronyms (HD, LOD, ID) stay; other words are lowercased after the first.
+fn join_words(words: &[String]) -> String {
     let mut out = String::new();
     for (i, w) in words.iter().enumerate() {
         if i > 0 {
             out.push(' ');
         }
-        // Acronyms (HD, LOD, ID) stay; other words are lowercased after the first.
         let acronym = w.len() > 1 && w.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
         if acronym {
             out.push_str(w);

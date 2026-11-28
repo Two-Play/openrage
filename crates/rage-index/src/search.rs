@@ -115,73 +115,115 @@ fn like_pattern(query: &str) -> String {
     format!("%{escaped}%")
 }
 
+/// Collects hits in order, skipping repeated paths, until `limit` is reached.
+struct Collector<'a> {
+    limit: usize,
+    /// How many rows to ask the database for: one more than `limit`.
+    fetch: i64,
+    language: Option<&'a str>,
+    seen: HashSet<String>,
+    results: SearchResults,
+}
+
+impl Collector<'_> {
+    fn wanted_language(&self, vpath: &str) -> bool {
+        match (self.language, language_of(vpath)) {
+            (Some(want), Some(lang)) => want.eq_ignore_ascii_case(lang),
+            _ => true,
+        }
+    }
+
+    fn push(&mut self, hits: Vec<Hit>) {
+        for h in hits {
+            if self.results.hits.len() >= self.limit {
+                self.results.limited = true;
+                return;
+            }
+            if self.seen.insert(h.vpath.clone()) {
+                self.results.hits.push(h);
+            }
+        }
+    }
+}
+
+fn row_to_hit(reason: HitReason) -> impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<Hit> {
+    move |r| {
+        Ok(Hit {
+            vpath: r.get(0)?,
+            name: r.get(1)?,
+            kind: EntryTag::from_i64(r.get(2)?),
+            size: r.get::<_, i64>(3)? as u64,
+            reason: reason.clone(),
+        })
+    }
+}
+
 impl Index {
     /// Searches names, hashes and text. Name and hash hits come first.
     ///
     /// With `language`, text hits in localized files of other languages are skipped.
     pub fn search(&self, query: &str, limit: usize, language: Option<&str>) -> Result<SearchResults, IndexError> {
         let query = query.trim();
-        let mut results = SearchResults { query_hash: joaat(query), hash: parse_hash(query), ..Default::default() };
+        let results = SearchResults { query_hash: joaat(query), hash: parse_hash(query), ..Default::default() };
         if query.is_empty() {
             return Ok(results);
         }
-        let mut seen = HashSet::new();
-        let wanted_language = |vpath: &str| match (language, language_of(vpath)) {
-            (Some(want), Some(lang)) => want.eq_ignore_ascii_case(lang),
-            _ => true,
-        };
-        let fetch = limit as i64 + 1;
-
-        let row_to_hit = |reason: HitReason| {
-            move |r: &rusqlite::Row<'_>| -> rusqlite::Result<Hit> {
-                Ok(Hit {
-                    vpath: r.get(0)?,
-                    name: r.get(1)?,
-                    kind: EntryTag::from_i64(r.get(2)?),
-                    size: r.get::<_, i64>(3)? as u64,
-                    reason: reason.clone(),
-                })
-            }
-        };
-        let mut push = |hits: Vec<Hit>, results: &mut SearchResults| {
-            for h in hits {
-                if results.hits.len() >= limit {
-                    results.limited = true;
-                    return;
-                }
-                if seen.insert(h.vpath.clone()) {
-                    results.hits.push(h);
-                }
-            }
-        };
-
-        if let Some(hash) = results.hash {
-            let mut stmt =
-                self.conn.prepare_cached("SELECT string FROM hashes WHERE hash = ?1 ORDER BY string LIMIT 50")?;
-            results.dictionary = stmt.query_map([hash as i64], |r| r.get(0))?.collect::<Result<_, _>>()?;
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT vpath, name, kind, size FROM entries WHERE name_hash = ?1 OR stem_hash = ?1 ORDER BY vpath LIMIT ?2",
-            )?;
-            let hits = stmt
-                .query_map(params![hash as i64, fetch], row_to_hit(HitReason::NameHash))?
-                .collect::<Result<_, _>>()?;
-            push(hits, &mut results);
-            // GXT2 labels are indexed as `0xHASH text` lines, unknown names in
-            // metadata as `hash_HASH`.
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT e.vpath, e.name, e.kind, e.size FROM content JOIN entries e ON e.id = content.rowid
-                 WHERE content MATCH ?1 ORDER BY rank LIMIT ?2",
-            )?;
-            let hits: Vec<Hit> = stmt
-                .query_map(
-                    params![format!("\"0x{hash:08x}\" OR \"hash_{hash:08x}\""), fetch * 20],
-                    row_to_hit(HitReason::Content),
-                )?
-                .collect::<Result<_, _>>()?;
-            push(hits.into_iter().filter(|h| wanted_language(&h.vpath)).collect(), &mut results);
-            return Ok(results);
+        let hash = results.hash;
+        let mut collector = Collector { limit, fetch: limit as i64 + 1, language, seen: HashSet::new(), results };
+        match hash {
+            Some(hash) => self.search_hash(hash, &mut collector)?,
+            None => self.search_words(query, &mut collector)?,
         }
+        Ok(collector.results)
+    }
 
+    /// Hits for a query that is a hash: dictionary strings, names with that hash, and texts that contain it.
+    fn search_hash(&self, hash: u32, c: &mut Collector) -> Result<(), IndexError> {
+        let fetch = c.fetch;
+        let mut stmt =
+            self.conn.prepare_cached("SELECT string FROM hashes WHERE hash = ?1 ORDER BY string LIMIT 50")?;
+        c.results.dictionary = stmt.query_map([hash as i64], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT vpath, name, kind, size FROM entries WHERE name_hash = ?1 OR stem_hash = ?1 ORDER BY vpath LIMIT ?2",
+        )?;
+        let hits =
+            stmt.query_map(params![hash as i64, fetch], row_to_hit(HitReason::NameHash))?.collect::<Result<_, _>>()?;
+        c.push(hits);
+        // GXT2 labels are indexed as `0xHASH text` lines, unknown names in
+        // metadata as `hash_HASH`.
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT e.vpath, e.name, e.kind, e.size FROM content JOIN entries e ON e.id = content.rowid
+                 WHERE content MATCH ?1 ORDER BY rank LIMIT ?2",
+        )?;
+        let hits: Vec<Hit> = stmt
+            .query_map(
+                params![format!("\"0x{hash:08x}\" OR \"hash_{hash:08x}\""), fetch * 20],
+                row_to_hit(HitReason::Content),
+            )?
+            .collect::<Result<_, _>>()?;
+        c.push(hits.into_iter().filter(|h| c.wanted_language(&h.vpath)).collect());
+        Ok(())
+    }
+
+    /// Hits for a query that is a name, a path or words of a text.
+    fn search_words(&self, query: &str, c: &mut Collector) -> Result<(), IndexError> {
+        let mut names = self.search_names(query, c.fetch)?;
+        let texts = self.search_texts(query, c)?;
+        // Names come first, but leave room for some text hits: a common word
+        // is in more names than are shown.
+        let limit = c.limit;
+        let named: HashSet<&str> = names.iter().map(|h| h.vpath.as_str()).collect();
+        let room = texts.iter().filter(|h| !named.contains(h.vpath.as_str())).take(limit / 4).count();
+        if names.len() > limit - room {
+            names.truncate(limit - room);
+            c.results.limited = true;
+        }
+        c.push(names);
+        c.push(texts);
+        Ok(())
+    }
+
+    fn search_names(&self, query: &str, fetch: i64) -> Result<Vec<Hit>, IndexError> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT vpath, name, kind, size FROM entries
              WHERE name LIKE ?1 ESCAPE '\\' OR ?5 AND vpath LIKE ?1 ESCAPE '\\'
@@ -195,30 +237,25 @@ impl Index {
         let prefix = format!("{}%", like_pattern(query).trim_start_matches('%'));
         let path = query.contains(['/', '\\']);
         let pattern = like_pattern(&query.replace('\\', "/"));
-        let mut names: Vec<Hit> = stmt
+        let names = stmt
             .query_map(params![pattern, fetch, joaat(query) as i64, prefix, path], row_to_hit(HitReason::Name))?
             .collect::<Result<_, _>>()?;
-        let mut texts: Vec<Hit> = Vec::new();
-        if let Some(fts) = fts_query(query) {
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT e.vpath, e.name, e.kind, e.size FROM content JOIN entries e ON e.id = content.rowid
+        Ok(names)
+    }
+
+    /// Hits in the text of files, in the wanted language; none if the query has no words.
+    fn search_texts(&self, query: &str, c: &Collector) -> Result<Vec<Hit>, IndexError> {
+        let Some(fts) = fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT e.vpath, e.name, e.kind, e.size FROM content JOIN entries e ON e.id = content.rowid
                  WHERE content MATCH ?1 ORDER BY rank LIMIT ?2",
-            )?;
-            texts =
-                stmt.query_map(params![fts, fetch * 20], row_to_hit(HitReason::Content))?.collect::<Result<_, _>>()?;
-            texts.retain(|h| wanted_language(&h.vpath));
-        }
-        // Names come first, but leave room for some text hits: a common word
-        // is in more names than are shown.
-        let named: HashSet<&str> = names.iter().map(|h| h.vpath.as_str()).collect();
-        let room = texts.iter().filter(|h| !named.contains(h.vpath.as_str())).take(limit / 4).count();
-        if names.len() > limit - room {
-            names.truncate(limit - room);
-            results.limited = true;
-        }
-        push(names, &mut results);
-        push(texts, &mut results);
-        Ok(results)
+        )?;
+        let mut texts: Vec<Hit> =
+            stmt.query_map(params![fts, c.fetch * 20], row_to_hit(HitReason::Content))?.collect::<Result<_, _>>()?;
+        texts.retain(|h| c.wanted_language(&h.vpath));
+        Ok(texts)
     }
 }
 

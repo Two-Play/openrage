@@ -60,124 +60,193 @@ fn vec3(res: &Resource, at: u64) -> Result<[f32; 3], ResourceError> {
     Ok([f32_at(res, at)?, f32_at(res, at + 4)?, f32_at(res, at + 8)?])
 }
 
-fn bound(
-    res: &Resource,
-    at: u64,
-    m: &Mat4,
-    b: &mut Builder,
-    stats: &mut Stats,
-    depth: usize,
-) -> Result<(), ResourceError> {
-    if depth > 8 {
-        return Err(bad("bounds nested too deeply"));
-    }
-    stats.bounds += 1;
-    match res.u8(at + 0x04)? {
-        kind::COMPOSITE => {
-            let children = ptr(res, at + 0x80)?;
-            let matrices = ptr(res, at + 0x84)?;
-            let count = res.u16(at + 0x90)? as u64;
-            for i in 0..count.min(4096) {
-                let child = ptr(res, children + i * 4)?;
-                if child == 0 {
-                    continue;
-                }
-                let mut t = math::IDENTITY;
-                if matrices != 0 {
-                    let raw = res.bytes(matrices + i * 64, 64)?;
-                    for (k, c) in raw.as_chunks::<4>().0.iter().enumerate() {
-                        t[k] = f32::from_le_bytes(*c);
-                    }
-                    (t[3], t[7], t[11], t[15]) = (0.0, 0.0, 0.0, 1.0);
-                }
-                bound(res, child, &math::mul(m, &t), b, stats, depth + 1)?;
-            }
-        }
-        kind::BOX | kind::GEOMETRY | kind::BVH => polyhedron(res, at, m, b, stats)?,
-        kind::CURVED => {
-            let (hi, lo) = (vec3(res, at + 0x10)?, vec3(res, at + 0x20)?);
-            let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
-            let half = [(hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0, (hi[2] - lo[2]) / 2.0];
-            let axis = (0..3).min_by(|&i, &j| half[i].total_cmp(&half[j])).unwrap_or(0);
-            let radius = (0..3).filter(|&i| i != axis).map(|i| half[i]).fold(0.0, f32::max);
-            let mut d = [0.0; 3];
-            d[axis] = half[axis];
-            let list = ptr(res, at + 0xD0)?;
-            let material = if list != 0 { res.u8(list)? } else { 0 };
-            b.round(material, m, sub(c, d), add(c, d), radius, false);
-        }
-        kind::SPHERE => {
-            let c = vec3(res, at + 0x30)?;
-            b.round(0, m, c, c, f32_at(res, at + 0x08)?, true);
-        }
-        kind::CAPSULE => {
-            let c = vec3(res, at + 0x30)?;
-            let half = f32_at(res, at + 0x90)? / 2.0;
-            b.round(0, m, sub(c, [0.0, half, 0.0]), add(c, [0.0, half, 0.0]), f32_at(res, at + 0x80)?, true);
-        }
-        t => return Err(bad(format!("unknown bound type {t}"))),
-    }
-    Ok(())
+/// The state of walking a tree of bounds: the file and what is built from it.
+struct Walk<'a> {
+    res: &'a Resource,
+    b: &'a mut Builder,
+    stats: &'a mut Stats,
 }
 
-fn polyhedron(res: &Resource, at: u64, m: &Mat4, b: &mut Builder, stats: &mut Stats) -> Result<(), ResourceError> {
-    let kind = res.u8(at + 0x04)?;
-    let polys = ptr(res, at + 0x8C)?;
-    let quantum = vec3(res, at + 0x90)?;
-    let offset = vec3(res, at + 0xA0)?;
-    let verts_at = ptr(res, at + 0xB0)?;
-    let vert_count = res.u32(at + 0xC8)? as u64;
-    let poly_count = res.u32(at + 0xCC)? as u64;
-    if vert_count > 1 << 20 || poly_count > 1 << 21 {
-        return Err(bad(format!("implausible geometry: {vert_count} vertices, {poly_count} polygons")));
+/// The transform of composite child `i` (identity without a transform list).
+fn child_transform(res: &Resource, matrices: u64, i: u64) -> Result<Mat4, ResourceError> {
+    let mut t = math::IDENTITY;
+    if matrices != 0 {
+        let raw = res.bytes(matrices + i * 64, 64)?;
+        for (k, c) in raw.as_chunks::<4>().0.iter().enumerate() {
+            t[k] = f32::from_le_bytes(*c);
+        }
+        (t[3], t[7], t[11], t[15]) = (0.0, 0.0, 0.0, 1.0);
     }
-    // Boxes keep no material list.
-    let types: Vec<u8> = if kind == kind::BOX {
-        vec![0]
-    } else {
-        let at_list = ptr(res, at + 0xD0)?;
-        let count = res.u32(at + 0xD8)?.clamp(1, 256) as u64;
-        (0..count).map(|i| if at_list != 0 { res.u8(at_list + i * 4).unwrap_or(0) } else { 0 }).collect()
-    };
-    stats.vertices += vert_count as usize;
-    let raw = if vert_count > 0 { res.bytes(verts_at, vert_count as usize * 6)? } else { &[][..] };
-    let verts: Vec<[f32; 3]> = raw
-        .as_chunks::<6>()
-        .0
-        .iter()
-        .map(|c| {
-            let q = [0, 2, 4].map(|o| i16::from_le_bytes([c[o], c[o + 1]]) as f32);
-            [q[0] * quantum[0] + offset[0], q[1] * quantum[1] + offset[1], q[2] * quantum[2] + offset[2]]
-        })
-        .collect();
-    let data = if poly_count > 0 { res.bytes(polys, poly_count as usize * 32)? } else { &[][..] };
-    for p in data.as_chunks::<32>().0 {
+    Ok(t)
+}
+
+impl Walk<'_> {
+    fn bound(&mut self, at: u64, m: &Mat4, depth: usize) -> Result<(), ResourceError> {
+        if depth > 8 {
+            return Err(bad("bounds nested too deeply"));
+        }
+        self.stats.bounds += 1;
+        match self.res.u8(at + 0x04)? {
+            kind::COMPOSITE => self.composite(at, m, depth),
+            kind::BOX | kind::GEOMETRY | kind::BVH => self.polyhedron(at, m),
+            kind::CURVED => self.curved(at, m),
+            kind::SPHERE => self.sphere(at, m),
+            kind::CAPSULE => self.capsule(at, m),
+            t => Err(bad(format!("unknown bound type {t}"))),
+        }
+    }
+
+    fn composite(&mut self, at: u64, m: &Mat4, depth: usize) -> Result<(), ResourceError> {
+        let res = self.res;
+        let children = ptr(res, at + 0x80)?;
+        let matrices = ptr(res, at + 0x84)?;
+        let count = res.u16(at + 0x90)? as u64;
+        for i in 0..count.min(4096) {
+            let child = ptr(res, children + i * 4)?;
+            if child == 0 {
+                continue;
+            }
+            let t = child_transform(res, matrices, i)?;
+            self.bound(child, &math::mul(m, &t), depth + 1)?;
+        }
+        Ok(())
+    }
+
+    /// A wheel: a cylinder filling the box along its shortest side.
+    fn curved(&mut self, at: u64, m: &Mat4) -> Result<(), ResourceError> {
+        let res = self.res;
+        let (hi, lo) = (vec3(res, at + 0x10)?, vec3(res, at + 0x20)?);
+        let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+        let half = [(hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0, (hi[2] - lo[2]) / 2.0];
+        let axis = (0..3).min_by(|&i, &j| half[i].total_cmp(&half[j])).unwrap_or(0);
+        let radius = (0..3).filter(|&i| i != axis).map(|i| half[i]).fold(0.0, f32::max);
+        let mut d = [0.0; 3];
+        d[axis] = half[axis];
+        let list = ptr(res, at + 0xD0)?;
+        let material = if list != 0 { res.u8(list)? } else { 0 };
+        self.b.round(material, m, sub(c, d), add(c, d), radius, false);
+        Ok(())
+    }
+
+    fn sphere(&mut self, at: u64, m: &Mat4) -> Result<(), ResourceError> {
+        let c = vec3(self.res, at + 0x30)?;
+        self.b.round(0, m, c, c, f32_at(self.res, at + 0x08)?, true);
+        Ok(())
+    }
+
+    fn capsule(&mut self, at: u64, m: &Mat4) -> Result<(), ResourceError> {
+        let c = vec3(self.res, at + 0x30)?;
+        let half = f32_at(self.res, at + 0x90)? / 2.0;
+        self.b.round(0, m, sub(c, [0.0, half, 0.0]), add(c, [0.0, half, 0.0]), f32_at(self.res, at + 0x80)?, true);
+        Ok(())
+    }
+
+    fn polyhedron(&mut self, at: u64, m: &Mat4) -> Result<(), ResourceError> {
+        let res = self.res;
+        let header = PolyHeader::read(res, at)?.checked()?;
+        let types = header.material_types(res, at)?;
+        self.stats.vertices += header.vert_count as usize;
+        let verts = header.vertices(res)?;
+        let data =
+            if header.poly_count > 0 { res.bytes(header.polys, header.poly_count as usize * 32)? } else { &[][..] };
+        let shape = Polys { verts: &verts, types: &types, m };
+        for p in data.as_chunks::<32>().0 {
+            self.polygon(&shape, p);
+        }
+        Ok(())
+    }
+
+    fn polygon(&mut self, shape: &Polys, p: &[u8; 32]) {
         let f = |o: usize| f32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
         let normal = [f(0), f(4), f(8)];
-        let material = types.get(p[12] as usize).copied().unwrap_or(types[0]);
+        let material = shape.types.get(p[12] as usize).copied().unwrap_or(shape.types[0]);
         let idx = [16, 18, 20, 22].map(|o| u16::from_le_bytes([p[o], p[o + 1]]) as usize);
-        let (Some(&a), Some(&c), Some(&d), Some(&e)) =
-            (verts.get(idx[0]), verts.get(idx[1]), verts.get(idx[2]), verts.get(idx[3]))
-        else {
-            continue;
+        let v = |k: usize| shape.verts.get(idx[k]);
+        let (Some(&a), Some(&c), Some(&d), Some(&e)) = (v(0), v(1), v(2), v(3)) else {
+            return;
         };
-        b.triangle(material, m, [a, c, d]);
-        stats.triangles += 1;
+        self.b.triangle(material, shape.m, [a, c, d]);
+        self.stats.triangles += 1;
         // A fourth index of 0 that is off the polygon's plane marks a triangle.
         let on_plane = dot(normal, sub(e, a)).abs() < 0.05 * dot(sub(d, a), sub(d, a)).sqrt().max(1.0);
         if idx[3] != 0 || on_plane {
-            b.triangle(material, m, [a, d, e]);
-            stats.triangles += 1;
+            self.b.triangle(material, shape.m, [a, d, e]);
+            self.stats.triangles += 1;
         }
     }
-    Ok(())
+}
+
+/// The header of a polyhedron bound: where its polygons and vertices are.
+struct PolyHeader {
+    kind: u8,
+    polys: u64,
+    quantum: [f32; 3],
+    offset: [f32; 3],
+    verts_at: u64,
+    vert_count: u64,
+    poly_count: u64,
+}
+
+impl PolyHeader {
+    fn read(res: &Resource, at: u64) -> Result<Self, ResourceError> {
+        Ok(Self {
+            kind: res.u8(at + 0x04)?,
+            polys: ptr(res, at + 0x8C)?,
+            quantum: vec3(res, at + 0x90)?,
+            offset: vec3(res, at + 0xA0)?,
+            verts_at: ptr(res, at + 0xB0)?,
+            vert_count: res.u32(at + 0xC8)? as u64,
+            poly_count: res.u32(at + 0xCC)? as u64,
+        })
+    }
+
+    fn checked(self) -> Result<Self, ResourceError> {
+        let (vert_count, poly_count) = (self.vert_count, self.poly_count);
+        if vert_count > 1 << 20 || poly_count > 1 << 21 {
+            return Err(bad(format!("implausible geometry: {vert_count} vertices, {poly_count} polygons")));
+        }
+        Ok(self)
+    }
+
+    /// The material type of each entry of the material list of the bound at `at`.
+    fn material_types(&self, res: &Resource, at: u64) -> Result<Vec<u8>, ResourceError> {
+        // Boxes keep no material list.
+        if self.kind == kind::BOX {
+            return Ok(vec![0]);
+        }
+        let at_list = ptr(res, at + 0xD0)?;
+        let count = res.u32(at + 0xD8)?.clamp(1, 256) as u64;
+        Ok((0..count).map(|i| if at_list != 0 { res.u8(at_list + i * 4).unwrap_or(0) } else { 0 }).collect())
+    }
+
+    /// The vertices: 3 × i16, × quantum + offset.
+    fn vertices(&self, res: &Resource) -> Result<Vec<[f32; 3]>, ResourceError> {
+        let (quantum, offset) = (self.quantum, self.offset);
+        let raw = if self.vert_count > 0 { res.bytes(self.verts_at, self.vert_count as usize * 6)? } else { &[][..] };
+        Ok(raw
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|c| {
+                let q = [0, 2, 4].map(|o| i16::from_le_bytes([c[o], c[o + 1]]) as f32);
+                [q[0] * quantum[0] + offset[0], q[1] * quantum[1] + offset[1], q[2] * quantum[2] + offset[2]]
+            })
+            .collect())
+    }
+}
+
+/// The vertices and material types of a polyhedron and the transform it is drawn with.
+struct Polys<'a> {
+    verts: &'a [[f32; 3]],
+    types: &'a [u8],
+    m: &'a Mat4,
 }
 
 /// Reads the bound at `at`.
 pub fn parse_bound(res: &Resource, at: u64) -> Result<(Drawable, Stats), ResourceError> {
     let mut b = Builder::default();
     let mut stats = Stats::default();
-    bound(res, at, &math::IDENTITY, &mut b, &mut stats, 0)?;
+    Walk { res, b: &mut b, stats: &mut stats }.bound(at, &math::IDENTITY, 0)?;
     let (mut d, stats) = finish(b, stats);
     for s in &mut d.shaders {
         s.name_hash = s.name_hash - crate::ybn::MATERIAL_BASE + MATERIAL_BASE;

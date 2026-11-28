@@ -586,6 +586,18 @@ fn average_block(src: &[u8], stride: usize) -> i32 {
         .sum()
 }
 
+/// The quantiser predicted from the neighbours, plus its delta.
+fn quantiser(around: &Around, f: fn(&Mb) -> i32, dq: i32) -> Result<i32> {
+    let predicted = match (around.top, around.left) {
+        (None, None) => 16,
+        (None, Some(l)) => f(l),
+        (Some(t), None) => f(t),
+        (Some(t), Some(l)) => mid(f(t), f(l), around.corner.map_or(0, f)),
+    };
+    let q = predicted + dq;
+    if (0..DC_PAT.len() as i32).contains(&q) { Ok(q) } else { bad("quantiser out of range") }
+}
+
 impl Slice<'_> {
     fn decode(mut self) -> Result<usize> {
         let columns = self.reference.0 / 32;
@@ -623,6 +635,26 @@ impl Slice<'_> {
     ) -> Result<Mb> {
         let kind = if self.key { INTRA } else { self.kind(lru) };
         let comps = 3 + usize::from(self.has_alpha);
+        let (mut mb, intra_dq, inter_dq) = self.predict(kind, x, y, around)?;
+        mb.intra_q = quantiser(around, |m| m.intra_q, intra_dq)?;
+        mb.inter_q = quantiser(around, |m| m.inter_q, inter_dq)?;
+
+        match kind {
+            INTRA => self.intra_residual(x, y, around, &mut mb, &mut cbp[0])?,
+            RESIDUE => self.inter_residual(x, y, &mb, &mut cbp[1])?,
+            _ => {}
+        }
+
+        self.store_motion(x, y, kind, &mb);
+        if kind != INTRA {
+            self.average_dcs(x, y, comps, &mut mb);
+        }
+        Ok(mb)
+    }
+
+    /// Reads the motion of a macroblock and compensates it; returns the block with the quantiser deltas
+    /// (intra, inter).
+    fn predict(&mut self, kind: usize, x: usize, y: usize, around: &Around) -> Result<(Mb, i32, i32)> {
         let mut mb = Mb::default();
         let (mut intra_dq, mut inter_dq) = (0, 0);
         match kind {
@@ -640,62 +672,53 @@ impl Slice<'_> {
                 self.compensate(x, y, &mb);
             }
         }
-        let quantiser = |f: fn(&Mb) -> i32, dq: i32| {
-            let predicted = match (around.top, around.left) {
-                (None, None) => 16,
-                (None, Some(l)) => f(l),
-                (Some(t), None) => f(t),
-                (Some(t), Some(l)) => mid(f(t), f(l), around.corner.map_or(0, f)),
-            };
-            let q = predicted + dq;
-            if (0..DC_PAT.len() as i32).contains(&q) { Ok(q) } else { bad("quantiser out of range") }
-        };
-        mb.intra_q = quantiser(|m| m.intra_q, intra_dq)?;
-        mb.inter_q = quantiser(|m| m.inter_q, inter_dq)?;
+        Ok((mb, intra_dq, inter_dq))
+    }
 
-        match kind {
-            INTRA => {
-                for (comp, cbp) in cbp[0].iter_mut().enumerate().take(comps) {
-                    mb.dc[comp] = self.intra(x, y, comp, around, mb.intra_q as usize, cbp)?;
-                }
-            }
-            RESIDUE => {
-                let cbp = &mut cbp[1];
-                self.inter(x, y, 0, mb.inter_q as usize, &mut cbp[0])?;
-                if self.bits.bit() {
-                    self.inter(x, y, 1, mb.inter_q as usize, &mut cbp[1])?;
-                    self.inter(x, y, 2, mb.inter_q as usize, &mut cbp[2])?;
-                } else {
-                    (cbp[1], cbp[2]) = (0, 0);
-                }
-                if self.has_alpha {
-                    self.inter(x, y, 3, mb.inter_q as usize, &mut cbp[3])?;
-                }
-            }
-            _ => {}
+    fn intra_residual(&mut self, x: usize, y: usize, around: &Around, mb: &mut Mb, cbp: &mut [u32; 4]) -> Result<()> {
+        let comps = 3 + usize::from(self.has_alpha);
+        for (comp, cbp) in cbp.iter_mut().enumerate().take(comps) {
+            mb.dc[comp] = self.intra(x, y, comp, around, mb.intra_q as usize, cbp)?;
         }
+        Ok(())
+    }
 
-        // For the loop filter and later predictions.
+    fn inter_residual(&mut self, x: usize, y: usize, mb: &Mb, cbp: &mut [u32; 4]) -> Result<()> {
+        self.inter(x, y, 0, mb.inter_q as usize, &mut cbp[0])?;
+        if self.bits.bit() {
+            self.inter(x, y, 1, mb.inter_q as usize, &mut cbp[1])?;
+            self.inter(x, y, 2, mb.inter_q as usize, &mut cbp[2])?;
+        } else {
+            (cbp[1], cbp[2]) = (0, 0);
+        }
+        if self.has_alpha {
+            self.inter(x, y, 3, mb.inter_q as usize, &mut cbp[3])?;
+        }
+        Ok(())
+    }
+
+    /// For the loop filter and later predictions.
+    fn store_motion(&mut self, x: usize, y: usize, kind: usize, mb: &Mb) {
         let mv_stride = self.reference.0 >> 4;
         for (j, mv) in mb.mv.iter().enumerate() {
             let at = ((y - self.start) / 16 + j / 2) * mv_stride + x * 2 + j % 2;
             self.mvs[at] = if kind == MOTION || kind == RESIDUE { *mv } else { [0; 2] };
         }
-        if kind != INTRA {
-            for comp in 0..comps {
-                let n = 4 >> shift(comp);
-                let stride = self.stride[comp];
-                for by in 0..n {
-                    let info = ((y - self.start) / 32 * n + by) * self.info_stride[comp] + x * n;
-                    self.info[comp][info..info + n].fill(0);
-                    for bx in 0..n {
-                        let at = self.origin(x, y, comp) + by * 8 * stride + bx * 8;
-                        mb.dc[comp][by * n + bx] = average_block(&self.dst[comp][at..], stride);
-                    }
+    }
+
+    fn average_dcs(&mut self, x: usize, y: usize, comps: usize, mb: &mut Mb) {
+        for comp in 0..comps {
+            let n = 4 >> shift(comp);
+            let stride = self.stride[comp];
+            for by in 0..n {
+                let info = ((y - self.start) / 32 * n + by) * self.info_stride[comp] + x * n;
+                self.info[comp][info..info + n].fill(0);
+                for bx in 0..n {
+                    let at = self.origin(x, y, comp) + by * 8 * stride + bx * 8;
+                    mb.dc[comp][by * n + bx] = average_block(&self.dst[comp][at..], stride);
                 }
             }
         }
-        Ok(mb)
     }
 
     /// Where a macroblock starts in this slice's part of a plane.

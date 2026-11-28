@@ -174,71 +174,11 @@ impl GameFiles for GameDir {
     fn list(&self, vpath: &str) -> Result<Vec<DirEntry>> {
         let mut out = Vec::new();
         match self.resolve(vpath)? {
-            Node::Dir(dir) => {
-                // A folder of the game, merged with the same folder in `mods`.
-                let mut dirs = vec![dir];
-                if let Some(mods) = rage_mods::mods_dir(&self.dir)
-                    && let Some(m) = rage_rpf::vfs::find_case_insensitive(&mods, vpath)
-                {
-                    dirs.push(m);
-                }
-                if vpath.is_empty() {
-                    dirs.truncate(1);
-                }
-                for d in dirs {
-                    for e in fs::read_dir(&d)?.flatten() {
-                        let name = e.file_name().to_string_lossy().into_owned();
-                        if out.iter().any(|o: &DirEntry| o.name.eq_ignore_ascii_case(&name)) {
-                            continue;
-                        }
-                        let meta = e.metadata()?;
-                        let is_dir = meta.is_dir() || name.to_ascii_lowercase().ends_with(".rpf");
-                        out.push(DirEntry { name, is_dir, size: if meta.is_dir() { 0 } else { meta.len() } });
-                    }
-                }
-            }
-            Node::ArchiveDir(rpf, id) => {
-                for c in rpf.children(id) {
-                    let e = rpf.entry(c);
-                    out.push(DirEntry { name: e.name.clone(), is_dir: e.is_dir() || e.is_archive(), size: e.size() });
-                }
-            }
-            Node::Rpf8Dir(rpf, dir) => {
-                let (dirs, files) = rpf.list_dir(&dir);
-                for d in dirs {
-                    out.push(DirEntry { name: d, is_dir: true, size: 0 });
-                }
-                for i in files {
-                    let name = rpf.entry_name(i);
-                    let size = rpf.entries().and_then(|e| e.get(i)).map_or(0, |e| e.size());
-                    out.push(DirEntry {
-                        name: name.rsplit('/').next().unwrap_or(&name).to_owned(),
-                        is_dir: false,
-                        size,
-                    });
-                }
-            }
-            Node::Gta4Dir(a, dir) => {
-                for c in a.children(dir) {
-                    let e = a.entry(c);
-                    out.push(DirEntry { name: e.name.clone(), is_dir: e.is_dir(), size: e.size() });
-                }
-            }
-            Node::Rpf9Dir(rpf, dir) => {
-                let entries = rpf.entries()?;
-                let (dirs, files) = rpf.list_dir(&entries, &dir);
-                for d in dirs {
-                    out.push(DirEntry { name: d, is_dir: true, size: 0 });
-                }
-                for i in files {
-                    let name = rpf.entry_name(&entries[i]);
-                    out.push(DirEntry {
-                        name: name.rsplit('/').next().unwrap_or(&name).to_owned(),
-                        is_dir: false,
-                        size: entries[i].size,
-                    });
-                }
-            }
+            Node::Dir(dir) => list_disk_dir(&self.dir, dir, vpath, &mut out)?,
+            Node::ArchiveDir(rpf, id) => list_rpf7_dir(&rpf, id, &mut out),
+            Node::Rpf8Dir(rpf, dir) => list_rpf8_dir(&rpf, &dir, &mut out),
+            Node::Gta4Dir(a, dir) => list_gta4_dir(&a, dir, &mut out),
+            Node::Rpf9Dir(rpf, dir) => list_rpf9_dir(&rpf, &dir, &mut out)?,
             Node::PlainFile(_)
             | Node::ArchiveFile(..)
             | Node::Rpf8File(..)
@@ -251,6 +191,81 @@ impl GameFiles for GameDir {
         out.sort_by_key(|e| (!e.is_dir, e.name.to_ascii_lowercase()));
         Ok(out)
     }
+}
+
+/// A folder of the game, merged with the same folder in `mods`.
+fn list_disk_dir(game_dir: &Path, dir: PathBuf, vpath: &str, out: &mut Vec<DirEntry>) -> Result<()> {
+    let mut dirs = vec![dir];
+    if let Some(mods) = rage_mods::mods_dir(game_dir)
+        && let Some(m) = rage_rpf::vfs::find_case_insensitive(&mods, vpath)
+    {
+        dirs.push(m);
+    }
+    if vpath.is_empty() {
+        dirs.truncate(1);
+    }
+    for d in dirs {
+        add_unseen_entries(&d, out)?;
+    }
+    Ok(())
+}
+
+/// The entries of the folder `d` whose name is not in `out` yet.
+fn add_unseen_entries(d: &Path, out: &mut Vec<DirEntry>) -> Result<()> {
+    for e in fs::read_dir(d)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if out.iter().any(|o: &DirEntry| o.name.eq_ignore_ascii_case(&name)) {
+            continue;
+        }
+        let meta = e.metadata()?;
+        let is_dir = meta.is_dir() || name.to_ascii_lowercase().ends_with(".rpf");
+        out.push(DirEntry { name, is_dir, size: if meta.is_dir() { 0 } else { meta.len() } });
+    }
+    Ok(())
+}
+
+fn list_rpf7_dir(rpf: &rage_rpf::Rpf7, id: rage_rpf::EntryId, out: &mut Vec<DirEntry>) {
+    for c in rpf.children(id) {
+        let e = rpf.entry(c);
+        out.push(DirEntry { name: e.name.clone(), is_dir: e.is_dir() || e.is_archive(), size: e.size() });
+    }
+}
+
+/// The last segment of an entry's path.
+fn file_name_of(name: &str) -> String {
+    name.rsplit('/').next().unwrap_or(name).to_owned()
+}
+
+fn list_rpf8_dir(rpf: &rage_rpf::Rpf8, dir: &str, out: &mut Vec<DirEntry>) {
+    let (dirs, files) = rpf.list_dir(dir);
+    for d in dirs {
+        out.push(DirEntry { name: d, is_dir: true, size: 0 });
+    }
+    for i in files {
+        let name = rpf.entry_name(i);
+        let size = rpf.entries().and_then(|e| e.get(i)).map_or(0, |e| e.size());
+        out.push(DirEntry { name: file_name_of(&name), is_dir: false, size });
+    }
+}
+
+fn list_gta4_dir(a: &rage_rpf::Gta4Archive, dir: rage_rpf::Gta4EntryId, out: &mut Vec<DirEntry>) {
+    for c in a.children(dir) {
+        let e = a.entry(c);
+        out.push(DirEntry { name: e.name.clone(), is_dir: e.is_dir(), size: e.size() });
+    }
+}
+
+fn list_rpf9_dir(rpf: &rage_rpf::Rpf9, dir: &str, out: &mut Vec<DirEntry>) -> Result<()> {
+    let entries = rpf.entries()?;
+    let (dirs, files) = rpf.list_dir(&entries, dir);
+    for d in dirs {
+        out.push(DirEntry { name: d, is_dir: true, size: 0 });
+    }
+    for i in files {
+        let name = rpf.entry_name(&entries[i]);
+        out.push(DirEntry { name: file_name_of(&name), is_dir: false, size: entries[i].size });
+    }
+    Ok(())
 }
 
 /// A plugin's model for the model writer ([`crate::obj::import`]): its
@@ -589,18 +604,30 @@ pub fn run_action(
         picked.iter().map(|p| Input { vpath: p.name.clone(), data: p.data.clone(), picked: true }).collect();
     let mut result = RunResult::default();
 
-    // (path, where outputs go relative to the save folder)
+    let (jobs, batch) = plan_jobs(&*files, action, targets)?;
+    let run = ActionRun { host, plugin, component, files: &files, action_id };
+    if !batch {
+        run.single(&jobs, picked_inputs, &mut result)?;
+        return Ok(result);
+    }
+    run.batch(&jobs, &picked_inputs, progress, &mut result);
+    Ok(result)
+}
+
+/// The files an action runs on as (path, where outputs go relative to the
+/// save folder), and whether any target was a folder (a batch run).
+fn plan_jobs(files: &dyn GameFiles, action: &Action, targets: &[String]) -> Result<(Vec<(String, String)>, bool)> {
     let mut jobs: Vec<(String, String)> = Vec::new();
     let mut batch = false;
     for target in targets {
         let target = target.replace('\\', "/");
-        if is_folder(&*files, &target) {
+        if is_folder(files, &target) {
             if !action.batch {
                 bail!("{} works on files, not on folders like {target}", action.title);
             }
             batch = true;
             let top = target.trim_end_matches('/').rsplit('/').next().unwrap_or("").to_owned();
-            for path in batch_files(&*files, &target, action)? {
+            for path in batch_files(files, &target, action)? {
                 let rel = path[target.trim_end_matches('/').len()..].trim_start_matches('/');
                 let dir = rel.rsplit_once('/').map_or("", |(d, _)| d);
                 let prefix =
@@ -611,62 +638,91 @@ pub fn run_action(
             jobs.push((target, String::new()));
         }
     }
+    Ok((jobs, batch))
+}
 
-    let finish = |result: &mut RunResult, outcome: openrage_plugins::Outcome<Vec<OutputFile>>, prefix: &str| {
-        result.log.extend(outcome.log);
-        for w in outcome.writes {
-            result.writes.retain(|o| !o.vpath.eq_ignore_ascii_case(&w.vpath));
-            result.writes.push(w);
-        }
-        outcome.value.map(|outputs| {
-            for mut o in outputs {
-                if !prefix.is_empty() {
-                    o.name = format!("{prefix}/{}", o.name);
-                }
-                result.outputs.push(o);
+/// Takes what a plugin run produced into `result`; fails when the plugin did.
+fn collect_outcome(
+    result: &mut RunResult,
+    outcome: openrage_plugins::Outcome<Vec<OutputFile>>,
+    prefix: &str,
+) -> Result<()> {
+    result.log.extend(outcome.log);
+    for w in outcome.writes {
+        result.writes.retain(|o| !o.vpath.eq_ignore_ascii_case(&w.vpath));
+        result.writes.push(w);
+    }
+    outcome.value.map(|outputs| {
+        for mut o in outputs {
+            if !prefix.is_empty() {
+                o.name = format!("{prefix}/{}", o.name);
             }
-        })
-    };
+            result.outputs.push(o);
+        }
+    })
+}
 
-    if !batch {
+/// What one run of a plugin action works with.
+struct ActionRun<'a> {
+    host: &'a Host,
+    plugin: &'a Plugin,
+    component: &'a Component,
+    files: &'a Arc<dyn GameFiles>,
+    action_id: &'a str,
+}
+
+impl ActionRun<'_> {
+    fn call(&self, inputs: &[Input]) -> openrage_plugins::Outcome<Vec<OutputFile>> {
+        self.host.run_action(self.plugin, self.component, Arc::clone(self.files), self.action_id, inputs)
+    }
+
+    /// All files in one call to the plugin, `picked` files after them.
+    fn single(&self, jobs: &[(String, String)], picked_inputs: Vec<Input>, result: &mut RunResult) -> Result<()> {
         let mut inputs = Vec::new();
-        for (path, _) in &jobs {
-            let data = files.read(path).with_context(|| format!("reading {path}"))?;
+        for (path, _) in jobs {
+            let data = self.files.read(path).with_context(|| format!("reading {path}"))?;
             inputs.push(Input { vpath: path.clone(), data, picked: false });
         }
         inputs.extend(picked_inputs);
         result.files = jobs.len();
-        let outcome = host.run_action(plugin, component, Arc::clone(&files), action_id, &inputs);
-        finish(&mut result, outcome, "")?;
-        return Ok(result);
+        collect_outcome(result, self.call(&inputs), "")
     }
 
-    let total = jobs.len();
-    for (i, (path, prefix)) in jobs.iter().enumerate() {
-        if !progress(i, total, path) {
-            result.cancelled = true;
-            return Ok(result);
-        }
-        let data = match files.read(path) {
-            Ok(d) => d,
-            Err(e) => {
-                result.failures.push((path.clone(), format!("{e:#}")));
-                continue;
+    /// One call per file, with `progress` before each; failures are recorded
+    /// and the run goes on.
+    fn batch(
+        &self,
+        jobs: &[(String, String)],
+        picked_inputs: &[Input],
+        progress: &mut BatchProgress,
+        result: &mut RunResult,
+    ) {
+        let total = jobs.len();
+        for (i, (path, prefix)) in jobs.iter().enumerate() {
+            if !progress(i, total, path) {
+                result.cancelled = true;
+                return;
             }
-        };
-        let mut inputs = vec![Input { vpath: path.clone(), data, picked: false }];
-        inputs.extend(picked_inputs.iter().cloned());
-        let outcome = host.run_action(plugin, component, Arc::clone(&files), action_id, &inputs);
-        result.files += 1;
-        if let Err(e) = finish(&mut result, outcome, prefix) {
-            result.failures.push((path.clone(), format!("{e:#}")));
+            let data = match self.files.read(path) {
+                Ok(d) => d,
+                Err(e) => {
+                    result.failures.push((path.clone(), format!("{e:#}")));
+                    continue;
+                }
+            };
+            let mut inputs = vec![Input { vpath: path.clone(), data, picked: false }];
+            inputs.extend(picked_inputs.iter().cloned());
+            let outcome = self.call(&inputs);
+            result.files += 1;
+            if let Err(e) = collect_outcome(result, outcome, prefix) {
+                result.failures.push((path.clone(), format!("{e:#}")));
+            }
         }
+        // Two files of a batch may produce the same name in one folder: keep the first.
+        let mut seen = std::collections::HashSet::new();
+        result.outputs.retain(|o| seen.insert(o.name.to_ascii_lowercase()));
+        progress(total, total, "");
     }
-    // Two files of a batch may produce the same name in one folder: keep the first.
-    let mut seen = std::collections::HashSet::new();
-    result.outputs.retain(|o| seen.insert(o.name.to_ascii_lowercase()));
-    progress(total, total, "");
-    Ok(result)
 }
 
 /// A History group name for one run of a plugin action (with the time, so

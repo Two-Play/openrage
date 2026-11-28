@@ -165,7 +165,58 @@ fn main() -> anyhow::Result<()> {
     }
     let cfg = Config::load();
     plugins::reload(&cfg);
-    // GTA VI archives are read through once to find their files: show how far that is.
+    show_indexing_progress(&ui);
+    let keys = load_keys().unwrap_or(None);
+    let (ask, game_dir) = pick_game_dir(&cfg);
+    let rdr2_ready = register_game_formats(game_dir.as_deref());
+
+    APP.with(|a| *a.borrow_mut() = Some(initial_app(cfg, game_dir, keys)));
+
+    apply_settings(&ui);
+    wire_callbacks(&ui);
+
+    let progress_timer = start_progress_timer(&ui);
+    refresh_games(&ui);
+    let ready = with_app(|app| app.game_dir.is_some() && (app.keys.is_some() || rdr2_ready));
+    if !launch(&ui, ask, ready) {
+        return Ok(());
+    }
+    #[cfg(debug_assertions)]
+    debug_snapshot(&ui);
+    // The start window (if any) closes once the explorer's event loop runs.
+    slint::Timer::single_shot(Duration::from_millis(300), close_launcher);
+    let result = ui.run();
+    gpu::shutdown();
+    result?;
+    drop(progress_timer);
+    Ok(())
+}
+
+/// The game to open at start-up, and whether to ask first.
+fn pick_game_dir(cfg: &Config) -> (bool, Option<PathBuf>) {
+    // Several games set up and none chosen as default: ask (after the window is up).
+    let known = installed_games(cfg);
+    let default = cfg.default_game.clone().filter(|d| known.contains(d));
+    let ask = default.is_none() && known.len() > 1;
+    let game_dir = if ask {
+        None
+    } else {
+        default.or_else(|| cfg.game_dir.clone().filter(|d| known.contains(d))).or_else(|| known.first().cloned())
+    };
+    (ask, game_dir)
+}
+
+/// Registers the games that need it; true when the game can be browsed without the GTA V keys.
+fn register_game_formats(game_dir: Option<&Path>) -> bool {
+    game_dir.is_some_and(|d| {
+        (is_rdr2_dir(d) && register_rdr2(d))
+            || (is_gta4_dir(d) && openrage_app::gta4::register(d).is_ok())
+            || detect::is_gta6_dir(d)
+    })
+}
+
+/// GTA VI archives are read through once to find their files: show how far that is.
+fn show_indexing_progress(ui: &AppWindow) {
     let status = ui.as_weak();
     openrage_app::rpf9::register(std::sync::Arc::new(move |step| {
         static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
@@ -184,70 +235,58 @@ fn main() -> anyhow::Result<()> {
         };
         let _ = status.upgrade_in_event_loop(move |ui| ui.set_status(text.into()));
     }));
-    let keys = load_keys().unwrap_or(None);
-    // Several games set up and none chosen as default: ask (after the window is up).
-    let known = installed_games(&cfg);
-    let default = cfg.default_game.clone().filter(|d| known.contains(d));
-    let ask = default.is_none() && known.len() > 1;
-    let game_dir = if ask {
-        None
-    } else {
-        default.or_else(|| cfg.game_dir.clone().filter(|d| known.contains(d))).or_else(|| known.first().cloned())
-    };
-    let rdr2_ready = game_dir.as_deref().is_some_and(|d| {
-        (is_rdr2_dir(d) && register_rdr2(d))
-            || (is_gta4_dir(d) && openrage_app::gta4::register(d).is_ok())
-            || detect::is_gta6_dir(d)
-    });
+}
 
-    APP.with(|a| {
-        *a.borrow_mut() = Some(App {
-            cfg,
-            game_dir,
-            keys,
-            listing: None,
-            visible: Vec::new(),
-            selected: None,
-            sort_column: 0,
-            sort_descending: false,
-            filter: String::new(),
-            tree: Tree::default(),
-            history: History::default(),
-            preview_generation: Arc::new(AtomicU64::new(0)),
-            navigate_generation: Arc::new(AtomicU64::new(0)),
-            cancel: Arc::new(AtomicBool::new(false)),
-            busy: false,
-            language: game_language_from_locale().map(str::to_owned),
-            search_generation: Arc::new(AtomicU64::new(0)),
-            overlay: false,
-            diff_generation: Arc::new(AtomicU64::new(0)),
-            prompt: None,
-            package: None,
-            model: None,
-            model_view: openrage_app::render::View::default(),
-            pending_viewer: false,
-            model_textures_path: None,
-            sound: None,
-            output: None,
-            sound_start: 0.0,
-            play_when_ready: false,
-            audio_timer: slint::Timer::default(),
-            video: None,
-            suggestions: Vec::new(),
-            suggest_ycd: String::new(),
-            suggest_awc: String::new(),
-            suggest_pending: false,
-            index_running: None,
-            plugin_package: None,
-        })
-    });
+fn initial_app(cfg: Config, game_dir: Option<PathBuf>, keys: Option<Arc<GtaVKeys>>) -> App {
+    App {
+        cfg,
+        game_dir,
+        keys,
+        listing: None,
+        visible: Vec::new(),
+        selected: None,
+        sort_column: 0,
+        sort_descending: false,
+        filter: String::new(),
+        tree: Tree::default(),
+        history: History::default(),
+        preview_generation: Arc::new(AtomicU64::new(0)),
+        navigate_generation: Arc::new(AtomicU64::new(0)),
+        cancel: Arc::new(AtomicBool::new(false)),
+        busy: false,
+        language: game_language_from_locale().map(str::to_owned),
+        search_generation: Arc::new(AtomicU64::new(0)),
+        overlay: false,
+        diff_generation: Arc::new(AtomicU64::new(0)),
+        prompt: None,
+        package: None,
+        model: None,
+        model_view: openrage_app::render::View::default(),
+        pending_viewer: false,
+        model_textures_path: None,
+        sound: None,
+        output: None,
+        sound_start: 0.0,
+        play_when_ready: false,
+        audio_timer: slint::Timer::default(),
+        video: None,
+        suggestions: Vec::new(),
+        suggest_ycd: String::new(),
+        suggest_awc: String::new(),
+        suggest_pending: false,
+        index_running: None,
+        plugin_package: None,
+    }
+}
 
+/// Applies the saved settings to the main window.
+fn apply_settings(ui: &AppWindow) {
     ui.set_mono_font(mono_font().into());
     ui.set_theme_mode(with_app(|a| theme_mode(a.cfg.theme.as_deref())));
     let (mode, color) = with_app(|a| accent::from_setting(a.cfg.accent.as_deref()));
     accent::set(mode, color);
     accent::set_text_scale(with_app(|a| a.cfg.text_size.unwrap_or(100)) as f32 / 100.0);
-    accent::apply(&ui);
+    accent::apply(ui);
     ui.set_view_mode(with_app(|a| view_mode(a.cfg.file_view.as_deref())));
     ui.set_history_in_window(with_app(|a| a.cfg.history_window.unwrap_or(true)));
     let languages: Vec<SharedString> =
@@ -256,9 +295,10 @@ fn main() -> anyhow::Result<()> {
     ui.set_language_index(with_app(|a| {
         a.language.as_deref().and_then(|l| LANGUAGES.iter().position(|x| *x == l)).map_or(0, |i| i as i32 + 1)
     }));
-    wire_callbacks(&ui);
+}
 
-    // Shows the progress of background loads (e.g. "Loading textures 5/13").
+/// Shows the progress of background loads (e.g. "Loading textures 5/13").
+fn start_progress_timer(ui: &AppWindow) -> slint::Timer {
     let progress_timer = slint::Timer::default();
     let w = ui.as_weak();
     progress_timer.start(slint::TimerMode::Repeated, Duration::from_millis(150), move || {
@@ -284,33 +324,28 @@ fn main() -> anyhow::Result<()> {
             }
         }
     });
-    refresh_games(&ui);
-    let ready = with_app(|app| app.game_dir.is_some() && (app.keys.is_some() || rdr2_ready));
-    // Several games and no default: a small start window asks first, then the
-    // explorer starts with the game chosen there.
+    progress_timer
+}
+
+/// Several games and no default: a small start window asks first, then the
+/// explorer starts with the game chosen there. Returns false when the user quit the start window.
+fn launch(ui: &AppWindow, ask: bool, ready: bool) -> bool {
     if ask {
-        match run_launcher(&ui) {
-            Ok(Some(LaunchChoice::Game(i, remember))) => open_game(&ui, i, remember),
-            Ok(Some(LaunchChoice::AddGame)) => show_setup(&ui, false),
-            Ok(None) => return Ok(()),
+        match run_launcher(ui) {
+            Ok(Some(LaunchChoice::Game(i, remember))) => open_game(ui, i, remember),
+            Ok(Some(LaunchChoice::AddGame)) => show_setup(ui, false),
+            Ok(None) => return false,
             Err(e) => {
                 eprintln!("start window: {e}");
                 ui.invoke_open_game_chooser(false);
             }
         }
     } else if ready {
-        start_browsing(&ui);
+        start_browsing(ui);
     } else {
-        show_setup(&ui, false);
+        show_setup(ui, false);
     }
-    #[cfg(debug_assertions)]
-    debug_snapshot(&ui);
-    // The start window (if any) closes once the explorer's event loop runs.
-    slint::Timer::single_shot(Duration::from_millis(300), close_launcher);
-    let result = ui.run();
-    gpu::shutdown();
-    result?;
-    Ok(())
+    true
 }
 
 fn with_ui(w: &Weak<AppWindow>, f: impl FnOnce(&AppWindow)) {

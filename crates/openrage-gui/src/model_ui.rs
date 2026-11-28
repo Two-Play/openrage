@@ -188,93 +188,132 @@ pub(crate) fn suggest_models(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, profi
     let Some(index) = index_path(game_dir).filter(|p| p.exists()).and_then(|p| Index::open(&p).ok()) else {
         return Vec::new();
     };
-    let search = |query: &str, limit: usize| -> Vec<String> {
-        index.search(query, limit, None).map(|r| r.hits.into_iter().map(|h| h.vpath).collect()).unwrap_or_default()
-    };
-    let is_model = |v: &str| {
-        let n = v.to_ascii_lowercase();
-        (n.ends_with(".ydd") || n.ends_with(".yft") || n.ends_with(".ydr")) && !n.ends_with("_hi.yft")
-    };
-    // Models named exactly like a hint; peds as their drawable dictionary.
-    let mut named: Vec<String> = Vec::new();
-    for hint in profile.hints.iter().take(80) {
-        let hits: Vec<String> =
-            search(hint, 100).into_iter().filter(|v| is_model(v) && suggest::model_stem(v) == *hint).collect();
-        let has_ydd = hits.iter().any(|v| v.ends_with(".ydd"));
-        named.extend(hits.into_iter().filter(|v| !has_ydd || v.ends_with(".ydd")));
-    }
+    let named = named_models(&index, profile);
     let mut candidates: Vec<suggest::Candidate> = Vec::new();
     let mut load: Vec<String> = named.clone();
     if is_rdr2_dir(game_dir) {
-        // RDR2's people and animals share bone names: rank them all by their
-        // base skeletons (vehicles and objects follow below as for GTA V).
-        if profile.kinds.contains(&suggest::Kind::Ped) || profile.rdr2_peds {
-            // The game has some 90,000 `.ymt` files; the outfit files are among them.
-            let outfits: Vec<String> = search(".ymt", 200_000)
-                .into_iter()
-                .filter(|v| {
-                    let (dir, name) = v.rsplit_once('/').unwrap_or(("", v));
-                    openrage_app::models::is_rdr2_ped_file(name, dir)
-                })
-                .collect();
-            candidates.extend(suggest::rdr2_ped_candidates(game_dir, outfits));
-        }
+        candidates.extend(rdr2_ped_candidates(&index, game_dir, profile));
     } else if let Some(animal) = &profile.animal {
-        load.extend(search(&format!("a_c_{animal}"), 160).into_iter().filter(|v| v.ends_with(".ydd")));
+        load.extend(search_paths(&index, &format!("a_c_{animal}"), 160).into_iter().filter(|v| v.ends_with(".ydd")));
     } else if profile.kinds.contains(&suggest::Kind::Ped) {
-        // All peds share one skeleton: no need to load each.
-        const PREFIXES: [&str; 13] =
-            ["a_m_", "a_f_", "s_m_", "s_f_", "g_m_", "g_f_", "u_m_", "u_f_", "ig_", "cs_", "csb_", "mp_", "player_"];
-        let mut peds: Vec<String> = search(".ydd", 24000)
-            .into_iter()
-            .filter(|v| {
-                let n = v.rsplit('/').next().unwrap_or(v).to_ascii_lowercase();
-                n.ends_with(".ydd")
-                    && PREFIXES.iter().any(|p| n.starts_with(p))
-                    && !n.contains("_p.ydd")
-                    && v.contains("peds")
-            })
-            .collect();
-        // Female clips suggest female peds first.
-        peds.sort_by_key(|v| {
-            let n = suggest::model_stem(v);
-            let is_female = n.contains("_f_") || n.starts_with("a_f") || n.starts_with("s_f");
-            (is_female != profile.female, v.starts_with("update"), n)
-        });
-        peds.dedup_by(|a, b| suggest::model_stem(a) == suggest::model_stem(b));
-        peds.truncate(150);
         let skeleton = suggest::ped_skeleton();
-        candidates.extend(peds.into_iter().map(|vpath| suggest::Candidate { vpath, tags: Some(skeleton.clone()) }));
+        candidates.extend(
+            ped_models(&index, profile)
+                .into_iter()
+                .map(|vpath| suggest::Candidate { vpath, tags: Some(skeleton.clone()) }),
+        );
     }
     if profile.kinds.contains(&suggest::Kind::Vehicle) && !named.iter().any(|v| v.contains("/vehicles")) {
-        // No vehicle named: try them all (their skeletons are cached).
-        let mut vehicles: Vec<String> = search(".yft", 200_000)
-            .into_iter()
-            .filter(|v| is_model(v) && v.contains("/vehicles") && !v.contains("vehiclemods"))
-            .collect();
-        vehicles.sort_by_key(|v| (suggest::model_stem(v), v.starts_with("update"), v.len()));
-        vehicles.dedup_by(|a, b| suggest::model_stem(a) == suggest::model_stem(b));
-        load.extend(vehicles);
+        load.extend(vehicle_models(&index));
     }
     if profile.kinds.contains(&suggest::Kind::Prop) && named.is_empty() {
-        // Objects sharing a word of the dictionary or clip names: the
-        // longest that names any model (RDR2's prop clips name models whose
-        // file names are not known).
-        let mut words: Vec<&String> = profile.hints.iter().filter(|h| !h.contains('@')).collect();
-        words.sort_by_key(|h| std::cmp::Reverse(h.len()));
-        for word in words.into_iter().take(6) {
-            let models: Vec<String> = search(word, 400).into_iter().filter(|v| is_model(v)).take(80).collect();
-            if !models.is_empty() {
-                load.extend(models);
-                break;
-            }
-        }
+        load.extend(prop_models(&index, profile));
     }
     load.sort();
     load.dedup();
-    // Read the skeletons in parallel.
+    candidates.extend(skeleton_candidates(game_dir, keys, &load));
+    let mut ranked = suggest::rank(profile, candidates);
+    ranked.truncate(200);
+    ranked
+}
+
+fn search_paths(index: &Index, query: &str, limit: usize) -> Vec<String> {
+    index.search(query, limit, None).map(|r| r.hits.into_iter().map(|h| h.vpath).collect()).unwrap_or_default()
+}
+
+fn is_model(v: &str) -> bool {
+    let n = v.to_ascii_lowercase();
+    (n.ends_with(".ydd") || n.ends_with(".yft") || n.ends_with(".ydr")) && !n.ends_with("_hi.yft")
+}
+
+/// Models named exactly like a hint; peds as their drawable dictionary.
+fn named_models(index: &Index, profile: &suggest::Profile) -> Vec<String> {
+    let mut named: Vec<String> = Vec::new();
+    for hint in profile.hints.iter().take(80) {
+        let hits: Vec<String> = search_paths(index, hint, 100)
+            .into_iter()
+            .filter(|v| is_model(v) && suggest::model_stem(v) == *hint)
+            .collect();
+        let has_ydd = hits.iter().any(|v| v.ends_with(".ydd"));
+        named.extend(hits.into_iter().filter(|v| !has_ydd || v.ends_with(".ydd")));
+    }
+    named
+}
+
+/// RDR2's people and animals share bone names: rank them all by their
+/// base skeletons (vehicles and objects follow as for GTA V).
+fn rdr2_ped_candidates(index: &Index, game_dir: &Path, profile: &suggest::Profile) -> Vec<suggest::Candidate> {
+    if !(profile.kinds.contains(&suggest::Kind::Ped) || profile.rdr2_peds) {
+        return Vec::new();
+    }
+    // The game has some 90,000 `.ymt` files; the outfit files are among them.
+    let outfits: Vec<String> = search_paths(index, ".ymt", 200_000)
+        .into_iter()
+        .filter(|v| {
+            let (dir, name) = v.rsplit_once('/').unwrap_or(("", v));
+            openrage_app::models::is_rdr2_ped_file(name, dir)
+        })
+        .collect();
+    suggest::rdr2_ped_candidates(game_dir, outfits)
+}
+
+/// The GTA V peds to try, female ones first for female clips.
+fn ped_models(index: &Index, profile: &suggest::Profile) -> Vec<String> {
+    // All peds share one skeleton: no need to load each.
+    const PREFIXES: [&str; 13] =
+        ["a_m_", "a_f_", "s_m_", "s_f_", "g_m_", "g_f_", "u_m_", "u_f_", "ig_", "cs_", "csb_", "mp_", "player_"];
+    let mut peds: Vec<String> = search_paths(index, ".ydd", 24000)
+        .into_iter()
+        .filter(|v| {
+            let n = v.rsplit('/').next().unwrap_or(v).to_ascii_lowercase();
+            n.ends_with(".ydd")
+                && PREFIXES.iter().any(|p| n.starts_with(p))
+                && !n.contains("_p.ydd")
+                && v.contains("peds")
+        })
+        .collect();
+    // Female clips suggest female peds first.
+    peds.sort_by_key(|v| {
+        let n = suggest::model_stem(v);
+        let is_female = n.contains("_f_") || n.starts_with("a_f") || n.starts_with("s_f");
+        (is_female != profile.female, v.starts_with("update"), n)
+    });
+    peds.dedup_by(|a, b| suggest::model_stem(a) == suggest::model_stem(b));
+    peds.truncate(150);
+    peds
+}
+
+/// No vehicle named: try them all (their skeletons are cached).
+fn vehicle_models(index: &Index) -> Vec<String> {
+    let mut vehicles: Vec<String> = search_paths(index, ".yft", 200_000)
+        .into_iter()
+        .filter(|v| is_model(v) && v.contains("/vehicles") && !v.contains("vehiclemods"))
+        .collect();
+    vehicles.sort_by_key(|v| (suggest::model_stem(v), v.starts_with("update"), v.len()));
+    vehicles.dedup_by(|a, b| suggest::model_stem(a) == suggest::model_stem(b));
+    vehicles
+}
+
+/// Objects sharing a word of the dictionary or clip names: the
+/// longest that names any model (RDR2's prop clips name models whose
+/// file names are not known).
+fn prop_models(index: &Index, profile: &suggest::Profile) -> Vec<String> {
+    let mut words: Vec<&String> = profile.hints.iter().filter(|h| !h.contains('@')).collect();
+    words.sort_by_key(|h| std::cmp::Reverse(h.len()));
+    for word in words.into_iter().take(6) {
+        let models: Vec<String> = search_paths(index, word, 400).into_iter().filter(|v| is_model(v)).take(80).collect();
+        if !models.is_empty() {
+            return models;
+        }
+    }
+    Vec::new()
+}
+
+/// Reads the skeletons of `load` in parallel.
+fn skeleton_candidates(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, load: &[String]) -> Vec<suggest::Candidate> {
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
     let chunk = load.len().div_ceil(threads).max(1);
+    let mut candidates = Vec::new();
     std::thread::scope(|scope| {
         let jobs: Vec<_> = load
             .chunks(chunk)
@@ -295,9 +334,7 @@ pub(crate) fn suggest_models(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, profi
             candidates.extend(job.join().unwrap_or_default());
         }
     });
-    let mut ranked = suggest::rank(profile, candidates);
-    ranked.truncate(200);
-    ranked
+    candidates
 }
 
 /// Renders a model into an image of `w × h` pixels: on the GPU if there is

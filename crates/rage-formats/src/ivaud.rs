@@ -64,6 +64,15 @@ pub fn is_stream(data: &[u8]) -> bool {
 
 /// Reads a streamed sound's header.
 pub fn info(d: &[u8]) -> Result<StreamInfo, IvaudError> {
+    let channels = check_stream_header(d)?;
+    let info = read_channel_table(d, channels)?;
+    if info.sample_rate == 0 {
+        return Err(err("no sample rate"));
+    }
+    Ok(info)
+}
+
+fn check_is_stream(d: &[u8]) -> Result<(), IvaudError> {
     let block_table = u64_at(d, 0x00)?;
     if !(0x1C..=0x24000).contains(&block_table) {
         return Err(err("not a GTA IV sound"));
@@ -71,15 +80,31 @@ pub fn info(d: &[u8]) -> Result<StreamInfo, IvaudError> {
     if u32_at(d, 0x10)? != 0 {
         return Err(err("a bank of sounds, not a stream"));
     }
+    Ok(())
+}
+
+/// Checks that `d` is a stream whose blocks fill it; returns its channel count.
+fn check_stream_header(d: &[u8]) -> Result<usize, IvaudError> {
+    check_is_stream(d)?;
     let (blocks, block_size, start) = (u32_at(d, 0x08)? as usize, u32_at(d, 0x0C)? as usize, u32_at(d, 0x2C)? as usize);
     let channels = u32_at(d, 0x24)? as usize;
     if channels == 0 || channels > 16 || block_size == 0 {
         return Err(err(format!("{channels} channels in blocks of {block_size} bytes")));
     }
+    check_fill(d, blocks, block_size, start)?;
+    Ok(channels)
+}
+
+fn check_fill(d: &[u8], blocks: usize, block_size: usize, start: usize) -> Result<(), IvaudError> {
     let expected = blocks * block_size + start;
     if expected != d.len() && expected + block_size != d.len() {
         return Err(err(format!("{blocks} blocks of {block_size} bytes do not fill {} bytes", d.len())));
     }
+    Ok(())
+}
+
+/// The channel hashes, and the format of the first channel.
+fn read_channel_table(d: &[u8], channels: usize) -> Result<StreamInfo, IvaudError> {
     let table = u64_at(d, 0x14)?;
     let infos = table + channels * 0x10;
     let mut hashes = Vec::with_capacity(channels);
@@ -92,9 +117,6 @@ pub fn info(d: &[u8]) -> Result<StreamInfo, IvaudError> {
             sample_rate = u32_at(d, at + 0x18)? & 0xFFFF;
             codec = u32_at(d, at + 0x1C)?;
         }
-    }
-    if sample_rate == 0 {
-        return Err(err("no sample rate"));
     }
     Ok(StreamInfo { channels, sample_rate, samples, codec, hashes })
 }
@@ -135,6 +157,60 @@ impl Ima {
     }
 }
 
+/// What a block's channels are read with.
+struct Blocks<'a> {
+    d: &'a [u8],
+    codec: u32,
+    header: usize,
+}
+
+impl Blocks<'_> {
+    /// Appends the samples of every channel of the block at `block`; `false` for a block that ends the stream.
+    fn append(&self, block: usize, channels: &mut [Vec<i16>], states: &mut [Ima]) -> Result<bool, IvaudError> {
+        let table = block + u64_at(self.d, block)?;
+        let end = block + u64_at(self.d, block + 0x08)?;
+        if end <= table || end > block + self.header {
+            return Ok(false);
+        }
+        let entry = (end - table) / channels.len();
+        for (c, (out, state)) in channels.iter_mut().zip(states).enumerate() {
+            self.append_channel(block, table + c * entry, c, out, state)?;
+        }
+        Ok(true)
+    }
+
+    /// Appends the samples of the channel whose table entry is at `e`.
+    fn append_channel(
+        &self,
+        block: usize,
+        e: usize,
+        c: usize,
+        out: &mut Vec<i16>,
+        state: &mut Ima,
+    ) -> Result<(), IvaudError> {
+        let d = self.d;
+        let at = block + self.header + u32_at(d, e)? as usize * 0x800;
+        let count = u32_at(d, e + 0x0C)? as usize;
+        let bytes = if self.codec == IMA { count.div_ceil(2) } else { count * 2 };
+        let Some(data) = d.get(at..at + bytes) else { return Err(err(format!("channel {c} runs past the file"))) };
+        if self.codec == IMA {
+            append_ima(out, state, data, count);
+        } else {
+            out.extend(data.as_chunks::<2>().0.iter().map(|s| i16::from_le_bytes(*s)));
+        }
+        Ok(())
+    }
+}
+
+fn append_ima(out: &mut Vec<i16>, state: &mut Ima, data: &[u8], count: usize) {
+    for (i, b) in data.iter().enumerate() {
+        out.push(state.decode(b & 0x0F));
+        if 2 * i + 1 < count {
+            out.push(state.decode(b >> 4));
+        }
+    }
+}
+
 /// Decodes a streamed sound: all channels, interleaved.
 pub fn decode(d: &[u8]) -> Result<Pcm, IvaudError> {
     let info = info(d)?;
@@ -143,41 +219,25 @@ pub fn decode(d: &[u8]) -> Result<Pcm, IvaudError> {
     }
     let (block_size, start) = (u32_at(d, 0x0C)? as usize, u32_at(d, 0x2C)? as usize);
     let header = if info.channels > 3 { 0x1000 } else { 0x800 };
+    let blocks = Blocks { d, codec: info.codec, header };
     let mut channels: Vec<Vec<i16>> = vec![Vec::with_capacity(info.samples); info.channels];
     let mut states = vec![Ima::default(); info.channels];
     let mut block = start;
-    while block + header <= d.len() {
-        let table = block + u64_at(d, block)?;
-        let end = block + u64_at(d, block + 0x08)?;
-        if end <= table || end > block + header {
-            break;
-        }
-        let entry = (end - table) / info.channels;
-        for (c, out) in channels.iter_mut().enumerate() {
-            let e = table + c * entry;
-            let at = block + header + u32_at(d, e)? as usize * 0x800;
-            let count = u32_at(d, e + 0x0C)? as usize;
-            let bytes = if info.codec == IMA { count.div_ceil(2) } else { count * 2 };
-            let Some(data) = d.get(at..at + bytes) else { return Err(err(format!("channel {c} runs past the file"))) };
-            if info.codec == IMA {
-                for (i, b) in data.iter().enumerate() {
-                    out.push(states[c].decode(b & 0x0F));
-                    if 2 * i + 1 < count {
-                        out.push(states[c].decode(b >> 4));
-                    }
-                }
-            } else {
-                out.extend(data.as_chunks::<2>().0.iter().map(|s| i16::from_le_bytes(*s)));
-            }
-        }
+    while block + header <= d.len() && blocks.append(block, &mut channels, &mut states)? {
         block += block_size;
     }
-    let frames = channels.iter().map(Vec::len).max().unwrap_or(0).min(info.samples.max(1));
-    let mut samples = Vec::with_capacity(frames * info.channels);
+    let samples = interleave(&channels, info.samples);
+    Ok(Pcm { sample_rate: info.sample_rate, channels: info.channels as u16, samples })
+}
+
+/// The channels' samples frame by frame, a short channel padded with silence; at most `limit` frames.
+fn interleave(channels: &[Vec<i16>], limit: usize) -> Vec<i16> {
+    let frames = channels.iter().map(Vec::len).max().unwrap_or(0).min(limit.max(1));
+    let mut samples = Vec::with_capacity(frames * channels.len());
     for f in 0..frames {
         samples.extend(channels.iter().map(|c| c.get(f).copied().unwrap_or(0)));
     }
-    Ok(Pcm { sample_rate: info.sample_rate, channels: info.channels as u16, samples })
+    samples
 }
 
 #[cfg(test)]

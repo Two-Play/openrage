@@ -524,6 +524,65 @@ impl Plane {
     }
 }
 
+/// The picture before, where blocks are copied from.
+struct Source<'a> {
+    last: &'a Plane,
+    stride: usize,
+    highest: usize,
+}
+
+impl Source<'_> {
+    #[inline]
+    fn moved(&self, b: &mut Bundles, at: usize) -> Result<[u8; 64]> {
+        let (x, y) = (b.x.get(), b.y.get());
+        let from = at as i64 + i64::from(x) + i64::from(y) * self.stride as i64;
+        match usize::try_from(from).ok().filter(|&from| from <= self.highest).and_then(|from| self.last.get(from)) {
+            Some(block) => Ok(block),
+            None => bad("a block comes from outside the picture"),
+        }
+    }
+
+    #[inline]
+    fn block(&self, b: &mut Bundles, bits: &mut Bits, at: usize, kind: i32) -> Result<[u8; 64]> {
+        Ok(match kind {
+            0 => self.last.get(at).expect("a block of the plane"),
+            2 => self.moved(b, at)?,
+            4 => {
+                let block = self.moved(b, at)?;
+                let add = residue(bits);
+                std::array::from_fn(|i| block[i].wrapping_add(add[i] as u8))
+            }
+            7 => {
+                let block = self.moved(b, at)?;
+                let dc = b.inter_dc.get();
+                let add = transformed(&coefficients(bits, dc, &INTER_QUANT));
+                std::array::from_fn(|i| block[i].wrapping_add(add[i] as u8))
+            }
+            _ => basic_block(b, bits, kind).unwrap_or_else(|| bad(&format!("block of type {kind}")))?,
+        })
+    }
+}
+
+/// The kinds of block that need nothing from the picture before; `None` for the others.
+#[inline]
+fn basic_block(b: &mut Bundles, bits: &mut Bits, kind: i32) -> Option<Result<[u8; 64]>> {
+    Some(match kind {
+        3 => b.run_block(bits),
+        5 => Ok(b.intra_block(bits)),
+        6 => Ok([b.colours.get() as u8; 64]),
+        8 => Ok(b.pattern_block()),
+        9 => Ok(b.raw_block()),
+        _ => return None,
+    })
+}
+
+/// A block of the half-size grid, drawn at twice its size.
+#[inline]
+fn large_block(b: &mut Bundles, bits: &mut Bits) -> Result<[u8; 64]> {
+    let kind = b.sub_types.get();
+    basic_block(b, bits, kind).unwrap_or_else(|| bad(&format!("large block of type {kind}")))
+}
+
 pub struct Decoder {
     revision: u8,
     has_alpha: bool,
@@ -602,15 +661,7 @@ impl Decoder {
         let (b, out, last) = (&mut self.bundles, &mut self.planes[index], &self.last[index]);
         b.start(bits, width, bw);
         let stride = out.stride;
-        let highest = (bw - 1 + stride * (bh - 1)) * 8;
-        let moved = |b: &mut Bundles, at: usize| {
-            let (x, y) = (b.x.get(), b.y.get());
-            let from = at as i64 + i64::from(x) + i64::from(y) * stride as i64;
-            match usize::try_from(from).ok().filter(|&from| from <= highest).and_then(|from| last.get(from)) {
-                Some(block) => Ok(block),
-                None => bad("a block comes from outside the picture"),
-            }
-        };
+        let source = Source { last, stride, highest: (bw - 1 + stride * (bh - 1)) * 8 };
         for by in 0..bh {
             b.read(bits, self.revision)?;
             let mut bx = 0;
@@ -622,41 +673,12 @@ impl Decoder {
                     bx += 2;
                     continue;
                 }
-                let block = match kind {
-                    0 => last.get(at).expect("a block of the plane"),
-                    1 => {
-                        let block = match b.sub_types.get() {
-                            3 => b.run_block(bits)?,
-                            5 => b.intra_block(bits),
-                            6 => [b.colours.get() as u8; 64],
-                            8 => b.pattern_block(),
-                            9 => b.raw_block(),
-                            kind => return bad(&format!("large block of type {kind}")),
-                        };
-                        out.put_scaled(at, &block);
-                        bx += 2;
-                        continue;
-                    }
-                    2 => moved(b, at)?,
-                    3 => b.run_block(bits)?,
-                    4 => {
-                        let block = moved(b, at)?;
-                        let add = residue(bits);
-                        std::array::from_fn(|i| block[i].wrapping_add(add[i] as u8))
-                    }
-                    5 => b.intra_block(bits),
-                    6 => [b.colours.get() as u8; 64],
-                    7 => {
-                        let block = moved(b, at)?;
-                        let dc = b.inter_dc.get();
-                        let add = transformed(&coefficients(bits, dc, &INTER_QUANT));
-                        std::array::from_fn(|i| block[i].wrapping_add(add[i] as u8))
-                    }
-                    8 => b.pattern_block(),
-                    9 => b.raw_block(),
-                    _ => return bad(&format!("block of type {kind}")),
-                };
-                out.put(at, &block);
+                if kind == 1 {
+                    out.put_scaled(at, &large_block(b, bits)?);
+                    bx += 2;
+                    continue;
+                }
+                out.put(at, &source.block(b, bits, at, kind)?);
                 bx += 1;
             }
             if bits.overread() {

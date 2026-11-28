@@ -1036,110 +1036,177 @@ struct Built {
 /// Every part of the model (placements baked into the vertices), with its
 /// textures uploaded.
 fn build(gpu: &Gpu, preview: &Arc<crate::ModelPreview>) -> Built {
-    let (model, materials) = (&preview.loaded, &preview.materials);
-    let (mut all_vertices, mut all_indices): (Vec<Vertex>, Vec<u32>) = (Vec::new(), Vec::new());
-    let mut textures = vec![plain_bind_group(gpu, &gpu.white)];
-    // Pictures → bind group.
-    let mut texture_of: HashMap<[usize; 4], usize> = HashMap::new();
-    let mut draws = Vec::new();
+    let model = &preview.loaded;
+    let mut asm = Assembly {
+        gpu,
+        model,
+        materials: &preview.materials,
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        textures: vec![plain_bind_group(gpu, &gpu.white)],
+        // Pictures → bind group.
+        texture_of: HashMap::new(),
+        draws: Vec::new(),
+    };
     for (part_index, part) in model.parts.iter().enumerate() {
         let Some((_, d)) = model.drawables.get(part.drawable) else { continue };
         for mesh in &d.meshes {
-            if mesh.positions.is_empty() || mesh.indices.is_empty() {
-                continue;
-            }
-            let has_n = mesh.normals.len() == mesh.positions.len();
-            let has_uv = mesh.uvs.len() == mesh.positions.len();
-            let has_uv1 = mesh.uvs1.len() == mesh.positions.len();
-            // The second layer runs like the first.
-            let layered = d
-                .shaders
-                .get(usize::from(mesh.shader))
-                .is_some_and(|s| s.sampler(param::LAYER_1_TEX).is_some() && s.sampler(param::DIFFUSE_TEX2).is_none());
-            let skinned = mesh.bone_weights.len() == mesh.positions.len();
-            let bone = part.bone.map(|b| b as u16);
-            let vertices: Vec<Vertex> = (0..mesh.positions.len())
-                .map(|i| Vertex {
-                    pos: math::transform_point(&part.transform, mesh.positions[i]),
-                    normal: if has_n {
-                        small_normal(math::transform_dir(&part.transform, mesh.normals[i]))
-                    } else {
-                        [0; 4]
-                    },
-                    uv: if has_uv { mesh.uvs[i] } else { [0.0; 2] },
-                    // Parts attached to a bone follow it; others use the mesh's weights.
-                    weights: match bone {
-                        Some(_) => [255, 0, 0, 0],
-                        None if skinned => small_weights(mesh.bone_weights[i]),
-                        None => [0; 4],
-                    },
-                    joints: match bone {
-                        Some(b) => [b, 0, 0, 0],
-                        None if skinned => mesh.bone_indices[i],
-                        None => [0; 4],
-                    },
-                    uv1: match (layered, has_uv1) {
-                        (true, _) if has_uv => mesh.uvs[i],
-                        (false, true) => mesh.uvs1[i],
-                        _ => [0.0; 2],
-                    },
-                    shading: mesh.shading.get(i).copied().unwrap_or([255; 4]),
-                })
-                .collect();
-            let usable = [has_uv, has_uv1 || (layered && has_uv), has_uv, has_uv];
-            let mut pictures = materials.pictures(part.drawable, mesh.shader);
-            pictures.iter_mut().zip(usable).for_each(|(p, usable)| *p = p.filter(|_| usable));
-            // A shader without a picture among others of its material that have
-            // one, whose colour says nothing about it.
-            let plain = pictures[0].is_none()
-                && model
-                    .material_index(part.drawable, mesh.shader)
-                    .and_then(|m| model.materials.get(m))
-                    .is_some_and(|m| m.textured);
-            let decal = d
-                .shaders
-                .get(usize::from(mesh.shader))
-                .is_some_and(|s| rage_formats::names::value(s.name_hash).contains("decal"));
-            if plain && decal {
-                continue;
-            }
-            let mut key = pictures.map(|p| p.map_or(0, |p| Arc::as_ptr(p) as usize));
-            key[0] = if plain { 1 } else { key[0] };
-            let texture = *texture_of.entry(key).or_insert_with(|| {
-                let [base, overlay, normal, specular] = pictures.map(|p| p.and_then(|p| picture_view(gpu, p)));
-                textures.push(texture_bind_group(
-                    gpu,
-                    base.as_ref().unwrap_or(if plain { &gpu.grey } else { &gpu.white }),
-                    overlay.as_ref().unwrap_or(&gpu.clear),
-                    normal.as_ref().unwrap_or(&gpu.flat),
-                    specular.as_ref().unwrap_or(&gpu.clear),
-                ));
-                textures.len() - 1
-            });
-            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-            for v in &vertices {
-                for k in 0..3 {
-                    lo[k] = lo[k].min(v.pos[k]);
-                    hi[k] = hi[k].max(v.pos[k]);
-                }
-            }
-            let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
-            let radius = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt() / 2.0;
-            draws.push(Draw {
-                sphere: (centre, radius),
-                part: part_index,
-                drawable: part.drawable,
-                shader: mesh.shader,
-                base_vertex: all_vertices.len() as i32,
-                indices: all_indices.len() as u32..(all_indices.len() + mesh.indices.len()) as u32,
-                texture,
-                decal,
-            });
-            all_vertices.extend_from_slice(&vertices);
-            all_indices.extend_from_slice(&mesh.indices);
+            asm.add_mesh(part_index, part, d, mesh);
         }
     }
-    Built { owner: Arc::downgrade(preview), draws, vertices: all_vertices, indices: all_indices, textures }
+    Built {
+        owner: Arc::downgrade(preview),
+        draws: asm.draws,
+        vertices: asm.vertices,
+        indices: asm.indices,
+        textures: asm.textures,
+    }
+}
+
+/// What [`build`] collects while it walks the model's meshes.
+struct Assembly<'a> {
+    gpu: &'a Gpu,
+    model: &'a openrage_app::models::LoadedModel,
+    materials: &'a openrage_app::render::Materials,
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+    textures: Vec<wgpu::BindGroup>,
+    texture_of: HashMap<[usize; 4], usize>,
+    draws: Vec<Draw>,
+}
+
+impl Assembly<'_> {
+    /// Adds one mesh of `part` to the buffers and the draw list (skipping decals on plain materials).
+    fn add_mesh(
+        &mut self,
+        part_index: usize,
+        part: &openrage_app::models::Part,
+        d: &rage_formats::drawable::Drawable,
+        mesh: &rage_formats::drawable::Mesh,
+    ) {
+        if mesh.positions.is_empty() || mesh.indices.is_empty() {
+            return;
+        }
+        let has_uv = mesh.uvs.len() == mesh.positions.len();
+        let has_uv1 = mesh.uvs1.len() == mesh.positions.len();
+        // The second layer runs like the first.
+        let layered = d
+            .shaders
+            .get(usize::from(mesh.shader))
+            .is_some_and(|s| s.sampler(param::LAYER_1_TEX).is_some() && s.sampler(param::DIFFUSE_TEX2).is_none());
+        let vertices = placed_vertices(part, mesh, layered);
+        let usable = [has_uv, has_uv1 || (layered && has_uv), has_uv, has_uv];
+        let mut pictures = self.materials.pictures(part.drawable, mesh.shader);
+        pictures.iter_mut().zip(usable).for_each(|(p, usable)| *p = p.filter(|_| usable));
+        // A shader without a picture among others of its material that have
+        // one, whose colour says nothing about it.
+        let plain = pictures[0].is_none()
+            && self
+                .model
+                .material_index(part.drawable, mesh.shader)
+                .and_then(|m| self.model.materials.get(m))
+                .is_some_and(|m| m.textured);
+        let decal = d
+            .shaders
+            .get(usize::from(mesh.shader))
+            .is_some_and(|s| rage_formats::names::value(s.name_hash).contains("decal"));
+        if plain && decal {
+            return;
+        }
+        let mut key = pictures.map(|p| p.map_or(0, |p| Arc::as_ptr(p) as usize));
+        key[0] = if plain { 1 } else { key[0] };
+        let (gpu, textures) = (self.gpu, &mut self.textures);
+        let texture = *self.texture_of.entry(key).or_insert_with(|| push_texture_group(gpu, textures, pictures, plain));
+        self.draws.push(Draw {
+            sphere: bounding_sphere(&vertices),
+            part: part_index,
+            drawable: part.drawable,
+            shader: mesh.shader,
+            base_vertex: self.vertices.len() as i32,
+            indices: self.indices.len() as u32..(self.indices.len() + mesh.indices.len()) as u32,
+            texture,
+            decal,
+        });
+        self.vertices.extend_from_slice(&vertices);
+        self.indices.extend_from_slice(&mesh.indices);
+    }
+}
+
+/// Parts attached to a bone follow it; others use the mesh's weights.
+fn skin_weights(bone: Option<u16>, mesh: &rage_formats::drawable::Mesh, i: usize) -> [u8; 4] {
+    match bone {
+        Some(_) => [255, 0, 0, 0],
+        None if mesh.bone_weights.len() == mesh.positions.len() => small_weights(mesh.bone_weights[i]),
+        None => [0; 4],
+    }
+}
+
+/// The bones of vertex `i`: the part's own bone, or the mesh's skinning.
+fn skin_joints(bone: Option<u16>, mesh: &rage_formats::drawable::Mesh, i: usize) -> [u16; 4] {
+    match bone {
+        Some(b) => [b, 0, 0, 0],
+        None if mesh.bone_weights.len() == mesh.positions.len() => mesh.bone_indices[i],
+        None => [0; 4],
+    }
+}
+
+/// The mesh's vertices with the part's placement baked in.
+fn placed_vertices(
+    part: &openrage_app::models::Part,
+    mesh: &rage_formats::drawable::Mesh,
+    layered: bool,
+) -> Vec<Vertex> {
+    let has_n = mesh.normals.len() == mesh.positions.len();
+    let has_uv = mesh.uvs.len() == mesh.positions.len();
+    let has_uv1 = mesh.uvs1.len() == mesh.positions.len();
+    let bone = part.bone.map(|b| b as u16);
+    (0..mesh.positions.len())
+        .map(|i| Vertex {
+            pos: math::transform_point(&part.transform, mesh.positions[i]),
+            normal: if has_n { small_normal(math::transform_dir(&part.transform, mesh.normals[i])) } else { [0; 4] },
+            uv: if has_uv { mesh.uvs[i] } else { [0.0; 2] },
+            weights: skin_weights(bone, mesh, i),
+            joints: skin_joints(bone, mesh, i),
+            uv1: match (layered, has_uv1) {
+                (true, _) if has_uv => mesh.uvs[i],
+                (false, true) => mesh.uvs1[i],
+                _ => [0.0; 2],
+            },
+            shading: mesh.shading.get(i).copied().unwrap_or([255; 4]),
+        })
+        .collect()
+}
+
+/// Uploads the pictures of one material as a bind group and returns its index in `textures`.
+fn push_texture_group(
+    gpu: &Gpu,
+    textures: &mut Vec<wgpu::BindGroup>,
+    pictures: [Option<&Arc<Picture>>; 4],
+    plain: bool,
+) -> usize {
+    let [base, overlay, normal, specular] = pictures.map(|p| p.and_then(|p| picture_view(gpu, p)));
+    textures.push(texture_bind_group(
+        gpu,
+        base.as_ref().unwrap_or(if plain { &gpu.grey } else { &gpu.white }),
+        overlay.as_ref().unwrap_or(&gpu.clear),
+        normal.as_ref().unwrap_or(&gpu.flat),
+        specular.as_ref().unwrap_or(&gpu.clear),
+    ));
+    textures.len() - 1
+}
+
+/// Centre and radius of the box around the vertices.
+fn bounding_sphere(vertices: &[Vertex]) -> ([f32; 3], f32) {
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for v in vertices {
+        for k in 0..3 {
+            lo[k] = lo[k].min(v.pos[k]);
+            hi[k] = hi[k].max(v.pos[k]);
+        }
+    }
+    let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+    let radius = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt() / 2.0;
+    (centre, radius)
 }
 
 /// Bytes of vertices or indices that share a buffer.

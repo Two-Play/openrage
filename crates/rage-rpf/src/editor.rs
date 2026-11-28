@@ -11,8 +11,9 @@
 //! file length to the caller *before* anything is written, which is enough to
 //! undo the commit exactly ([`Backup::restore`]).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -223,52 +224,11 @@ impl ArchiveEditor {
         let old_len = std::fs::metadata(&self.path)?.len();
         let entries: Vec<(&String, &Slot)> = self.files.values().map(|(p, s)| (p, s)).collect();
         let dirs: Vec<&str> = self.dirs.values().map(String::as_str).collect();
-        let meta = |s: &Slot| match s {
-            Slot::Existing { meta, .. } => *meta,
-            Slot::New(r) => r.meta(),
-        };
-        let mut files: Vec<TocFile<'_>> = entries
-            .iter()
-            .map(|(p, s)| TocFile {
-                path: p,
-                meta: meta(s),
-                block: match s {
-                    Slot::Existing { offset, .. } => (offset / BLOCK) as u32,
-                    Slot::New(_) => 0,
-                },
-            })
-            .collect();
+        let mut files = toc_files(&entries);
         let (probe, _) = toc::build(&files, &dirs)?;
         let toc_end = (probe.len() as u64).div_ceil(BLOCK) * BLOCK;
 
-        // Which entries need their data written at the end of the file?
-        let mut cursor = old_len.div_ceil(BLOCK).max(1) * BLOCK;
-        cursor = cursor.max(toc_end);
-        let mut writes: Vec<(u64, std::borrow::Cow<'_, [u8]>, Option<u32>)> = Vec::new();
-        let mut relocated = 0;
-        for (i, (_, slot)) in entries.iter().enumerate() {
-            let bytes: Option<std::borrow::Cow<'_, [u8]>> = match slot {
-                Slot::New(r) => Some(r.data().into()),
-                Slot::Existing { id, offset, .. } if *offset < toc_end => {
-                    relocated += 1;
-                    let raw = self.rpf.read_raw_entry(*id)?;
-                    Some(match raw {
-                        RawEntry::Binary { data, .. } | RawEntry::Resource { data, .. } => data.into(),
-                    })
-                }
-                Slot::Existing { .. } => None,
-            };
-            if let Some(bytes) = bytes {
-                files[i].block = (cursor / BLOCK) as u32;
-                let large = match (slot, files[i].meta) {
-                    (Slot::New(_), Meta::Resource { len, .. }) => Some(len),
-                    _ => None,
-                };
-                let len = bytes.len() as u64;
-                writes.push((cursor, bytes, large));
-                cursor += len.div_ceil(BLOCK) * BLOCK;
-            }
-        }
+        let (writes, relocated, cursor) = self.place_data(&entries, &mut files, old_len, toc_end)?;
         let (mut table, _) = toc::build(&files, &dirs)?;
         table.resize(toc_end as usize, 0);
 
@@ -279,23 +239,108 @@ impl ArchiveEditor {
         let backup = Backup { old_len, new_len: cursor, region };
         before_write(&backup)?;
 
-        let appended: u64 = writes.iter().map(|(_, b, _)| b.len() as u64).sum();
-        for (at, bytes, large) in &writes {
-            f.seek(SeekFrom::Start(*at))?;
-            if let Some(len) = large {
-                let mut h = bytes[..16].to_vec();
-                toc::patch_large_resource_header(&mut h, *len);
-                f.write_all(&h)?;
-                f.write_all(&bytes[16..])?;
-            } else {
-                f.write_all(bytes)?;
-            }
-        }
-        f.set_len(cursor)?;
-        f.sync_data()?;
-        f.seek(SeekFrom::Start(0))?;
-        f.write_all(&table)?;
-        f.sync_all()?;
+        let appended = write_archive(&mut f, &writes, &table, cursor)?;
         Ok(CommitStats { changed: true, appended, relocated, new_len: cursor })
     }
+
+    /// Decides which entries need their data written at the end of the file and
+    /// assigns their blocks. Returns the writes, the number of relocated
+    /// entries and the new file length.
+    fn place_data<'a>(
+        &self,
+        entries: &[(&String, &'a Slot)],
+        files: &mut [TocFile<'_>],
+        old_len: u64,
+        toc_end: u64,
+    ) -> Result<(Vec<PlacedWrite<'a>>, usize, u64), RpfError> {
+        let mut cursor = old_len.div_ceil(BLOCK).max(1) * BLOCK;
+        cursor = cursor.max(toc_end);
+        let mut writes: Vec<PlacedWrite<'a>> = Vec::new();
+        let mut relocated = 0;
+        for (i, (_, slot)) in entries.iter().enumerate() {
+            let Some(bytes) = self.slot_bytes(slot, toc_end, &mut relocated)? else {
+                continue;
+            };
+            files[i].block = (cursor / BLOCK) as u32;
+            let large = match (slot, files[i].meta) {
+                (Slot::New(_), Meta::Resource { len, .. }) => Some(len),
+                _ => None,
+            };
+            let len = bytes.len() as u64;
+            writes.push((cursor, bytes, large));
+            cursor += len.div_ceil(BLOCK) * BLOCK;
+        }
+        Ok((writes, relocated, cursor))
+    }
+
+    /// The data of `slot` if it has to be written at the end (new, or in the way of the table).
+    fn slot_bytes<'a>(
+        &self,
+        slot: &'a Slot,
+        toc_end: u64,
+        relocated: &mut usize,
+    ) -> Result<Option<Cow<'a, [u8]>>, RpfError> {
+        Ok(match slot {
+            Slot::New(r) => Some(r.data().into()),
+            Slot::Existing { id, offset, .. } if *offset < toc_end => {
+                *relocated += 1;
+                let raw = self.rpf.read_raw_entry(*id)?;
+                Some(match raw {
+                    RawEntry::Binary { data, .. } | RawEntry::Resource { data, .. } => data.into(),
+                })
+            }
+            Slot::Existing { .. } => None,
+        })
+    }
+}
+
+type PlacedWrite<'a> = (u64, Cow<'a, [u8]>, Option<u32>);
+
+fn slot_meta(s: &Slot) -> Meta {
+    match s {
+        Slot::Existing { meta, .. } => *meta,
+        Slot::New(r) => r.meta(),
+    }
+}
+
+fn toc_files<'a>(entries: &[(&'a String, &Slot)]) -> Vec<TocFile<'a>> {
+    entries
+        .iter()
+        .map(|(p, s)| TocFile {
+            path: p,
+            meta: slot_meta(s),
+            block: match s {
+                Slot::Existing { offset, .. } => (offset / BLOCK) as u32,
+                Slot::New(_) => 0,
+            },
+        })
+        .collect()
+}
+
+/// Writes the data blocks, then the table of contents; returns the number of data bytes appended.
+fn write_archive(f: &mut File, writes: &[PlacedWrite<'_>], table: &[u8], cursor: u64) -> Result<u64, RpfError> {
+    let appended: u64 = writes.iter().map(|(_, b, _)| b.len() as u64).sum();
+    for (at, bytes, large) in writes {
+        write_data(f, *at, bytes, *large)?;
+    }
+    f.set_len(cursor)?;
+    f.sync_data()?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(table)?;
+    f.sync_all()?;
+    Ok(appended)
+}
+
+/// Writes one entry's data at `at`; `large` is the size of a resource whose header needs patching.
+fn write_data(f: &mut File, at: u64, bytes: &[u8], large: Option<u32>) -> Result<(), RpfError> {
+    f.seek(SeekFrom::Start(at))?;
+    if let Some(len) = large {
+        let mut h = bytes[..16].to_vec();
+        toc::patch_large_resource_header(&mut h, len);
+        f.write_all(&h)?;
+        f.write_all(&bytes[16..])?;
+    } else {
+        f.write_all(bytes)?;
+    }
+    Ok(())
 }

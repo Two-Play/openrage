@@ -294,6 +294,39 @@ pub fn color(hash: u32) -> Option<[f32; 4]> {
     registered().read().ok()?.get(&hash).map(|(_, c)| *c)
 }
 
+/// Readable labels of the vehicle shaders, by technical name (without `_enveff`).
+const FRIENDLY_LABELS: &[(&str, &str)] = &[
+    ("vehicle_paint1", "Primary paint"),
+    ("vehicle_paint2", "Secondary paint"),
+    ("vehicle_paint3", "Paint 3 (pearl/livery)"),
+    ("vehicle_paint3_lvr", "Paint 3 (pearl/livery)"),
+    ("vehicle_paint4", "Paint 4"),
+    ("vehicle_paint4_emissive", "Paint 4"),
+    ("vehicle_paint5", "Paint 5"),
+    ("vehicle_paint6", "Paint 6"),
+    ("vehicle_paint7", "Paint 7"),
+    ("vehicle_paint8", "Paint 8"),
+    ("vehicle_paint9", "Paint 9"),
+    ("vehicle_vehglass", "Glass"),
+    ("vehicle_vehglass_inner", "Glass (inside)"),
+    ("vehicle_tire", "Tyres"),
+    ("vehicle_tire_emissive", "Tyres"),
+    ("vehicle_interior", "Interior"),
+    ("vehicle_interior2", "Interior"),
+    ("vehicle_lightsemissive", "Lights"),
+    ("vehicle_lights", "Lights"),
+    ("vehicle_lightsemissive_siren", "Lights"),
+    ("vehicle_badges", "Badges"),
+    ("vehicle_licenseplate", "License plate"),
+    ("vehicle_shuts", "Door shuts"),
+    ("vehicle_dash_emissive", "Dashboard"),
+    ("vehicle_dash_emissive_opaque", "Dashboard"),
+    ("vehicle_mesh", "Body details"),
+    ("vehicle_mesh2", "Body details"),
+    ("vehicle_decal", "Decals"),
+    ("vehicle_decal2", "Decals"),
+];
+
 /// A label for people: vehicle paints, glass, tyres, … get readable names;
 /// other shaders their technical name.
 pub fn label(hash: u32) -> String {
@@ -302,30 +335,10 @@ pub fn label(hash: u32) -> String {
     }
     let Some(name) = name(hash) else { return format!("Shader {hash:08x}") };
     let base = name.trim_end_matches("_enveff");
-    let friendly = match base {
-        "vehicle_paint1" => "Primary paint",
-        "vehicle_paint2" => "Secondary paint",
-        "vehicle_paint3" | "vehicle_paint3_lvr" => "Paint 3 (pearl/livery)",
-        "vehicle_paint4" | "vehicle_paint4_emissive" => "Paint 4",
-        "vehicle_paint5" => "Paint 5",
-        "vehicle_paint6" => "Paint 6",
-        "vehicle_paint7" => "Paint 7",
-        "vehicle_paint8" => "Paint 8",
-        "vehicle_paint9" => "Paint 9",
-        "vehicle_vehglass" => "Glass",
-        "vehicle_vehglass_inner" => "Glass (inside)",
-        "vehicle_tire" | "vehicle_tire_emissive" => "Tyres",
-        "vehicle_interior" | "vehicle_interior2" => "Interior",
-        "vehicle_lightsemissive" | "vehicle_lights" | "vehicle_lightsemissive_siren" => "Lights",
-        "vehicle_badges" => "Badges",
-        "vehicle_licenseplate" => "License plate",
-        "vehicle_shuts" => "Door shuts",
-        "vehicle_dash_emissive" | "vehicle_dash_emissive_opaque" => "Dashboard",
-        "vehicle_mesh" | "vehicle_mesh2" => "Body details",
-        "vehicle_decal" | "vehicle_decal2" => "Decals",
-        _ => return name.to_owned(),
-    };
-    friendly.to_owned()
+    FRIENDLY_LABELS
+        .iter()
+        .find(|(shader, _)| *shader == base)
+        .map_or_else(|| name.to_owned(), |(_, friendly)| (*friendly).to_owned())
 }
 
 /// Whether the shader takes its colour from the car's paint (no colour texture).

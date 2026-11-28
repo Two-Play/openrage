@@ -386,24 +386,33 @@ fn read_expression_at(res: &Resource, e: u64, shift: u64) -> Result<Expression, 
     let (tracks_ptr, track_count) = list(res, e + 0x30 + shift)?;
     let (_, variables) = list(res, e + 0x50 + shift)?;
     let name = res.string(res.u64(e + 0x60 + shift)?).unwrap_or_default();
-    let tracks = (0..track_count)
-        .map(|i| {
-            let t = tracks_ptr + i * 4;
-            Ok(Track { bone: res.u16(t)?, track: res.u8(t + 2)?, format: res.u8(t + 3)? & 0x7F })
-        })
-        .collect::<Result<_, ResourceError>>()?;
+    let tracks = (0..track_count).map(|i| read_track(res, tracks_ptr + i * 4)).collect::<Result<_, _>>()?;
     let mut streams = Vec::with_capacity(stream_count as usize);
     for i in 0..stream_count {
-        let s = res.u64(streams_ptr + i * 8)?;
-        let name = res.u32(s)?;
-        let (l1, l2, l3) = (res.u32(s + 4)? as usize, res.u32(s + 8)? as usize, res.u16(s + 12)? as usize);
-        let d1 = res.bytes(s + 16, l1)?;
-        let d2 = res.bytes(s + 16 + l1 as u64, l2)?;
-        let d3 = res.bytes(s + 16 + (l1 + l2) as u64, l3)?;
-        let ops = if shift == 0 { read_ops(d1, d2, d3)? } else { read_ops_rdr2(d1, d2, d3)? };
-        streams.push(Stream { name, ops });
+        streams.push(read_stream(res, res.u64(streams_ptr + i * 8)?, shift)?);
     }
     Ok(Expression { name, tracks, streams, variables: variables as usize })
+}
+
+fn read_track(res: &Resource, t: u64) -> Result<Track, ResourceError> {
+    Ok(Track { bone: res.u16(t)?, track: res.u8(t + 2)?, format: res.u8(t + 3)? & 0x7F })
+}
+
+/// The three data blocks of the stream at `s`, one after the other behind its header.
+fn stream_data(res: &Resource, s: u64) -> Result<[&[u8]; 3], ResourceError> {
+    let (l1, l2, l3) = (res.u32(s + 4)? as usize, res.u32(s + 8)? as usize, res.u16(s + 12)? as usize);
+    let d1 = res.bytes(s + 16, l1)?;
+    let d2 = res.bytes(s + 16 + l1 as u64, l2)?;
+    let d3 = res.bytes(s + 16 + (l1 + l2) as u64, l3)?;
+    Ok([d1, d2, d3])
+}
+
+/// A stream: its name hash and the operations from its three data blocks (RDR2 when `shift` is set).
+fn read_stream(res: &Resource, s: u64, shift: u64) -> Result<Stream, ResourceError> {
+    let name = res.u32(s)?;
+    let [d1, d2, d3] = stream_data(res, s)?;
+    let ops = if shift == 0 { read_ops(d1, d2, d3)? } else { read_ops_rdr2(d1, d2, d3)? };
+    Ok(Stream { name, ops })
 }
 
 /// Reads an expression dictionary (`.yed`).

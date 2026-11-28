@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -616,25 +616,40 @@ impl Rpf9 {
             });
         }
         let outside = || RpfError::OutOfBounds { archive: self.display.clone(), entry: name.clone() };
-        if entry.offset < u64::from(self.header.data_offset)
-            || entry.stored == 0
-            || entry.size == 0
-            || entry.streams == 0
-            || entry.offset.checked_add(entry.stored).is_none_or(|end| end > self.size)
-        {
+        if !self.stored_in_bounds(entry) {
             return Err(outside());
         }
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(entry.offset))?;
         let mut reader = BufReader::with_capacity(1 << 16, file.take(entry.stored));
         if entry.kind != Kind::Zlib {
-            if entry.size != entry.stored || entry.streams != 1 {
-                return Err(outside());
-            }
-            let written = std::io::copy(&mut reader, out)?;
-            return if written == entry.size { Ok(written) } else { Err(outside()) };
+            return copy_plain(entry, &mut reader, out, outside);
         }
-        let inflate = |source| RpfError::Inflate { archive: self.display.clone(), entry: name.clone(), source };
+        self.copy_zlib(entry, &name, reader, out)
+    }
+
+    /// Whether the entry's stored bytes lie inside the file's data area.
+    fn stored_in_bounds(&self, entry: &Entry) -> bool {
+        !(entry.offset < u64::from(self.header.data_offset)
+            || entry.stored == 0
+            || entry.size == 0
+            || entry.streams == 0
+            || entry.offset.checked_add(entry.stored).is_none_or(|end| end > self.size))
+    }
+
+    fn inflate_error(&self, name: &str, source: std::io::Error) -> RpfError {
+        RpfError::Inflate { archive: self.display.clone(), entry: name.to_owned(), source }
+    }
+
+    /// Inflates the `entry.streams` zlib streams of a stored entry, checking every length against the index.
+    fn copy_zlib(
+        &self,
+        entry: &Entry,
+        name: &str,
+        mut reader: impl BufRead,
+        out: &mut dyn Write,
+    ) -> Result<u64, RpfError> {
+        let inflate = |source| self.inflate_error(name, source);
         let (mut read, mut written) = (0u64, 0u64);
         for _ in 0..entry.streams {
             // Streams start aligned; the entry itself does too.
@@ -827,80 +842,107 @@ impl Scanner {
         let size = self.size;
         let start = self.at(pos)?;
         if start.len() >= 28 && &start[..3] == b"KB2" && start[3].is_ascii_lowercase() {
-            // Bink 2: length without the first 8 bytes, frame count, …, width, height.
-            let total = u64::from(crate::word(start, 4)) + 8;
-            let (frames, width, height) = (crate::word(start, 8), crate::word(start, 20), crate::word(start, 24));
-            let plausible = (1..=10_000_000).contains(&frames)
-                && (1..=16_384).contains(&width)
-                && (1..=16_384).contains(&height)
-                && total >= 28
-                && total <= size - pos;
-            let mut head = [0u8; 16];
-            head.copy_from_slice(&start[..16]);
-            return Ok(plausible.then_some(Stream {
-                offset: pos,
-                stored: total,
-                size: total,
-                kind: Kind::Bink2,
-                head,
-                head_len: 16,
-            }));
+            return Ok(bink2_stream(start, pos, size));
         }
         if pos.is_multiple_of(ALIGN)
             && let Some(total) = awc_len(start)
         {
-            let mut head = [0u8; 16];
-            head.copy_from_slice(&start[..16]);
-            return Ok((total <= size - pos).then_some(Stream {
-                offset: pos,
-                stored: total,
-                size: total,
-                kind: Kind::Awc,
-                head,
-                head_len: 16,
-            }));
+            return Ok((total <= size - pos).then(|| container_stream(start, pos, total, Kind::Awc)));
         }
         if start.len() < 2 || start[0] != 0x78 || !matches!(start[1], 0x01 | 0x5E | 0x9C | 0xDA) {
             return Ok(None);
         }
-        let mut inflater = flate2::Decompress::new(true);
+        self.zlib_stream(pos, cancel)
+    }
+
+    /// Inflates from `pos` until the stream ends; `None` if it is not a complete zlib stream.
+    fn zlib_stream(&mut self, pos: u64, cancel: &AtomicBool) -> Result<Option<Stream>, RpfError> {
+        let mut probe = ZlibProbe { inflater: flate2::Decompress::new(true), head: [0u8; 16], head_len: 0 };
         let mut scratch = std::mem::take(&mut self.scratch);
-        let (mut head, mut head_len) = ([0u8; 16], 0usize);
-        let result = loop {
-            if cancel.load(Ordering::Relaxed) {
-                self.scratch = scratch;
-                return Err(RpfError::Cancelled);
-            }
-            let (read, written) = (inflater.total_in(), inflater.total_out());
-            let input = match self.at(pos + read) {
-                Ok(input) if !input.is_empty() => input,
-                Ok(_) => break None,
-                Err(e) => {
-                    self.scratch = scratch;
-                    return Err(e);
-                }
-            };
-            let status = inflater.decompress(input, &mut scratch, flate2::FlushDecompress::None);
-            let produced = (inflater.total_out() - written) as usize;
-            let take = produced.min(16 - head_len);
-            head[head_len..head_len + take].copy_from_slice(&scratch[..take]);
-            head_len += take;
-            match status {
-                Ok(flate2::Status::StreamEnd) => break Some(()),
-                Ok(_) if inflater.total_in() > read || produced > 0 => {}
-                _ => break None,
-            }
-        };
+        let result = self.inflate_until_end(pos, cancel, &mut scratch, &mut probe);
         self.scratch = scratch;
-        Ok(result.filter(|()| inflater.total_out() > 0).map(|()| Stream {
+        let inflater = &probe.inflater;
+        Ok(result?.filter(|()| inflater.total_out() > 0).map(|()| Stream {
             offset: pos,
             stored: inflater.total_in(),
             size: inflater.total_out(),
             kind: Kind::Zlib,
-            head,
-            head_len: head_len as u8,
+            head: probe.head,
+            head_len: probe.head_len as u8,
         }))
     }
+
+    /// Feeds the file from `pos` to the inflater; `Some` when the stream ended.
+    fn inflate_until_end(
+        &mut self,
+        pos: u64,
+        cancel: &AtomicBool,
+        scratch: &mut [u8],
+        probe: &mut ZlibProbe,
+    ) -> Result<Option<()>, RpfError> {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(RpfError::Cancelled);
+            }
+            let inflater = &mut probe.inflater;
+            let (read, written) = (inflater.total_in(), inflater.total_out());
+            let input = self.at(pos + read)?;
+            if input.is_empty() {
+                return Ok(None);
+            }
+            let status = inflater.decompress(input, scratch, flate2::FlushDecompress::None);
+            let produced = (inflater.total_out() - written) as usize;
+            let take = produced.min(16 - probe.head_len);
+            probe.head[probe.head_len..probe.head_len + take].copy_from_slice(&scratch[..take]);
+            probe.head_len += take;
+            match status {
+                Ok(flate2::Status::StreamEnd) => return Ok(Some(())),
+                Ok(_) if probe.inflater.total_in() > read || produced > 0 => {}
+                _ => return Ok(None),
+            }
+        }
+    }
+}
+
+/// An inflater and the first output bytes it produced.
+struct ZlibProbe {
+    inflater: flate2::Decompress,
+    head: [u8; 16],
+    head_len: usize,
+}
+
+/// The Bink 2 video at the start of `start` (at least 28 bytes), if its header is plausible.
+fn bink2_stream(start: &[u8], pos: u64, size: u64) -> Option<Stream> {
+    // Length without the first 8 bytes, frame count, …, width, height.
+    let total = u64::from(crate::word(start, 4)) + 8;
+    let (frames, width, height) = (crate::word(start, 8), crate::word(start, 20), crate::word(start, 24));
+    let plausible = (1..=10_000_000).contains(&frames)
+        && (1..=16_384).contains(&width)
+        && (1..=16_384).contains(&height)
+        && total >= 28
+        && total <= size - pos;
+    plausible.then(|| container_stream(start, pos, total, Kind::Bink2))
+}
+
+/// A stream stored as is, `total` bytes long, starting at `pos`.
+fn container_stream(start: &[u8], pos: u64, total: u64, kind: Kind) -> Stream {
+    let mut head = [0u8; 16];
+    head.copy_from_slice(&start[..16]);
+    Stream { offset: pos, stored: total, size: total, kind, head, head_len: 16 }
+}
+
+/// Copies an entry that is stored as is; its sizes must agree with the index.
+fn copy_plain(
+    entry: &Entry,
+    reader: &mut impl Read,
+    out: &mut dyn Write,
+    outside: impl Fn() -> RpfError,
+) -> Result<u64, RpfError> {
+    if entry.size != entry.stored || entry.streams != 1 {
+        return Err(outside());
+    }
+    let written = std::io::copy(reader, out)?;
+    if written == entry.size { Ok(written) } else { Err(outside()) }
 }
 
 /// The length of the audio container that starts here, from its own tables:
@@ -969,34 +1011,10 @@ pub fn decode_index(data: &[u8]) -> Option<Vec<Entry>> {
     if !rest.is_empty() {
         return None;
     }
-    let u64_at = |r: &[u8], at: usize| Some(u64::from_le_bytes(r.get(at..at + 8)?.try_into().ok()?));
     let mut entries = Vec::with_capacity(records.len());
     for r in records {
-        let kind = match r[28] {
-            0 => Kind::Zlib,
-            1 => Kind::Bink2,
-            2 => Kind::Awc,
-            _ => return None,
-        };
-        let entry = Entry {
-            offset: u64_at(r, 0)?,
-            stored: u64_at(r, 8)?,
-            size: u64_at(r, 16)?,
-            streams: crate::word(r, 24),
-            kind,
-            head: r[30..46].try_into().ok()?,
-            head_len: r[29],
-        };
-        let end = entry.offset.checked_add(entry.stored)?;
-        if entry.offset < HEADER_LEN as u64
-            || entry.stored == 0
-            || entry.size == 0
-            || entry.streams == 0
-            || entry.head_len > 16
-            || u64::from(entry.head_len) > entry.size
-            || (entry.kind != Kind::Zlib && (entry.stored != entry.size || entry.streams != 1))
-            || u64::from(entry.streams) > entry.stored
-            || end <= entry.offset
+        let entry = decode_record(r)?;
+        if !plausible_entry(&entry)
             || entries.last().is_some_and(|prev: &Entry| prev.offset + prev.stored > entry.offset)
         {
             return None;
@@ -1004,6 +1022,39 @@ pub fn decode_index(data: &[u8]) -> Option<Vec<Entry>> {
         entries.push(entry);
     }
     Some(entries)
+}
+
+fn decode_record(r: &[u8; INDEX_RECORD]) -> Option<Entry> {
+    let u64_at = |at: usize| Some(u64::from_le_bytes(r.get(at..at + 8)?.try_into().ok()?));
+    let kind = match r[28] {
+        0 => Kind::Zlib,
+        1 => Kind::Bink2,
+        2 => Kind::Awc,
+        _ => return None,
+    };
+    Some(Entry {
+        offset: u64_at(0)?,
+        stored: u64_at(8)?,
+        size: u64_at(16)?,
+        streams: crate::word(r, 24),
+        kind,
+        head: r[30..46].try_into().ok()?,
+        head_len: r[29],
+    })
+}
+
+/// Whether a decoded index record is consistent with itself.
+fn plausible_entry(entry: &Entry) -> bool {
+    let Some(end) = entry.offset.checked_add(entry.stored) else { return false };
+    let sizes = entry.offset >= HEADER_LEN as u64 && entry.stored != 0 && entry.size != 0 && end > entry.offset;
+    sizes && plausible_streams(entry)
+}
+
+fn plausible_streams(entry: &Entry) -> bool {
+    let head = entry.head_len <= 16 && u64::from(entry.head_len) <= entry.size;
+    let streams = entry.streams != 0 && u64::from(entry.streams) <= entry.stored;
+    let single = entry.kind == Kind::Zlib || (entry.stored == entry.size && entry.streams == 1);
+    head && streams && single
 }
 
 #[cfg(test)]

@@ -1,6 +1,8 @@
 //! Red Dead Redemption 2: archives, keys, names and peds.
 
 use crate::*;
+use rage_rpf::rpf8::{Compression, Rdr2Keys, Rpf8};
+use rage_rpf::rpf8_names::NameIndex;
 
 /// Which files `openrage rpf8` parses instead of only reading them.
 #[derive(Clone, Copy)]
@@ -15,23 +17,431 @@ pub(crate) struct Checks {
     pub(crate) anims: bool,
 }
 
+fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let p = e?.path();
+        if p.is_dir() {
+            collect(&p, out)?;
+        } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rpf")) {
+            out.push(p);
+        }
+    }
+    Ok(())
+}
+
+/// Counts and report lines for one archive file and everything nested in it.
+#[derive(Default)]
+struct Tally {
+    archives: usize,
+    nested: usize,
+    readable: usize,
+    entries: usize,
+    failed: usize,
+    /// Textures decoded, models parsed or text tables read.
+    textures: usize,
+    /// Triangles of the models, or strings of the text tables.
+    triangles: usize,
+    /// PSO files rebuilt byte for byte, and ones not fully readable.
+    identical: usize,
+    unreadable: usize,
+    /// Fragment children with meshes (wheels) and cloths.
+    parts: usize,
+    cloths: usize,
+    lines: Vec<String>,
+}
+/// Parses a texture dictionary and decodes all its textures; returns how many.
+fn check_textures(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
+    let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
+    let dict = rage_formats::ytd::parse_rdr2(&res).map_err(|err| err.to_string())?;
+    if let Some(err) = dict.errors.first() {
+        return Err(format!(
+            "{} of {} textures unreadable, e.g. {err}",
+            dict.errors.len(),
+            dict.errors.len() + dict.textures.len()
+        ));
+    }
+    for t in &dict.textures {
+        if t.to_rgba().is_none() {
+            return Err(format!("{}: cannot decode {}", t.name, t.format.name()));
+        }
+    }
+    Ok(dict.textures.len())
+}
+fn has_implausible_positions(d: &rage_formats::drawable::Drawable) -> bool {
+    d.meshes.iter().any(|m| m.positions.iter().any(|p| p.iter().any(|v| !v.is_finite() || v.abs() > 1.0e6)))
+}
+
+/// Parses a model; returns its triangle count, and for a fragment its
+/// children with meshes and its cloths.
+fn check_model(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<(usize, usize, usize), String> {
+    use rage_formats::drawable;
+    let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
+    let (mut parts, mut cloths) = (0, 0);
+    let drawables = match e.ext_id {
+        3 => {
+            // The body, the children with meshes (wheels) and the cloth.
+            let f = drawable::parse_fragment_rdr2(&res).map_err(|err| err.to_string())?;
+            (parts, cloths) = (f.children.len(), f.cloths.len());
+            std::iter::once(f.drawable).chain(f.children.into_iter().map(|c| c.drawable)).chain(f.cloths).collect()
+        }
+        4 => drawable::parse_ydd_rdr2(&res).map_err(|err| err.to_string())?.into_iter().map(|(_, d)| d).collect(),
+        _ => vec![drawable::parse_ydr_rdr2(&res).map_err(|err| err.to_string())?],
+    };
+    let triangles: usize = drawables.iter().map(|d| d.triangle_count()).sum();
+    if drawables.iter().all(|d| d.meshes.is_empty()) {
+        return Err("no meshes".into());
+    }
+    if drawables.iter().any(has_implausible_positions) {
+        return Err("implausible vertex positions".into());
+    }
+    Ok((triangles, parts, cloths))
+}
+/// Converts a metadata file to XML; returns how many problems it had.
+fn check_meta(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
+    let xml = if e.is_resource {
+        let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
+        if !rage_formats::meta::is_meta(res.version) {
+            return Err(format!("resource version {} is not a meta file", res.version));
+        }
+        openrage_app::metadata::from_resource(&res).map_err(|err| err.to_string())?
+    } else {
+        openrage_app::metadata::from_bytes_rdr2(&rpf.read(e).map_err(|err| err.to_string())?)
+            .map_err(|err| err.to_string())?
+    };
+    Ok(xml.errors.len())
+}
+/// Reads a text table; returns its string count.
+fn check_texts(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
+    let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
+    Ok(rage_formats::ldb::parse(&res).map_err(|err| err.to_string())?.len())
+}
+/// Decodes every sound of an audio container; `None` when it is not one.
+fn check_audio(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<Option<(usize, f32)>, String> {
+    let data = rpf.read(e).map_err(|err| err.to_string())?;
+    if !data.starts_with(b"ADAT") {
+        return Ok(None);
+    }
+    let awc = rage_formats::awc::Awc::parse_rdr2(data).map_err(|err| err.to_string())?;
+    if awc.stream_format.is_some() {
+        let pcm = awc.decode_stream().map_err(|err| err.to_string())?;
+        return Ok(Some((1, pcm.duration_secs())));
+    }
+    let mut secs = 0.0;
+    for i in 0..awc.sounds.len() {
+        secs += awc.decode_sound(i).map_err(|err| format!("sound {:08x}: {err}", awc.sounds[i].id))?.duration_secs();
+    }
+    Ok(Some((awc.sounds.len(), secs)))
+}
+/// Indentation and name of the entry a message belongs to.
+struct At<'a> {
+    indent: &'a str,
+    name: &'a str,
+}
+impl Tally {
+    fn fail(&mut self, at: &At, err: impl std::fmt::Display) {
+        self.failed += 1;
+        self.lines.push(format!("{}{}: {err}", at.indent, at.name));
+    }
+}
+/// What one level of the archive walk needs besides the archive itself.
+struct Walk<'a> {
+    depth: usize,
+    list: bool,
+    checks: Checks,
+    indent: &'a str,
+}
+fn list_line(e: &rage_rpf::rpf8::Entry, indent: &str, name: &str) -> String {
+    let comp = match e.compression {
+        Compression::None => "",
+        Compression::Deflate => " deflate",
+        Compression::Oodle => " oodle",
+        Compression::Unknown(_) => " ?",
+    };
+    let enc = if e.is_encrypted() { " encrypted" } else { "" };
+    format!("{indent}{name:<60} {:>10}{comp}{enc}", e.size())
+}
+fn scan_anims(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+    // Extension id 67 is `.#cd` (`.ycd` on PC).
+    if !(e.ext_id == 67 && e.is_resource) {
+        return;
+    }
+    match rpf
+        .read_resource(e)
+        .map_err(|err| err.to_string())
+        .and_then(|res| rage_formats::clip::parse_ycd(&res).map_err(|err| err.to_string()))
+    {
+        Ok(dict) => {
+            for a in &dict.animations {
+                for f in 0..a.frames {
+                    for k in 0..a.tracks.len() {
+                        let _ = a.value(k, f as f32);
+                    }
+                }
+            }
+            t.textures += dict.clips.len();
+            t.triangles += dict.animations.len();
+        }
+        Err(err) => t.fail(at, err),
+    }
+}
+fn scan_audio(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+    // Audio containers have no extension (their hash covers the path).
+    if !(e.ext_id == 0xFF && !e.is_resource) {
+        return;
+    }
+    match check_audio(rpf, e) {
+        Ok(Some((sounds, secs))) => {
+            t.textures += sounds;
+            t.triangles += secs.round() as usize;
+        }
+        Ok(None) => {}
+        Err(err) => t.fail(at, err),
+    }
+}
+fn pso_rebuild(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<Option<super::verify::PsoRoundTrip>, String> {
+    rpf.read(e).map_err(|err| err.to_string()).and_then(|d| {
+        if rage_formats::pso::is_pso(&d) { super::verify::pso_round_trip(&d, true).map(Some) } else { Ok(None) }
+    })
+}
+fn scan_rebuild(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+    use super::verify::PsoRoundTrip;
+    if !(matches!(e.ext_id, 1 | 11 | 73 | 74) && !e.is_resource) {
+        return;
+    }
+    match pso_rebuild(rpf, e) {
+        Ok(None) => {}
+        Ok(Some(r)) => {
+            t.textures += 1;
+            match r {
+                PsoRoundTrip::Identical => t.identical += 1,
+                PsoRoundTrip::SameXml => {}
+                PsoRoundTrip::Unreadable => t.unreadable += 1,
+            }
+        }
+        Err(err) => t.fail(at, err),
+    }
+}
+fn scan_meta(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+    // .ymap 73, .ytyp 74, .ymt 11, .ymf 1
+    if !matches!(e.ext_id, 1 | 11 | 73 | 74) {
+        return;
+    }
+    match check_meta(rpf, e) {
+        Ok(problems) => {
+            t.textures += 1;
+            t.triangles += problems;
+            if problems > 0 {
+                t.lines.push(format!("{}{}: {problems} parts not read", at.indent, at.name));
+            }
+        }
+        Err(err) => t.fail(at, err),
+    }
+}
+fn scan_models(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+    if !(matches!(e.ext_id, 2..=4) && e.is_resource) {
+        return;
+    }
+    match check_model(rpf, e) {
+        Ok((n, parts, cloths)) => {
+            t.textures += 1;
+            t.triangles += n;
+            t.parts += parts;
+            t.cloths += cloths;
+        }
+        Err(err) => t.fail(at, err),
+    }
+}
+fn scan_texts(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+    // Extension id 76 is `.#ldb` (`.yldb` on PC).
+    if !(e.ext_id == 76 && e.is_resource) {
+        return;
+    }
+    match check_texts(rpf, e) {
+        Ok(n) => {
+            t.textures += 1;
+            t.triangles += n;
+        }
+        Err(err) => t.fail(at, err),
+    }
+}
+fn scan_textures(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+    if !(e.ext_id == 5 && e.is_resource) {
+        return;
+    }
+    match check_textures(rpf, e) {
+        Ok(n) => t.textures += n,
+        Err(err) => t.fail(at, err),
+    }
+}
+/// Parses a non-archive entry the way the selected check says; without one it is only read.
+fn check_entry(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, checks: Checks, at: &At, t: &mut Tally) {
+    if checks.anims {
+        scan_anims(rpf, e, at, t);
+    } else if checks.audio {
+        scan_audio(rpf, e, at, t);
+    } else if checks.meta && checks.rebuild {
+        scan_rebuild(rpf, e, at, t);
+    } else if checks.meta {
+        scan_meta(rpf, e, at, t);
+    } else if checks.models {
+        scan_models(rpf, e, at, t);
+    } else if checks.texts {
+        scan_texts(rpf, e, at, t);
+    } else if checks.textures {
+        scan_textures(rpf, e, at, t);
+    } else if let Err(err) = rpf.read(e) {
+        t.fail(at, err);
+    }
+}
+fn walk_entry(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, w: &Walk, t: &mut Tally) {
+    t.entries += 1;
+    let name = e.display_name(rpf.header().platform);
+    if w.list {
+        t.lines.push(list_line(e, w.indent, &name));
+    }
+    let at = At { indent: w.indent, name: &name };
+    if e.ext_id != 0 {
+        return check_entry(rpf, e, w.checks, &at, t);
+    }
+    match rpf.open_child(e) {
+        Ok(child) => {
+            t.nested += 1;
+            walk(&child, w.depth + 1, w.list, w.checks, t);
+        }
+        Err(err) => t.fail(&at, err),
+    }
+}
+fn walk(rpf: &Rpf8, depth: usize, list: bool, checks: Checks, t: &mut Tally) {
+    let Some(entries) = rpf.entries() else { return };
+    t.readable += 1;
+    let indent = "  ".repeat(depth + 1);
+    let w = Walk { depth, list, checks, indent: &indent };
+    for e in entries {
+        walk_entry(rpf, e, &w, t);
+    }
+}
+
+/// What scanning one archive file needs besides the file itself.
+struct Scan<'a> {
+    root: &'a Path,
+    keys: &'a Option<Arc<Rdr2Keys>>,
+    names: &'a Option<Arc<NameIndex>>,
+    list: bool,
+    checks: Checks,
+}
+
+impl Scan<'_> {
+    /// Opens one archive file and walks it; returns the display name and the tally.
+    fn file(&self, file: &Path) -> (String, Tally) {
+        let name = file
+            .strip_prefix(self.root)
+            .ok()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        let mut t = Tally::default();
+        if file.metadata().is_ok_and(|m| m.len() == 0) {
+            t.lines.push(format!("{name}: empty file"));
+            return (name, t);
+        }
+        match Rpf8::open_with_keys(file, self.keys.clone()) {
+            Ok(rpf) => self.walk_archive(rpf, &name, &mut t),
+            Err(e) => {
+                t.failed += 1;
+                t.lines.push(format!("{name}: {e}"));
+            }
+        }
+        (name, t)
+    }
+
+    fn walk_archive(&self, mut rpf: Rpf8, name: &str, t: &mut Tally) {
+        if let Some(n) = self.names {
+            rpf.set_names(std::sync::Arc::clone(n));
+        }
+        t.archives = 1;
+        let h = rpf.header();
+        let table =
+            if h.is_encrypted() { format!("encrypted (key {})", h.decryption_tag) } else { "plaintext".to_string() };
+        t.lines.push(format!(
+            "{name}: {} entries, table {table}, platform '{}', {} bytes",
+            h.entry_count,
+            h.platform,
+            rpf.size()
+        ));
+        walk(&rpf, 0, self.list, self.checks, t);
+    }
+}
+
+/// The counters of all archive files together.
+#[derive(Default)]
+struct Totals {
+    ok: usize,
+    nested: usize,
+    plain: usize,
+    entries: usize,
+    failed: usize,
+    empty: usize,
+    textures: usize,
+    triangles: usize,
+    identical: usize,
+    unreadable: usize,
+    parts: usize,
+    cloths: usize,
+}
+
+impl Totals {
+    fn add(&mut self, t: &Tally) {
+        if t.archives == 0 && t.failed == 0 {
+            self.empty += 1;
+        }
+        self.ok += t.archives;
+        self.nested += t.nested;
+        self.plain += t.readable;
+        self.entries += t.entries;
+        self.failed += t.failed;
+        self.textures += t.textures;
+        self.triangles += t.triangles;
+        self.identical += t.identical;
+        self.unreadable += t.unreadable;
+        self.parts += t.parts;
+        self.cloths += t.cloths;
+    }
+}
+
+/// The line that says what the selected checks found.
+fn print_check_summary(t: &Totals, checks: Checks) {
+    let Totals { textures, triangles, identical, unreadable, parts, cloths, .. } = *t;
+    if checks.textures {
+        outln!("\n{textures} textures decoded");
+    }
+    if checks.models {
+        outln!("\n{textures} models parsed ({triangles} triangles; fragments: {parts} parts, {cloths} cloths)");
+    }
+    if checks.texts {
+        outln!("\n{textures} text tables read ({triangles} strings)");
+    }
+    if checks.meta && checks.rebuild {
+        outln!(
+            "\n{textures} PSO files converted to XML and back: {identical} identical, {} with other bytes but \
+             the same XML, {unreadable} not fully readable (skipped)",
+            textures - identical - unreadable
+        );
+    } else if checks.meta {
+        outln!("\n{textures} metadata files converted ({triangles} parts not read)");
+    }
+    if checks.audio {
+        outln!("\n{textures} sounds decoded ({:.1} hours)", triangles as f64 / 3600.0);
+    }
+    if checks.anims {
+        outln!("\n{textures} clips, {triangles} animations read (every frame evaluated)");
+    }
+}
+
 pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
-    let Checks { textures, models, texts: text, meta, rebuild, audio, anims } = checks;
-    use rage_rpf::rpf8::{Compression, Rpf8};
     let keys = openrage_app::rdr2::load_keys()?;
     let start = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
     let names = openrage_app::rdr2::game_folder(start).and_then(|g| openrage_app::rdr2::load_names(&g));
-    fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-        for e in std::fs::read_dir(dir)? {
-            let p = e?.path();
-            if p.is_dir() {
-                collect(&p, out)?;
-            } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("rpf")) {
-                out.push(p);
-            }
-        }
-        Ok(())
-    }
     let mut files = Vec::new();
     if path.is_dir() {
         collect(path, &mut files)?;
@@ -39,397 +449,22 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
     } else {
         files.push(path.to_path_buf());
     }
-    /// Counts and report lines for one archive file and everything nested in it.
-    #[derive(Default)]
-    struct Tally {
-        archives: usize,
-        nested: usize,
-        readable: usize,
-        entries: usize,
-        failed: usize,
-        /// Textures decoded, models parsed or text tables read.
-        textures: usize,
-        /// Triangles of the models, or strings of the text tables.
-        triangles: usize,
-        /// PSO files rebuilt byte for byte, and ones not fully readable.
-        identical: usize,
-        unreadable: usize,
-        /// Fragment children with meshes (wheels) and cloths.
-        parts: usize,
-        cloths: usize,
-        lines: Vec<String>,
-    }
-    /// Parses a texture dictionary and decodes all its textures; returns how many.
-    fn check_textures(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
-        let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
-        let dict = rage_formats::ytd::parse_rdr2(&res).map_err(|err| err.to_string())?;
-        if let Some(err) = dict.errors.first() {
-            return Err(format!(
-                "{} of {} textures unreadable, e.g. {err}",
-                dict.errors.len(),
-                dict.errors.len() + dict.textures.len()
-            ));
-        }
-        for t in &dict.textures {
-            if t.to_rgba().is_none() {
-                return Err(format!("{}: cannot decode {}", t.name, t.format.name()));
-            }
-        }
-        Ok(dict.textures.len())
-    }
-    /// Parses a model; returns its triangle count, and for a fragment its
-    /// children with meshes and its cloths.
-    fn check_model(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<(usize, usize, usize), String> {
-        use rage_formats::drawable;
-        let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
-        let (mut parts, mut cloths) = (0, 0);
-        let drawables = match e.ext_id {
-            3 => {
-                // The body, the children with meshes (wheels) and the cloth.
-                let f = drawable::parse_fragment_rdr2(&res).map_err(|err| err.to_string())?;
-                (parts, cloths) = (f.children.len(), f.cloths.len());
-                std::iter::once(f.drawable).chain(f.children.into_iter().map(|c| c.drawable)).chain(f.cloths).collect()
-            }
-            4 => drawable::parse_ydd_rdr2(&res).map_err(|err| err.to_string())?.into_iter().map(|(_, d)| d).collect(),
-            _ => vec![drawable::parse_ydr_rdr2(&res).map_err(|err| err.to_string())?],
-        };
-        let triangles: usize = drawables.iter().map(|d| d.triangle_count()).sum();
-        if drawables.iter().all(|d| d.meshes.is_empty()) {
-            return Err("no meshes".into());
-        }
-        for d in &drawables {
-            for m in &d.meshes {
-                if m.positions.iter().any(|p| p.iter().any(|v| !v.is_finite() || v.abs() > 1.0e6)) {
-                    return Err("implausible vertex positions".into());
-                }
-            }
-        }
-        Ok((triangles, parts, cloths))
-    }
-    /// Converts a metadata file to XML; returns how many problems it had.
-    fn check_meta(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
-        let xml = if e.is_resource {
-            let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
-            if !rage_formats::meta::is_meta(res.version) {
-                return Err(format!("resource version {} is not a meta file", res.version));
-            }
-            openrage_app::metadata::from_resource(&res).map_err(|err| err.to_string())?
-        } else {
-            openrage_app::metadata::from_bytes_rdr2(&rpf.read(e).map_err(|err| err.to_string())?)
-                .map_err(|err| err.to_string())?
-        };
-        Ok(xml.errors.len())
-    }
-    /// Reads a text table; returns its string count.
-    fn check_texts(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<usize, String> {
-        let res = rpf.read_resource(e).map_err(|err| err.to_string())?;
-        Ok(rage_formats::ldb::parse(&res).map_err(|err| err.to_string())?.len())
-    }
-    /// Decodes every sound of an audio container; `None` when it is not one.
-    fn check_audio(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<Option<(usize, f32)>, String> {
-        let data = rpf.read(e).map_err(|err| err.to_string())?;
-        if !data.starts_with(b"ADAT") {
-            return Ok(None);
-        }
-        let awc = rage_formats::awc::Awc::parse_rdr2(data).map_err(|err| err.to_string())?;
-        if awc.stream_format.is_some() {
-            let pcm = awc.decode_stream().map_err(|err| err.to_string())?;
-            return Ok(Some((1, pcm.duration_secs())));
-        }
-        let mut secs = 0.0;
-        for i in 0..awc.sounds.len() {
-            secs +=
-                awc.decode_sound(i).map_err(|err| format!("sound {:08x}: {err}", awc.sounds[i].id))?.duration_secs();
-        }
-        Ok(Some((awc.sounds.len(), secs)))
-    }
-    /// Indentation and name of the entry a message belongs to.
-    struct At<'a> {
-        indent: &'a str,
-        name: &'a str,
-    }
-    impl Tally {
-        fn fail(&mut self, at: &At, err: impl std::fmt::Display) {
-            self.failed += 1;
-            self.lines.push(format!("{}{}: {err}", at.indent, at.name));
-        }
-    }
-    /// What one level of the archive walk needs besides the archive itself.
-    struct Walk<'a> {
-        depth: usize,
-        list: bool,
-        checks: Checks,
-        indent: &'a str,
-    }
-    fn list_line(e: &rage_rpf::rpf8::Entry, indent: &str, name: &str) -> String {
-        let comp = match e.compression {
-            Compression::None => "",
-            Compression::Deflate => " deflate",
-            Compression::Oodle => " oodle",
-            Compression::Unknown(_) => " ?",
-        };
-        let enc = if e.is_encrypted() { " encrypted" } else { "" };
-        format!("{indent}{name:<60} {:>10}{comp}{enc}", e.size())
-    }
-    fn scan_anims(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
-        // Extension id 67 is `.#cd` (`.ycd` on PC).
-        if !(e.ext_id == 67 && e.is_resource) {
-            return;
-        }
-        match rpf
-            .read_resource(e)
-            .map_err(|err| err.to_string())
-            .and_then(|res| rage_formats::clip::parse_ycd(&res).map_err(|err| err.to_string()))
-        {
-            Ok(dict) => {
-                for a in &dict.animations {
-                    for f in 0..a.frames {
-                        for k in 0..a.tracks.len() {
-                            let _ = a.value(k, f as f32);
-                        }
-                    }
-                }
-                t.textures += dict.clips.len();
-                t.triangles += dict.animations.len();
-            }
-            Err(err) => t.fail(at, err),
-        }
-    }
-    fn scan_audio(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
-        // Audio containers have no extension (their hash covers the path).
-        if !(e.ext_id == 0xFF && !e.is_resource) {
-            return;
-        }
-        match check_audio(rpf, e) {
-            Ok(Some((sounds, secs))) => {
-                t.textures += sounds;
-                t.triangles += secs.round() as usize;
-            }
-            Ok(None) => {}
-            Err(err) => t.fail(at, err),
-        }
-    }
-    fn pso_rebuild(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<Option<super::verify::PsoRoundTrip>, String> {
-        rpf.read(e).map_err(|err| err.to_string()).and_then(|d| {
-            if rage_formats::pso::is_pso(&d) { super::verify::pso_round_trip(&d, true).map(Some) } else { Ok(None) }
-        })
-    }
-    fn scan_rebuild(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
-        use super::verify::PsoRoundTrip;
-        if !(matches!(e.ext_id, 1 | 11 | 73 | 74) && !e.is_resource) {
-            return;
-        }
-        match pso_rebuild(rpf, e) {
-            Ok(None) => {}
-            Ok(Some(r)) => {
-                t.textures += 1;
-                match r {
-                    PsoRoundTrip::Identical => t.identical += 1,
-                    PsoRoundTrip::SameXml => {}
-                    PsoRoundTrip::Unreadable => t.unreadable += 1,
-                }
-            }
-            Err(err) => t.fail(at, err),
-        }
-    }
-    fn scan_meta(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
-        // .ymap 73, .ytyp 74, .ymt 11, .ymf 1
-        if !matches!(e.ext_id, 1 | 11 | 73 | 74) {
-            return;
-        }
-        match check_meta(rpf, e) {
-            Ok(problems) => {
-                t.textures += 1;
-                t.triangles += problems;
-                if problems > 0 {
-                    t.lines.push(format!("{}{}: {problems} parts not read", at.indent, at.name));
-                }
-            }
-            Err(err) => t.fail(at, err),
-        }
-    }
-    fn scan_models(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
-        if !(matches!(e.ext_id, 2..=4) && e.is_resource) {
-            return;
-        }
-        match check_model(rpf, e) {
-            Ok((n, parts, cloths)) => {
-                t.textures += 1;
-                t.triangles += n;
-                t.parts += parts;
-                t.cloths += cloths;
-            }
-            Err(err) => t.fail(at, err),
-        }
-    }
-    fn scan_texts(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
-        // Extension id 76 is `.#ldb` (`.yldb` on PC).
-        if !(e.ext_id == 76 && e.is_resource) {
-            return;
-        }
-        match check_texts(rpf, e) {
-            Ok(n) => {
-                t.textures += 1;
-                t.triangles += n;
-            }
-            Err(err) => t.fail(at, err),
-        }
-    }
-    fn scan_textures(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
-        if !(e.ext_id == 5 && e.is_resource) {
-            return;
-        }
-        match check_textures(rpf, e) {
-            Ok(n) => t.textures += n,
-            Err(err) => t.fail(at, err),
-        }
-    }
-    /// Parses a non-archive entry the way the selected check says; without one it is only read.
-    fn check_entry(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, checks: Checks, at: &At, t: &mut Tally) {
-        if checks.anims {
-            scan_anims(rpf, e, at, t);
-        } else if checks.audio {
-            scan_audio(rpf, e, at, t);
-        } else if checks.meta && checks.rebuild {
-            scan_rebuild(rpf, e, at, t);
-        } else if checks.meta {
-            scan_meta(rpf, e, at, t);
-        } else if checks.models {
-            scan_models(rpf, e, at, t);
-        } else if checks.texts {
-            scan_texts(rpf, e, at, t);
-        } else if checks.textures {
-            scan_textures(rpf, e, at, t);
-        } else if let Err(err) = rpf.read(e) {
-            t.fail(at, err);
-        }
-    }
-    fn walk_entry(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, w: &Walk, t: &mut Tally) {
-        t.entries += 1;
-        let name = e.display_name(rpf.header().platform);
-        if w.list {
-            t.lines.push(list_line(e, w.indent, &name));
-        }
-        let at = At { indent: w.indent, name: &name };
-        if e.ext_id != 0 {
-            return check_entry(rpf, e, w.checks, &at, t);
-        }
-        match rpf.open_child(e) {
-            Ok(child) => {
-                t.nested += 1;
-                walk(&child, w.depth + 1, w.list, w.checks, t);
-            }
-            Err(err) => t.fail(&at, err),
-        }
-    }
-    fn walk(rpf: &Rpf8, depth: usize, list: bool, checks: Checks, t: &mut Tally) {
-        let Some(entries) = rpf.entries() else { return };
-        t.readable += 1;
-        let indent = "  ".repeat(depth + 1);
-        let w = Walk { depth, list, checks, indent: &indent };
-        for e in entries {
-            walk_entry(rpf, e, &w, t);
-        }
-    }
+    let scan = Scan { root: path, keys: &keys, names: &names, list, checks };
     let tallies: Vec<(String, Tally)> = {
         use rayon::prelude::*;
-        files
-            .par_iter()
-            .map(|file| {
-                let name = file
-                    .strip_prefix(path)
-                    .ok()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(file)
-                    .display()
-                    .to_string();
-                let mut t = Tally::default();
-                if file.metadata().is_ok_and(|m| m.len() == 0) {
-                    t.lines.push(format!("{name}: empty file"));
-                    return (name, t);
-                }
-                match Rpf8::open_with_keys(file, keys.clone()) {
-                    Ok(mut rpf) => {
-                        if let Some(n) = &names {
-                            rpf.set_names(std::sync::Arc::clone(n));
-                        }
-                        t.archives = 1;
-                        let h = rpf.header();
-                        let table = if h.is_encrypted() {
-                            format!("encrypted (key {})", h.decryption_tag)
-                        } else {
-                            "plaintext".to_string()
-                        };
-                        t.lines.push(format!(
-                            "{name}: {} entries, table {table}, platform '{}', {} bytes",
-                            h.entry_count,
-                            h.platform,
-                            rpf.size()
-                        ));
-                        walk(&rpf, 0, list, checks, &mut t);
-                    }
-                    Err(e) => {
-                        t.failed += 1;
-                        t.lines.push(format!("{name}: {e}"));
-                    }
-                }
-                (name, t)
-            })
-            .collect()
+        files.par_iter().map(|file| scan.file(file)).collect()
     };
-    let (mut ok, mut nested, mut plain, mut entries_total, mut failed, mut empty) = (0, 0, 0, 0usize, 0, 0);
-    let mut textures_total = 0;
-    let mut triangles_total = 0;
-    let (mut identical, mut unreadable) = (0, 0);
-    let (mut parts_total, mut cloths_total) = (0, 0);
+    let mut totals = Totals::default();
     for (_, t) in &tallies {
         for l in &t.lines {
             outln!("{l}");
         }
-        if t.archives == 0 && t.failed == 0 {
-            empty += 1;
-        }
-        ok += t.archives;
-        nested += t.nested;
-        plain += t.readable;
-        entries_total += t.entries;
-        failed += t.failed;
-        textures_total += t.textures;
-        triangles_total += t.triangles;
-        identical += t.identical;
-        unreadable += t.unreadable;
-        parts_total += t.parts;
-        cloths_total += t.cloths;
+        totals.add(t);
     }
-    if textures {
-        outln!("\n{textures_total} textures decoded");
-    }
-    if models {
-        outln!(
-            "\n{textures_total} models parsed ({triangles_total} triangles; fragments: {parts_total} parts, \
-             {cloths_total} cloths)"
-        );
-    }
-    if text {
-        outln!("\n{textures_total} text tables read ({triangles_total} strings)");
-    }
-    if meta && rebuild {
-        outln!(
-            "\n{textures_total} PSO files converted to XML and back: {identical} identical, {} with other bytes but \
-             the same XML, {unreadable} not fully readable (skipped)",
-            textures_total - identical - unreadable
-        );
-    } else if meta {
-        outln!("\n{textures_total} metadata files converted ({triangles_total} parts not read)");
-    }
-    if audio {
-        outln!("\n{textures_total} sounds decoded ({:.1} hours)", triangles_total as f64 / 3600.0);
-    }
-    if anims {
-        outln!("\n{textures_total} clips, {triangles_total} animations read (every frame evaluated)");
-    }
+    print_check_summary(&totals, checks);
+    let Totals { ok, nested, plain, entries, failed, empty, .. } = totals;
     outln!(
-        "\n{ok} archives read ({nested} more nested in them), {empty} empty, {failed} failed; {plain} with a readable table ({entries_total} entries).{}",
+        "\n{ok} archives read ({nested} more nested in them), {empty} empty, {failed} failed; {plain} with a readable table ({entries} entries).{}",
         if keys.is_some() {
             ""
         } else {

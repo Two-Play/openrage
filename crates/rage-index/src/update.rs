@@ -19,6 +19,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rage_core::hash::joaat;
 use rage_crypto::GtaVKeys;
+use rage_rpf::rpf9::Entry;
 use rage_rpf::{EntryKind, Gta4Archive, Rpf7, Rpf9, vfs};
 use rayon::prelude::*;
 use rusqlite::params;
@@ -108,52 +109,72 @@ fn scan_disk(game_dir: &Path) -> (Vec<Record>, Vec<DiskArchive>, HashSet<String>
     while let Some((dir, rel_dir)) = stack.pop() {
         let Ok(rd) = fs::read_dir(&dir) else { continue };
         for entry in rd.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name == ".openrage" {
-                continue; // OpenRAGE's journal inside the mods folder
+            let Some((record, archive)) = scan_entry(&entry, &rel_dir, &mut dictionary) else { continue };
+            if record.kind == EntryTag::Dir {
+                stack.push((entry.path(), record.vpath.clone()));
             }
-            let rel = if rel_dir.is_empty() { name.clone() } else { format!("{rel_dir}/{name}") };
-            let lower = name.to_ascii_lowercase();
-            let gta4 = !meta.is_dir()
-                && (lower.ends_with(".img") || lower.ends_with(".rpf"))
-                && Gta4Archive::file_is_gta4(&entry.path());
-            let is_rpf = !meta.is_dir() && (lower.ends_with(".rpf") || gta4);
-            let kind = if meta.is_dir() {
-                EntryTag::Dir
-            } else if is_rpf {
-                EntryTag::Archive
-            } else {
-                EntryTag::File
-            };
-            let mut body = None;
-            if kind == EntryTag::File
-                && is_indexable(&name)
-                && meta.len() <= MAX_LOOSE_TEXT
-                && let Ok(data) = fs::read(entry.path())
-                && let Some((text, words)) = content_for(&name, &data)
-            {
-                body = Some(text);
-                dictionary.extend(words);
-            }
-            records.push(Record { vpath: rel.clone(), name, kind, size: meta.len(), body, hash: None });
-            if meta.is_dir() {
-                stack.push((entry.path(), rel));
-            } else if is_rpf {
-                archives.push(DiskArchive {
-                    rel,
-                    path: entry.path(),
-                    size: meta.len() as i64,
-                    mtime: mtime_of(&meta),
-                    gta4,
-                    rdr2: !gta4 && rage_rpf::Rpf8::file_is_rpf8(&entry.path()),
-                    gta6: !gta4 && Rpf9::file_is_rpf9(&entry.path()),
-                    read: AtomicU64::new(0),
-                });
-            }
+            archives.extend(archive);
+            records.push(record);
         }
     }
     (records, archives, dictionary)
+}
+
+/// The record of one directory entry, and its archive if it is one; `None` if it is skipped.
+fn scan_entry(
+    entry: &fs::DirEntry,
+    rel_dir: &str,
+    dictionary: &mut HashSet<String>,
+) -> Option<(Record, Option<DiskArchive>)> {
+    let meta = entry.metadata().ok()?;
+    let name = entry.file_name().to_string_lossy().into_owned();
+    if name == ".openrage" {
+        return None; // OpenRAGE's journal inside the mods folder
+    }
+    let rel = if rel_dir.is_empty() { name.clone() } else { format!("{rel_dir}/{name}") };
+    let (kind, gta4) = classify_disk_entry(&meta, &name, &entry.path());
+    let body = loose_text(entry, &meta, &name, kind, dictionary);
+    let archive = (kind == EntryTag::Archive).then(|| DiskArchive {
+        rel: rel.clone(),
+        path: entry.path(),
+        size: meta.len() as i64,
+        mtime: mtime_of(&meta),
+        gta4,
+        rdr2: !gta4 && rage_rpf::Rpf8::file_is_rpf8(&entry.path()),
+        gta6: !gta4 && Rpf9::file_is_rpf9(&entry.path()),
+        read: AtomicU64::new(0),
+    });
+    Some((Record { vpath: rel, name, kind, size: meta.len(), body, hash: None }, archive))
+}
+
+/// Whether a directory entry is a folder, an archive or a file, and whether it is a GTA IV archive.
+fn classify_disk_entry(meta: &fs::Metadata, name: &str, path: &Path) -> (EntryTag, bool) {
+    if meta.is_dir() {
+        return (EntryTag::Dir, false);
+    }
+    let lower = name.to_ascii_lowercase();
+    let gta4 = (lower.ends_with(".img") || lower.ends_with(".rpf")) && Gta4Archive::file_is_gta4(path);
+    if lower.ends_with(".rpf") || gta4 { (EntryTag::Archive, gta4) } else { (EntryTag::File, gta4) }
+}
+
+/// The text of a loose file that is indexed with it; its words go to the dictionary.
+fn loose_text(
+    entry: &fs::DirEntry,
+    meta: &fs::Metadata,
+    name: &str,
+    kind: EntryTag,
+    dictionary: &mut HashSet<String>,
+) -> Option<String> {
+    if kind == EntryTag::File
+        && is_indexable(name)
+        && meta.len() <= MAX_LOOSE_TEXT
+        && let Ok(data) = fs::read(entry.path())
+        && let Some((text, words)) = content_for(name, &data)
+    {
+        dictionary.extend(words);
+        return Some(text);
+    }
+    None
 }
 
 /// Reads one GTA IV archive (`.img`, RPF2/RPF3) into a batch, with the key
@@ -288,7 +309,8 @@ fn read_gta6_archive(
 ) -> Option<Batch> {
     match Rpf9::open(&archive.path) {
         Ok(rpf) if rpf.is_native() => {
-            walk_gta6(&rpf, &archive.rel, 0, cancel, part, &|| archive.part(), &|bytes| archive.add_read(bytes));
+            let walk = Gta6Walk { cancel, part, new_part: &|| archive.part(), read: &|bytes| archive.add_read(bytes) };
+            walk_gta6(&rpf, &archive.rel, 0, &walk);
         }
         // Not readable with this executable: tried again by the next update.
         _ => {
@@ -299,20 +321,60 @@ fn read_gta6_archive(
     (!cancel.load(Ordering::Relaxed)).then_some(batch)
 }
 
-fn walk_gta6(
-    rpf: &Rpf9,
-    prefix: &str,
-    depth: u8,
-    cancel: &AtomicBool,
-    part: &(dyn Fn(Batch) + Sync),
-    new_part: &(dyn Fn() -> Batch + Sync),
-    read: &(dyn Fn(u64) + Sync),
-) {
-    let mut batch = new_part();
+/// What a walk over a GTA VI archive reports to: cancellation, parts of the result, and bytes read.
+#[derive(Clone, Copy)]
+struct Gta6Walk<'a> {
+    cancel: &'a AtomicBool,
+    part: &'a (dyn Fn(Batch) + Sync),
+    new_part: &'a (dyn Fn() -> Batch + Sync),
+    read: &'a (dyn Fn(u64) + Sync),
+}
+
+impl Gta6Walk<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// A nested archive and its path.
+type Gta6Child<'a> = (&'a Entry, String);
+/// A file whose text is read: entry, path, name and kind.
+type Gta6Text<'a> = (&'a Entry, String, String, EntryTag);
+/// A record with the text read for it.
+type Gta6Read = (Record, Result<Option<(String, Vec<String>)>, rage_rpf::RpfError>);
+
+fn walk_gta6(rpf: &Rpf9, prefix: &str, depth: u8, w: &Gta6Walk) {
+    let mut batch = (w.new_part)();
     let Ok(entries) = rpf.entries() else {
         batch.errors += 1;
-        return part(batch);
+        return (w.part)(batch);
     };
+    let (children, texts) = list_gta6_entries(rpf, &entries, prefix, &mut batch);
+    if w.cancelled() {
+        return;
+    }
+    (w.part)(batch);
+    // A few at a time: converted metadata is several times its size.
+    for chunk in texts.chunks(TEXTS_AT_ONCE) {
+        let found = read_gta6_texts(rpf, chunk, w.cancel);
+        let mut batch = (w.new_part)();
+        add_gta6_texts(&mut batch, found);
+        if w.cancelled() {
+            return;
+        }
+        (w.part)(batch);
+    }
+    walk_gta6_children(rpf, &children, depth, w);
+}
+
+/// Adds the folders and the files that are not read for their text to the batch; gives the nested archives and
+/// the files whose text is read.
+fn list_gta6_entries<'a>(
+    rpf: &Rpf9,
+    entries: &'a [Entry],
+    prefix: &str,
+    batch: &mut Batch,
+) -> (Vec<Gta6Child<'a>>, Vec<Gta6Text<'a>>) {
     // Folders come from the entries' paths.
     let mut dirs: HashSet<String> = HashSet::new();
     let mut children = Vec::new();
@@ -322,28 +384,12 @@ fn walk_gta6(
         let vpath = format!("{prefix}/{name}");
         let mut parts: Vec<&str> = name.split('/').collect();
         let base = parts.pop().unwrap_or_default().to_owned();
-        let mut dir = prefix.to_owned();
-        for folder in parts {
-            dir = format!("{dir}/{folder}");
-            if dirs.insert(dir.to_ascii_lowercase()) {
-                batch.records.push(Record {
-                    vpath: dir.clone(),
-                    name: folder.to_owned(),
-                    kind: EntryTag::Dir,
-                    size: 0,
-                    body: None,
-                    hash: None,
-                });
-            }
-        }
-        let kind = if rpf.is_archive(e) {
+        push_new_folders(batch, &mut dirs, prefix, parts);
+        let is_archive = rpf.is_archive(e);
+        if is_archive {
             children.push((e, vpath.clone()));
-            EntryTag::Archive
-        } else if rpf.resource_parts(e).is_some() {
-            EntryTag::Resource
-        } else {
-            EntryTag::File
-        };
+        }
+        let kind = gta6_kind(rpf, e, is_archive);
         if kind != EntryTag::Archive
             && is_indexable_gta6(&base)
             && e.size <= MAX_GTA6_TEXT
@@ -355,54 +401,81 @@ fn walk_gta6(
         let hash = rpf.unnamed_hash(e);
         batch.records.push(Record { vpath, name: base, kind, size: e.size, body: None, hash });
     }
-    if cancel.load(Ordering::Relaxed) {
-        return;
+    (children, texts)
+}
+
+fn gta6_kind(rpf: &Rpf9, entry: &Entry, is_archive: bool) -> EntryTag {
+    if is_archive {
+        EntryTag::Archive
+    } else if rpf.resource_parts(entry).is_some() {
+        EntryTag::Resource
+    } else {
+        EntryTag::File
     }
-    part(batch);
-    // A few at a time: converted metadata is several times its size.
-    for chunk in texts.chunks(TEXTS_AT_ONCE) {
-        let found: Vec<_> = chunk
-            .par_iter()
-            .filter(|_| !cancel.load(Ordering::Relaxed))
-            .map(|(e, vpath, base, kind)| {
-                let content = rpf9_content(rpf, e, base).map(|found| {
-                    let is_text = is_indexable(base) || base.to_ascii_lowercase().ends_with(".#ldbmt");
-                    found.map(|(text, words)| (if is_text { text } else { without_numbers(&text) }, words))
-                });
-                let hash = rpf.unnamed_hash(e);
-                let record =
-                    Record { vpath: vpath.clone(), name: base.clone(), kind: *kind, size: e.size, body: None, hash };
-                (record, content)
-            })
-            .collect();
-        let mut batch = new_part();
-        for (mut record, content) in found {
-            match content {
-                Ok(Some((text, words))) => {
-                    record.body = Some(text);
-                    batch.dictionary.extend(words);
-                }
-                Ok(None) => {}
-                Err(_) => batch.errors += 1,
+}
+
+/// Adds a record for each folder of an entry's path that was not seen yet.
+fn push_new_folders(batch: &mut Batch, dirs: &mut HashSet<String>, prefix: &str, folders: Vec<&str>) {
+    let mut dir = prefix.to_owned();
+    for folder in folders {
+        dir = format!("{dir}/{folder}");
+        if dirs.insert(dir.to_ascii_lowercase()) {
+            batch.records.push(Record {
+                vpath: dir.clone(),
+                name: folder.to_owned(),
+                kind: EntryTag::Dir,
+                size: 0,
+                body: None,
+                hash: None,
+            });
+        }
+    }
+}
+
+/// Reads the texts of a few files at a time, in parallel, until cancelled.
+fn read_gta6_texts(rpf: &Rpf9, chunk: &[Gta6Text], cancel: &AtomicBool) -> Vec<Gta6Read> {
+    chunk
+        .par_iter()
+        .filter(|_| !cancel.load(Ordering::Relaxed))
+        .map(|(e, vpath, base, kind)| {
+            let content = rpf9_content(rpf, e, base).map(|found| {
+                let is_text = is_indexable(base) || base.to_ascii_lowercase().ends_with(".#ldbmt");
+                found.map(|(text, words)| (if is_text { text } else { without_numbers(&text) }, words))
+            });
+            let hash = rpf.unnamed_hash(e);
+            let record =
+                Record { vpath: vpath.clone(), name: base.clone(), kind: *kind, size: e.size, body: None, hash };
+            (record, content)
+        })
+        .collect()
+}
+
+fn add_gta6_texts(batch: &mut Batch, found: Vec<Gta6Read>) {
+    for (mut record, content) in found {
+        match content {
+            Ok(Some((text, words))) => {
+                record.body = Some(text);
+                batch.dictionary.extend(words);
             }
-            batch.records.push(record);
+            Ok(None) => {}
+            Err(_) => batch.errors += 1,
         }
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        part(batch);
+        batch.records.push(record);
     }
+}
+
+fn walk_gta6_children(rpf: &Rpf9, children: &[Gta6Child], depth: u8, w: &Gta6Walk) {
     children.par_iter().for_each(|(e, vpath)| {
-        if cancel.load(Ordering::Relaxed) {
+        if w.cancelled() {
             return;
         }
         match rpf.open_child(e) {
             Ok(child) if depth < rage_rpf::MAX_NESTING => {
-                walk_gta6(&child, vpath, depth + 1, cancel, part, new_part, &|_| {});
+                walk_gta6(&child, vpath, depth + 1, &Gta6Walk { read: &|_| {}, ..*w });
             }
-            _ => part(Batch { errors: 1, ..new_part() }),
+            _ => (w.part)(Batch { errors: 1, ..(w.new_part)() }),
         }
-        read(e.size);
+        (w.read)(e.size);
     });
 }
 
