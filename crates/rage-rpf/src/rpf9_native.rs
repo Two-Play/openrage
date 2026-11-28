@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -367,12 +367,8 @@ impl NativeArchive {
             0 if !resource && entry.size <= len => {
                 std::io::copy(&mut (&mut member).take(entry.size), out).map_err(|e| e.to_string())?
             }
-            // One raw DEFLATE stream.
-            1 if !resource => {
-                let mut inflate = flate2::bufread::DeflateDecoder::new(BufReader::with_capacity(1 << 16, member));
-                // One byte more shows a stream longer than declared.
-                std::io::copy(&mut (&mut inflate).take(entry.size.saturating_add(1)), out).map_err(|e| e.to_string())?
-            }
+            // One raw DEFLATE stream, padded like the member.
+            1 if !resource => inflate_exact(&mut member, out, false, len, ALIGN, entry.size)?,
             layout => return Err(format!("storage layout {layout} is not supported")),
         };
         if written == entry.size { Ok(written) } else { Err("decoded size differs from the index".into()) }
@@ -393,6 +389,8 @@ const STRINGS_MAX: u64 = 64 << 20;
 
 /// Clear bytes in front of a resource's chunks.
 const RESOURCE_PREFIX: u64 = 16;
+/// Members whose data is one stream are padded to a multiple of this.
+const ALIGN: u64 = 16;
 
 /// Which bytes of a member are encrypted, and with what. Members are often
 /// encrypted only in part: `head` bytes, then from there on `run` bytes of
@@ -480,20 +478,66 @@ fn copy_chunks(member: &mut Member, chunks: &[Chunk], size: u64, out: &mut dyn W
         }
         member.at = chunk.offset;
         let mut stored = member.by_ref().take(chunk.stored);
-        let written = if chunk.zlib {
-            let mut inflate = flate2::bufread::ZlibDecoder::new(BufReader::with_capacity(1 << 16, stored));
-            // One byte more shows a stream longer than declared, and reading
-            // to the end checks the stream's checksum.
-            std::io::copy(&mut (&mut inflate).take(chunk.size + 1), out)
-        } else {
-            std::io::copy(&mut stored, out)
-        }
-        .map_err(|e| e.to_string())?;
-        if written != chunk.size {
+        if chunk.zlib {
+            // The table gives a chunk's stored bytes without padding.
+            inflate_exact(&mut stored, out, true, chunk.stored, 1, chunk.size)?;
+        } else if std::io::copy(&mut stored, out).map_err(|e| e.to_string())? != chunk.size {
             return Err("a chunk's decoded size differs from the index".into());
         }
     }
     Ok(size)
+}
+
+/// Inflates one zlib (`zlib`) or raw DEFLATE stream from `stored` bytes into
+/// exactly `size` bytes. The stream has to reach its proper end, which for
+/// zlib includes a matching checksum, and end where its stored bytes do,
+/// padded to a multiple of `align`: more bytes left over mean that the index
+/// and the data disagree.
+fn inflate_exact(
+    input: &mut impl Read,
+    out: &mut dyn Write,
+    zlib: bool,
+    stored: u64,
+    align: u64,
+    size: u64,
+) -> Result<u64, String> {
+    let mut inflater = flate2::Decompress::new(zlib);
+    let mut source = vec![0u8; 1 << 16];
+    let mut target = vec![0u8; 1 << 16];
+    let (mut at, mut filled) = (0, 0);
+    loop {
+        if at == filled {
+            filled = input.read(&mut source).map_err(|e| e.to_string())?;
+            at = 0;
+        }
+        let (read, written) = (inflater.total_in(), inflater.total_out());
+        // Room for one byte more than is left shows a stream longer than
+        // declared without decoding all of it.
+        let room = (size - written).saturating_add(1).min(target.len() as u64) as usize;
+        let flush = if filled == 0 { flate2::FlushDecompress::Finish } else { flate2::FlushDecompress::None };
+        let status = inflater
+            .decompress(&source[at..filled], &mut target[..room], flush)
+            .map_err(|e| format!("broken compressed stream: {e}"))?;
+        let consumed = (inflater.total_in() - read) as usize;
+        let produced = (inflater.total_out() - written) as usize;
+        at += consumed;
+        if inflater.total_out() > size {
+            return Err("decoded data is longer than the index says".into());
+        }
+        out.write_all(&target[..produced]).map_err(|e| e.to_string())?;
+        if status == flate2::Status::StreamEnd {
+            if inflater.total_in().next_multiple_of(align) != stored {
+                return Err("compressed stream size differs from the index".into());
+            }
+            if inflater.total_out() != size {
+                return Err("decoded size differs from the index".into());
+            }
+            return Ok(size);
+        }
+        if consumed == 0 && produced == 0 {
+            return Err("compressed stream ends early".into());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -524,5 +568,55 @@ mod tests {
         record[4] = 16;
         assert!(Encryption::parse(&record, 0x10000).is_err());
         assert!(Encryption::parse(&record[..30], 0x10000).is_err());
+    }
+
+    fn inflate(data: &[u8], zlib: bool, stored: usize, size: u64) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        inflate_exact(&mut &data[..stored], &mut out, zlib, stored as u64, if zlib { 1 } else { ALIGN }, size)?;
+        Ok(out)
+    }
+
+    #[test]
+    fn zlib_streams_need_their_end_checksum_and_exact_sizes() {
+        use flate2::{Compression, write::ZlibEncoder};
+        let text = b"a small zlib stream that is long enough to compress a little, a little".repeat(50);
+        let size = text.len() as u64;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&text).unwrap();
+        let data = encoder.finish().unwrap();
+        assert_eq!(inflate(&data, true, data.len(), size).as_deref(), Ok(&text[..]));
+        // Cut into the checksum, or into the compressed data itself.
+        for cut in [1, 2, 3, 4, 5, data.len() / 2] {
+            assert!(inflate(&data, true, data.len() - cut, size).is_err(), "cut {cut}");
+        }
+        let mut bad = data.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(inflate(&bad, true, bad.len(), size).is_err());
+        // More stored bytes than the stream uses.
+        let mut longer = data.clone();
+        longer.push(0);
+        assert!(inflate(&longer, true, longer.len(), size).is_err());
+        // Decoded size larger or smaller than the index says.
+        assert!(inflate(&data, true, data.len(), size - 1).is_err());
+        assert!(inflate(&data, true, data.len(), size + 1).is_err());
+    }
+
+    #[test]
+    fn raw_deflate_streams_need_their_end_and_padded_size() {
+        use flate2::{Compression, write::DeflateEncoder};
+        let text = b"raw DEFLATE without a header or checksum, raw DEFLATE".repeat(40);
+        let size = text.len() as u64;
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&text).unwrap();
+        let data = encoder.finish().unwrap();
+        // Stored like a member: padded to a multiple of 16 bytes.
+        let mut padded = data.clone();
+        padded.resize(data.len().next_multiple_of(16), 0);
+        assert_eq!(inflate(&padded, false, padded.len(), size).as_deref(), Ok(&text[..]));
+        assert!(inflate(&data, false, data.len() - 1, size).is_err());
+        // Padding beyond the next multiple of 16.
+        padded.resize(padded.len() + 16, 0);
+        assert!(inflate(&padded, false, padded.len(), size).is_err());
+        assert!(inflate(&data, false, data.len(), size - 1).is_err());
     }
 }
