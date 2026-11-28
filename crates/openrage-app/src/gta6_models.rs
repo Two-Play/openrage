@@ -165,7 +165,7 @@ pub(crate) fn bind(game: &Path, file: &str, drawables: &mut [(String, Drawable)]
 fn best_base<'a>(bases: &'a [(String, Skeleton)], file: &str, wanted: &HashSet<u32>) -> Option<&'a Skeleton> {
     let file = file.to_ascii_lowercase();
     let words: Vec<&str> = file.split(['_', '.', '+']).collect();
-    // `fr1`, `mo1`, â€¦: a woman's or a man's part, of one of the builds.
+    // `fr1`, `mo1`, …: a woman's or a man's part, of one of the builds.
     let sex = words.iter().find_map(|w| match w.as_bytes() {
         [b'f', b'a'..=b'z', b'0'..=b'9'] => Some("ambient_femalebody.#ft"),
         [b'm', b'a'..=b'z', b'0'..=b'9'] => Some("ambient_malebody.#ft"),
@@ -350,4 +350,3 @@ mod tests {
         assert_eq!(pick("belt_fr1_000.#dd", &["a"]), Some(0));
     }
 }
-

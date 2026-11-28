@@ -1,7 +1,7 @@
 //! Export of drawables as binary glTF 2.0 (`.glb`), with textures embedded as PNG.
 //!
 //! GTA V is Z-up (x right, y forward); glTF is Y-up (x right, -z forward). The
-//! scene's root node converts `(x, y, z) â†’ (x, z, -y)`, so vertex data and part
+//! scene's root node converts `(x, y, z) → (x, z, -y)`, so vertex data and part
 //! placements stay in the game's coordinates.
 
 use std::fmt::Write;
@@ -112,7 +112,7 @@ pub struct Node {
     pub transform: Mat4,
 }
 
-/// Game Z-up â†’ glTF Y-up: `(x, y, z) â†’ (x, z, -y)`, applied by the root node.
+/// Game Z-up → glTF Y-up: `(x, y, z) → (x, z, -y)`, applied by the root node.
 const Z_UP_TO_Y_UP: Mat4 = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
 
 fn matrix_json(m: &Mat4) -> String {
@@ -126,13 +126,20 @@ pub fn has_skin_weights(mesh: &Mesh, bones: usize) -> bool {
         && mesh.bone_hashes.is_empty()
         && mesh.bone_indices.len() == mesh.positions.len()
         && mesh.bone_weights.len() == mesh.positions.len()
-        && mesh.bone_indices.iter().zip(&mesh.bone_weights).all(|(joints, weights)| {
-            let sum: f32 = weights.iter().sum();
-            sum.is_finite()
-                && sum > 0.0
-                && joints.iter().zip(weights).all(|(&joint, &weight)| {
-                    weight.is_finite() && weight >= 0.0 && (weight == 0.0 || usize::from(joint) < bones)
-                })
+        && mesh
+            .bone_indices
+            .iter()
+            .zip(&mesh.bone_weights)
+            .all(|(joints, weights)| usable_influences(joints, weights, bones))
+}
+
+/// A vertex's influences: weights that add up, each on a bone the skeleton has.
+fn usable_influences(joints: &[u16; 4], weights: &[f32; 4], bones: usize) -> bool {
+    let sum: f32 = weights.iter().sum();
+    sum.is_finite()
+        && sum > 0.0
+        && joints.iter().zip(weights).all(|(&joint, &weight)| {
+            weight.is_finite() && weight >= 0.0 && (weight == 0.0 || usize::from(joint) < bones)
         })
 }
 
@@ -171,7 +178,7 @@ pub fn write_glb<'a>(d: &Drawable, name: &str, lookup: &dyn Fn(&str) -> Option<&
 
 /// Writes drawables placed by `nodes` as one `.glb` scene. `lookup` resolves
 /// texture names per drawable (embedded dictionary, a `.ytd` next to the
-/// model, â€¦); missing textures leave the material untextured. Drawables no
+/// model, …); missing textures leave the material untextured. Drawables no
 /// node uses are left out. `material` gives a shader's colour factor per
 /// drawable and shader index, `None` to leave its meshes out.
 pub fn write_glb_scene<'a>(
@@ -219,6 +226,24 @@ pub fn write_glb_scene_with_skins<'a, 's>(
         }
     }
 
+    let (nodes_json, children) = placement_nodes(nodes, &mesh_of, &binds, &mut parts.skins);
+    let root = format!(
+        "{{\"name\":\"{}\",\"matrix\":[{}],\"children\":[{}]}}",
+        esc(name),
+        matrix_json(&Z_UP_TO_Y_UP),
+        children.join(",")
+    );
+    let json = parts.scene_json(&root, &nodes_json, &meshes_json);
+    glb_container(&json, &parts.b.bin)
+}
+
+/// The scene's nodes below the root (node 0), and which of them are its children.
+fn placement_nodes(
+    nodes: &[Node],
+    mesh_of: &[[Option<usize>; 2]],
+    binds: &[Option<(&Skeleton, usize)>],
+    skins: &mut Vec<String>,
+) -> (Vec<String>, Vec<String>) {
     let mut nodes_json = Vec::new();
     let mut children = Vec::new();
     for n in nodes {
@@ -228,35 +253,35 @@ pub fn write_glb_scene_with_skins<'a, 's>(
         }
         children.push((nodes_json.len() + 1).to_string());
         let mesh = rigid.map(|i| format!(",\"mesh\":{i}")).unwrap_or_default();
-        let mut placement = format!("\"name\":\"{}\",\"matrix\":[{}]{mesh}", esc(&n.name), matrix_json(&n.transform));
-        if let (Some(mesh), Some((rig, inverse_bind))) = (skinned, binds[n.mesh]) {
-            let mesh_node = nodes_json.len() + 2;
-            let first_joint = mesh_node + 1;
-            let (roots, bone_nodes) = joint_nodes(rig, first_joint);
-            let roots = std::iter::once(mesh_node).chain(roots).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-            let _ = write!(placement, ",\"children\":[{roots}]");
-            let joints =
-                (first_joint..first_joint + rig.bones.len()).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-            parts.skins.push(format!("{{\"joints\":[{joints}],\"inverseBindMatrices\":{inverse_bind}}}"));
-            nodes_json.push(format!("{{{placement}}}"));
-            nodes_json.push(format!(
-                "{{\"name\":\"{}\",\"mesh\":{mesh},\"skin\":{}}}",
-                esc(&n.name),
-                parts.skins.len() - 1
-            ));
-            nodes_json.extend(bone_nodes);
+        let placement = format!("\"name\":\"{}\",\"matrix\":[{}]{mesh}", esc(&n.name), matrix_json(&n.transform));
+        if let (Some(mesh), Some(bind)) = (skinned, binds[n.mesh]) {
+            push_skinned_nodes(&mut nodes_json, skins, placement, (&n.name, mesh), bind);
         } else {
             nodes_json.push(format!("{{{placement}}}"));
         }
     }
-    let root = format!(
-        "{{\"name\":\"{}\",\"matrix\":[{}],\"children\":[{}]}}",
-        esc(name),
-        matrix_json(&Z_UP_TO_Y_UP),
-        children.join(",")
-    );
-    let json = parts.scene_json(&root, &nodes_json, &meshes_json);
-    glb_container(&json, &parts.b.bin)
+    (nodes_json, children)
+}
+
+/// The nodes of a placement whose mesh `mesh` is bound to a skeleton: the
+/// placement, below it the skinned mesh and the skeleton's joints.
+fn push_skinned_nodes(
+    nodes_json: &mut Vec<String>,
+    skins: &mut Vec<String>,
+    mut placement: String,
+    (name, mesh): (&str, usize),
+    (rig, inverse_bind): (&Skeleton, usize),
+) {
+    let mesh_node = nodes_json.len() + 2;
+    let first_joint = mesh_node + 1;
+    let (roots, bone_nodes) = joint_nodes(rig, first_joint);
+    let roots = std::iter::once(mesh_node).chain(roots).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let _ = write!(placement, ",\"children\":[{roots}]");
+    let joints = (first_joint..first_joint + rig.bones.len()).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    skins.push(format!("{{\"joints\":[{joints}],\"inverseBindMatrices\":{inverse_bind}}}"));
+    nodes_json.push(format!("{{{placement}}}"));
+    nodes_json.push(format!("{{\"name\":\"{}\",\"mesh\":{mesh},\"skin\":{}}}", esc(name), skins.len() - 1));
+    nodes_json.extend(bone_nodes);
 }
 
 /// What the caller of [`write_glb_scene`] provides: texture and material lookups.
@@ -481,7 +506,7 @@ mod tests {
         let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
         let json = std::str::from_utf8(&glb[20..20 + json_len]).unwrap();
         assert!(json.contains("\"POSITION\"") && json.contains("\"NORMAL\"") && json.contains("\"material\":0"));
-        // Vertices stay in game coordinates; the root node converts Z-up â†’ Y-up.
+        // Vertices stay in game coordinates; the root node converts Z-up → Y-up.
         assert!(json.contains("\"min\":[0,0,0],\"max\":[1,1,0]"), "{json}");
         assert!(json.contains("\"matrix\":[1,0,0,0,0,0,-1,0,0,1,0,0,0,0,0,1]"), "{json}");
     }
@@ -528,4 +553,3 @@ mod tests {
         assert_eq!(get_f32(280), -1.0);
     }
 }
-

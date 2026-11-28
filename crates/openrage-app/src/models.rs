@@ -67,7 +67,7 @@ pub struct PedOutfit {
 #[derive(Debug, Clone)]
 pub struct MaterialSlot {
     pub name_hash: u32,
-    /// Readable name ("Primary paint", "Glass", `normal_spec`, â€¦).
+    /// Readable name ("Primary paint", "Glass", `normal_spec`, …).
     pub label: String,
     /// Takes its colour from the paint (vehicle_paint*).
     pub paint: bool,
@@ -146,9 +146,9 @@ impl LoadedModel {
         self.shared = Vec::new();
     }
 
-    /// Dresses a GTA IV ped: for each (component, drawable, texture) â€” a
+    /// Dresses a GTA IV ped: for each (component, drawable, texture) — a
     /// component like `hand`, its drawable number (`hand_001_r`) and texture
-    /// variant (0 `a`, 1 `b`, â€¦) â€” shows that drawable instead of the
+    /// variant (0 `a`, 1 `b`, …) — shows that drawable instead of the
     /// component's others and gives it that texture variant
     /// (`hand_diff_001_b_whi`). Choices the model lacks are left out.
     pub fn choose_gta4_components(&mut self, choices: &[(&str, u32, u32)]) {
@@ -294,7 +294,7 @@ impl LoadedModel {
     }
 }
 
-/// Ped component names (`head_000_r`, `uppr_001_u`, â€¦) by hash: drawable
+/// Ped component names (`head_000_r`, `uppr_001_u`, …) by hash: drawable
 /// dictionaries of peds only store the hashes.
 /// The names of a `.ydd`'s drawables as the viewer shows them (and OBJ
 /// export names their parts): ped components by name (`uppr_000_u`), others
@@ -345,7 +345,7 @@ fn is_ped_dictionary(names: &[String]) -> bool {
 const SHOWN_AT_FIRST: usize = 64;
 
 /// Which drawables of a dictionary to show at first. Peds: the first variant of
-/// every component (head, upper body, legs, â€¦) â€” a whole person; other
+/// every component (head, upper body, legs, …) — a whole person; other
 /// dictionaries: all of them (laid out side by side), up to a limit.
 fn default_visibility(names: &[String]) -> Vec<bool> {
     let component = |n: &str| n.split('_').next().map(str::to_owned);
@@ -374,7 +374,7 @@ const STREAMED_GROUPS: &[&str] = &["head", "berd", "hair", "uppr", "lowr", "hand
 type StreamedPed = (Vec<(String, Drawable)>, Vec<Part>, Vec<(String, TextureDictionary)>);
 
 /// The first variant of every component in a streamed ped's folder
-/// (`head_000_r.ydd`, `uppr_000_u.ydd`, â€¦) and its first texture variant
+/// (`head_000_r.ydd`, `uppr_000_u.ydd`, …) and its first texture variant
 /// (`head_diff_000_a_whi.ytd`).
 fn streamed_ped(rpf: &rage_rpf::Rpf7, folder: rage_rpf::EntryId) -> Result<StreamedPed> {
     let files: Vec<(String, rage_rpf::EntryId)> =
@@ -418,7 +418,7 @@ fn streamed_component(rpf: &rage_rpf::Rpf7, files: &[StreamedFile], group: &str)
     let res = rpf.read_resource(*id).ok()?;
     let (_, d) = drawable::parse_ydd(&res).ok().and_then(|v| v.into_iter().next())?;
     let stem = name.trim_end_matches(".ydd").to_owned();
-    // `head_000_r` â†’ textures `head_diff_000_a_*.ytd`.
+    // `head_000_r` → textures `head_diff_000_a_*.ytd`.
     let variant = stem.split('_').nth(1).unwrap_or("000");
     let dict = streamed_textures(rpf, files, &format!("{group}_diff_{variant}_a"));
     Some((stem, d, dict))
@@ -709,7 +709,7 @@ fn load_inner(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
 const EXPRESSIONS: &str = "x64c.rpf/anim/expressions.rpf";
 
 /// The expressions of a ped: its dictionary (named after the ped; the story
-/// characters use `p_m_zero` â€¦), the face setup first, then one per part.
+/// characters use `p_m_zero` …), the face setup first, then one per part.
 fn ped_expressions(
     game_dir: &Path,
     keys: Option<Arc<GtaVKeys>>,
@@ -934,7 +934,7 @@ fn collision_body(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, f: &Gta5File) ->
     Ok(Gta5Body::plain((vec![(f.stem.to_owned(), collision)], vec![whole_part(f.stem)])))
 }
 
-/// Particle models (debris, sparks, â€¦) side by side, textured from the
+/// Particle models (debris, sparks, …) side by side, textured from the
 /// dictionary inside the file.
 fn particle_body(f: &Gta5File) -> Result<Gta5Body> {
     let ptfx = rage_formats::ypt::parse(f.res)?;
@@ -1011,7 +1011,7 @@ fn fragment_body(f: &Gta5File) -> Result<Gta5Body> {
     Ok(Gta5Body::Model(assembled_model((drawables, parts), textures, skeleton)))
 }
 
-/// Textures usually live next to the model: adder.yft â†’ adder.ytd (+ vehshare.ytd for vehicles).
+/// Textures usually live next to the model: adder.yft → adder.ytd (+ vehshare.ytd for vehicles).
 fn add_neighbor_textures(f: &Gta5File, dir: rage_rpf::EntryId, external: &mut Vec<(String, TextureDictionary)>) {
     let stem = f.stem;
     let mut candidates = vec![format!("{stem}.ytd"), format!("{stem}+hi.ytd")];
@@ -1041,7 +1041,7 @@ fn vehicle_shared_names(drawables: &[(String, Drawable)], external: &[(String, T
         shared.push("vehshare.ytd".to_owned());
     }
     // Interiors come from shared dictionaries named after the texture
-    // (supergt_interior â†’ vehicles_supergt_interior.ytd).
+    // (supergt_interior → vehicles_supergt_interior.ytd).
     for d in drawables.iter().map(|(_, d)| d) {
         for t in d.shaders.iter().filter_map(|s| s.base_texture()) {
             let t = t.to_ascii_lowercase();
@@ -1323,7 +1323,7 @@ fn grid_layout(drawables: &[(String, Drawable)]) -> Vec<Mat4> {
         .collect()
 }
 
-/// Group of a ped component (`uppr_001_u` â†’ "Upper body"); other drawables none.
+/// Group of a ped component (`uppr_001_u` → "Upper body"); other drawables none.
 fn ped_group(name: &str) -> String {
     if !ped_component_names().values().any(|v| v == name) {
         return String::new();
@@ -1593,7 +1593,7 @@ const GTA4_PLAYER_GROUPS: &[&str] = &["head", "hair", "uppr", "lowr", "hand", "f
 
 /// GTA IV's player (`playerped.rpf/player.wft`): the fragment holds only the
 /// skeleton; the body is the first variant of every component next to it
-/// (`head_000_r.wdr`, `uppr_000_u.wdr`, â€¦) with its first texture variant
+/// (`head_000_r.wdr`, `uppr_000_u.wdr`, …) with its first texture variant
 /// (`head_diff_000_a_whi.wtd`).
 fn gta4_player(archive: &rage_rpf::Gta4Archive, skeleton: drawable::Skeleton) -> Result<LoadedModel> {
     use rage_rpf::Gta4Archive;
@@ -1619,7 +1619,7 @@ fn gta4_player(archive: &rage_rpf::Gta4Archive, skeleton: drawable::Skeleton) ->
         drawables.push((stem, d));
     }
     if drawables.is_empty() {
-        bail!("no body parts (head_000_r.wdr, â€¦) next to player.wft");
+        bail!("no body parts (head_000_r.wdr, …) next to player.wft");
     }
     fit_to_skeleton(&mut drawables, &skeleton);
     Ok(assembled_model((drawables, parts), external, Some(skeleton)))
@@ -2224,7 +2224,7 @@ fn skin_mesh(mesh: &mut drawable::Mesh, skin: &[Mat4]) {
 }
 
 /// The part of a texture name before its variation (`pant_mf1_061_c3_000_ab`
-/// â†’ `pant_mf1_061`): everything before the first `_c<digit>` token.
+/// → `pant_mf1_061`): everything before the first `_c<digit>` token.
 fn texture_stem(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     let tokens: Vec<&str> = lower.split('_').collect();
@@ -2256,8 +2256,8 @@ fn replace_texture(d: &mut Drawable, suffix: &str, texture: &str) {
 /// Where RDR2 keeps the peds' base skeletons (`meta_base_<ped>.yft`).
 const RDR2_BASE_SKELETONS: &str = "packs_0.rpf/packs/base/models/metaped_fragments.rpf";
 
-/// The base skeleton of an RDR2 ped part: `a_c_cow_merge_4` â†’ `meta_base_cow`,
-/// `a_c_bear_01_merge_2` â†’ `meta_base_bear_01` (the longest name that exists,
+/// The base skeleton of an RDR2 ped part: `a_c_cow_merge_4` → `meta_base_cow`,
+/// `a_c_bear_01_merge_2` → `meta_base_bear_01` (the longest name that exists,
 /// with or without the `a_c_`/`cs_` prefix).
 pub(crate) fn rdr2_base_skeleton(rpf: &rage_rpf::Rpf8, stem: &str) -> Option<drawable::Skeleton> {
     rdr2_base_skeleton_in(&crate::rdr2::game_folder(rpf.path())?, stem)
@@ -2464,4 +2464,3 @@ mod tests {
         assert_eq!(bones[0], 2);
     }
 }
-
