@@ -22,5 +22,5 @@ The games do not run on macOS themselves, so OpenRAGE cannot find them on its
 own. Choose the game folder by hand: a copy from a Windows PC, an external
 drive, or the folder inside CrossOver, Whisky or a similar tool.
 
-Guide:       https://two-play.github.io/openRAGE/
+Guide:       https://openrage.dev/
 Source code: https://github.com/Two-Play/openrage

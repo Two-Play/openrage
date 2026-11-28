@@ -16,4 +16,4 @@
 - [ ] `cargo fmt --all --check` and `cargo test` pass locally.
 - [ ] No game files, executables, encryption keys or extracted game assets are included.
 - [ ] Large generated files (dictionaries, test data) are left out or discussed first.
-- [ ] Documentation in `site/` is updated if the change affects users.
+- [ ] Documentation on the [website](https://github.com/openRAGE-org/website) is updated (separate pull request there) if the change affects users.

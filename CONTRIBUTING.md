@@ -14,9 +14,9 @@ For bigger changes (a new game, a new archive format, a large refactoring), open
 - Work goes into **`develop`**; `main` only takes releases. Please target `develop`.
 - Keep pull requests focused: one feature or fix each. Large changes are easier to review in several smaller steps.
 - Run `cargo fmt --all --check` and `cargo test` before opening the pull request.
-- Update the documentation in [`site/`](site/) when the change affects users.
+- Update the documentation in the [website repository](https://github.com/openRAGE-org/website) when the change affects users.
 
-Building from source, the build environment and the project layout are described on the [development page](https://two-play.github.io/openRAGE/development/).
+Building from source, the build environment and the project layout are described on the [development page](https://openrage.dev/development/).
 
 ## What we cannot accept
 
