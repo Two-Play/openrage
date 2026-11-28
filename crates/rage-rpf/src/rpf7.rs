@@ -132,6 +132,182 @@ impl Entry {
     }
 }
 
+/// What is needed to read the table of contents of an archive.
+struct TocSource<'a> {
+    file: &'a File,
+    base: u64,
+    size: u64,
+    display_path: &'a str,
+    name: &'a str,
+    keys: Option<&'a GtaVKeys>,
+}
+
+impl TocSource<'_> {
+    fn corrupt(&self, reason: &str) -> RpfError {
+        RpfError::CorruptToc { archive: self.display_path.to_owned(), reason: reason.into() }
+    }
+
+    fn keys(&self) -> Result<&GtaVKeys, RpfError> {
+        self.keys.ok_or_else(|| RpfError::KeysRequired(self.display_path.to_owned()))
+    }
+
+    /// Reads, decrypts and decodes the table of contents and links the parents.
+    fn read_entries(&self) -> Result<(Vec<Entry>, Encryption), RpfError> {
+        let (entry_count, names_len, encryption) = self.read_header()?;
+        let (entries_raw, names) = self.read_toc_bytes(entry_count, names_len, encryption)?;
+        let mut entries = Vec::with_capacity(entry_count as usize);
+        for raw in entries_raw.as_chunks::<16>().0 {
+            entries.push(self.decode_entry(raw, &names)?);
+        }
+        if !entries[0].is_dir() {
+            return Err(self.corrupt("root entry is not a directory"));
+        }
+        self.link_parents(&mut entries)?;
+        Ok((entries, encryption))
+    }
+
+    /// The header: entry count, length of the name table, encryption.
+    fn read_header(&self) -> Result<(u32, u32, Encryption), RpfError> {
+        // Some games ship empty placeholders (RDR2's `common.rpf` is 0 bytes).
+        if self.size < 16 {
+            return Err(RpfError::Empty(self.display_path.to_owned(), self.size));
+        }
+        let mut header = [0u8; 16];
+        read_exact_at(self.file, &mut header, self.base)?;
+        let magic = u32_le(&header, 0);
+        if magic != MAGIC_RPF7 {
+            return Err(RpfError::BadMagic(self.display_path.to_owned(), magic));
+        }
+        let entry_count = u32_le(&header, 4);
+        let names_len = u32_le(&header, 8);
+        let encryption = Encryption::from_raw(u32_le(&header, 12));
+
+        if entry_count == 0 || entry_count > MAX_ENTRIES {
+            return Err(self.corrupt("implausible entry count"));
+        }
+        if 16 + entry_count as u64 * 16 + names_len as u64 > self.size {
+            return Err(self.corrupt("table of contents exceeds archive size"));
+        }
+        Ok((entry_count, names_len, encryption))
+    }
+
+    /// The entry table and the name table, decrypted.
+    fn read_toc_bytes(
+        &self,
+        entry_count: u32,
+        names_len: u32,
+        encryption: Encryption,
+    ) -> Result<(Vec<u8>, Vec<u8>), RpfError> {
+        let toc_entries = entry_count as usize * 16;
+        let mut entries_raw = vec![0u8; toc_entries];
+        let mut names = vec![0u8; names_len as usize];
+        read_exact_at(self.file, &mut entries_raw, self.base + 16)?;
+        read_exact_at(self.file, &mut names, self.base + 16 + toc_entries as u64)?;
+        self.decrypt_toc(encryption, &mut entries_raw, &mut names)?;
+        Ok((entries_raw, names))
+    }
+
+    fn decrypt_toc(&self, encryption: Encryption, entries_raw: &mut [u8], names: &mut [u8]) -> Result<(), RpfError> {
+        match encryption {
+            Encryption::None | Encryption::Open => {}
+            Encryption::Aes => {
+                let k = self.keys()?;
+                k.decrypt_aes(entries_raw);
+                k.decrypt_aes(names);
+            }
+            Encryption::Ng | Encryption::Unknown(_) => {
+                let k = self.keys()?;
+                k.decrypt_ng(entries_raw, self.name, self.size as u32);
+                k.decrypt_ng(names, self.name, self.size as u32);
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_entry(&self, raw: &[u8; 16], names: &[u8]) -> Result<Entry, RpfError> {
+        let second = u32_le(raw, 4);
+        if second == DIR_MARKER {
+            Ok(Entry {
+                name: read_name(names, u32_le(raw, 0) as usize),
+                parent: None,
+                kind: EntryKind::Directory { first: u32_le(raw, 8), count: u32_le(raw, 12) },
+            })
+        } else if second & 0x8000_0000 == 0 {
+            self.decode_binary(raw, names)
+        } else {
+            self.decode_resource(raw, names)
+        }
+    }
+
+    fn decode_binary(&self, raw: &[u8; 16], names: &[u8]) -> Result<Entry, RpfError> {
+        let encrypted = match u32_le(raw, 12) {
+            0 => false,
+            1 => true,
+            _ => return Err(self.corrupt("invalid binary entry encryption flag")),
+        };
+        Ok(Entry {
+            name: read_name(names, u16::from_le_bytes([raw[0], raw[1]]) as usize),
+            parent: None,
+            kind: EntryKind::Binary {
+                offset: u24_le(raw, 5) as u64 * BLOCK,
+                stored_size: u24_le(raw, 2),
+                size: u32_le(raw, 8),
+                encrypted,
+            },
+        })
+    }
+
+    fn decode_resource(&self, raw: &[u8; 16], names: &[u8]) -> Result<Entry, RpfError> {
+        let offset = (u24_le(raw, 5) & 0x7F_FFFF) as u64 * BLOCK;
+        let mut res_size = u24_le(raw, 2);
+        if res_size == 0xFF_FFFF {
+            // Sizes ≥ 16 MiB are scattered across the RSC7 header instead.
+            let mut h = [0u8; 16];
+            read_exact_at(self.file, &mut h, self.base + offset)?;
+            res_size = (h[7] as u32) | (h[14] as u32) << 8 | (h[5] as u32) << 16 | (h[2] as u32) << 24;
+        }
+        Ok(Entry {
+            name: read_name(names, u16::from_le_bytes([raw[0], raw[1]]) as usize),
+            parent: None,
+            kind: EntryKind::Resource {
+                offset,
+                size: res_size,
+                system_flags: u32_le(raw, 8),
+                graphics_flags: u32_le(raw, 12),
+            },
+        })
+    }
+
+    /// Links parents starting at the root; each entry may be claimed only once,
+    /// which also rules out cycles in a malformed table of contents.
+    fn link_parents(&self, entries: &mut [Entry]) -> Result<(), RpfError> {
+        let mut pending = vec![0usize];
+        while let Some(dir) = pending.pop() {
+            let EntryKind::Directory { first, count } = entries[dir].kind else { continue };
+            let (first, count) = (first as usize, count as usize);
+            if first == 0 || first.checked_add(count).is_none_or(|end| end > entries.len()) {
+                return Err(self.corrupt("directory range out of bounds"));
+            }
+            for (child, entry) in entries[first..first + count].iter_mut().enumerate() {
+                if entry.parent.is_some() {
+                    return Err(self.corrupt("cyclic or shared directory entries"));
+                }
+                entry.parent = Some(dir);
+                if entry.is_dir() {
+                    pending.push(first + child);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_name(names: &[u8], off: usize) -> String {
+    let tail = names.get(off..).unwrap_or(&[]);
+    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+    String::from_utf8_lossy(&tail[..end]).into_owned()
+}
+
 /// An opened RPF7 archive (top-level or nested).
 pub struct Rpf7 {
     file: Arc<File>,
@@ -164,126 +340,9 @@ impl Rpf7 {
         keys: Option<Arc<GtaVKeys>>,
         depth: u8,
     ) -> Result<Self, RpfError> {
-        let corrupt = |reason: &str| RpfError::CorruptToc { archive: display_path.clone(), reason: reason.into() };
-
-        // Some games ship empty placeholders (RDR2's `common.rpf` is 0 bytes).
-        if size < 16 {
-            return Err(RpfError::Empty(display_path, size));
-        }
-        let mut header = [0u8; 16];
-        read_exact_at(&file, &mut header, base)?;
-        let magic = u32_le(&header, 0);
-        if magic != MAGIC_RPF7 {
-            return Err(RpfError::BadMagic(display_path, magic));
-        }
-        let entry_count = u32_le(&header, 4);
-        let names_len = u32_le(&header, 8);
-        let encryption = Encryption::from_raw(u32_le(&header, 12));
-
-        if entry_count == 0 || entry_count > MAX_ENTRIES {
-            return Err(corrupt("implausible entry count"));
-        }
-        let toc_entries = entry_count as usize * 16;
-        if 16 + toc_entries as u64 + names_len as u64 > size {
-            return Err(corrupt("table of contents exceeds archive size"));
-        }
-
-        let mut entries_raw = vec![0u8; toc_entries];
-        let mut names = vec![0u8; names_len as usize];
-        read_exact_at(&file, &mut entries_raw, base + 16)?;
-        read_exact_at(&file, &mut names, base + 16 + toc_entries as u64)?;
-
-        match encryption {
-            Encryption::None | Encryption::Open => {}
-            Encryption::Aes => {
-                let k = keys.as_deref().ok_or_else(|| RpfError::KeysRequired(display_path.clone()))?;
-                k.decrypt_aes(&mut entries_raw);
-                k.decrypt_aes(&mut names);
-            }
-            Encryption::Ng | Encryption::Unknown(_) => {
-                let k = keys.as_deref().ok_or_else(|| RpfError::KeysRequired(display_path.clone()))?;
-                k.decrypt_ng(&mut entries_raw, &name, size as u32);
-                k.decrypt_ng(&mut names, &name, size as u32);
-            }
-        }
-
-        let read_name = |off: usize| -> String {
-            let tail = names.get(off..).unwrap_or(&[]);
-            let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
-            String::from_utf8_lossy(&tail[..end]).into_owned()
-        };
-
-        let mut entries = Vec::with_capacity(entry_count as usize);
-        for raw in entries_raw.as_chunks::<16>().0 {
-            let second = u32_le(raw, 4);
-            let entry = if second == DIR_MARKER {
-                Entry {
-                    name: read_name(u32_le(raw, 0) as usize),
-                    parent: None,
-                    kind: EntryKind::Directory { first: u32_le(raw, 8), count: u32_le(raw, 12) },
-                }
-            } else if second & 0x8000_0000 == 0 {
-                let encrypted = match u32_le(raw, 12) {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(corrupt("invalid binary entry encryption flag")),
-                };
-                Entry {
-                    name: read_name(u16::from_le_bytes([raw[0], raw[1]]) as usize),
-                    parent: None,
-                    kind: EntryKind::Binary {
-                        offset: u24_le(raw, 5) as u64 * BLOCK,
-                        stored_size: u24_le(raw, 2),
-                        size: u32_le(raw, 8),
-                        encrypted,
-                    },
-                }
-            } else {
-                let offset = (u24_le(raw, 5) & 0x7F_FFFF) as u64 * BLOCK;
-                let mut res_size = u24_le(raw, 2);
-                if res_size == 0xFF_FFFF {
-                    // Sizes ≥ 16 MiB are scattered across the RSC7 header instead.
-                    let mut h = [0u8; 16];
-                    read_exact_at(&file, &mut h, base + offset)?;
-                    res_size = (h[7] as u32) | (h[14] as u32) << 8 | (h[5] as u32) << 16 | (h[2] as u32) << 24;
-                }
-                Entry {
-                    name: read_name(u16::from_le_bytes([raw[0], raw[1]]) as usize),
-                    parent: None,
-                    kind: EntryKind::Resource {
-                        offset,
-                        size: res_size,
-                        system_flags: u32_le(raw, 8),
-                        graphics_flags: u32_le(raw, 12),
-                    },
-                }
-            };
-            entries.push(entry);
-        }
-
-        if !entries[0].is_dir() {
-            return Err(corrupt("root entry is not a directory"));
-        }
-        // Link parents starting at the root; each entry may be claimed only once,
-        // which also rules out cycles in a malformed table of contents.
-        let mut pending = vec![0usize];
-        while let Some(dir) = pending.pop() {
-            let EntryKind::Directory { first, count } = entries[dir].kind else { continue };
-            let (first, count) = (first as usize, count as usize);
-            if first == 0 || first.checked_add(count).is_none_or(|end| end > entries.len()) {
-                return Err(corrupt("directory range out of bounds"));
-            }
-            for (child, entry) in entries[first..first + count].iter_mut().enumerate() {
-                if entry.parent.is_some() {
-                    return Err(corrupt("cyclic or shared directory entries"));
-                }
-                entry.parent = Some(dir);
-                if entry.is_dir() {
-                    pending.push(first + child);
-                }
-            }
-        }
-
+        let src =
+            TocSource { file: &file, base, size, display_path: &display_path, name: &name, keys: keys.as_deref() };
+        let (entries, encryption) = src.read_entries()?;
         Ok(Self { file, keys, name, display_path, base, size, encryption, entries, depth })
     }
 

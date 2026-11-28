@@ -155,6 +155,30 @@ fn add_audio_names(data: &[u8], names: &mut rage_rpf::gta4::AudioNames) {
     }
 }
 
+/// Writes one archive entry (`(id, relative path)`) below `out` and reports progress.
+fn write_entry(
+    archive: &Gta4Archive,
+    out: &Path,
+    (id, rel): (Gta4EntryId, &str),
+    s: &mut ExtractSummary,
+    progress: &mut dyn FnMut(&ExtractSummary, &str),
+) -> Result<()> {
+    let target = out.join(vfs::safe_relative_path(rel).with_context(|| format!("unsafe path {rel}"))?);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match archive.read(id) {
+        Ok(data) => {
+            fs::write(&target, &data)?;
+            s.files += 1;
+            s.bytes += data.len() as u64;
+        }
+        Err(e) => s.failures.push(e.to_string()),
+    }
+    progress(s, rel);
+    Ok(())
+}
+
 /// Extracts an entry of a GTA IV archive (a file, a folder or the whole
 /// archive) below `out`. Files keep their stored form: resources stay RSC5
 /// files, the form OpenIV exports.
@@ -166,25 +190,9 @@ pub fn extract(
     progress: &mut dyn FnMut(&ExtractSummary, &str),
 ) -> Result<ExtractSummary> {
     let mut summary = ExtractSummary { target: out.to_path_buf(), ..Default::default() };
-    let mut write = |i: Gta4EntryId, rel: &str, s: &mut ExtractSummary| -> Result<()> {
-        let target = out.join(vfs::safe_relative_path(rel).with_context(|| format!("unsafe path {rel}"))?);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match archive.read(i) {
-            Ok(data) => {
-                fs::write(&target, &data)?;
-                s.files += 1;
-                s.bytes += data.len() as u64;
-            }
-            Err(e) => s.failures.push(e.to_string()),
-        }
-        progress(s, rel);
-        Ok(())
-    };
     let entry = archive.entry(id);
     if !entry.is_dir() {
-        write(id, &entry.name, &mut summary)?;
+        write_entry(archive, out, (id, &entry.name), &mut summary, progress)?;
         summary.target = out.join(&entry.name);
         return Ok(summary);
     }
@@ -202,7 +210,7 @@ pub fn extract(
             summary.cancelled = true;
             break;
         }
-        write(i, &rel, &mut summary)?;
+        write_entry(archive, out, (i, &rel), &mut summary, progress)?;
     }
     Ok(summary)
 }
@@ -252,6 +260,14 @@ pub struct TextureIndex {
     members: OnceLock<HashMap<u32, (PathBuf, String)>>,
     /// Interiors (`mlo` sections): name hash → the objects inside.
     mlos: HashMap<u32, Vec<MloEntity>>,
+}
+
+/// In an `mlo` section: the interior being read, and whether its rooms and
+/// portals (after its objects) have started.
+#[derive(Default)]
+struct MloState {
+    current: Option<u32>,
+    rooms: bool,
 }
 
 /// An object inside an interior (`mlo` section of an `.ide`), in the
@@ -306,77 +322,87 @@ impl TextureIndex {
     /// Reads the model → dictionary lines of an `.ide` file, and its interiors.
     pub fn add_ide(&mut self, text: &str) {
         let mut section = String::new();
-        // In an `mlo` section: the interior being read, and whether its
-        // rooms and portals (after its objects) have started.
-        let mut mlo: Option<u32> = None;
-        let mut rooms = false;
+        let mut mlo = MloState::default();
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if section == "mlo" {
-                let lower = line.to_ascii_lowercase();
-                match lower.as_str() {
-                    "mloroomstart" | "roomend" | "mloportalstart" => {
-                        rooms = true;
-                        continue;
-                    }
-                    "mloend" => {
-                        (mlo, rooms) = (None, false);
-                        continue;
-                    }
-                    _ => {}
-                }
-                if line.contains(',') {
-                    let f: Vec<&str> = line.split(',').map(str::trim).collect();
-                    match mlo {
-                        // `Portacabin, 2048, 2, 3, 22, -1, -1, -1`: a new interior.
-                        None => {
-                            let hash = rage_core::hash::joaat(f[0]);
-                            self.model_names.entry(hash).or_insert_with(|| f[0].to_owned());
-                            self.mlos.entry(hash).or_default().clear();
-                            mlo = Some(hash);
-                        }
-                        // `KM_PortacabinDoor, x, y, z, qx, qy, qz, qw, 0, 384,`: an object in it.
-                        Some(hash) if !rooms => {
-                            let v: Vec<f32> = f.iter().skip(1).take(7).filter_map(|v| v.parse().ok()).collect();
-                            if let ([x, y, z, qx, qy, qz, qw], false) = (v.as_slice(), f[0].is_empty()) {
-                                self.mlos.entry(hash).or_default().push(MloEntity {
-                                    model: f[0].to_owned(),
-                                    position: [*x, *y, *z],
-                                    rotation: [*qx, *qy, *qz, *qw],
-                                });
-                            }
-                        }
-                        Some(_) => {}
-                    }
-                    continue;
-                }
+            if section == "mlo" && self.mlo_line(line, &mut mlo) {
+                continue;
             }
             if !line.contains(',') {
                 section = if line.eq_ignore_ascii_case("end") { String::new() } else { line.to_ascii_lowercase() };
                 continue;
             }
-            if matches!(section.as_str(), "objs" | "tobj" | "anim" | "cars" | "peds" | "weap")
-                && let Some(model) = line.split(',').next().map(str::trim).filter(|m| !m.is_empty())
-            {
-                self.model_names.entry(rage_core::hash::joaat(model)).or_insert_with(|| model.to_owned());
+            self.ide_model_line(&section, line);
+        }
+    }
+
+    /// Handles one line of an `mlo` section; `false` when it is neither a
+    /// keyword nor a comma-separated record.
+    fn mlo_line(&mut self, line: &str, mlo: &mut MloState) -> bool {
+        match line.to_ascii_lowercase().as_str() {
+            "mloroomstart" | "roomend" | "mloportalstart" => {
+                mlo.rooms = true;
+                return true;
             }
-            let mut fields = line.split(',').map(|f| f.trim().to_ascii_lowercase());
-            let (Some(a), Some(b)) = (fields.next(), fields.next()) else { continue };
-            if a.is_empty() || b.is_empty() || b == "null" {
-                continue;
+            "mloend" => {
+                *mlo = MloState::default();
+                return true;
             }
-            match section.as_str() {
-                "objs" | "tobj" | "anim" | "cars" => {
-                    self.model_txd.entry(a).or_insert(b);
-                }
-                "txdp" => {
-                    self.parent.entry(a).or_insert(b);
-                }
-                _ => {}
+            _ => {}
+        }
+        if !line.contains(',') {
+            return false;
+        }
+        let f: Vec<&str> = line.split(',').map(str::trim).collect();
+        match mlo.current {
+            // `Portacabin, 2048, 2, 3, 22, -1, -1, -1`: a new interior.
+            None => {
+                let hash = rage_core::hash::joaat(f[0]);
+                self.model_names.entry(hash).or_insert_with(|| f[0].to_owned());
+                self.mlos.entry(hash).or_default().clear();
+                mlo.current = Some(hash);
             }
+            // `KM_PortacabinDoor, x, y, z, qx, qy, qz, qw, 0, 384,`: an object in it.
+            Some(hash) if !mlo.rooms => self.add_mlo_entity(hash, &f),
+            Some(_) => {}
+        }
+        true
+    }
+
+    fn add_mlo_entity(&mut self, hash: u32, f: &[&str]) {
+        let v: Vec<f32> = f.iter().skip(1).take(7).filter_map(|v| v.parse().ok()).collect();
+        if let ([x, y, z, qx, qy, qz, qw], false) = (v.as_slice(), f[0].is_empty()) {
+            self.mlos.entry(hash).or_default().push(MloEntity {
+                model: f[0].to_owned(),
+                position: [*x, *y, *z],
+                rotation: [*qx, *qy, *qz, *qw],
+            });
+        }
+    }
+
+    /// Handles one comma-separated record of a model section.
+    fn ide_model_line(&mut self, section: &str, line: &str) {
+        if matches!(section, "objs" | "tobj" | "anim" | "cars" | "peds" | "weap")
+            && let Some(model) = line.split(',').next().map(str::trim).filter(|m| !m.is_empty())
+        {
+            self.model_names.entry(rage_core::hash::joaat(model)).or_insert_with(|| model.to_owned());
+        }
+        let mut fields = line.split(',').map(|f| f.trim().to_ascii_lowercase());
+        let (Some(a), Some(b)) = (fields.next(), fields.next()) else { return };
+        if a.is_empty() || b.is_empty() || b == "null" {
+            return;
+        }
+        match section {
+            "objs" | "tobj" | "anim" | "cars" => {
+                self.model_txd.entry(a).or_insert(b);
+            }
+            "txdp" => {
+                self.parent.entry(a).or_insert(b);
+            }
+            _ => {}
         }
     }
 

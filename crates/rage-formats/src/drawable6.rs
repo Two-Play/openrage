@@ -88,6 +88,8 @@ const GRAPHICS: u64 = 0x6000_0000;
 const MAX_PART: u64 = 256 << 20;
 const MAX_VERTICES: usize = 1_000_000;
 const MAX_MESHES: usize = 1024;
+/// Most models a level of detail lists.
+const MAX_MODELS: usize = 256;
 /// Slots of the vertex format.
 const POSITION: usize = 0;
 const WEIGHTS: [usize; 2] = [16, 17];
@@ -147,6 +149,32 @@ fn is_drawable(d: &[u8], at: usize, inside: bool) -> bool {
     check().unwrap_or(false)
 }
 
+/// Whether the pointers and counts of a fragment are there; `None` if the bytes end before the counts.
+fn has_fragment_fields(system: &[u8]) -> Option<bool> {
+    let optional = |at| system.u64_at(at) == Some(0) || system_pointer(system, at).is_some();
+    let counts = |at| system.u16_at(at).filter(|n| *n <= 4096);
+    Some(
+        system_pointer(system, 24).is_some()
+            && system_pointer(system, 168).is_some()
+            && [16, 32, 40].into_iter().all(optional)
+            && counts(48)? > 0
+            && counts(50).is_some()
+            && counts(52)? <= counts(54)?,
+    )
+}
+
+/// Whether the root is a drawable dictionary; `None` if the bytes end before its count.
+fn is_dictionary(system: &[u8]) -> Option<bool> {
+    let count = system.u16_at(56)?;
+    let first = || is_drawable(system, system_pointer(system, system_pointer(system, 48)?)?, true).then_some(());
+    Some(
+        count > 0
+            && [40, 42, 58].into_iter().all(|at| system.u16_at(at) == Some(count))
+            && system_pointer(system, 32).is_some()
+            && first().is_some(),
+    )
+}
+
 /// What the resource whose system part starts with these bytes is; `None`
 /// if it is no model, or if the bytes end before the drawable of a fragment
 /// or the first one of a dictionary.
@@ -157,26 +185,12 @@ pub fn root(system: &[u8]) -> Option<Root> {
     if is_drawable(system, 0, false) {
         return Some(Root::Drawable);
     }
-    let optional = |at| system.u64_at(at) == Some(0) || system_pointer(system, at).is_some();
-    let counts = |at| system.u16_at(at).filter(|n| *n <= 4096);
-    if system_pointer(system, 24).is_some()
-        && system_pointer(system, 168).is_some()
-        && [16, 32, 40].into_iter().all(optional)
-        && counts(48)? > 0
-        && counts(50).is_some()
-        && counts(52)? <= counts(54)?
-    {
+    if has_fragment_fields(system)? {
         // Other resources have pointers and small numbers there too: what
         // tells a fragment is the drawable it points to.
         return is_drawable(system, system_pointer(system, 24)?, true).then_some(Root::Fragment);
     }
-    let count = system.u16_at(56)?;
-    let first = || is_drawable(system, system_pointer(system, system_pointer(system, 48)?)?, true).then_some(());
-    (count > 0
-        && [40, 42, 58].into_iter().all(|at| system.u16_at(at) == Some(count))
-        && system_pointer(system, 32).is_some()
-        && first().is_some())
-    .then_some(Root::Dictionary)
+    is_dictionary(system)?.then_some(Root::Dictionary)
 }
 
 /// The name of the model whose system part starts with these bytes: a
@@ -197,6 +211,27 @@ pub fn name(system: &[u8]) -> Option<String> {
             system_pointer(system, 24).and_then(|at| text(at + 168)).or_else(|| text(168).map(|n| format!("{n}.#ft")))
         }
         Root::Dictionary => None,
+    }
+}
+
+/// How the bones of a model's meshes are numbered.
+struct ModelBones {
+    /// The hashes of the names of the model's bones; empty without such a list.
+    hashes: Vec<u32>,
+    /// The number of bones a mesh's bone numbers must stay below.
+    count: usize,
+    /// For each bone of the model, the skeleton's bone with that name, if the skeleton has them all.
+    own: Option<Vec<u16>>,
+}
+
+impl ModelBones {
+    /// Numbers the bones of `mesh` by the skeleton's, or leaves it the hashes to find them by.
+    fn assign(&self, mesh: &mut Mesh) {
+        match &self.own {
+            Some(map) => mesh.bone_indices.iter_mut().flatten().for_each(|b| *b = map[usize::from(*b)]),
+            None if !mesh.bone_indices.is_empty() => mesh.bone_hashes = self.hashes.clone(),
+            None => {}
+        }
     }
 }
 
@@ -241,6 +276,51 @@ impl<'a> Reader<'a> {
         Ok((self.g(at + 24, len.ok_or_else(|| bad("a buffer of an impossible size"))?)?, stride))
     }
 
+    /// The list of the most detailed level's models and their number.
+    fn models(&self, at: usize) -> Result<(usize, usize), ModelError> {
+        let lod = self.s(at + 80, 16)?;
+        let models = self.u16(lod + 8)?;
+        if !(1..=MAX_MODELS).contains(&models) {
+            return Err(bad("an impossible number of models"));
+        }
+        Ok((self.s(lod, models * 8)?, models))
+    }
+
+    /// What a model's bones are called and which of the skeleton's they are.
+    fn model_bones(&self, model: usize, skeleton: Option<&Skeleton>) -> Result<ModelBones, ModelError> {
+        let used = self.u16(model + 20)?;
+        // What its bones are called; a model without such a list has the skeleton's.
+        let hashes: Vec<u32> = match self.s(model + 40, used * 4) {
+            Ok(list) => (0..used).filter_map(|i| self.sys.u32_at(list + i * 4)).collect(),
+            Err(_) => Vec::new(),
+        };
+        let skeleton_bones = skeleton.map_or(0, |s| s.bones.len());
+        let count = if !hashes.is_empty() || used == skeleton_bones { used } else { 0 };
+        // The skeleton's, if it has them all; else those of another one.
+        let own: Option<Vec<u16>> = skeleton
+            .filter(|_| !hashes.is_empty())
+            .and_then(|s| hashes.iter().map(|&h| s.find_hash(h).map(|b| b as u16)).collect());
+        Ok(ModelBones { hashes, count, own })
+    }
+
+    /// The geometries of the model at `model`, added to `meshes`.
+    fn model(&self, model: usize, skeleton: Option<&Skeleton>, meshes: &mut Vec<Mesh>) -> Result<(), ModelError> {
+        let count = self.u16(model + 16)?;
+        if !(1..=MAX_MESHES).contains(&count) || meshes.len() + count > MAX_MESHES {
+            return Err(bad("an impossible number of geometries"));
+        }
+        let geometries = self.s(model + 8, count * 8)?;
+        let shaders = self.s(model + 32, count * 2).ok();
+        let bones = self.model_bones(model, skeleton)?;
+        for g in 0..count {
+            let mut mesh = self.mesh(self.s(geometries + g * 8, 160)?, bones.count)?;
+            bones.assign(&mut mesh);
+            mesh.shader = shaders.and_then(|s| self.sys.u16_at(s + g * 2)).unwrap_or(0);
+            meshes.push(mesh);
+        }
+        Ok(())
+    }
+
     fn drawable(&self, at: usize, fallback_name: &str) -> Result<Drawable, ModelError> {
         if at + 176 > self.sys.len() {
             return Err(bad("a drawable outside the resource"));
@@ -248,45 +328,11 @@ impl<'a> Reader<'a> {
         let name = if self.sys.u64_at(at + 168) == Some(0) { fallback_name.to_owned() } else { self.name(at + 168)? };
         let bounds = |o| vec3(self.sys, at + o).ok_or_else(|| bad("bounds that are no numbers"));
         // The most detailed level.
-        let lod = self.s(at + 80, 16)?;
-        let models = self.u16(lod + 8)?;
-        if !(1..=256).contains(&models) {
-            return Err(bad("an impossible number of models"));
-        }
-        let list = self.s(lod, models * 8)?;
+        let (list, models) = self.models(at)?;
         let skeleton = self.skeleton(at);
-        let bones = skeleton.as_ref().map_or(0, |s| s.bones.len());
         let mut meshes = Vec::new();
         for m in 0..models {
-            let model = self.s(list + m * 8, 56)?;
-            let count = self.u16(model + 16)?;
-            if !(1..=MAX_MESHES).contains(&count) || meshes.len() + count > MAX_MESHES {
-                return Err(bad("an impossible number of geometries"));
-            }
-            let geometries = self.s(model + 8, count * 8)?;
-            let shaders = self.s(model + 32, count * 2).ok();
-            let used = self.u16(model + 20)?;
-            // What its bones are called; a model without such a list has the skeleton's.
-            let hashes: Vec<u32> = match self.s(model + 40, used * 4) {
-                Ok(list) => (0..used).filter_map(|i| self.sys.u32_at(list + i * 4)).collect(),
-                Err(_) => Vec::new(),
-            };
-            let bones = if !hashes.is_empty() || used == bones { used } else { 0 };
-            // The skeleton's, if it has them all; else those of another one.
-            let own: Option<Vec<u16>> = skeleton
-                .as_ref()
-                .filter(|_| !hashes.is_empty())
-                .and_then(|s| hashes.iter().map(|&h| s.find_hash(h).map(|b| b as u16)).collect());
-            for g in 0..count {
-                let mut mesh = self.mesh(self.s(geometries + g * 8, 160)?, bones)?;
-                match &own {
-                    Some(map) => mesh.bone_indices.iter_mut().flatten().for_each(|b| *b = map[usize::from(*b)]),
-                    None if !mesh.bone_indices.is_empty() => mesh.bone_hashes = hashes.clone(),
-                    None => {}
-                }
-                mesh.shader = shaders.and_then(|s| self.sys.u16_at(s + g * 2)).unwrap_or(0);
-                meshes.push(mesh);
-            }
+            self.model(self.s(list + m * 8, 56)?, skeleton.as_ref(), &mut meshes)?;
         }
         Ok(Drawable {
             name,
@@ -382,6 +428,16 @@ impl<'a> Reader<'a> {
             .collect()
     }
 
+    /// The triangle indices of a geometry with `vertices` vertices.
+    fn indices(&self, geometry: usize, vertices: usize) -> Result<Vec<u32>, ModelError> {
+        let descriptor = self.s(geometry + 64, 16)?;
+        let (index, stride) = self.buffer(self.s(descriptor, 64)?)?;
+        if stride != 4 {
+            return Err(bad("an index buffer of an unknown kind"));
+        }
+        clusters(index, vertices)
+    }
+
     /// A geometry of a drawable with `bones` bones.
     fn mesh(&self, geometry: usize, bones: usize) -> Result<Mesh, ModelError> {
         let vb = self.s(geometry + 8, 80)?;
@@ -392,118 +448,227 @@ impl<'a> Reader<'a> {
             return Err(bad("an impossible vertex count"));
         }
         let (data, _) = self.buffer(vb)?;
-        let part = |slot: usize| -> (usize, u8, u8) {
-            let offset = self.sys.u32_at(format + slot * 4).unwrap_or(0) as usize;
-            (offset, self.sys[format + 0xD0 + slot], self.sys[format + 0x104 + slot])
-        };
-        let within = |offset: usize, size: usize| {
-            offset.checked_add(vertices * size).filter(|end| *end <= data.len()).map(|_| offset)
-        };
+        let vertex_data = VertexData { sys: self.sys, format, data, count: vertices };
 
-        let (offset, size, encoding) = part(POSITION);
-        let at = within(offset, usize::from(size)).ok_or_else(|| bad("positions outside their buffer"))?;
-        let positions: Vec<[f32; 3]> = match (size, encoding) {
-            (12, 6) => (0..vertices).map(|i| vec3(data, at + i * 12)).collect::<Option<_>>(),
-            // Fixed point: 24 bits, 24 bits (the lowest byte and two more
-            // above the first number) and 16 bits.
-            (8, 16) => (|| {
-                let (bias, scale, axes) = (vec3(data, 96)?, vec3(data, 112)?, data.u32_at(108)?);
-                let numbers = data[at..at + vertices * 8].as_chunks::<8>().0;
-                Some(
-                    numbers
-                        .iter()
-                        .map(|c| {
-                            let q = u64::from_le_bytes(*c);
-                            let parts = [q >> 8 & 0xFF_FFFF, (q >> 32 & 0xFFFF) << 8 | q & 0xFF, q >> 48];
-                            let p: [f32; 3] = std::array::from_fn(|k| {
-                                (f64::from(bias[k]) + f64::from(scale[k]) * parts[k] as f64) as f32
-                            });
-                            match axes {
-                                0 => [p[2], p[1], p[0]],
-                                1 => [p[1], p[2], p[0]],
-                                _ => p,
-                            }
-                        })
-                        .collect(),
-                )
-            })(),
+        let positions = vertex_data.positions()?;
+        let (uvs, uvs1) = (vertex_data.coordinates(TEXCOORD), vertex_data.coordinates(TEXCOORD + 1));
+        let (bone_indices, bone_weights) = vertex_data.skinning(bones);
+        let shading = vertex_data.shading();
+
+        let indices = self.indices(geometry, vertices)?;
+        let normals = smooth_normals(&positions, &indices);
+        Ok(Mesh { positions, normals, uvs, uvs1, shading, indices, bone_indices, bone_weights, ..Default::default() })
+    }
+}
+
+/// The vertices of a geometry: its vertex buffer and where the format (in the system part) puts each part.
+struct VertexData<'a> {
+    sys: &'a [u8],
+    format: usize,
+    data: &'a [u8],
+    count: usize,
+}
+
+impl<'a> VertexData<'a> {
+    /// A part's offset in the buffer, size and encoding.
+    fn part(&self, slot: usize) -> (usize, u8, u8) {
+        let offset = self.sys.u32_at(self.format + slot * 4).unwrap_or(0) as usize;
+        (offset, self.sys[self.format + 0xD0 + slot], self.sys[self.format + 0x104 + slot])
+    }
+
+    /// `offset` if all vertices' elements of `size` bytes from there lie inside the buffer.
+    fn within(&self, offset: usize, size: usize) -> Option<usize> {
+        offset.checked_add(self.count * size).filter(|end| *end <= self.data.len()).map(|_| offset)
+    }
+
+    fn positions(&self) -> Result<Vec<[f32; 3]>, ModelError> {
+        let (offset, size, encoding) = self.part(POSITION);
+        let at = self.within(offset, usize::from(size)).ok_or_else(|| bad("positions outside their buffer"))?;
+        let positions = match (size, encoding) {
+            (12, 6) => (0..self.count).map(|i| vec3(self.data, at + i * 12)).collect::<Option<_>>(),
+            (8, 16) => self.fixed_point_positions(at),
             _ => return Err(bad(format!("positions of an unknown kind ({size} bytes, encoding {encoding})"))),
+        };
+        positions.ok_or_else(|| bad("positions that are no numbers"))
+    }
+
+    /// Fixed point: 24 bits, 24 bits (the lowest byte and two more
+    /// above the first number) and 16 bits.
+    fn fixed_point_positions(&self, at: usize) -> Option<Vec<[f32; 3]>> {
+        let data = self.data;
+        let (bias, scale, axes) = (vec3(data, 96)?, vec3(data, 112)?, data.u32_at(108)?);
+        let numbers = data[at..at + self.count * 8].as_chunks::<8>().0;
+        Some(
+            numbers
+                .iter()
+                .map(|c| {
+                    let q = u64::from_le_bytes(*c);
+                    let parts = [q >> 8 & 0xFF_FFFF, (q >> 32 & 0xFFFF) << 8 | q & 0xFF, q >> 48];
+                    let p: [f32; 3] =
+                        std::array::from_fn(|k| (f64::from(bias[k]) + f64::from(scale[k]) * parts[k] as f64) as f32);
+                    match axes {
+                        0 => [p[2], p[1], p[0]],
+                        1 => [p[1], p[2], p[0]],
+                        _ => p,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// The texture coordinates of a slot, empty when it has none or of an unknown kind.
+    fn coordinates(&self, slot: usize) -> Vec<[f32; 2]> {
+        let (offset, size, encoding) = self.part(slot);
+        match (size, encoding, self.within(offset, usize::from(size))) {
+            (8, 16, Some(at)) => self.float_coordinates(at),
+            (4, 38, Some(at)) => self.scaled_coordinates(at),
+            _ => Vec::new(),
         }
-        .ok_or_else(|| bad("positions that are no numbers"))?;
+    }
 
-        let coordinates = |slot: usize| -> Vec<[f32; 2]> {
-            let (offset, size, encoding) = part(slot);
-            match (size, encoding, within(offset, usize::from(size))) {
-                (8, 16, Some(at)) => data[at..at + vertices * 8]
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .map(|c| {
-                        [f32::from_le_bytes([c[0], c[1], c[2], c[3]]), f32::from_le_bytes([c[4], c[5], c[6], c[7]])]
-                    })
-                    .collect(),
-                (4, 38, Some(at)) => {
-                    let scale = data.u32_at(124).map(f32::from_bits).filter(|s| s.is_finite()).unwrap_or(1.0);
-                    let number = |a: u8, b: u8| (f32::from(i16::from_le_bytes([a, b])) / 32767.0).max(-1.0) * scale;
-                    data[at..at + vertices * 4]
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|c| [number(c[0], c[1]), number(c[2], c[3])])
-                        .collect()
-                }
-                _ => Vec::new(),
-            }
-        };
-        let (uvs, uvs1) = (coordinates(TEXCOORD), coordinates(TEXCOORD + 1));
+    fn float_coordinates(&self, at: usize) -> Vec<[f32; 2]> {
+        self.data[at..at + self.count * 8]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| [f32::from_le_bytes([c[0], c[1], c[2], c[3]]), f32::from_le_bytes([c[4], c[5], c[6], c[7]])])
+            .collect()
+    }
 
-        let bytes = |slot: usize, size: usize, encoding: u8| -> Option<&[u8]> {
-            let (offset, own_size, own_encoding) = part(slot);
-            let at = within(offset, size).filter(|_| (usize::from(own_size), own_encoding) == (size, encoding))?;
-            data.get(at..at + vertices * size)
-        };
-        let skinning = |i: usize| -> Option<([u16; 4], [f32; 4])> {
-            if let Some(single) = bytes(BONES[0], 1, 62) {
-                return Some(([u16::from(single[i]), 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
-            }
-            let mut found: Vec<(u8, u16)> = Vec::with_capacity(8);
-            for (weights, numbers) in WEIGHTS.into_iter().zip(BONES) {
-                let Some(w) = bytes(weights, 4, 28) else { continue };
-                if let Some(n) = bytes(numbers, 4, 30) {
-                    found.extend((0..4).map(|k| (w[i * 4 + k], u16::from(n[i * 4 + k]))));
-                } else if let Some(n) = bytes(numbers, 16, 3) {
-                    // The bone is in the lower 12 bits.
-                    let number = |k: usize| u16::from_le_bytes([n[(i * 4 + k) * 4], n[(i * 4 + k) * 4 + 1]]) & 0xFFF;
-                    found.extend((0..4).map(|k| (w[i * 4 + k], number(k))));
-                }
-            }
-            found.sort_by_key(|(w, _)| std::cmp::Reverse(*w));
-            let (mut numbers, mut weights) = ([0; 4], [0.0; 4]);
-            for (k, (w, n)) in found.into_iter().filter(|(w, _)| *w > 0).take(4).enumerate() {
-                numbers[k] = n;
-                weights[k] = f32::from(w) / 255.0;
-            }
-            let total: f32 = weights.iter().sum();
-            (total > 0.0).then(|| (numbers, weights.map(|w| w / total)))
-        };
-        // All vertices, with bones the skeleton has, or none.
-        let (bone_indices, bone_weights) = (0..vertices)
-            .map(|i| skinning(i).filter(|(n, _)| n.iter().all(|n| usize::from(*n) < bones)))
+    fn scaled_coordinates(&self, at: usize) -> Vec<[f32; 2]> {
+        let scale = self.data.u32_at(124).map(f32::from_bits).filter(|s| s.is_finite()).unwrap_or(1.0);
+        let number = |a: u8, b: u8| (f32::from(i16::from_le_bytes([a, b])) / 32767.0).max(-1.0) * scale;
+        self.data[at..at + self.count * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| [number(c[0], c[1]), number(c[2], c[3])])
+            .collect()
+    }
+
+    /// The bytes of a slot if it has exactly this element size and encoding.
+    fn bytes(&self, slot: usize, size: usize, encoding: u8) -> Option<&'a [u8]> {
+        let (offset, own_size, own_encoding) = self.part(slot);
+        let at = self.within(offset, size).filter(|_| (usize::from(own_size), own_encoding) == (size, encoding))?;
+        self.data.get(at..at + self.count * size)
+    }
+
+    /// Bone numbers and weights of every vertex, with bones the skeleton (of `bones` bones) has, or none.
+    fn skinning(&self, bones: usize) -> (Vec<[u16; 4]>, Vec<[f32; 4]>) {
+        (0..self.count)
+            .map(|i| self.skin_of(i).filter(|(n, _)| n.iter().all(|n| usize::from(*n) < bones)))
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default()
             .into_iter()
-            .unzip();
+            .unzip()
+    }
 
-        let shading = bytes(COLOUR, 4, 28).map(|all| all.as_chunks::<4>().0.to_vec()).unwrap_or_default();
-
-        let descriptor = self.s(geometry + 64, 16)?;
-        let (index, stride) = self.buffer(self.s(descriptor, 64)?)?;
-        if stride != 4 {
-            return Err(bad("an index buffer of an unknown kind"));
+    fn skin_of(&self, i: usize) -> Option<([u16; 4], [f32; 4])> {
+        if let Some(single) = self.bytes(BONES[0], 1, 62) {
+            return Some(([u16::from(single[i]), 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
         }
-        let indices = clusters(index, vertices)?;
-        let normals = smooth_normals(&positions, &indices);
-        Ok(Mesh { positions, normals, uvs, uvs1, shading, indices, bone_indices, bone_weights, ..Default::default() })
+        let mut found = self.weighted_bones(i);
+        found.sort_by_key(|(w, _)| std::cmp::Reverse(*w));
+        let (mut numbers, mut weights) = ([0; 4], [0.0; 4]);
+        for (k, (w, n)) in found.into_iter().filter(|(w, _)| *w > 0).take(4).enumerate() {
+            numbers[k] = n;
+            weights[k] = f32::from(w) / 255.0;
+        }
+        let total: f32 = weights.iter().sum();
+        (total > 0.0).then(|| (numbers, weights.map(|w| w / total)))
+    }
+
+    /// The (weight, bone number) pairs of vertex `i`, from both weight parts.
+    fn weighted_bones(&self, i: usize) -> Vec<(u8, u16)> {
+        let mut found: Vec<(u8, u16)> = Vec::with_capacity(8);
+        for (weights, numbers) in WEIGHTS.into_iter().zip(BONES) {
+            let Some(w) = self.bytes(weights, 4, 28) else { continue };
+            if let Some(n) = self.bytes(numbers, 4, 30) {
+                found.extend((0..4).map(|k| (w[i * 4 + k], u16::from(n[i * 4 + k]))));
+            } else if let Some(n) = self.bytes(numbers, 16, 3) {
+                // The bone is in the lower 12 bits.
+                let number = |k: usize| u16::from_le_bytes([n[(i * 4 + k) * 4], n[(i * 4 + k) * 4 + 1]]) & 0xFFF;
+                found.extend((0..4).map(|k| (w[i * 4 + k], number(k))));
+            }
+        }
+        found
+    }
+
+    fn shading(&self) -> Vec<[u8; 4]> {
+        self.bytes(COLOUR, 4, 28).map(|all| all.as_chunks::<4>().0.to_vec()).unwrap_or_default()
+    }
+}
+
+/// The flag of an index buffer with 16-bit vertex references.
+const REFS_16_BIT: u32 = 0x8000_0000;
+
+fn index_word(index: &[u8], at: usize) -> Result<u32, ModelError> {
+    index.u32_at(at).ok_or_else(|| bad("an index buffer that is cut off"))
+}
+
+/// The cut-up index buffer: where its clusters, triangles and vertex references are.
+struct ClusterBuffer<'a> {
+    index: &'a [u8],
+    vertices: usize,
+    cluster_count: usize,
+    triangles: usize,
+    refs: usize,
+    wide: bool,
+    triangles_at: usize,
+    refs_at: usize,
+}
+
+impl<'a> ClusterBuffer<'a> {
+    fn parse(index: &'a [u8], vertices: usize) -> Result<Self, ModelError> {
+        let flags = index_word(index, 0)?;
+        let cluster_count = (flags & if flags & 0x4000_0000 != 0 { 0xFFFF } else { 0x7FFF_FFFF }) as usize;
+        let (triangles, refs) = (index_word(index, 4)? as usize, index_word(index, 8)? as usize);
+        if !(1..=2048).contains(&cluster_count) || !(1..=65535).contains(&triangles) || !(1..=65535).contains(&refs) {
+            return Err(bad("impossible counts in an index buffer"));
+        }
+        let wide = flags & REFS_16_BIT == 0;
+        let triangles_at = 12 + cluster_count * 16;
+        let refs_at = triangles_at + triangles * 4;
+        Ok(Self { index, vertices, cluster_count, triangles, refs, wide, triangles_at, refs_at })
+    }
+
+    fn word(&self, at: usize) -> Result<u32, ModelError> {
+        index_word(self.index, at)
+    }
+
+    /// The vertex the `i`th reference names.
+    fn reference(&self, i: usize) -> Result<u32, ModelError> {
+        let v = if self.wide {
+            self.word(self.refs_at + i * 4)?
+        } else {
+            u32::from(self.index.u16_at(self.refs_at + i * 2).ok_or_else(|| bad("truncated"))?)
+        };
+        if (v as usize) < self.vertices { Ok(v) } else { Err(bad("a triangle with a vertex that does not exist")) }
+    }
+
+    /// The corners of the triangle with word `w`, whose cluster has `own_refs` references from `first_ref` on.
+    fn read_triangle(&self, w: u32, first_ref: usize, own_refs: usize, out: &mut Vec<u32>) -> Result<(), ModelError> {
+        for corner in 0..3 {
+            let local = (w >> (corner * 7) & 127) as usize;
+            if local >= own_refs {
+                return Err(bad("a triangle outside its cluster"));
+            }
+            out.push(self.reference(first_ref + local)?);
+        }
+        Ok(())
+    }
+
+    fn read_cluster(&self, cluster: usize, out: &mut Vec<u32>) -> Result<(), ModelError> {
+        let (counts, starts) = (self.word(12 + cluster * 16)?, self.word(16 + cluster * 16)?);
+        let (own_refs, own_triangles) = ((counts & 127) as usize + 1, (counts >> 7 & 255) as usize + 1);
+        let (first_ref, first_triangle) = ((starts & 0xFFFF) as usize, (starts >> 16) as usize);
+        if first_ref + own_refs > self.refs || first_triangle + own_triangles > self.triangles {
+            return Err(bad("a cluster outside its buffer"));
+        }
+        for t in first_triangle..first_triangle + own_triangles {
+            self.read_triangle(self.word(self.triangles_at + t * 4)?, first_ref, own_refs, out)?;
+        }
+        Ok(())
     }
 }
 
@@ -514,43 +679,12 @@ impl<'a> Reader<'a> {
 /// into the cluster's references, the cluster from bit 21); the references
 /// (16 bits each if the top flag is set, else 32).
 fn clusters(index: &[u8], vertices: usize) -> Result<Vec<u32>, ModelError> {
-    let word = |at: usize| index.u32_at(at).ok_or_else(|| bad("an index buffer that is cut off"));
-    let flags = word(0)?;
-    let cluster_count = (flags & if flags & 0x4000_0000 != 0 { 0xFFFF } else { 0x7FFF_FFFF }) as usize;
-    let (triangles, refs) = (word(4)? as usize, word(8)? as usize);
-    if !(1..=2048).contains(&cluster_count) || !(1..=65535).contains(&triangles) || !(1..=65535).contains(&refs) {
-        return Err(bad("impossible counts in an index buffer"));
+    let buffer = ClusterBuffer::parse(index, vertices)?;
+    let mut out = Vec::with_capacity(buffer.triangles * 3);
+    for cluster in 0..buffer.cluster_count {
+        buffer.read_cluster(cluster, &mut out)?;
     }
-    let wide = flags & 0x8000_0000 == 0;
-    let (triangles_at, refs_at) = (12 + cluster_count * 16, 12 + cluster_count * 16 + triangles * 4);
-    let reference = |i: usize| -> Result<u32, ModelError> {
-        let v = if wide {
-            word(refs_at + i * 4)?
-        } else {
-            u32::from(index.u16_at(refs_at + i * 2).ok_or_else(|| bad("truncated"))?)
-        };
-        if (v as usize) < vertices { Ok(v) } else { Err(bad("a triangle with a vertex that does not exist")) }
-    };
-    let mut out = Vec::with_capacity(triangles * 3);
-    for cluster in 0..cluster_count {
-        let (counts, starts) = (word(12 + cluster * 16)?, word(16 + cluster * 16)?);
-        let (own_refs, own_triangles) = ((counts & 127) as usize + 1, (counts >> 7 & 255) as usize + 1);
-        let (first_ref, first_triangle) = ((starts & 0xFFFF) as usize, (starts >> 16) as usize);
-        if first_ref + own_refs > refs || first_triangle + own_triangles > triangles {
-            return Err(bad("a cluster outside its buffer"));
-        }
-        for t in first_triangle..first_triangle + own_triangles {
-            let w = word(triangles_at + t * 4)?;
-            for corner in 0..3 {
-                let local = (w >> (corner * 7) & 127) as usize;
-                if local >= own_refs {
-                    return Err(bad("a triangle outside its cluster"));
-                }
-                out.push(reference(first_ref + local)?);
-            }
-        }
-    }
-    if out.len() != triangles * 3 {
+    if out.len() != buffer.triangles * 3 {
         return Err(bad("clusters that do not add up to the triangle count"));
     }
     Ok(out)
@@ -580,38 +714,52 @@ fn smooth_normals(positions: &[[f32; 3]], indices: &[u32]) -> Vec<[f32; 3]> {
 /// [`ModelError::Graphics`] says the graphics part is too short.
 pub fn parse(system: &[u8], graphics: &[u8]) -> Result<Vec<Drawable>, ModelError> {
     let reader = Reader { sys: system, gfx: graphics };
-    let pages = reader.s(8, 16).map_err(|_| ModelError::NotAModel)?;
-    if !(1..=32).contains(&system[pages + 8]) || !(1..=32).contains(&system[pages + 9]) {
-        return Err(ModelError::NotAModel);
-    }
+    reader.check_pages()?;
     match root(system).ok_or(ModelError::NotAModel)? {
         Root::Drawable => Ok(vec![reader.drawable(0, "")?]),
-        Root::Fragment => {
-            let at = reader.s(24, 176)?;
-            if !is_drawable(system, at, true) {
+        Root::Fragment => reader.fragment(),
+        Root::Dictionary => reader.dictionary(),
+    }
+}
+
+impl Reader<'_> {
+    /// Whether the page counts a model's resource starts with are plausible.
+    fn check_pages(&self) -> Result<(), ModelError> {
+        let pages = self.s(8, 16).map_err(|_| ModelError::NotAModel)?;
+        if !(1..=32).contains(&self.sys[pages + 8]) || !(1..=32).contains(&self.sys[pages + 9]) {
+            return Err(ModelError::NotAModel);
+        }
+        Ok(())
+    }
+
+    /// The drawable of a fragment.
+    fn fragment(&self) -> Result<Vec<Drawable>, ModelError> {
+        let at = self.s(24, 176)?;
+        if !is_drawable(self.sys, at, true) {
+            return Err(ModelError::NotAModel);
+        }
+        Ok(vec![self.drawable(at, &self.name(168)?)?])
+    }
+
+    /// The drawables of a dictionary; those that cannot be read cost only themselves.
+    fn dictionary(&self) -> Result<Vec<Drawable>, ModelError> {
+        let count = self.u16(56)?;
+        let list = self.s(48, count * 8)?;
+        let mut drawables = Vec::with_capacity(count);
+        let mut first_error = None;
+        for i in 0..count {
+            let at = self.s(list + i * 8, 176)?;
+            if !is_drawable(self.sys, at, true) {
                 return Err(ModelError::NotAModel);
             }
-            Ok(vec![reader.drawable(at, &reader.name(168)?)?])
-        }
-        Root::Dictionary => {
-            let count = reader.u16(56)?;
-            let list = reader.s(48, count * 8)?;
-            let mut drawables = Vec::with_capacity(count);
-            let mut first_error = None;
-            for i in 0..count {
-                let at = reader.s(list + i * 8, 176)?;
-                if !is_drawable(system, at, true) {
-                    return Err(ModelError::NotAModel);
-                }
-                match reader.drawable(at, &format!("drawable {i}")) {
-                    Ok(d) => drawables.push(d),
-                    // More graphics data may help; anything else only costs this one.
-                    Err(e @ ModelError::Graphics(_)) => return Err(e),
-                    Err(e) => first_error = first_error.or(Some(e)),
-                }
+            match self.drawable(at, &format!("drawable {i}")) {
+                Ok(d) => drawables.push(d),
+                // More graphics data may help; anything else only costs this one.
+                Err(e @ ModelError::Graphics(_)) => return Err(e),
+                Err(e) => first_error = first_error.or(Some(e)),
             }
-            if drawables.is_empty() { Err(first_error.unwrap_or(ModelError::NotAModel)) } else { Ok(drawables) }
         }
+        if drawables.is_empty() { Err(first_error.unwrap_or(ModelError::NotAModel)) } else { Ok(drawables) }
     }
 }
 

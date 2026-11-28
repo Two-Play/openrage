@@ -1,6 +1,35 @@
 //! `openrage verify`: archive data and game-specific formats.
 
 use crate::*;
+use rage_formats::{drawable, ydr_write};
+use ydr_write::Place;
+
+#[derive(Default)]
+struct TextureStats {
+    dicts: usize,
+    textures: usize,
+    decoded: usize,
+    undecodable: std::collections::BTreeMap<String, usize>,
+    errors: Vec<String>,
+    models: usize,
+    grown: usize,
+    unreadable: Vec<String>,
+}
+
+impl TextureStats {
+    fn add(&mut self, other: TextureStats) {
+        self.dicts += other.dicts;
+        self.textures += other.textures;
+        self.decoded += other.decoded;
+        self.models += other.models;
+        self.grown += other.grown;
+        self.unreadable.extend(other.unreadable);
+        self.errors.extend(other.errors);
+        for (k, v) in other.undecodable {
+            *self.undecodable.entry(k).or_default() += v;
+        }
+    }
+}
 
 pub(crate) fn cmd_verify_textures(
     game_dir: &Path,
@@ -8,137 +37,41 @@ pub(crate) fn cmd_verify_textures(
     rebuild: bool,
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
-    #[derive(Default)]
-    struct Stats {
-        dicts: usize,
-        textures: usize,
-        decoded: usize,
-        undecodable: std::collections::BTreeMap<String, usize>,
-        errors: Vec<String>,
-        models: usize,
-        grown: usize,
-        unreadable: Vec<String>,
-    }
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     let (all, nested) = for_each_entry_parallel(
         &starts,
         |e| e.resource_version().is_some(),
-        |a, id, p, s: &mut Stats| {
+        |a, id, p, s: &mut TextureStats| {
             // Models with textures of their own: check the writer in memory.
             if rebuild
                 && openrage_app::textures::gta5_model_ext(p).is_some()
                 && let rage_rpf::EntryKind::Resource { system_flags, graphics_flags, .. } = a.entry(id).kind
             {
-                let check = a.read_resource(id).map_err(anyhow::Error::from).and_then(|res| {
-                    openrage_app::textures::check_model_textures(&res, p, system_flags, graphics_flags)
-                });
-                match check {
-                    Ok(openrage_app::textures::ModelCheck::Ok { grown }) => {
-                        s.models += 1;
-                        s.grown += grown as usize;
-                    }
-                    Ok(openrage_app::textures::ModelCheck::NoTextures) => {}
-                    Ok(openrage_app::textures::ModelCheck::Unreadable(why)) => s.unreadable.push(format!("{p}: {why}")),
-                    Err(e) => s.errors.push(format!("{p}: model textures: {e:#}")),
-                }
+                check_model_textures_entry(a, id, p, (system_flags, graphics_flags), s);
                 return;
             }
             if !a.entry(id).name.to_ascii_lowercase().ends_with(".ytd") || a.entry(id).resource_version().is_none() {
                 return;
             }
             s.dicts += 1;
-            let dict = match a
-                .read_resource(id)
-                .map_err(anyhow::Error::from)
-                .and_then(|r| Ok(rage_formats::ytd::parse(&r)?))
-            {
-                Ok(d) => d,
-                Err(e) => return s.errors.push(format!("{p}: {e:#}")),
-            };
-            s.errors.extend(dict.errors.iter().map(|e| format!("{p}: {e}")));
-            if rebuild && dict.errors.is_empty() {
-                let check = rage_formats::ytd_write::rebuild(&dict)
-                    .and_then(|file| rage_resource::Resource::from_rsc7(&file))
-                    .and_then(|res| rage_formats::ytd::parse(&res));
-                match check {
-                    Ok(back) => {
-                        let mut a: Vec<_> = dict
-                            .textures
-                            .iter()
-                            .map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data))
-                            .collect();
-                        let mut b: Vec<_> = back
-                            .textures
-                            .iter()
-                            .map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data))
-                            .collect();
-                        a.sort_by(|x, y| x.0.cmp(y.0));
-                        b.sort_by(|x, y| x.0.cmp(y.0));
-                        if a != b || !back.errors.is_empty() {
-                            s.errors.push(format!("{p}: rebuilt dictionary differs from the original"));
-                        }
-                        // Structures must match byte for byte, apart from pointers.
-                        let pointers: &[(usize, usize)] = match dict.layout {
-                            rage_formats::ytd::Layout::Legacy => &[(0x28, 0x30), (0x70, 0x78)],
-                            rage_formats::ytd::Layout::Enhanced | rage_formats::ytd::Layout::Rdr2 => &[(0x28, 0x40)],
-                            rage_formats::ytd::Layout::Gta4 => &[(0x14, 0x18), (0x48, 0x4C)],
-                        };
-                        let masked = |t: &[u8]| {
-                            let mut t = t.to_vec();
-                            for &(from, to) in pointers {
-                                t[from..to].fill(0);
-                            }
-                            t
-                        };
-                        for (t, st) in dict.textures.iter().zip(&dict.stored) {
-                            let Some(j) = back.textures.iter().position(|x| x.name == t.name) else { continue };
-                            let (x, y) = (masked(&st.template), masked(&back.stored[j].template));
-                            if x != y {
-                                let diffs: Vec<String> = (0..x.len())
-                                    .filter(|&i| x[i] != y[i])
-                                    .map(|i| format!("{i:#x}: {:02x}→{:02x}", x[i], y[i]))
-                                    .collect();
-                                s.errors.push(format!(
-                                    "{p}/{}: rebuilt texture structure differs ({}x{} {} mips {}; {})",
-                                    t.name,
-                                    t.width,
-                                    t.height,
-                                    t.format.name(),
-                                    t.levels,
-                                    diffs.join(", ")
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
-                }
-            }
-            for t in &dict.textures {
-                s.textures += 1;
-                match t.to_rgba() {
-                    Some(_) => s.decoded += 1,
-                    None => *s.undecodable.entry(t.format.name()).or_default() += 1,
-                }
-            }
+            check_ytd_entry(a, id, p, rebuild, s);
         },
     );
-    let mut total = Stats { errors: nested, ..Default::default() };
+    let mut total = TextureStats { errors: nested, ..Default::default() };
     for s in all {
-        total.dicts += s.dicts;
-        total.textures += s.textures;
-        total.decoded += s.decoded;
-        total.models += s.models;
-        total.grown += s.grown;
-        total.unreadable.extend(s.unreadable);
-        total.errors.extend(s.errors);
-        for (k, v) in s.undecodable {
-            *total.undecodable.entry(k).or_default() += v;
-        }
+        total.add(s);
     }
     total.errors.sort();
     total.unreadable.sort();
+    print_texture_stats(&total, rebuild, started);
+    if !total.errors.is_empty() {
+        bail!("{} errors", total.errors.len());
+    }
+    Ok(())
+}
+
+fn print_texture_stats(total: &TextureStats, rebuild: bool, started: Instant) {
     for e in total.errors.iter().take(50) {
         outln!("FAIL {e}");
     }
@@ -163,10 +96,117 @@ pub(crate) fn cmd_verify_textures(
         total.errors.len(),
         started.elapsed().as_secs_f32()
     );
-    if !total.errors.is_empty() {
-        bail!("{} errors", total.errors.len());
+}
+
+/// A model with textures of its own: the writer is checked in memory.
+fn check_model_textures_entry(
+    a: &Rpf7,
+    id: EntryId,
+    p: &str,
+    (system_flags, graphics_flags): (u32, u32),
+    s: &mut TextureStats,
+) {
+    let check = a
+        .read_resource(id)
+        .map_err(anyhow::Error::from)
+        .and_then(|res| openrage_app::textures::check_model_textures(&res, p, system_flags, graphics_flags));
+    match check {
+        Ok(openrage_app::textures::ModelCheck::Ok { grown }) => {
+            s.models += 1;
+            s.grown += grown as usize;
+        }
+        Ok(openrage_app::textures::ModelCheck::NoTextures) => {}
+        Ok(openrage_app::textures::ModelCheck::Unreadable(why)) => s.unreadable.push(format!("{p}: {why}")),
+        Err(e) => s.errors.push(format!("{p}: model textures: {e:#}")),
     }
-    Ok(())
+}
+
+/// Parses a texture dictionary (and with `rebuild`, writes it anew) and counts its textures.
+fn check_ytd_entry(a: &Rpf7, id: EntryId, p: &str, rebuild: bool, s: &mut TextureStats) {
+    let dict = match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| Ok(rage_formats::ytd::parse(&r)?)) {
+        Ok(d) => d,
+        Err(e) => return s.errors.push(format!("{p}: {e:#}")),
+    };
+    s.errors.extend(dict.errors.iter().map(|e| format!("{p}: {e}")));
+    if rebuild && dict.errors.is_empty() {
+        check_ytd_rebuild(&dict, p, s);
+    }
+    for t in &dict.textures {
+        s.textures += 1;
+        match t.to_rgba() {
+            Some(_) => s.decoded += 1,
+            None => *s.undecodable.entry(t.format.name()).or_default() += 1,
+        }
+    }
+}
+
+fn check_ytd_rebuild(dict: &rage_formats::ytd::TextureDictionary, p: &str, s: &mut TextureStats) {
+    let check = rage_formats::ytd_write::rebuild(dict)
+        .and_then(|file| rage_resource::Resource::from_rsc7(&file))
+        .and_then(|res| rage_formats::ytd::parse(&res));
+    match check {
+        Ok(back) => {
+            if textures_differ(dict, &back) || !back.errors.is_empty() {
+                s.errors.push(format!("{p}: rebuilt dictionary differs from the original"));
+            }
+            check_rebuilt_structures(dict, &back, p, s);
+        }
+        Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
+    }
+}
+
+/// Whether two dictionaries hold different textures, by name regardless of order.
+fn textures_differ(a: &rage_formats::ytd::TextureDictionary, b: &rage_formats::ytd::TextureDictionary) -> bool {
+    let mut a: Vec<_> = a.textures.iter().map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data)).collect();
+    let mut b: Vec<_> = b.textures.iter().map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data)).collect();
+    a.sort_by(|x, y| x.0.cmp(y.0));
+    b.sort_by(|x, y| x.0.cmp(y.0));
+    a != b
+}
+
+/// Where a texture's structure holds pointers, which differ between a file and its rebuild.
+fn pointer_ranges(layout: rage_formats::ytd::Layout) -> &'static [(usize, usize)] {
+    match layout {
+        rage_formats::ytd::Layout::Legacy => &[(0x28, 0x30), (0x70, 0x78)],
+        rage_formats::ytd::Layout::Enhanced | rage_formats::ytd::Layout::Rdr2 => &[(0x28, 0x40)],
+        rage_formats::ytd::Layout::Gta4 => &[(0x14, 0x18), (0x48, 0x4C)],
+    }
+}
+
+fn masked(t: &[u8], pointers: &[(usize, usize)]) -> Vec<u8> {
+    let mut t = t.to_vec();
+    for &(from, to) in pointers {
+        t[from..to].fill(0);
+    }
+    t
+}
+
+/// Structures must match byte for byte, apart from pointers.
+fn check_rebuilt_structures(
+    dict: &rage_formats::ytd::TextureDictionary,
+    back: &rage_formats::ytd::TextureDictionary,
+    p: &str,
+    s: &mut TextureStats,
+) {
+    let pointers = pointer_ranges(dict.layout);
+    for (t, st) in dict.textures.iter().zip(&dict.stored) {
+        let Some(j) = back.textures.iter().position(|x| x.name == t.name) else { continue };
+        let (x, y) = (masked(&st.template, pointers), masked(&back.stored[j].template, pointers));
+        if x != y {
+            let diffs: Vec<String> =
+                (0..x.len()).filter(|&i| x[i] != y[i]).map(|i| format!("{i:#x}: {:02x}→{:02x}", x[i], y[i])).collect();
+            s.errors.push(format!(
+                "{p}/{}: rebuilt texture structure differs ({}x{} {} mips {}; {})",
+                t.name,
+                t.width,
+                t.height,
+                t.format.name(),
+                t.levels,
+                diffs.join(", ")
+            ));
+            break;
+        }
+    }
 }
 
 pub(crate) fn cmd_verify_media(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
@@ -364,119 +404,194 @@ pub(crate) fn collision_mesh(d: &rage_formats::drawable::Drawable) -> rage_forma
     out
 }
 
+/// Counts of one worker of `cmd_verify_collision_writer`.
+#[derive(Default)]
+struct CollisionCounts {
+    files: usize,
+    /// Game hierarchies checked.
+    hierarchies: usize,
+    /// Collisions written anew and read back the same.
+    written: usize,
+    /// No triangle mesh to copy, or too large.
+    skipped: usize,
+    errors: Vec<String>,
+}
+
+/// Collisions of boxes and spheres only borrow the structure of a triangle mesh.
+type CollisionDonor<'a> = Option<(&'a rage_resource::Resource, bool)>;
+
+/// How far the area per material may differ after the rewrite: relative, plus absolute.
+const AREA_TOLERANCE_RELATIVE: f64 = 0.01;
+const AREA_TOLERANCE_ABSOLUTE: f64 = 0.05;
+/// The bounds may differ by this fraction of their extent, plus a minimum.
+const BOUNDS_SLACK_DIVISOR: f32 = 30000.0;
+const BOUNDS_SLACK_MINIMUM: f32 = 1e-3;
+
+fn triangle_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f64 {
+    let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+    let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    0.5 * ((n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) as f64).sqrt()
+}
+
+/// Per material type: triangles and area.
+/// Triangles that lie on the coarser vertex grid of the one new bound can collapse
+/// (slivers), so triangles may get fewer, never more; the area stays.
+fn material_totals(d: &drawable::Drawable) -> std::collections::BTreeMap<u32, (usize, f64)> {
+    let mut t = std::collections::BTreeMap::new();
+    for m in &d.meshes {
+        let e = t.entry(d.shaders[m.shader as usize].name_hash).or_insert((0usize, 0f64));
+        for c in m.indices.as_chunks::<3>().0 {
+            let [a, b, c] = c.map(|i| m.positions[i as usize]);
+            e.0 += 1;
+            e.1 += triangle_area(a, b, c);
+        }
+    }
+    t
+}
+
+fn compare_materials(before: &drawable::Drawable, after: &drawable::Drawable) -> Result<()> {
+    let (x, y) = (material_totals(before), material_totals(after));
+    if x.len() != y.len() {
+        bail!("materials {:?} written as {:?}", x.keys().collect::<Vec<_>>(), y.keys().collect::<Vec<_>>());
+    }
+    for ((m, a), (n, b)) in x.iter().zip(&y) {
+        if m != n || b.0 > a.0 || (a.1 - b.1).abs() > AREA_TOLERANCE_RELATIVE * a.1 + AREA_TOLERANCE_ABSOLUTE {
+            bail!("material {m:x}: {} triangles, area {:.2} written as {} triangles, area {:.2}", a.0, a.1, b.0, b.1);
+        }
+    }
+    Ok(())
+}
+
+fn compare_collisions(before: &drawable::Drawable, after: &drawable::Drawable) -> Result<()> {
+    compare_materials(before, after)?;
+    let slack: Vec<f32> = (0..3)
+        .map(|k| (before.bounds_max[k] - before.bounds_min[k]) / BOUNDS_SLACK_DIVISOR + BOUNDS_SLACK_MINIMUM)
+        .collect();
+    if (0..3).any(|k| {
+        (before.bounds_min[k] - after.bounds_min[k]).abs() > slack[k]
+            || (before.bounds_max[k] - after.bounds_max[k]).abs() > slack[k]
+    }) {
+        bail!(
+            "box {:?}..{:?} written as {:?}..{:?}",
+            before.bounds_min,
+            before.bounds_max,
+            after.bounds_min,
+            after.bounds_max
+        );
+    }
+    Ok(())
+}
+
+/// Writes the collision of `res` anew from `mesh`; returns the written resource and its collision root.
+fn rewrite_collision(
+    res: &rage_resource::Resource,
+    ydr: bool,
+    mesh: &rage_formats::ybn_write::CollisionMesh,
+    donor: CollisionDonor,
+) -> Result<(rage_resource::Resource, u64)> {
+    use rage_formats::ybn_write;
+    let file = ybn_write::replace_collision(res, ydr, mesh, donor)?;
+    let back = rage_resource::Resource::from_rsc7(&file)?;
+    let at = ybn_write::collision_of(&back, ydr)?;
+    for b in ybn_write::bvh_bounds(&back, at) {
+        ybn_write::check_bvh(&back, b).context("the written hierarchy")?;
+    }
+    Ok((back, at))
+}
+
+/// Checks the game's own hierarchies of the collision at `root`.
+fn check_game_hierarchies(res: &rage_resource::Resource, root: u64, c: &mut CollisionCounts) -> Result<()> {
+    use rage_formats::ybn_write;
+    for b in ybn_write::bvh_bounds(res, root) {
+        ybn_write::check_bvh(res, b).context("the game's own hierarchy")?;
+        c.hierarchies += 1;
+    }
+    Ok(())
+}
+
+/// Checks the game's own hierarchies of a collision and reads it.
+fn game_collision(res: &rage_resource::Resource, ydr: bool, c: &mut CollisionCounts) -> Result<drawable::Drawable> {
+    use rage_formats::{ybn, ybn_write};
+    let root = ybn_write::collision_of(res, ydr)?;
+    check_game_hierarchies(res, root, c)?;
+    Ok(ybn::parse_at(res, root)?.0)
+}
+
+/// Writes the collision anew from `mesh` and compares what the reader gets back.
+fn check_written(
+    res: &rage_resource::Resource,
+    ydr: bool,
+    before: &drawable::Drawable,
+    mesh: &rage_formats::ybn_write::CollisionMesh,
+    donor: CollisionDonor,
+) -> Result<()> {
+    let (back, at) = rewrite_collision(res, ydr, mesh, donor)?;
+    let (after, _) = rage_formats::ybn::parse_at(&back, at)?;
+    compare_collisions(before, &after)?;
+    if ydr {
+        let (a, b) = (drawable::parse_ydr(res)?, drawable::parse_ydr(&back)?);
+        if a.meshes.len() != b.meshes.len() {
+            bail!("the drawable's meshes changed");
+        }
+    }
+    Ok(())
+}
+
+fn check_collision(
+    res: &rage_resource::Resource,
+    ydr: bool,
+    donor: CollisionDonor,
+    c: &mut CollisionCounts,
+) -> Result<()> {
+    let before = game_collision(res, ydr, c)?;
+    let mesh = collision_mesh(&before);
+    if mesh.indices.len() / 3 > rage_formats::ybn_write::MAX_TRIANGLES || mesh.indices.is_empty() {
+        c.skipped += 1;
+        return Ok(());
+    }
+    check_written(res, ydr, &before, &mesh, donor)?;
+    c.written += 1;
+    Ok(())
+}
+
 /// Checks the game's collision hierarchies against the writer's reading of
 /// them, then writes every Enhanced `.ybn` and drawable collision anew from
 /// its own triangles (`ybn_write`) and compares what the reader gets back.
 pub(crate) fn cmd_verify_collision_writer(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
-    use rage_formats::{drawable, ybn, ybn_write};
     let starts = archive_roots(game_dir, within, keys.clone())?;
     let started = Instant::now();
-    // Per material type: triangles and area.
-    // Triangles that lie on the coarser vertex grid of the one new bound can collapse
-    // (slivers), so triangles may get fewer, never more; the area stays.
-    let totals = |d: &drawable::Drawable| -> std::collections::BTreeMap<u32, (usize, f64)> {
-        let mut t = std::collections::BTreeMap::new();
-        for m in &d.meshes {
-            let e = t.entry(d.shaders[m.shader as usize].name_hash).or_insert((0usize, 0f64));
-            for c in m.indices.as_chunks::<3>().0 {
-                let [a, b, c] = c.map(|i| m.positions[i as usize]);
-                let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
-                let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
-                let area = 0.5 * ((n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) as f64).sqrt();
-                e.0 += 1;
-                e.1 += area;
-            }
-        }
-        t
-    };
-    // (game hierarchies checked, written anew, skipped: no triangle mesh to copy / too large)
-    // Collisions of boxes and spheres only borrow the structure of a triangle mesh.
     let donor = openrage_app::obj::find_collision_donor(game_dir, within, keys.clone());
     let donor = donor.as_ref().map(|(r, y)| (r, *y));
-    let check = |res: &rage_resource::Resource, ydr: bool, s: &mut (usize, usize, usize)| -> Result<()> {
-        let root = ybn_write::collision_of(res, ydr)?;
-        for b in ybn_write::bvh_bounds(res, root) {
-            ybn_write::check_bvh(res, b).context("the game's own hierarchy")?;
-            s.0 += 1;
-        }
-        let (before, _) = ybn::parse_at(res, root)?;
-        let mesh = collision_mesh(&before);
-        if mesh.indices.len() / 3 > ybn_write::MAX_TRIANGLES || mesh.indices.is_empty() {
-            s.2 += 1;
-            return Ok(());
-        }
-        let file = ybn_write::replace_collision(res, ydr, &mesh, donor)?;
-        let back = rage_resource::Resource::from_rsc7(&file)?;
-        let at = ybn_write::collision_of(&back, ydr)?;
-        for b in ybn_write::bvh_bounds(&back, at) {
-            ybn_write::check_bvh(&back, b).context("the written hierarchy")?;
-        }
-        let (after, _) = ybn::parse_at(&back, at)?;
-        let (x, y) = (totals(&before), totals(&after));
-        if x.len() != y.len() {
-            bail!("materials {:?} written as {:?}", x.keys().collect::<Vec<_>>(), y.keys().collect::<Vec<_>>());
-        }
-        for ((m, a), (n, b)) in x.iter().zip(&y) {
-            if m != n || b.0 > a.0 || (a.1 - b.1).abs() > 0.01 * a.1 + 0.05 {
-                bail!(
-                    "material {m:x}: {} triangles, area {:.2} written as {} triangles, area {:.2}",
-                    a.0,
-                    a.1,
-                    b.0,
-                    b.1
-                );
-            }
-        }
-        let slack: Vec<f32> = (0..3).map(|k| (before.bounds_max[k] - before.bounds_min[k]) / 30000.0 + 1e-3).collect();
-        if (0..3).any(|k| {
-            (before.bounds_min[k] - after.bounds_min[k]).abs() > slack[k]
-                || (before.bounds_max[k] - after.bounds_max[k]).abs() > slack[k]
-        }) {
-            bail!(
-                "box {:?}..{:?} written as {:?}..{:?}",
-                before.bounds_min,
-                before.bounds_max,
-                after.bounds_min,
-                after.bounds_max
-            );
-        }
-        if ydr {
-            let (a, b) = (drawable::parse_ydr(res)?, drawable::parse_ydr(&back)?);
-            if a.meshes.len() != b.meshes.len() {
-                bail!("the drawable's meshes changed");
-            }
-        }
-        s.1 += 1;
-        Ok(())
-    };
-    type Counts = (usize, (usize, usize, usize), Vec<String>);
     let (all, nested) = for_each_entry_parallel(
         &starts,
         |e| {
             let name = e.name.to_ascii_lowercase();
             name.ends_with(".ydr") || name.ends_with(".ybn")
         },
-        |a, id, p, (files, s, errors): &mut Counts| {
+        |a, id, p, c: &mut CollisionCounts| {
             let ydr = a.entry(id).name.to_ascii_lowercase().ends_with(".ydr");
             let Ok(res) = a.read_resource(id) else { return };
-            if ydr && (res.version != drawable::VERSION_YDR_ENHANCED || ybn_write::collision_of(&res, true).is_err()) {
+            if ydr
+                && (res.version != drawable::VERSION_YDR_ENHANCED
+                    || rage_formats::ybn_write::collision_of(&res, true).is_err())
+            {
                 return;
             }
-            *files += 1;
-            if let Err(e) = check(&res, ydr, s) {
-                errors.push(format!("{p}: {e:#}"));
+            c.files += 1;
+            if let Err(e) = check_collision(&res, ydr, donor, c) {
+                c.errors.push(format!("{p}: {e:#}"));
             }
         },
     );
-    let sum = |f: fn(&Counts) -> usize| all.iter().map(f).sum::<usize>();
-    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.2).chain(&nested).collect();
+    let sum = |f: fn(&CollisionCounts) -> usize| all.iter().map(f).sum::<usize>();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.errors).chain(&nested).collect();
     errors.sort();
     outln!(
         "{} collisions ({} game hierarchies as expected), {} written anew and read back the same, {} skipped (no triangles, or over {}), {} errors ({:.1}s)",
-        sum(|x| x.0),
-        sum(|x| x.1.0),
-        sum(|x| x.1.1),
-        sum(|x| x.1.2),
+        sum(|x| x.files),
+        sum(|x| x.hierarchies),
+        sum(|x| x.written),
+        sum(|x| x.skipped),
         rage_formats::ybn_write::MAX_TRIANGLES,
         errors.len(),
         started.elapsed().as_secs_f32()
@@ -631,249 +746,34 @@ pub(crate) fn cmd_verify_text(game_dir: &Path, within: &str, keys: Option<Arc<Gt
 /// (through the model writer) and compares what the reader gets back.
 /// Skinned meshes keep the bones and weights of every vertex.
 pub(crate) fn cmd_verify_model_writer(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
-    use rage_formats::{drawable, ydr_write};
-    use ydr_write::Place;
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
-    // The bone with the most weight, per vertex.
-    let main_bones = |m: &drawable::Mesh| -> Vec<u16> {
-        m.bone_indices
-            .iter()
-            .zip(&m.bone_weights)
-            .map(|(b, w)| b[(0..4).fold(0, |k, i| if w[i] > w[k] { i } else { k })])
-            .collect()
-    };
-    let single_bone = |m: &drawable::Mesh| m.bone_weights.iter().all(|w| w.iter().filter(|&&x| x > 0.0).count() == 1);
-    let byte = |w: f32| (w * 255.0).round() as u8;
-    // Places written (0: nothing to write) and child models / dictionary drawables among them.
-    let check = |res: &rage_resource::Resource, name: &str| -> Result<(usize, usize, usize)> {
-        if res.version != drawable::VERSION_YDR_ENHANCED && res.version != drawable::VERSION_YFT_ENHANCED {
-            return Ok((0, 0, 0));
-        }
-        let places: Vec<Place> = if name.ends_with(".ydd") {
-            (0..ydr_write::entry_hashes(res)?.len()).map(Place::Entry).collect()
-        } else {
-            std::iter::once(Place::Main).chain((0..ydr_write::child_models(res).len()).map(Place::Child)).collect()
-        };
-        let mut chosen: Vec<(Place, Vec<ydr_write::NewMesh>)> = Vec::new();
-        for place in places {
-            let before = ydr_write::read_at(res, place)?;
-            let usable = ydr_write::usable_shaders_at(res, place).with_context(|| format!("{place:?}"))?;
-            let skinned = ydr_write::is_skinned_at(res, place)?;
-            let meshes: Vec<ydr_write::NewMesh> = before
-                .meshes
-                .iter()
-                .filter(|m| usable.contains(&m.shader) && !m.indices.is_empty() && m.bone_indices.is_empty() != skinned)
-                .map(|m| {
-                    // Vertices on one bone each (vehicles) as the OBJ import gives them;
-                    // blended ones (peds) with all their bones and weights.
-                    let (bones, blend) = if m.bone_indices.is_empty() {
-                        (Vec::new(), Vec::new())
-                    } else if single_bone(m) {
-                        (main_bones(m), Vec::new())
-                    } else {
-                        let blend = m
-                            .bone_indices
-                            .iter()
-                            .zip(&m.bone_weights)
-                            .map(|(b, w)| ydr_write::Blend { bones: *b, weights: *w })
-                            .collect();
-                        (Vec::new(), blend)
-                    };
-                    ydr_write::NewMesh {
-                        shader: m.shader,
-                        positions: m.positions.clone(),
-                        normals: m.normals.clone(),
-                        uvs: m.uvs.clone(),
-                        colors: m.colors.clone(),
-                        indices: m.indices.clone(),
-                        bones,
-                        blend,
-                    }
-                })
-                .collect();
-            if !meshes.is_empty() {
-                chosen.push((place, meshes));
-            }
-        }
-        if chosen.is_empty() {
-            return Ok((0, 0, 0));
-        }
-        let lods: Vec<[&[ydr_write::NewMesh]; 1]> = chosen.iter().map(|(_, m)| [m.as_slice()]).collect();
-        let parts: Vec<ydr_write::Part> = chosen
-            .iter()
-            .zip(&lods)
-            .map(|((place, _), l)| ydr_write::Part { place: *place, lods: l, materials: None })
-            .collect();
-        let file = ydr_write::replace_parts(res, &parts, None)?;
-        let after_res = rage_resource::Resource::from_rsc7(&file)?;
-        // What the game gets reads back as a whole.
-        if name.ends_with(".ydd") {
-            drawable::parse_ydd(&after_res)?;
-        } else {
-            ydr_write::read_back(&file)?;
-        }
-        for (place, meshes) in &chosen {
-            let after = ydr_write::read_at(&after_res, *place)?;
-            if after.meshes.len() != meshes.len() {
-                bail!("{place:?}: {} meshes written, {} read back", meshes.len(), after.meshes.len());
-            }
-            for (i, (a, m)) in after.meshes.iter().zip(meshes).enumerate() {
-                // Bit for bit: some of the game's vertices hold NaN, which never equals itself.
-                let same = |x: &[f32], y: &[f32]| {
-                    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
-                };
-                if !same(a.positions.as_flattened(), m.positions.as_flattened())
-                    || a.indices != m.indices
-                    || a.shader != m.shader
-                {
-                    bail!("{place:?} mesh {i}: geometry differs after writing");
-                }
-                if !m.uvs.is_empty() && !same(a.uvs.as_flattened(), m.uvs.as_flattened()) {
-                    bail!("{place:?} mesh {i}: texture coordinates differ after writing");
-                }
-                let close = |x: &[[f32; 3]], y: &[[f32; 3]]| {
-                    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| (0..3).all(|k| (p[k] - q[k]).abs() < 0.01))
-                };
-                if !m.normals.is_empty() && !close(&a.normals, &m.normals) {
-                    bail!("{place:?} mesh {i}: normals differ after writing");
-                }
-                if !m.colors.is_empty() && a.colors.first() != m.colors.first() {
-                    bail!("{place:?} mesh {i}: colours differ after writing");
-                }
-                if m.blend.is_empty() {
-                    if main_bones(a) != m.bones {
-                        bail!("{place:?} mesh {i}: vertices move with other bones after writing");
-                    }
-                } else {
-                    let got = a.bone_indices.iter().zip(&a.bone_weights).map(|(b, w)| (*b, w.map(byte)));
-                    if got.ne(m.blend.iter().map(|bl| (bl.bones, bl.weights.map(byte)))) {
-                        bail!("{place:?} mesh {i}: bones or weights differ after writing");
-                    }
-                }
-            }
-        }
-        let children = chosen.iter().filter(|(p, _)| matches!(p, Place::Child(_))).count();
-        let entries = chosen.iter().filter(|(p, _)| matches!(p, Place::Entry(_))).count();
-        let written = (chosen.len(), children, entries);
-
-        // Materials: a shader copy per mesh shader, with a texture where the
-        // place's shader group has an embedded dictionary to put it in.
-        // (A model with an empty embedded dictionary borrows the structure from another one when
-        // importing; here only models with embedded textures get one.)
-        let owner = |p: Place| if matches!(p, Place::Child(_)) { Place::Main } else { p };
-        let mut materials: Vec<Vec<ydr_write::NewMaterial>> = Vec::new();
-        let mut with_materials = Vec::new();
-        for (place, meshes) in &chosen {
-            let embedded = ydr_write::read_at(res, owner(*place))?.textures.is_some_and(|t| !t.textures.is_empty());
-            let mut mats: Vec<ydr_write::NewMaterial> = Vec::new();
-            let mut meshes = meshes.clone();
-            for m in &mut meshes {
-                let k = match mats.iter().position(|mat| mat.shader == m.shader) {
-                    Some(k) => k,
-                    None => {
-                        let texture = embedded
-                            .then(|| {
-                                ydr_write::texture_from_rgba(
-                                    &format!("openrage_check_{}", mats.len()),
-                                    2,
-                                    2,
-                                    &[200; 16],
-                                )
-                            })
-                            .transpose()?;
-                        mats.push(ydr_write::NewMaterial { shader: m.shader, texture });
-                        mats.len() - 1
-                    }
-                };
-                m.shader = k as u16;
-            }
-            materials.push(mats);
-            with_materials.push(meshes);
-        }
-        let lods: Vec<[&[ydr_write::NewMesh]; 1]> = with_materials.iter().map(|m| [m.as_slice()]).collect();
-        let parts: Vec<ydr_write::Part> = chosen
-            .iter()
-            .zip(&lods)
-            .zip(&materials)
-            .map(|(((place, _), l), mats)| ydr_write::Part { place: *place, lods: l, materials: Some(mats) })
-            .collect();
-        let file = match ydr_write::replace_parts(res, &parts, None) {
-            Ok(f) => f,
-            // Shaders without a colour slot cannot take a texture: fine, skip that part.
-            Err(e) if e.to_string().contains("colour") => return Ok(written),
-            Err(e) => return Err(e.into()),
-        };
-        let after_res = rage_resource::Resource::from_rsc7(&file)?;
-        // Where each part's copies start: after the group's shaders and the copies of earlier parts.
-        let mut next: Vec<(Place, usize)> = Vec::new();
-        for (((place, _), mats), meshes) in chosen.iter().zip(&materials).zip(&with_materials) {
-            let o = owner(*place);
-            let first = match next.iter_mut().find(|(p, _)| *p == o) {
-                Some((_, n)) => n,
-                None => {
-                    next.push((o, ydr_write::read_at(res, o)?.shaders.len()));
-                    &mut next.last_mut().expect("pushed").1
-                }
-            };
-            let start = *first;
-            *first += mats.len();
-            let group = ydr_write::read_at(&after_res, o)?;
-            for (k, mat) in mats.iter().enumerate() {
-                let Some(shader) = group.shaders.get(start + k) else {
-                    bail!("{place:?} materials: {} shaders, copy {} missing", group.shaders.len(), start + k);
-                };
-                if let Some(t) = &mat.texture {
-                    if !shader.textures.contains(&t.name) {
-                        bail!("{place:?} material {k}: its shader does not use {}", t.name);
-                    }
-                    let found = group.textures.as_ref().and_then(|d| d.textures.iter().find(|x| x.name == t.name));
-                    if found.and_then(|x| x.to_rgba()).as_deref() != Some(&[200u8; 16][..]) {
-                        bail!("{place:?} material {k}: texture {} not embedded intact", t.name);
-                    }
-                }
-            }
-            let after = ydr_write::read_at(&after_res, *place)?;
-            if after.meshes.iter().map(|m| m.shader as usize).ne(meshes.iter().map(|m| start + m.shader as usize)) {
-                bail!("{place:?} materials: meshes do not use their shader copies");
-            }
-        }
-        for (o, n) in &next {
-            let got = ydr_write::read_at(&after_res, *o)?.shaders.len();
-            if got != *n {
-                bail!("{o:?} materials: {got} shaders, expected {n}");
-            }
-        }
-        Ok(written)
-    };
-    type Counts = (usize, usize, usize, usize, Vec<String>);
-    let is_model = |name: &str| name.ends_with(".ydr") || name.ends_with(".yft") || name.ends_with(".ydd");
     let (results, nested) = for_each_entry_parallel(
         &starts,
-        |e| is_model(&e.name.to_ascii_lowercase()),
-        |a, id, p, (seen, written, children, entries, errors): &mut Counts| {
+        |e| is_model_file(&e.name.to_ascii_lowercase()),
+        |a, id, p, counts: &mut WriterCounts| {
             let name = a.entry(id).name.to_ascii_lowercase();
-            *seen += 1;
-            match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| check(&r, &name)) {
+            counts.seen += 1;
+            match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| check_model_writer(&r, &name)) {
                 Ok((0, _, _)) => {}
                 Ok((_, c, e)) => {
-                    *written += 1;
-                    *children += c;
-                    *entries += e;
+                    counts.written += 1;
+                    counts.children += c;
+                    counts.entries += e;
                 }
-                Err(e) => errors.push(format!("{p}: {e:#}")),
+                Err(e) => counts.errors.push(format!("{p}: {e:#}")),
             }
         },
     );
-    let sum = |f: fn(&Counts) -> usize| results.iter().map(f).sum::<usize>();
-    let mut errors: Vec<&String> = results.iter().flat_map(|r| &r.4).chain(&nested).collect();
+    let sum = |f: fn(&WriterCounts) -> usize| results.iter().map(f).sum::<usize>();
+    let mut errors: Vec<&String> = results.iter().flat_map(|r| &r.errors).chain(&nested).collect();
     errors.sort();
     outln!(
         "{} models, {} written anew and read back identically ({} fragment child models, {} dictionary drawables among them), {} errors ({:.1}s)",
-        sum(|r| r.0),
-        sum(|r| r.1),
-        sum(|r| r.2),
-        sum(|r| r.3),
+        sum(|r| r.seen),
+        sum(|r| r.written),
+        sum(|r| r.children),
+        sum(|r| r.entries),
         errors.len(),
         started.elapsed().as_secs_f32()
     );
@@ -881,6 +781,328 @@ pub(crate) fn cmd_verify_model_writer(game_dir: &Path, within: &str, keys: Optio
         outln!("  {e}");
     }
     if errors.is_empty() { Ok(()) } else { bail!("{} models failed", errors.len()) }
+}
+
+#[derive(Default)]
+struct WriterCounts {
+    seen: usize,
+    written: usize,
+    children: usize,
+    entries: usize,
+    errors: Vec<String>,
+}
+
+fn is_model_file(name: &str) -> bool {
+    name.ends_with(".ydr") || name.ends_with(".yft") || name.ends_with(".ydd")
+}
+
+/// Places written (0: nothing to write) and child models / dictionary drawables among them.
+type Written = (usize, usize, usize);
+
+/// The places of a model with the meshes to write back into them.
+type ChosenPlaces = Vec<(Place, Vec<ydr_write::NewMesh>)>;
+
+/// The texture each material copy gets: 2×2 pixels, RGBA.
+const CHECK_TEXTURE_SIDE: u32 = 2;
+const CHECK_TEXTURE_RGBA: [u8; 16] = [200; 16];
+
+fn check_model_writer(res: &rage_resource::Resource, name: &str) -> Result<Written> {
+    if res.version != drawable::VERSION_YDR_ENHANCED && res.version != drawable::VERSION_YFT_ENHANCED {
+        return Ok((0, 0, 0));
+    }
+    let chosen = chosen_places(res, name)?;
+    if chosen.is_empty() {
+        return Ok((0, 0, 0));
+    }
+    check_meshes_written(res, name, &chosen)?;
+    let children = chosen.iter().filter(|(p, _)| matches!(p, Place::Child(_))).count();
+    let entries = chosen.iter().filter(|(p, _)| matches!(p, Place::Entry(_))).count();
+    let written = (chosen.len(), children, entries);
+    check_materials_written(res, &chosen)?;
+    Ok(written)
+}
+
+fn chosen_places(res: &rage_resource::Resource, name: &str) -> Result<ChosenPlaces> {
+    let places: Vec<Place> = if name.ends_with(".ydd") {
+        (0..ydr_write::entry_hashes(res)?.len()).map(Place::Entry).collect()
+    } else {
+        std::iter::once(Place::Main).chain((0..ydr_write::child_models(res).len()).map(Place::Child)).collect()
+    };
+    let mut chosen = ChosenPlaces::new();
+    for place in places {
+        let meshes = usable_meshes(res, place)?;
+        if !meshes.is_empty() {
+            chosen.push((place, meshes));
+        }
+    }
+    Ok(chosen)
+}
+
+/// The meshes of a place the model writer can take, as new meshes.
+fn usable_meshes(res: &rage_resource::Resource, place: Place) -> Result<Vec<ydr_write::NewMesh>> {
+    let before = ydr_write::read_at(res, place)?;
+    let usable = ydr_write::usable_shaders_at(res, place).with_context(|| format!("{place:?}"))?;
+    let skinned = ydr_write::is_skinned_at(res, place)?;
+    Ok(before
+        .meshes
+        .iter()
+        .filter(|m| usable.contains(&m.shader) && !m.indices.is_empty() && m.bone_indices.is_empty() != skinned)
+        .map(new_mesh)
+        .collect())
+}
+
+fn new_mesh(m: &drawable::Mesh) -> ydr_write::NewMesh {
+    // Vertices on one bone each (vehicles) as the OBJ import gives them;
+    // blended ones (peds) with all their bones and weights.
+    let (bones, blend) = if m.bone_indices.is_empty() {
+        (Vec::new(), Vec::new())
+    } else if single_bone(m) {
+        (main_bones(m), Vec::new())
+    } else {
+        let blend = m
+            .bone_indices
+            .iter()
+            .zip(&m.bone_weights)
+            .map(|(b, w)| ydr_write::Blend { bones: *b, weights: *w })
+            .collect();
+        (Vec::new(), blend)
+    };
+    ydr_write::NewMesh {
+        shader: m.shader,
+        positions: m.positions.clone(),
+        normals: m.normals.clone(),
+        uvs: m.uvs.clone(),
+        colors: m.colors.clone(),
+        indices: m.indices.clone(),
+        bones,
+        blend,
+    }
+}
+
+/// The bone with the most weight, per vertex.
+fn main_bones(m: &drawable::Mesh) -> Vec<u16> {
+    m.bone_indices
+        .iter()
+        .zip(&m.bone_weights)
+        .map(|(b, w)| b[(0..4).fold(0, |k, i| if w[i] > w[k] { i } else { k })])
+        .collect()
+}
+
+fn single_bone(m: &drawable::Mesh) -> bool {
+    m.bone_weights.iter().all(|w| w.iter().filter(|&&x| x > 0.0).count() == 1)
+}
+
+fn weight_byte(w: f32) -> u8 {
+    (w * 255.0).round() as u8
+}
+
+/// Writes the chosen meshes anew and compares what the reader gets back.
+fn check_meshes_written(res: &rage_resource::Resource, name: &str, chosen: &ChosenPlaces) -> Result<()> {
+    let lods: Vec<[&[ydr_write::NewMesh]; 1]> = chosen.iter().map(|(_, m)| [m.as_slice()]).collect();
+    let parts: Vec<ydr_write::Part> = chosen
+        .iter()
+        .zip(&lods)
+        .map(|((place, _), l)| ydr_write::Part { place: *place, lods: l, materials: None })
+        .collect();
+    let file = ydr_write::replace_parts(res, &parts, None)?;
+    let after_res = rage_resource::Resource::from_rsc7(&file)?;
+    // What the game gets reads back as a whole.
+    if name.ends_with(".ydd") {
+        drawable::parse_ydd(&after_res)?;
+    } else {
+        ydr_write::read_back(&file)?;
+    }
+    compare_written(&after_res, chosen)
+}
+
+fn compare_written(after_res: &rage_resource::Resource, chosen: &ChosenPlaces) -> Result<()> {
+    for (place, meshes) in chosen {
+        let after = ydr_write::read_at(after_res, *place)?;
+        if after.meshes.len() != meshes.len() {
+            bail!("{place:?}: {} meshes written, {} read back", meshes.len(), after.meshes.len());
+        }
+        for (i, (a, m)) in after.meshes.iter().zip(meshes).enumerate() {
+            compare_written_mesh(*place, i, a, m)?;
+        }
+    }
+    Ok(())
+}
+
+/// Bit for bit: some of the game's vertices hold NaN, which never equals itself.
+fn same_bits(x: &[f32], y: &[f32]) -> bool {
+    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+}
+
+fn normals_close(x: &[[f32; 3]], y: &[[f32; 3]]) -> bool {
+    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| (0..3).all(|k| (p[k] - q[k]).abs() < 0.01))
+}
+
+fn compare_written_mesh(place: Place, i: usize, a: &drawable::Mesh, m: &ydr_write::NewMesh) -> Result<()> {
+    if !same_bits(a.positions.as_flattened(), m.positions.as_flattened())
+        || a.indices != m.indices
+        || a.shader != m.shader
+    {
+        bail!("{place:?} mesh {i}: geometry differs after writing");
+    }
+    if !m.uvs.is_empty() && !same_bits(a.uvs.as_flattened(), m.uvs.as_flattened()) {
+        bail!("{place:?} mesh {i}: texture coordinates differ after writing");
+    }
+    if !m.normals.is_empty() && !normals_close(&a.normals, &m.normals) {
+        bail!("{place:?} mesh {i}: normals differ after writing");
+    }
+    compare_written_skin(place, i, a, m)
+}
+
+fn compare_written_skin(place: Place, i: usize, a: &drawable::Mesh, m: &ydr_write::NewMesh) -> Result<()> {
+    if !m.colors.is_empty() && a.colors.first() != m.colors.first() {
+        bail!("{place:?} mesh {i}: colours differ after writing");
+    }
+    if m.blend.is_empty() {
+        if main_bones(a) != m.bones {
+            bail!("{place:?} mesh {i}: vertices move with other bones after writing");
+        }
+    } else {
+        let got = a.bone_indices.iter().zip(&a.bone_weights).map(|(b, w)| (*b, w.map(weight_byte)));
+        if got.ne(m.blend.iter().map(|bl| (bl.bones, bl.weights.map(weight_byte)))) {
+            bail!("{place:?} mesh {i}: bones or weights differ after writing");
+        }
+    }
+    Ok(())
+}
+
+/// A fragment child's shaders are its body's.
+fn material_owner(p: Place) -> Place {
+    if matches!(p, Place::Child(_)) { Place::Main } else { p }
+}
+
+/// Materials: a shader copy per mesh shader, with a texture where the
+/// place's shader group has an embedded dictionary to put it in.
+/// (A model with an empty embedded dictionary borrows the structure from another one when
+/// importing; here only models with embedded textures get one.)
+fn check_materials_written(res: &rage_resource::Resource, chosen: &ChosenPlaces) -> Result<()> {
+    let mut materials: Vec<Vec<ydr_write::NewMaterial>> = Vec::new();
+    let mut with_materials = Vec::new();
+    for (place, meshes) in chosen {
+        let embedded =
+            ydr_write::read_at(res, material_owner(*place))?.textures.is_some_and(|t| !t.textures.is_empty());
+        let (mats, meshes) = material_copies(embedded, meshes)?;
+        materials.push(mats);
+        with_materials.push(meshes);
+    }
+    let lods: Vec<[&[ydr_write::NewMesh]; 1]> = with_materials.iter().map(|m| [m.as_slice()]).collect();
+    let parts: Vec<ydr_write::Part> = chosen
+        .iter()
+        .zip(&lods)
+        .zip(&materials)
+        .map(|(((place, _), l), mats)| ydr_write::Part { place: *place, lods: l, materials: Some(mats) })
+        .collect();
+    let file = match ydr_write::replace_parts(res, &parts, None) {
+        Ok(f) => f,
+        // Shaders without a colour slot cannot take a texture: fine, skip that part.
+        Err(e) if e.to_string().contains("colour") => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let after_res = rage_resource::Resource::from_rsc7(&file)?;
+    check_material_copies(res, &after_res, chosen, &materials, &with_materials)
+}
+
+/// The meshes with their shaders renumbered to a new material per shader.
+fn material_copies(
+    embedded: bool,
+    meshes: &[ydr_write::NewMesh],
+) -> Result<(Vec<ydr_write::NewMaterial>, Vec<ydr_write::NewMesh>)> {
+    let mut mats: Vec<ydr_write::NewMaterial> = Vec::new();
+    let mut meshes = meshes.to_vec();
+    for m in &mut meshes {
+        let k = match mats.iter().position(|mat| mat.shader == m.shader) {
+            Some(k) => k,
+            None => {
+                let texture = embedded
+                    .then(|| {
+                        ydr_write::texture_from_rgba(
+                            &format!("openrage_check_{}", mats.len()),
+                            CHECK_TEXTURE_SIDE,
+                            CHECK_TEXTURE_SIDE,
+                            &CHECK_TEXTURE_RGBA,
+                        )
+                    })
+                    .transpose()?;
+                mats.push(ydr_write::NewMaterial { shader: m.shader, texture });
+                mats.len() - 1
+            }
+        };
+        m.shader = k as u16;
+    }
+    Ok((mats, meshes))
+}
+
+fn check_material_copies(
+    res: &rage_resource::Resource,
+    after_res: &rage_resource::Resource,
+    chosen: &ChosenPlaces,
+    materials: &[Vec<ydr_write::NewMaterial>],
+    with_materials: &[Vec<ydr_write::NewMesh>],
+) -> Result<()> {
+    // Where each part's copies start: after the group's shaders and the copies of earlier parts.
+    let mut next: Vec<(Place, usize)> = Vec::new();
+    for (((place, _), mats), meshes) in chosen.iter().zip(materials).zip(with_materials) {
+        let o = material_owner(*place);
+        let start = claim_copies(&mut next, res, o, mats.len())?;
+        let group = ydr_write::read_at(after_res, o)?;
+        check_shader_copies(*place, &group, mats, start)?;
+        let after = ydr_write::read_at(after_res, *place)?;
+        if after.meshes.iter().map(|m| m.shader as usize).ne(meshes.iter().map(|m| start + m.shader as usize)) {
+            bail!("{place:?} materials: meshes do not use their shader copies");
+        }
+    }
+    for (o, n) in &next {
+        let got = ydr_write::read_at(after_res, *o)?.shaders.len();
+        if got != *n {
+            bail!("{o:?} materials: {got} shaders, expected {n}");
+        }
+    }
+    Ok(())
+}
+
+/// Reserves `count` shader copies in the group of `o`; returns where they start.
+fn claim_copies(
+    next: &mut Vec<(Place, usize)>,
+    res: &rage_resource::Resource,
+    o: Place,
+    count: usize,
+) -> Result<usize> {
+    let first = match next.iter_mut().find(|(p, _)| *p == o) {
+        Some((_, n)) => n,
+        None => {
+            next.push((o, ydr_write::read_at(res, o)?.shaders.len()));
+            &mut next.last_mut().expect("pushed").1
+        }
+    };
+    let start = *first;
+    *first += count;
+    Ok(start)
+}
+
+fn check_shader_copies(
+    place: Place,
+    group: &drawable::Drawable,
+    mats: &[ydr_write::NewMaterial],
+    start: usize,
+) -> Result<()> {
+    for (k, mat) in mats.iter().enumerate() {
+        let Some(shader) = group.shaders.get(start + k) else {
+            bail!("{place:?} materials: {} shaders, copy {} missing", group.shaders.len(), start + k);
+        };
+        let Some(t) = &mat.texture else { continue };
+        if !shader.textures.contains(&t.name) {
+            bail!("{place:?} material {k}: its shader does not use {}", t.name);
+        }
+        let found = group.textures.as_ref().and_then(|d| d.textures.iter().find(|x| x.name == t.name));
+        if found.and_then(|x| x.to_rgba()).as_deref() != Some(&CHECK_TEXTURE_RGBA[..]) {
+            bail!("{place:?} material {k}: texture {} not embedded intact", t.name);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn cmd_verify_meta(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
@@ -1346,67 +1568,88 @@ impl Pending {
 /// leave the other cores idle. Reading and decompressing happen in the
 /// workers too. The workers are plain threads, not rayon tasks: walkers wait
 /// on a full queue, and waiting rayon tasks could starve rayon workers.
-fn run_parallel<A, I, S>(
-    starts: &[(String, Arc<A>, I)],
-    report: bool,
-    walk: impl Fn(&Arc<A>, I, &str, &mut dyn FnMut(&Arc<A>, I, &str), &mut Vec<String>) + Sync,
-    work: impl Fn(&A, I, &str, &mut S) + Sync,
-) -> (Vec<S>, Vec<String>)
+fn run_parallel<A, I, S, W, F>(run: ParallelRun<A, I, W, F>) -> (Vec<S>, Vec<String>)
 where
     A: Send + Sync,
     I: Copy + Send + Sync,
     S: Default + Send,
+    W: Fn(&Arc<A>, I, &str, &mut dyn FnMut(&Arc<A>, I, &str), &mut Vec<String>) + Sync,
+    F: Fn(&A, I, &str, &mut S) + Sync,
 {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
     let (send, receive) = std::sync::mpsc::sync_channel::<Job<A, I>>(workers * 4);
     // Owned by the workers only: should they all stop (a panic), the walkers stop waiting.
     let receive = Arc::new(std::sync::Mutex::new(receive));
-    let work = &work;
+    let work = &run.work;
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 let receive = Arc::clone(&receive);
-                scope.spawn(move || {
-                    let mut s = S::default();
-                    loop {
-                        // The lock is held only while waiting for the next file.
-                        let job = receive.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok((archive, id, path, pending)) = job else { break };
-                        work(&archive, id, &path, &mut s);
-                        pending.done();
-                    }
-                    s
-                })
+                scope.spawn(move || run_worker(&receive, work))
             })
             .collect();
         drop(receive);
-        let errors: Vec<String> = starts
-            .par_iter()
-            .flat_map_iter(|(prefix, archive, dir)| {
-                let pending = Arc::new(Pending { left: AtomicUsize::new(1), prefix: prefix.clone(), report });
-                let mut errors = Vec::new();
-                let send = send.clone();
-                walk(
-                    archive,
-                    *dir,
-                    prefix,
-                    &mut |a, id, p| {
-                        pending.left.fetch_add(1, Ordering::AcqRel);
-                        if send.send((Arc::clone(a), id, p.to_owned(), Arc::clone(&pending))).is_err() {
-                            pending.done();
-                        }
-                    },
-                    &mut errors,
-                );
-                pending.done();
-                errors
-            })
-            .collect();
+        let errors: Vec<String> =
+            run.starts.par_iter().flat_map_iter(|root| queue_root(root, run.report, &send, &run.walk)).collect();
         drop(send);
         let stats = handles.into_iter().map(|h| h.join().expect("verify worker")).collect();
         (stats, errors)
     })
+}
+
+/// What [`run_parallel`] runs: `walk` finds the files below each root and `work` checks them.
+struct ParallelRun<'a, A, I, W, F> {
+    starts: &'a [(String, Arc<A>, I)],
+    report: bool,
+    walk: W,
+    work: F,
+}
+
+fn run_worker<A, I, S: Default>(
+    receive: &std::sync::Mutex<std::sync::mpsc::Receiver<Job<A, I>>>,
+    work: &impl Fn(&A, I, &str, &mut S),
+) -> S {
+    let mut s = S::default();
+    loop {
+        // The lock is held only while waiting for the next file.
+        let job = receive.lock().unwrap_or_else(|e| e.into_inner()).recv();
+        let Ok((archive, id, path, pending)) = job else { break };
+        work(&archive, id, &path, &mut s);
+        pending.done();
+    }
+    s
+}
+
+/// Walks one archive root, queueing its files; returns the errors of walking.
+fn queue_root<A, I, W>(
+    root: &(String, Arc<A>, I),
+    report: bool,
+    send: &std::sync::mpsc::SyncSender<Job<A, I>>,
+    walk: &W,
+) -> Vec<String>
+where
+    I: Copy,
+    W: Fn(&Arc<A>, I, &str, &mut dyn FnMut(&Arc<A>, I, &str), &mut Vec<String>),
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (prefix, archive, dir) = root;
+    let pending = Arc::new(Pending { left: AtomicUsize::new(1), prefix: prefix.clone(), report });
+    let mut errors = Vec::new();
+    let send = send.clone();
+    walk(
+        archive,
+        *dir,
+        prefix,
+        &mut |a, id, p| {
+            pending.left.fetch_add(1, Ordering::AcqRel);
+            if send.send((Arc::clone(a), id, p.to_owned(), Arc::clone(&pending))).is_err() {
+                pending.done();
+            }
+        },
+        &mut errors,
+    );
+    pending.done();
+    errors
 }
 
 /// Runs `work` on every entry below the archive roots (nested archives too)
@@ -1453,7 +1696,12 @@ pub(crate) fn for_each_entry_parallel_reporting<S: Default + Send>(
             }
         }
     }
-    run_parallel(starts, report, |a, dir, prefix, emit, errors| walk(a, dir, prefix, &wanted, emit, errors), work)
+    let walk = |a: &Arc<Rpf7>,
+                dir,
+                prefix: &str,
+                emit: &mut dyn FnMut(&Arc<Rpf7>, EntryId, &str),
+                errors: &mut Vec<String>| { walk(a, dir, prefix, &wanted, emit, errors) };
+    run_parallel(ParallelRun { starts, report, walk, work })
 }
 
 /// [`for_each_entry_parallel`] for GTA IV archives (`.rpf`, `.img`; not nested).
@@ -1463,18 +1711,18 @@ pub(crate) fn for_each_gta4_entry_parallel<S: Default + Send>(
     wanted: impl Fn(&rage_rpf::Gta4Archive, rage_rpf::Gta4EntryId) -> bool + Sync,
     work: impl Fn(&rage_rpf::Gta4Archive, rage_rpf::Gta4EntryId, &str, &mut S) + Sync,
 ) -> Vec<S> {
-    let (stats, _) = run_parallel(
-        starts,
-        report,
-        |a, dir, prefix, emit, _| {
-            vfs::walk_gta4(a, dir, prefix, &mut |id, p| {
-                if wanted(a, id) {
-                    emit(a, id, p)
-                }
-            })
-        },
-        work,
-    );
+    let walk = |a: &Arc<rage_rpf::Gta4Archive>,
+                dir,
+                prefix: &str,
+                emit: &mut dyn FnMut(&Arc<rage_rpf::Gta4Archive>, rage_rpf::Gta4EntryId, &str),
+                _: &mut Vec<String>| {
+        vfs::walk_gta4(a, dir, prefix, &mut |id, p| {
+            if wanted(a, id) {
+                emit(a, id, p)
+            }
+        })
+    };
+    let (stats, _) = run_parallel(ParallelRun { starts, report, walk, work });
     stats
 }
 

@@ -55,145 +55,243 @@ fn f32_at(res: &Resource, at: u64) -> Result<f32, ResourceError> {
     Ok(f32::from_bits(res.u32(at)?))
 }
 
-fn bound(
-    res: &Resource,
-    at: u64,
-    m: &Mat4,
-    b: &mut Builder,
-    stats: &mut Stats,
-    depth: usize,
-) -> Result<(), ResourceError> {
-    if depth > 8 {
-        return Err(ResourceError::Format("bounds nested too deeply".into()));
-    }
-    stats.bounds += 1;
-    let kind = res.u8(at + 0x10)?;
-    let material = res.u8(at + 0x4C)?;
-    match kind {
-        kind::COMPOSITE => {
-            let children = res.u64(at + 0x70)?;
-            let transforms = res.u64(at + 0x78)?;
-            let count = res.u16(at + 0xA0)? as u64;
-            for i in 0..count.min(4096) {
-                let child = res.u64(children + i * 8)?;
-                if child == 0 {
-                    continue;
-                }
-                let mut t = math::IDENTITY;
-                if transforms != 0 {
-                    let raw = res.bytes(transforms + i * 64, 64)?;
-                    for (k, c) in raw.as_chunks::<4>().0.iter().enumerate() {
-                        t[k] = f32::from_le_bytes(*c);
-                    }
-                    // The w components hold other data.
-                    (t[3], t[7], t[11], t[15]) = (0.0, 0.0, 0.0, 1.0);
-                }
-                bound(res, child, &math::mul(m, &t), b, stats, depth + 1)?;
-            }
-        }
-        kind::GEOMETRY | kind::BVH => geometry(res, at, m, b, stats)?,
-        kind::SPHERE => {
-            let c = vec3(res, at + 0x50)?;
-            b.round(material, m, c, c, f32_at(res, at + 0x14)?, true);
-        }
-        kind::BOX => {
-            let (lo, hi) = (vec3(res, at + 0x30)?, vec3(res, at + 0x20)?);
-            let c = scale(add(lo, hi), 0.5);
-            let h = scale(sub(hi, lo), 0.5);
-            b.cuboid(material, m, c, [[h[0], 0.0, 0.0], [0.0, h[1], 0.0], [0.0, 0.0, h[2]]]);
-        }
-        kind::CAPSULE => {
-            let c = vec3(res, at + 0x40)?;
-            let margin = f32_at(res, at + 0x2C)?;
-            let half = f32_at(res, at + 0x14)? - margin;
-            b.round(material, m, sub(c, [0.0, half, 0.0]), add(c, [0.0, half, 0.0]), margin, true);
-        }
-        kind::CYLINDER | kind::DISC => {
-            let (lo, hi) = (vec3(res, at + 0x30)?, vec3(res, at + 0x20)?);
-            let c = scale(add(lo, hi), 0.5);
-            let (r, half) = if kind == kind::DISC {
-                (f32_at(res, at + 0x14)?, f32_at(res, at + 0x2C)?)
-            } else {
-                ((hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0)
-            };
-            // Cylinders stand along Y, discs lie along X.
-            let axis = if kind == kind::DISC { [half, 0.0, 0.0] } else { [0.0, half, 0.0] };
-            b.round(material, m, sub(c, axis), add(c, axis), r, false);
-        }
-        _ => {}
-    }
-    Ok(())
+/// The state of walking a tree of bounds: the file and what is built from it.
+struct Walk<'a> {
+    res: &'a Resource,
+    b: &'a mut Builder,
+    stats: &'a mut Stats,
 }
 
-fn geometry(res: &Resource, at: u64, m: &Mat4, b: &mut Builder, stats: &mut Stats) -> Result<(), ResourceError> {
-    let polys = res.u64(at + 0x88)?;
-    let quantum = vec3(res, at + 0x90)?;
-    let centre = vec3(res, at + 0xA0)?;
-    let verts_at = res.u64(at + 0xB0)?;
-    let vert_count = res.u32(at + 0xD0)? as u64;
-    let poly_count = res.u32(at + 0xD4)? as u64;
-    let materials_at = res.u64(at + 0xF0)?;
-    let material_count = res.u8(at + 0x120)? as u64;
-    let poly_materials = res.u64(at + 0x118)?;
-    if vert_count > 1 << 20 || poly_count > 1 << 21 {
-        return Err(ResourceError::Format(format!(
-            "implausible geometry: {vert_count} vertices, {poly_count} polygons"
-        )));
+/// The transform of composite child `i` (identity without a transform list).
+fn child_transform(res: &Resource, transforms: u64, i: u64) -> Result<Mat4, ResourceError> {
+    let mut t = math::IDENTITY;
+    if transforms != 0 {
+        let raw = res.bytes(transforms + i * 64, 64)?;
+        for (k, c) in raw.as_chunks::<4>().0.iter().enumerate() {
+            t[k] = f32::from_le_bytes(*c);
+        }
+        // The w components hold other data.
+        (t[3], t[7], t[11], t[15]) = (0.0, 0.0, 0.0, 1.0);
     }
-    stats.vertices += vert_count as usize;
-    let raw = if vert_count > 0 { res.bytes(verts_at, vert_count as usize * 6)? } else { &[][..] };
-    let verts: Vec<[f32; 3]> = raw
-        .as_chunks::<6>()
-        .0
-        .iter()
-        .map(|c| {
-            let q = [0, 2, 4].map(|o| i16::from_le_bytes([c[o], c[o + 1]]) as f32);
-            [q[0] * quantum[0] + centre[0], q[1] * quantum[1] + centre[1], q[2] * quantum[2] + centre[2]]
-        })
-        .collect();
-    let types: Vec<u8> = (0..material_count.max(1))
-        .map(|i| if materials_at != 0 { res.u8(materials_at + i * 8).unwrap_or(0) } else { 0 })
-        .collect();
-    let data = if poly_count > 0 { res.bytes(polys, poly_count as usize * 16)? } else { &[][..] };
-    let index_bytes =
-        if poly_materials != 0 && poly_count > 0 { res.bytes(poly_materials, poly_count as usize)? } else { &[][..] };
-    let vert = |i: u16| verts.get((i & 0x7FFF) as usize).copied();
-    let u16_at = |p: &[u8], o: usize| u16::from_le_bytes([p[o], p[o + 1]]);
-    let f32_in = |p: &[u8], o: usize| f32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
-    for (i, p) in data.as_chunks::<16>().0.iter().enumerate() {
-        let material = types.get(*index_bytes.get(i).unwrap_or(&0) as usize).copied().unwrap_or(0);
-        match p[0] & 7 {
-            0 => {
-                if let (Some(a), Some(c), Some(d)) = (vert(u16_at(p, 4)), vert(u16_at(p, 6)), vert(u16_at(p, 8))) {
-                    b.triangle(material, m, [a, c, d]);
-                    stats.triangles += 1;
-                }
-            }
-            1 => {
-                if let Some(c) = vert(u16_at(p, 2)) {
-                    b.round(material, m, c, c, f32_in(p, 4), true);
-                }
-            }
-            2 | 4 => {
-                if let (Some(a), Some(c)) = (vert(u16_at(p, 2)), vert(u16_at(p, 8))) {
-                    b.round(material, m, a, c, f32_in(p, 4), p[0] & 7 == 2);
-                }
-            }
-            3 => {
-                let corners = [4, 6, 8, 10].map(|o| vert(u16_at(p, o)));
-                if let [Some(v1), Some(v2), Some(v3), Some(v4)] = corners {
-                    // Four alternating corners of the box: the sum of two of
-                    // them, seen from the centre, is twice a half axis.
-                    let c = scale(add(add(v1, v2), add(v3, v4)), 0.25);
-                    let s = [v1, v2, v3, v4].map(|v| sub(v, c));
-                    let axes = [scale(add(s[0], s[1]), 0.5), scale(add(s[0], s[2]), 0.5), scale(add(s[0], s[3]), 0.5)];
-                    b.cuboid(material, m, c, axes);
-                }
-            }
-            _ => {}
+    Ok(t)
+}
+
+impl Walk<'_> {
+    fn bound(&mut self, at: u64, m: &Mat4, depth: usize) -> Result<(), ResourceError> {
+        if depth > 8 {
+            return Err(ResourceError::Format("bounds nested too deeply".into()));
+        }
+        self.stats.bounds += 1;
+        let kind = self.res.u8(at + 0x10)?;
+        let material = self.res.u8(at + 0x4C)?;
+        match kind {
+            kind::COMPOSITE => self.composite(at, m, depth),
+            kind::GEOMETRY | kind::BVH => self.geometry(at, m),
+            kind::SPHERE => self.sphere(at, m, material),
+            kind::BOX => self.cuboid(at, m, material),
+            kind::CAPSULE => self.capsule(at, m, material),
+            kind::CYLINDER | kind::DISC => self.cylinder(kind, at, m, material),
+            _ => Ok(()),
         }
     }
-    Ok(())
+
+    fn composite(&mut self, at: u64, m: &Mat4, depth: usize) -> Result<(), ResourceError> {
+        let res = self.res;
+        let children = res.u64(at + 0x70)?;
+        let transforms = res.u64(at + 0x78)?;
+        let count = res.u16(at + 0xA0)? as u64;
+        for i in 0..count.min(4096) {
+            let child = res.u64(children + i * 8)?;
+            if child == 0 {
+                continue;
+            }
+            let t = child_transform(res, transforms, i)?;
+            self.bound(child, &math::mul(m, &t), depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn sphere(&mut self, at: u64, m: &Mat4, material: u8) -> Result<(), ResourceError> {
+        let c = vec3(self.res, at + 0x50)?;
+        self.b.round(material, m, c, c, f32_at(self.res, at + 0x14)?, true);
+        Ok(())
+    }
+
+    fn cuboid(&mut self, at: u64, m: &Mat4, material: u8) -> Result<(), ResourceError> {
+        let (lo, hi) = (vec3(self.res, at + 0x30)?, vec3(self.res, at + 0x20)?);
+        let c = scale(add(lo, hi), 0.5);
+        let h = scale(sub(hi, lo), 0.5);
+        self.b.cuboid(material, m, c, [[h[0], 0.0, 0.0], [0.0, h[1], 0.0], [0.0, 0.0, h[2]]]);
+        Ok(())
+    }
+
+    fn capsule(&mut self, at: u64, m: &Mat4, material: u8) -> Result<(), ResourceError> {
+        let c = vec3(self.res, at + 0x40)?;
+        let margin = f32_at(self.res, at + 0x2C)?;
+        let half = f32_at(self.res, at + 0x14)? - margin;
+        self.b.round(material, m, sub(c, [0.0, half, 0.0]), add(c, [0.0, half, 0.0]), margin, true);
+        Ok(())
+    }
+
+    /// A cylinder or a disc (`kind`).
+    fn cylinder(&mut self, kind: u8, at: u64, m: &Mat4, material: u8) -> Result<(), ResourceError> {
+        let (lo, hi) = (vec3(self.res, at + 0x30)?, vec3(self.res, at + 0x20)?);
+        let c = scale(add(lo, hi), 0.5);
+        let (r, half) = if kind == kind::DISC {
+            (f32_at(self.res, at + 0x14)?, f32_at(self.res, at + 0x2C)?)
+        } else {
+            ((hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0)
+        };
+        // Cylinders stand along Y, discs lie along X.
+        let axis = if kind == kind::DISC { [half, 0.0, 0.0] } else { [0.0, half, 0.0] };
+        self.b.round(material, m, sub(c, axis), add(c, axis), r, false);
+        Ok(())
+    }
+}
+
+/// The header of a geometry bound: where its polygons, vertices and materials are.
+struct GeometryHeader {
+    polys: u64,
+    quantum: [f32; 3],
+    centre: [f32; 3],
+    verts_at: u64,
+    vert_count: u64,
+    poly_count: u64,
+    materials_at: u64,
+    material_count: u64,
+    poly_materials: u64,
+}
+
+impl GeometryHeader {
+    fn read(res: &Resource, at: u64) -> Result<Self, ResourceError> {
+        Ok(Self {
+            polys: res.u64(at + 0x88)?,
+            quantum: vec3(res, at + 0x90)?,
+            centre: vec3(res, at + 0xA0)?,
+            verts_at: res.u64(at + 0xB0)?,
+            vert_count: res.u32(at + 0xD0)? as u64,
+            poly_count: res.u32(at + 0xD4)? as u64,
+            materials_at: res.u64(at + 0xF0)?,
+            material_count: res.u8(at + 0x120)? as u64,
+            poly_materials: res.u64(at + 0x118)?,
+        })
+    }
+
+    fn checked(self) -> Result<Self, ResourceError> {
+        let (vert_count, poly_count) = (self.vert_count, self.poly_count);
+        if vert_count > 1 << 20 || poly_count > 1 << 21 {
+            return Err(ResourceError::Format(format!(
+                "implausible geometry: {vert_count} vertices, {poly_count} polygons"
+            )));
+        }
+        Ok(self)
+    }
+
+    /// The vertices: 3 × i16, × quantum + centre.
+    fn vertices(&self, res: &Resource) -> Result<Vec<[f32; 3]>, ResourceError> {
+        let (quantum, centre) = (self.quantum, self.centre);
+        let raw = if self.vert_count > 0 { res.bytes(self.verts_at, self.vert_count as usize * 6)? } else { &[][..] };
+        Ok(raw
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .map(|c| {
+                let q = [0, 2, 4].map(|o| i16::from_le_bytes([c[o], c[o + 1]]) as f32);
+                [q[0] * quantum[0] + centre[0], q[1] * quantum[1] + centre[1], q[2] * quantum[2] + centre[2]]
+            })
+            .collect())
+    }
+
+    /// The material type of each entry of the material list.
+    fn material_types(&self, res: &Resource) -> Vec<u8> {
+        let at = self.materials_at;
+        (0..self.material_count.max(1)).map(|i| if at != 0 { res.u8(at + i * 8).unwrap_or(0) } else { 0 }).collect()
+    }
+
+    /// The polygon bytes and the per-polygon material indices.
+    fn polygons<'a>(&self, res: &'a Resource) -> Result<(&'a [u8], &'a [u8]), ResourceError> {
+        let n = self.poly_count as usize;
+        let data = if self.poly_count > 0 { res.bytes(self.polys, n * 16)? } else { &[][..] };
+        let indices =
+            if self.poly_materials != 0 && self.poly_count > 0 { res.bytes(self.poly_materials, n)? } else { &[][..] };
+        Ok((data, indices))
+    }
+}
+
+/// The vertices of a geometry bound and the transform they are drawn with.
+struct Shape<'a> {
+    verts: &'a [[f32; 3]],
+    m: &'a Mat4,
+}
+
+impl Shape<'_> {
+    /// The vertex `i` names (its top bit is a flag).
+    fn vert(&self, i: u16) -> Option<[f32; 3]> {
+        self.verts.get((i & 0x7FFF) as usize).copied()
+    }
+
+    fn vert_at(&self, p: &[u8; 16], o: usize) -> Option<[f32; 3]> {
+        self.vert(u16::from_le_bytes([p[o], p[o + 1]]))
+    }
+}
+
+fn f32_in(p: &[u8; 16], o: usize) -> f32 {
+    f32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]])
+}
+
+impl Walk<'_> {
+    fn geometry(&mut self, at: u64, m: &Mat4) -> Result<(), ResourceError> {
+        let res = self.res;
+        let header = GeometryHeader::read(res, at)?.checked()?;
+        self.stats.vertices += header.vert_count as usize;
+        let verts = header.vertices(res)?;
+        let types = header.material_types(res);
+        let (data, index_bytes) = header.polygons(res)?;
+        let shape = Shape { verts: &verts, m };
+        for (i, p) in data.as_chunks::<16>().0.iter().enumerate() {
+            let material = types.get(*index_bytes.get(i).unwrap_or(&0) as usize).copied().unwrap_or(0);
+            match p[0] & 7 {
+                0 => self.triangle_polygon(&shape, p, material),
+                1 => self.sphere_polygon(&shape, p, material),
+                kind @ (2 | 4) => self.capsule_polygon(&shape, p, material, kind == 2),
+                3 => self.box_polygon(&shape, p, material),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn triangle_polygon(&mut self, shape: &Shape, p: &[u8; 16], material: u8) {
+        if let (Some(a), Some(c), Some(d)) = (shape.vert_at(p, 4), shape.vert_at(p, 6), shape.vert_at(p, 8)) {
+            self.b.triangle(material, shape.m, [a, c, d]);
+            self.stats.triangles += 1;
+        }
+    }
+
+    fn sphere_polygon(&mut self, shape: &Shape, p: &[u8; 16], material: u8) {
+        if let Some(c) = shape.vert_at(p, 2) {
+            self.b.round(material, shape.m, c, c, f32_in(p, 4), true);
+        }
+    }
+
+    /// A capsule, or a cylinder (not `capsule`).
+    fn capsule_polygon(&mut self, shape: &Shape, p: &[u8; 16], material: u8, capsule: bool) {
+        if let (Some(a), Some(c)) = (shape.vert_at(p, 2), shape.vert_at(p, 8)) {
+            self.b.round(material, shape.m, a, c, f32_in(p, 4), capsule);
+        }
+    }
+
+    fn box_polygon(&mut self, shape: &Shape, p: &[u8; 16], material: u8) {
+        let corners = [4, 6, 8, 10].map(|o| shape.vert_at(p, o));
+        if let [Some(v1), Some(v2), Some(v3), Some(v4)] = corners {
+            // Four alternating corners of the box: the sum of two of
+            // them, seen from the centre, is twice a half axis.
+            let c = scale(add(add(v1, v2), add(v3, v4)), 0.25);
+            let s = [v1, v2, v3, v4].map(|v| sub(v, c));
+            let axes = [scale(add(s[0], s[1]), 0.5), scale(add(s[0], s[2]), 0.5), scale(add(s[0], s[3]), 0.5)];
+            self.b.cuboid(material, shape.m, c, axes);
+        }
+    }
 }
 
 /// Reads a collision file and turns it into a drawable (one mesh per
@@ -206,7 +304,7 @@ pub fn parse(res: &Resource) -> Result<(Drawable, Stats), ResourceError> {
 pub fn parse_at(res: &Resource, at: u64) -> Result<(Drawable, Stats), ResourceError> {
     let mut b = Builder::default();
     let mut stats = Stats::default();
-    bound(res, at, &math::IDENTITY, &mut b, &mut stats, 0)?;
+    Walk { res, b: &mut b, stats: &mut stats }.bound(at, &math::IDENTITY, 0)?;
     Ok(finish(b, stats))
 }
 

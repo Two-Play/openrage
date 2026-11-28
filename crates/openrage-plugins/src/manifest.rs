@@ -201,6 +201,9 @@ pub struct FileType {
     pub category: String,
 }
 
+/// Most fields one tool may declare.
+const MAX_TOOL_FIELDS: usize = 32;
+
 /// The icon groups of the file list.
 pub const CATEGORIES: &[&str] =
     &["file", "texture", "model", "map", "text", "lang", "audio", "anim", "script", "package", "data"];
@@ -267,7 +270,7 @@ impl Manifest {
         Self::parse(&text).with_context(|| format!("in {}", path.display()))
     }
 
-    fn validate(&self) -> Result<()> {
+    fn check_identity(&self) -> Result<()> {
         if !valid_id(&self.id) {
             bail!("id {:?}: use lowercase letters, digits and '-' (at most 64)", self.id);
         }
@@ -280,66 +283,39 @@ impl Manifest {
         if safe_relative(&self.wasm).is_none() || !self.wasm.ends_with(".wasm") {
             bail!("wasm {:?}: must be a .wasm file inside the plugin folder", self.wasm);
         }
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.check_identity()?;
         for t in &self.file_types {
-            if !CATEGORIES.contains(&t.category.as_str()) {
-                bail!("file type {:?}: unknown category {:?} (one of {})", t.name, t.category, CATEGORIES.join(", "));
-            }
-            check_extensions(&t.extensions, false)?;
+            check_file_type(t)?;
         }
         for p in &self.preview {
             check_extensions(&p.extensions, true)?;
         }
         for (i, a) in self.actions.iter().enumerate() {
-            if !valid_id(&a.id) {
-                bail!("action id {:?}: use lowercase letters, digits and '-'", a.id);
-            }
-            if self.actions[..i].iter().any(|b| b.id == a.id) {
-                bail!("action id {:?} is used twice", a.id);
-            }
-            check_extensions(&a.extensions, true)?;
-            if !a.pick.is_empty() {
-                check_extensions(&a.pick, false)?;
-            }
-            if a.kind == ActionKind::Modify && !self.permissions.contains(&Permission::WriteMods) {
-                bail!("action {:?} is of kind modify, which needs the write-mods permission", a.id);
-            }
+            self.check_action(i, a)?;
         }
         for (i, t) in self.tools.iter().enumerate() {
-            if !valid_id(&t.id) {
-                bail!("tool id {:?}: use lowercase letters, digits and '-'", t.id);
-            }
-            if self.tools[..i].iter().any(|u| u.id == t.id) {
-                bail!("tool id {:?} is used twice", t.id);
-            }
-            if t.title.trim().is_empty() {
-                bail!("tool {:?} has no title", t.id);
-            }
-            if t.fields.len() > 32 {
-                bail!("tool {:?} has more than 32 fields", t.id);
-            }
-            for (j, f) in t.fields.iter().enumerate() {
-                if !valid_id(&f.id) {
-                    bail!("tool {:?}: field id {:?}: use lowercase letters, digits and '-'", t.id, f.id);
-                }
-                if t.fields[..j].iter().any(|g| g.id == f.id) {
-                    bail!("tool {:?}: field id {:?} is used twice", t.id, f.id);
-                }
-                match f.kind {
-                    FieldKind::Choice if f.choices.is_empty() => {
-                        bail!("tool {:?}: choice field {:?} has no choices", t.id, f.id)
-                    }
-                    FieldKind::Choice if !f.default.is_empty() && !f.choices.contains(&f.default) => {
-                        bail!("tool {:?}: field {:?}: default {:?} is not one of its choices", t.id, f.id, f.default)
-                    }
-                    FieldKind::Check if !matches!(f.default.as_str(), "" | "true" | "false") => {
-                        bail!("tool {:?}: check box {:?}: default must be true or false", t.id, f.id)
-                    }
-                    FieldKind::Text | FieldKind::Check if !f.choices.is_empty() => {
-                        bail!("tool {:?}: field {:?}: only choice fields have choices", t.id, f.id)
-                    }
-                    _ => {}
-                }
-            }
+            check_tool(&self.tools[..i], t)?;
+        }
+        Ok(())
+    }
+
+    fn check_action(&self, i: usize, a: &Action) -> Result<()> {
+        if !valid_id(&a.id) {
+            bail!("action id {:?}: use lowercase letters, digits and '-'", a.id);
+        }
+        if self.actions[..i].iter().any(|b| b.id == a.id) {
+            bail!("action id {:?} is used twice", a.id);
+        }
+        check_extensions(&a.extensions, true)?;
+        if !a.pick.is_empty() {
+            check_extensions(&a.pick, false)?;
+        }
+        if a.kind == ActionKind::Modify && !self.permissions.contains(&Permission::WriteMods) {
+            bail!("action {:?} is of kind modify, which needs the write-mods permission", a.id);
         }
         Ok(())
     }
@@ -363,6 +339,62 @@ fn valid_id(id: &str) -> bool {
         && id.len() <= 64
         && !id.starts_with('-')
         && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn check_file_type(t: &FileType) -> Result<()> {
+    if !CATEGORIES.contains(&t.category.as_str()) {
+        bail!("file type {:?}: unknown category {:?} (one of {})", t.name, t.category, CATEGORIES.join(", "));
+    }
+    check_extensions(&t.extensions, false)
+}
+
+/// Checks a tool; `earlier` are the tools declared before it.
+fn check_tool(earlier: &[Tool], t: &Tool) -> Result<()> {
+    if !valid_id(&t.id) {
+        bail!("tool id {:?}: use lowercase letters, digits and '-'", t.id);
+    }
+    if earlier.iter().any(|u| u.id == t.id) {
+        bail!("tool id {:?} is used twice", t.id);
+    }
+    if t.title.trim().is_empty() {
+        bail!("tool {:?} has no title", t.id);
+    }
+    if t.fields.len() > MAX_TOOL_FIELDS {
+        bail!("tool {:?} has more than {MAX_TOOL_FIELDS} fields", t.id);
+    }
+    for (j, f) in t.fields.iter().enumerate() {
+        check_field(&t.id, &t.fields[..j], f)?;
+    }
+    Ok(())
+}
+
+/// Checks a tool field; `earlier` are the fields declared before it.
+fn check_field(tool_id: &str, earlier: &[Field], f: &Field) -> Result<()> {
+    if !valid_id(&f.id) {
+        bail!("tool {:?}: field id {:?}: use lowercase letters, digits and '-'", tool_id, f.id);
+    }
+    if earlier.iter().any(|g| g.id == f.id) {
+        bail!("tool {:?}: field id {:?} is used twice", tool_id, f.id);
+    }
+    check_field_choices(tool_id, f)
+}
+
+fn check_field_choices(tool_id: &str, f: &Field) -> Result<()> {
+    match f.kind {
+        FieldKind::Choice if f.choices.is_empty() => {
+            bail!("tool {:?}: choice field {:?} has no choices", tool_id, f.id)
+        }
+        FieldKind::Choice if !f.default.is_empty() && !f.choices.contains(&f.default) => {
+            bail!("tool {:?}: field {:?}: default {:?} is not one of its choices", tool_id, f.id, f.default)
+        }
+        FieldKind::Check if !matches!(f.default.as_str(), "" | "true" | "false") => {
+            bail!("tool {:?}: check box {:?}: default must be true or false", tool_id, f.id)
+        }
+        FieldKind::Text | FieldKind::Check if !f.choices.is_empty() => {
+            bail!("tool {:?}: field {:?}: only choice fields have choices", tool_id, f.id)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn check_extensions(exts: &[String], wildcard: bool) -> Result<()> {

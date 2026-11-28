@@ -126,21 +126,27 @@ pub struct Labels {
     pub rows: ModelRc<crate::InfoRow>,
 }
 
+type SharedState = Rc<RefCell<State>>;
+
+/// Radians of rotation per pixel of dragging.
+const ORBIT_RADIANS_PER_PIXEL: f32 = 0.01;
+/// The camera never looks further up or down than this (radians).
+const MAX_PITCH: f32 = 1.5;
+/// Zoom factor per wheel notch.
+const ZOOM_PER_NOTCH: f32 = 1.1;
+/// Wheel delta of one notch.
+const WHEEL_NOTCH: f32 = 120.0;
+/// How often the free-fly camera moves while a key is held.
+const FLY_FRAME: Duration = Duration::from_millis(16);
+/// The playback speeds of the speed menu.
+const ANIM_SPEEDS: [f32; 4] = [0.25, 0.5, 1.0, 2.0];
+/// Appended to the status line of RDR2 clips.
+const RDR2_MOTION_NOTE: &str = " · RDR2: some motion is approximated";
+
 /// Opens a viewer; with `animation` (path of a `.ycd`) its first clip plays.
 pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Option<String>) {
     let Ok(win) = ViewerWindow::new() else { return };
-    win.set_theme_mode(ui.get_theme_mode());
-    crate::accent::apply(&win);
-    win.set_mono_font(ui.get_mono_font());
-    win.set_heading(labels.heading.into());
-    win.set_path(labels.path.into());
-    win.set_icon_name(labels.icon.into());
-    win.set_tint(labels.tint);
-    win.set_rows(labels.rows);
-    win.set_model_mode(matches!(content, Content::Model(_)));
-    if let Content::Image(img) = &content {
-        win.set_image(img.clone());
-    }
+    fill_window(ui, &win, labels, &content);
     let id = NEXT_ID.with(|n| {
         n.set(n.get() + 1);
         n.get()
@@ -171,21 +177,60 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         outfit_timer: slint::Timer::default(),
     }));
 
+    wire_orbit(&win, &state);
+    wire_zoom(&win, &state);
+    wire_fly(&win, &state);
+    wire_parts(ui, &win, &state);
+    wire_materials(ui, &win, &state);
     let (w, s) = (win.as_weak(), Rc::clone(&state));
+    win.on_resized(move || render(&w, &s));
+    wire_reset_view(&win, &state);
+    wire_exports(ui, &win, &state);
+    wire_animation(&win, &state);
+    wire_window_close(&win, id);
+
+    start_initial_animation(&win, &state, animation, has_skeleton);
+    if win.show().is_ok() {
+        render(&win.as_weak(), &state);
+        OPEN.with(|o| o.borrow_mut().push((id, win)));
+    }
+}
+
+/// The window's texts and, for an image, the image: what it shows before the model's lists.
+fn fill_window(ui: &AppWindow, win: &ViewerWindow, labels: Labels, content: &Content) {
+    win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(win);
+    win.set_mono_font(ui.get_mono_font());
+    win.set_heading(labels.heading.into());
+    win.set_path(labels.path.into());
+    win.set_icon_name(labels.icon.into());
+    win.set_tint(labels.tint);
+    win.set_rows(labels.rows);
+    win.set_model_mode(matches!(content, Content::Model(_)));
+    if let Content::Image(img) = content {
+        win.set_image(img.clone());
+    }
+}
+
+fn wire_orbit(win: &ViewerWindow, state: &SharedState) {
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_orbit(move |dx, dy| {
         let mut st = s.borrow_mut();
         match &mut st.fly {
             // Dragging looks around.
             Some(f) => f.look(dx, dy),
             None => {
-                st.view.yaw -= dx * 0.01;
-                st.view.pitch = (st.view.pitch + dy * 0.01).clamp(-1.5, 1.5);
+                st.view.yaw -= dx * ORBIT_RADIANS_PER_PIXEL;
+                st.view.pitch = (st.view.pitch + dy * ORBIT_RADIANS_PER_PIXEL).clamp(-MAX_PITCH, MAX_PITCH);
             }
         }
         drop(st);
         render(&w, &s);
     });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+}
+
+fn wire_zoom(win: &ViewerWindow, state: &SharedState) {
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_zoom(move |delta| {
         let mut st = s.borrow_mut();
         if let Some(f) = &mut st.fly {
@@ -194,14 +239,18 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
                 win.set_fly_speed(f.speed_text().into());
             }
         } else {
-            st.view.zoom = (st.view.zoom * 1.1f32.powf(delta / 120.0)).clamp(0.2, 20.0);
+            st.view.zoom = (st.view.zoom * ZOOM_PER_NOTCH.powf(delta / WHEEL_NOTCH)).clamp(0.2, 20.0);
         }
         drop(st);
         render(&w, &s);
     });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+}
+
+/// The free-fly camera: its switch, the view along an axis, keys and focus.
+fn wire_fly(win: &ViewerWindow, state: &SharedState) {
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_fly(move || toggle_fly(&w, &s));
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_look_along(move |axis| {
         {
             let mut st = s.borrow_mut();
@@ -213,7 +262,7 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         }
         render(&w, &s);
     });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_key_down(move |text, shift| {
         let key = text.to_lowercase();
         if key == "f" {
@@ -232,17 +281,17 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         }
         if !st.timer.running() {
             let (w2, s2) = (w.clone(), Rc::clone(&s));
-            st.timer.start(slint::TimerMode::Repeated, Duration::from_millis(16), move || tick(&w2, &s2));
+            st.timer.start(slint::TimerMode::Repeated, FLY_FRAME, move || tick(&w2, &s2));
         }
     });
-    let s = Rc::clone(&state);
+    let s = Rc::clone(state);
     win.on_key_up(move |text, shift| {
         let mut st = s.borrow_mut();
         if !st.fly.as_mut().is_some_and(|f| f.key_up(&text.to_lowercase(), shift)) {
             st.timer.stop();
         }
     });
-    let s = Rc::clone(&state);
+    let s = Rc::clone(state);
     win.on_focus_lost(move || {
         let mut st = s.borrow_mut();
         if let Some(f) = &mut st.fly {
@@ -250,7 +299,11 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         }
         st.timer.stop();
     });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+}
+
+/// Showing and hiding parts, and the outfit of a ped.
+fn wire_parts(ui: &AppWindow, win: &ViewerWindow, state: &SharedState) {
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     let main = ui.as_weak();
     win.on_part_toggled(move |row, on| {
         let st = s.borrow();
@@ -263,15 +316,18 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         drop(st);
         look_changed(&w, &s, &main);
     });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     let main = ui.as_weak();
     win.on_all_parts(move |on| {
         change_look(&s.borrow(), |look| look.parts.iter_mut().for_each(|v| *v = on));
         look_changed(&w, &s, &main);
     });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_outfit_selected(move |n| change_outfit(&w, &s, n));
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+}
+
+fn wire_materials(ui: &AppWindow, win: &ViewerWindow, state: &SharedState) {
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     let main = ui.as_weak();
     win.on_material_visible(move |i, on| {
         change_look(&s.borrow(), |look| {
@@ -281,28 +337,29 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         });
         look_changed(&w, &s, &main);
     });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     let main = ui.as_weak();
     win.on_material_color(move |i, c| {
         set_tint(&s.borrow(), i, Some([c.red(), c.green(), c.blue()].map(|v| v as f32 / 255.0)));
         look_changed(&w, &s, &main);
     });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     let main = ui.as_weak();
     win.on_material_hex(move |i, text| {
         let Some(rgb) = parse_hex(&text) else { return };
         set_tint(&s.borrow(), i, Some(rgb));
         look_changed(&w, &s, &main);
     });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     let main = ui.as_weak();
     win.on_material_reset(move |i| {
         set_tint(&s.borrow(), i, None);
         look_changed(&w, &s, &main);
     });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
-    win.on_resized(move || render(&w, &s));
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+}
+
+fn wire_reset_view(win: &ViewerWindow, state: &SharedState) {
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_reset_view(move || {
         let mut st = s.borrow_mut();
         st.view = View::default();
@@ -314,121 +371,36 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         }
         render(&w, &s);
     });
-    let s = Rc::clone(&state);
+}
+
+fn wire_exports(ui: &AppWindow, win: &ViewerWindow, state: &SharedState) {
+    let s = Rc::clone(state);
     let main = ui.as_weak();
     win.on_export_gltf(move || {
         if let Content::Model(m) = &s.borrow().content {
             crate::save_glb(Arc::clone(m), main.clone());
         }
     });
-    let s = Rc::clone(&state);
+    let s = Rc::clone(state);
     let (main, w) = (ui.as_weak(), win.as_weak());
     win.on_save_png(move || {
         if let (Content::Image(img), Some(win)) = (&s.borrow().content, w.upgrade()) {
             crate::save_png_image(img, win.get_heading().to_string(), main.clone());
         }
     });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+}
+
+/// The clip dictionary search, opening one, choosing a clip and playback.
+fn wire_animation(win: &ViewerWindow, state: &SharedState) {
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_anim_search(move |text| anim_search(&w, &s, &text));
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
-    win.on_anim_open(move |i| {
-        let Some(win) = w.upgrade() else { return };
-        if i < 0 {
-            s.borrow_mut().anim = None;
-            win.set_anim_dictionary("".into());
-            win.set_anim_clip(-1);
-            render(&w, &s);
-            return;
-        }
-        let Some(vpath) = s.borrow().results.get(i as usize).cloned() else { return };
-        win.set_anim_status(format!("Loading {vpath} …").into());
-        match crate::load_clip_dictionary(&vpath) {
-            Ok(dict) => {
-                let rows: Vec<ClipRow> = dict
-                    .clips
-                    .iter()
-                    .map(|c| ClipRow { name: c.name.clone().into(), info: format!("{:.1} s", c.duration()).into() })
-                    .collect();
-                let name = vpath.rsplit('/').next().unwrap_or(&vpath).to_owned();
-                win.set_anim_clips(ModelRc::new(VecModel::from(rows)));
-                win.set_anim_dictionary(name.into());
-                win.set_anim_clip(-1);
-                // RDR2 dictionaries: one channel kind is not decoded yet and
-                // is interpolated between values every 64 frames.
-                let rdr2 = dict.animations.iter().any(|a| a.flags != 0);
-                let note = if rdr2 { " · RDR2: some motion is approximated" } else { "" };
-                win.set_anim_status(format!("{} clips · {vpath}{note}", dict.clips.len()).into());
-                s.borrow_mut().anim = Some(AnimState {
-                    dict: Arc::new(dict),
-                    clip: None,
-                    bindings: Vec::new(),
-                    time: 0.0,
-                    playing: false,
-                    speed: 1.0,
-                    last: Instant::now(),
-                });
-            }
-            Err(e) => win.set_anim_status(format!("Cannot read {vpath}: {e:#}").into()),
-        }
-    });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
-    win.on_anim_select(move |i| {
-        {
-            let mut st = s.borrow_mut();
-            let skeleton = st.model().and_then(|m| m.loaded.skeleton.clone());
-            let expressions = st.model().map(|m| m.loaded.expressions.clone()).unwrap_or_default();
-            let Some(a) = st.anim.as_mut() else { return };
-            let Some(clip) = a.dict.clips.get(i as usize) else { return };
-            let bindings: Vec<Option<Binding>> = clip
-                .parts
-                .iter()
-                .map(|p| {
-                    let anim = &a.dict.animations[p.animation];
-                    skeleton.as_ref().map(|sk| Binding::new(sk, anim).with_expressions(sk, anim, &expressions))
-                })
-                .collect();
-            let moved = bindings.first().and_then(Option::as_ref).map_or(0, Binding::animated_bones);
-            a.bindings = bindings;
-            a.clip = Some(i as usize);
-            a.time = 0.0;
-            a.playing = true;
-            a.last = Instant::now();
-            let rdr2 = a.dict.animations.iter().any(|x| x.flags != 0);
-            if let Some(win) = w.upgrade() {
-                win.set_anim_clip(i);
-                if moved == 0 {
-                    win.set_anim_status("This clip animates none of the model's bones (different skeleton).".into());
-                } else {
-                    let note = if rdr2 { " · RDR2: some motion is approximated" } else { "" };
-                    win.set_anim_status(format!("{moved} bones animated{note}").into());
-                }
-            }
-        }
-        start_anim_timer(&w, &s);
-    });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
-    win.on_anim_toggle(move || {
-        let playing = {
-            let mut st = s.borrow_mut();
-            let Some(a) = st.anim.as_mut() else { return };
-            if a.clip.is_none() {
-                return;
-            }
-            if !a.playing && a.time >= a.clip_duration() {
-                a.time = 0.0;
-            }
-            a.playing = !a.playing;
-            a.last = Instant::now();
-            a.playing
-        };
-        if playing {
-            start_anim_timer(&w, &s);
-        } else {
-            s.borrow().anim_timer.stop();
-            update_anim_ui(&w, &s);
-        }
-    });
-    let (w, s) = (win.as_weak(), Rc::clone(&state));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
+    win.on_anim_open(move |i| anim_open(&w, &s, i));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
+    win.on_anim_select(move |i| anim_select(&w, &s, i));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
+    win.on_anim_toggle(move || anim_toggle(&w, &s));
+    let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_anim_seek(move |v| {
         if let Some(a) = s.borrow_mut().anim.as_mut() {
             a.time = v.clamp(0.0, 1.0) * a.clip_duration();
@@ -436,13 +408,123 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         update_anim_ui(&w, &s);
         render(&w, &s);
     });
-    let s = Rc::clone(&state);
+    let s = Rc::clone(state);
     win.on_anim_speed(move |i| {
         if let Some(a) = s.borrow_mut().anim.as_mut() {
-            a.speed = [0.25, 0.5, 1.0, 2.0].get(i as usize).copied().unwrap_or(1.0);
+            a.speed = ANIM_SPEEDS.get(i as usize).copied().unwrap_or(1.0);
         }
     });
+}
 
+/// Opens the clip dictionary of search result `i` (`-1`: closes the open one).
+fn anim_open(w: &slint::Weak<ViewerWindow>, s: &SharedState, i: i32) {
+    let Some(win) = w.upgrade() else { return };
+    if i < 0 {
+        s.borrow_mut().anim = None;
+        win.set_anim_dictionary("".into());
+        win.set_anim_clip(-1);
+        render(w, s);
+        return;
+    }
+    let Some(vpath) = s.borrow().results.get(i as usize).cloned() else { return };
+    win.set_anim_status(format!("Loading {vpath} …").into());
+    match crate::load_clip_dictionary(&vpath) {
+        Ok(dict) => show_clip_dictionary(&win, s, &vpath, dict),
+        Err(e) => win.set_anim_status(format!("Cannot read {vpath}: {e:#}").into()),
+    }
+}
+
+fn show_clip_dictionary(win: &ViewerWindow, s: &SharedState, vpath: &str, dict: ClipDictionary) {
+    let rows: Vec<ClipRow> = dict
+        .clips
+        .iter()
+        .map(|c| ClipRow { name: c.name.clone().into(), info: format!("{:.1} s", c.duration()).into() })
+        .collect();
+    let name = vpath.rsplit('/').next().unwrap_or(vpath).to_owned();
+    win.set_anim_clips(ModelRc::new(VecModel::from(rows)));
+    win.set_anim_dictionary(name.into());
+    win.set_anim_clip(-1);
+    // RDR2 dictionaries: one channel kind is not decoded yet and
+    // is interpolated between values every 64 frames.
+    let rdr2 = dict.animations.iter().any(|a| a.flags != 0);
+    let note = if rdr2 { RDR2_MOTION_NOTE } else { "" };
+    win.set_anim_status(format!("{} clips · {vpath}{note}", dict.clips.len()).into());
+    s.borrow_mut().anim = Some(AnimState {
+        dict: Arc::new(dict),
+        clip: None,
+        bindings: Vec::new(),
+        time: 0.0,
+        playing: false,
+        speed: 1.0,
+        last: Instant::now(),
+    });
+}
+
+/// Binds clip `i` of the open dictionary to the model and starts playing it.
+fn anim_select(w: &slint::Weak<ViewerWindow>, s: &SharedState, i: i32) {
+    if !bind_clip(w, s, i) {
+        return;
+    }
+    start_anim_timer(w, s);
+}
+
+/// Whether there is a clip `i` to play (then it is bound and the status shown).
+fn bind_clip(w: &slint::Weak<ViewerWindow>, s: &SharedState, i: i32) -> bool {
+    let mut st = s.borrow_mut();
+    let skeleton = st.model().and_then(|m| m.loaded.skeleton.clone());
+    let expressions = st.model().map(|m| m.loaded.expressions.clone()).unwrap_or_default();
+    let Some(a) = st.anim.as_mut() else { return false };
+    let Some(clip) = a.dict.clips.get(i as usize) else { return false };
+    let bindings: Vec<Option<Binding>> = clip
+        .parts
+        .iter()
+        .map(|p| {
+            let anim = &a.dict.animations[p.animation];
+            skeleton.as_ref().map(|sk| Binding::new(sk, anim).with_expressions(sk, anim, &expressions))
+        })
+        .collect();
+    let moved = bindings.first().and_then(Option::as_ref).map_or(0, Binding::animated_bones);
+    a.bindings = bindings;
+    a.clip = Some(i as usize);
+    a.time = 0.0;
+    a.playing = true;
+    a.last = Instant::now();
+    let rdr2 = a.dict.animations.iter().any(|x| x.flags != 0);
+    if let Some(win) = w.upgrade() {
+        win.set_anim_clip(i);
+        if moved == 0 {
+            win.set_anim_status("This clip animates none of the model's bones (different skeleton).".into());
+        } else {
+            let note = if rdr2 { RDR2_MOTION_NOTE } else { "" };
+            win.set_anim_status(format!("{moved} bones animated{note}").into());
+        }
+    }
+    true
+}
+
+fn anim_toggle(w: &slint::Weak<ViewerWindow>, s: &SharedState) {
+    let playing = {
+        let mut st = s.borrow_mut();
+        let Some(a) = st.anim.as_mut() else { return };
+        if a.clip.is_none() {
+            return;
+        }
+        if !a.playing && a.time >= a.clip_duration() {
+            a.time = 0.0;
+        }
+        a.playing = !a.playing;
+        a.last = Instant::now();
+        a.playing
+    };
+    if playing {
+        start_anim_timer(w, s);
+    } else {
+        s.borrow().anim_timer.stop();
+        update_anim_ui(w, s);
+    }
+}
+
+fn wire_window_close(win: &ViewerWindow, id: u64) {
     let w = win.as_weak();
     let wp = win.as_weak();
     win.on_copy_path(move || {
@@ -463,34 +545,34 @@ pub fn open_with(ui: &AppWindow, content: Content, labels: Labels, animation: Op
         forget(id);
         slint::CloseRequestResponse::HideWindow
     });
+}
 
+/// Starts the clip given to [`open_with`], or suggests the generic movement clips for peds.
+fn start_initial_animation(win: &ViewerWindow, state: &SharedState, animation: Option<String>, has_skeleton: bool) {
     if let Some(ycd) = animation.filter(|_| has_skeleton) {
         let rows = vec![ClipRow { name: ycd.rsplit('/').next().unwrap_or(&ycd).into(), info: ycd.clone().into() }];
         win.set_anim_results(ModelRc::new(VecModel::from(rows)));
         state.borrow_mut().results = vec![ycd];
         win.invoke_anim_open(0);
-        // The clip that moves most of this model's bones (in a cutscene: its own).
-        let best = {
-            let st = state.borrow();
-            let skeleton = st.model().and_then(|m| m.loaded.skeleton.as_ref());
-            match (st.anim.as_ref(), skeleton) {
-                (Some(a), Some(sk)) => {
-                    let tags: std::collections::HashSet<u16> = sk.bones.iter().map(|b| b.tag).collect();
-                    openrage_app::suggest::best_clip(&openrage_app::suggest::clip_tags(&a.dict), &tags, &win.get_path())
-                }
-                _ => 0,
-            }
-        };
-        win.invoke_anim_select(best as i32);
+        win.invoke_anim_select(best_clip_index(win, state) as i32);
         win.set_panel_tab(3);
     } else if has_skeleton {
         // Suggest the generic movement clips for peds.
         let female = win.get_heading().contains("_f_");
-        anim_search(&win.as_weak(), &state, if female { "move_f@generic" } else { "move_m@generic" });
+        anim_search(&win.as_weak(), state, if female { "move_f@generic" } else { "move_m@generic" });
     }
-    if win.show().is_ok() {
-        render(&win.as_weak(), &state);
-        OPEN.with(|o| o.borrow_mut().push((id, win)));
+}
+
+/// The clip that moves most of this model's bones (in a cutscene: its own).
+fn best_clip_index(win: &ViewerWindow, state: &SharedState) -> usize {
+    let st = state.borrow();
+    let skeleton = st.model().and_then(|m| m.loaded.skeleton.as_ref());
+    match (st.anim.as_ref(), skeleton) {
+        (Some(a), Some(sk)) => {
+            let tags: std::collections::HashSet<u16> = sk.bones.iter().map(|b| b.tag).collect();
+            openrage_app::suggest::best_clip(&openrage_app::suggest::clip_tags(&a.dict), &tags, &win.get_path())
+        }
+        _ => 0,
     }
 }
 

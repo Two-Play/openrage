@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use rage_rpf::vfs;
-use rage_rpf::{EntryId, Rpf7};
+use rage_rpf::{Entry, EntryId, Rpf7};
 
 #[derive(Debug, Default, Clone)]
 pub struct ExtractSummary {
@@ -118,12 +118,8 @@ pub fn extract_entry(
     let own_name = vfs::safe_relative_path(own_name).with_context(|| format!("unsafe entry name {own_name:?}"))?;
     let mut summary = ExtractSummary { target: out.join(&own_name), ..Default::default() };
 
-    if !entry.is_dir() && !(expand_archives && entry.is_archive()) {
-        let data = rpf.read(id)?;
-        fs::write(&summary.target, &data).with_context(|| format!("writing {}", summary.target.display()))?;
-        summary.files = 1;
-        summary.bytes = data.len() as u64;
-        progress(&summary, &entry.name);
+    if !is_container(entry, expand_archives) {
+        write_single_file(rpf, id, &entry.name, &mut summary, progress)?;
         return Ok(summary);
     }
 
@@ -132,36 +128,75 @@ pub fn extract_entry(
     let base = summary.target.clone();
     fs::create_dir_all(&base)?;
 
-    let mut visit = |a: &Rpf7, eid: EntryId, rel: &str| {
-        if summary.cancelled || cancel.load(Ordering::Relaxed) {
-            summary.cancelled = true;
+    let mut visitor = EntryVisitor { summary: &mut summary, base: &base, cancel, expand_archives, progress };
+    let mut nested_errors = Vec::new();
+    vfs::walk(&start, start_dir, "", expand_archives, &mut |a, eid, rel| visitor.visit(a, eid, rel), &mut |e| {
+        nested_errors.push(e.to_string())
+    });
+    summary.failures.extend(nested_errors);
+    Ok(summary)
+}
+
+/// Whether the entry is created as a folder: a directory, or an archive that is expanded.
+fn is_container(entry: &Entry, expand_archives: bool) -> bool {
+    entry.is_dir() || (expand_archives && entry.is_archive())
+}
+
+/// Writes the single (non-directory) entry `id` to the summary's target.
+fn write_single_file(
+    rpf: &Arc<Rpf7>,
+    id: EntryId,
+    entry_name: &str,
+    summary: &mut ExtractSummary,
+    progress: &mut dyn FnMut(&ExtractSummary, &str),
+) -> Result<()> {
+    let data = rpf.read(id)?;
+    fs::write(&summary.target, &data).with_context(|| format!("writing {}", summary.target.display()))?;
+    summary.files = 1;
+    summary.bytes = data.len() as u64;
+    progress(summary, entry_name);
+    Ok(())
+}
+
+/// State of an entry walk started by [`extract_entry`].
+struct EntryVisitor<'a> {
+    summary: &'a mut ExtractSummary,
+    base: &'a Path,
+    cancel: &'a AtomicBool,
+    expand_archives: bool,
+    progress: &'a mut dyn FnMut(&ExtractSummary, &str),
+}
+
+impl EntryVisitor<'_> {
+    fn visit(&mut self, a: &Rpf7, eid: EntryId, rel: &str) {
+        if self.summary.cancelled || self.cancel.load(Ordering::Relaxed) {
+            self.summary.cancelled = true;
             return;
         }
         let e = a.entry(eid);
-        let Some(target) = vfs::safe_relative_path(rel).map(|r| base.join(r)) else {
-            summary.failures.push(format!("{rel}: unsafe path skipped"));
+        let Some(target) = vfs::safe_relative_path(rel).map(|r| self.base.join(r)) else {
+            self.summary.failures.push(format!("{rel}: unsafe path skipped"));
             return;
         };
-        let result = if e.is_dir() || (expand_archives && e.is_archive()) {
+        let result = if is_container(e, self.expand_archives) {
             fs::create_dir_all(&target).map_err(anyhow::Error::from)
         } else {
-            a.read(eid).map_err(anyhow::Error::from).and_then(|data| {
-                fs::write(&target, &data)?;
-                summary.files += 1;
-                summary.bytes += data.len() as u64;
-                Ok(())
-            })
+            self.write_file(a, eid, &target)
         };
         match result {
-            Ok(()) if !e.is_dir() => progress(&summary, rel),
+            Ok(()) if !e.is_dir() => (self.progress)(self.summary, rel),
             Ok(()) => {}
-            Err(err) => summary.failures.push(format!("{rel}: {err:#}")),
+            Err(err) => self.summary.failures.push(format!("{rel}: {err:#}")),
         }
-    };
-    let mut nested_errors = Vec::new();
-    vfs::walk(&start, start_dir, "", expand_archives, &mut visit, &mut |e| nested_errors.push(e.to_string()));
-    summary.failures.extend(nested_errors);
-    Ok(summary)
+    }
+
+    fn write_file(&mut self, a: &Rpf7, eid: EntryId, target: &Path) -> Result<()> {
+        let data = a.read(eid)?;
+        fs::write(target, &data)?;
+        self.summary.files += 1;
+        self.summary.bytes += data.len() as u64;
+        Ok(())
+    }
 }
 
 /// Human-readable byte size (`1.5M`, `312B`).

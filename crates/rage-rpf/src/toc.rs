@@ -13,6 +13,13 @@ pub(crate) const BLOCK: u64 = 512;
 pub(crate) const MAX_U24: u32 = 0xFF_FFFF;
 const OPEN: u32 = 0x4E45_504F;
 const MAGIC_RPF7: u32 = 0x5250_4637;
+/// Second word of a directory entry.
+const DIR_MARKER: u32 = 0x7FFF_FF00;
+/// Highest block number that fits next to the resource flag.
+const MAX_BLOCK: u32 = 0x7F_FFFF;
+/// Top bit of the 24-bit block field of a resource entry.
+const RESOURCE_FLAG: u32 = 0x80_0000;
+const MAX_NAMES: usize = 0xFFFF;
 
 /// What the table of contents needs to know about a file entry.
 #[derive(Debug, Clone, Copy)]
@@ -42,50 +49,54 @@ pub(crate) fn err(reason: impl Into<String>) -> RpfError {
     RpfError::CorruptToc { archive: "<new archive>".into(), reason: reason.into() }
 }
 
-/// Returns the table bytes (unpadded) and the indices of `files` in table order.
-/// `dirs` lists directories that must exist even if empty.
-pub(crate) fn build(files: &[TocFile<'_>], dirs: &[&str]) -> Result<(Vec<u8>, Vec<usize>), RpfError> {
-    struct Node {
-        name: String,
-        children: BTreeMap<String, usize>,
-        file: Option<usize>,
-    }
-    let mut nodes = vec![Node { name: String::new(), children: BTreeMap::new(), file: None }];
-    let insert = |nodes: &mut Vec<Node>, path: &str, file: Option<usize>| -> Result<(), RpfError> {
-        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-        let mut cur = 0;
-        for (i, part) in parts.iter().enumerate() {
-            let key = part.to_ascii_lowercase();
-            let next = match nodes[cur].children.get(&key) {
-                Some(&n) => n,
-                None => {
-                    nodes.push(Node { name: (*part).to_owned(), children: BTreeMap::new(), file: None });
-                    let n = nodes.len() - 1;
-                    nodes[cur].children.insert(key, n);
-                    n
-                }
-            };
-            let last = i + 1 == parts.len();
-            if last && file.is_some() {
-                if !nodes[next].children.is_empty() || nodes[next].file.is_some() {
-                    return Err(err(format!("{path} is both a file and a directory")));
-                }
-                nodes[next].file = file;
-            } else if nodes[next].file.is_some() {
-                return Err(err(format!("{path} lies below a file")));
+struct Node {
+    name: String,
+    children: BTreeMap<String, usize>,
+    file: Option<usize>,
+}
+
+/// Adds `path` (and the directories on the way) to the tree; `file` is the index of the file it names, if any.
+fn insert_path(nodes: &mut Vec<Node>, path: &str, file: Option<usize>) -> Result<(), RpfError> {
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let mut cur = 0;
+    for (i, part) in parts.iter().enumerate() {
+        let key = part.to_ascii_lowercase();
+        let next = match nodes[cur].children.get(&key) {
+            Some(&n) => n,
+            None => {
+                nodes.push(Node { name: (*part).to_owned(), children: BTreeMap::new(), file: None });
+                let n = nodes.len() - 1;
+                nodes[cur].children.insert(key, n);
+                n
             }
-            cur = next;
+        };
+        let last = i + 1 == parts.len();
+        if last && file.is_some() {
+            if !nodes[next].children.is_empty() || nodes[next].file.is_some() {
+                return Err(err(format!("{path} is both a file and a directory")));
+            }
+            nodes[next].file = file;
+        } else if nodes[next].file.is_some() {
+            return Err(err(format!("{path} lies below a file")));
         }
-        Ok(())
-    };
+        cur = next;
+    }
+    Ok(())
+}
+
+fn build_tree(files: &[TocFile<'_>], dirs: &[&str]) -> Result<Vec<Node>, RpfError> {
+    let mut nodes = vec![Node { name: String::new(), children: BTreeMap::new(), file: None }];
     for d in dirs {
-        insert(&mut nodes, d, None)?;
+        insert_path(&mut nodes, d, None)?;
     }
     for (fi, f) in files.iter().enumerate() {
-        insert(&mut nodes, f.path, Some(fi))?;
+        insert_path(&mut nodes, f.path, Some(fi))?;
     }
+    Ok(nodes)
+}
 
-    // Breadth-first order: every directory's children are contiguous.
+/// Breadth-first order: every directory's children are contiguous. Also returns each node's first child.
+fn breadth_first(nodes: &[Node]) -> (Vec<usize>, Vec<u32>) {
     let mut order = vec![0usize];
     let mut first_child = vec![0u32; nodes.len()];
     let mut i = 0;
@@ -97,20 +108,15 @@ pub(crate) fn build(files: &[TocFile<'_>], dirs: &[&str]) -> Result<(Vec<u8>, Ve
         }
         i += 1;
     }
+    (order, first_child)
+}
 
-    let mut names = Vec::new();
-    let mut name_off = vec![0u32; nodes.len()];
-    for &n in &order {
-        name_off[n] = names.len() as u32;
-        names.extend_from_slice(nodes[n].name.as_bytes());
-        names.push(0);
-    }
-    while names.len() % 16 != 0 {
-        names.push(0);
-    }
-    if names.len() > 0xFFFF {
-        return Err(err("name table exceeds 64 KiB"));
-    }
+/// Returns the table bytes (unpadded) and the indices of `files` in table order.
+/// `dirs` lists directories that must exist even if empty.
+pub(crate) fn build(files: &[TocFile<'_>], dirs: &[&str]) -> Result<(Vec<u8>, Vec<usize>), RpfError> {
+    let nodes = build_tree(files, dirs)?;
+    let (order, first_child) = breadth_first(&nodes);
+    let (names, name_off) = name_table(&nodes, &order)?;
 
     let mut out = Vec::with_capacity(16 + order.len() * 16 + names.len());
     out.extend_from_slice(&MAGIC_RPF7.to_le_bytes());
@@ -119,48 +125,74 @@ pub(crate) fn build(files: &[TocFile<'_>], dirs: &[&str]) -> Result<(Vec<u8>, Ve
     out.extend_from_slice(&OPEN.to_le_bytes());
     let mut file_order = Vec::new();
     for &n in &order {
-        let mut e = [0u8; 16];
-        match nodes[n].file {
-            None => {
-                e[0..4].copy_from_slice(&name_off[n].to_le_bytes());
-                e[4..8].copy_from_slice(&0x7FFF_FF00u32.to_le_bytes());
-                e[8..12].copy_from_slice(&first_child[n].to_le_bytes());
-                e[12..16].copy_from_slice(&(nodes[n].children.len() as u32).to_le_bytes());
-            }
+        let e = match nodes[n].file {
+            None => dir_entry(name_off[n], first_child[n], nodes[n].children.len() as u32),
             Some(fi) => {
-                let f = &files[fi];
-                if f.block > 0x7F_FFFF {
-                    return Err(err("archive exceeds 4 GiB"));
-                }
-                e[0..2].copy_from_slice(&(name_off[n] as u16).to_le_bytes());
-                match f.meta {
-                    Meta::Binary { stored_len, compressed, size, encrypted } => {
-                        let stored = if compressed { stored_len } else { 0 };
-                        if stored > MAX_U24 {
-                            return Err(err(format!("{}: compressed size too large", f.path)));
-                        }
-                        e[2..5].copy_from_slice(&stored.to_le_bytes()[..3]);
-                        e[5..8].copy_from_slice(&f.block.to_le_bytes()[..3]);
-                        e[8..12].copy_from_slice(&size.to_le_bytes());
-                        e[12..16].copy_from_slice(&u32::from(encrypted).to_le_bytes());
-                    }
-                    Meta::Resource { len, system_flags, graphics_flags } => {
-                        if len < 16 {
-                            return Err(err(format!("{}: resource too short", f.path)));
-                        }
-                        e[2..5].copy_from_slice(&len.min(MAX_U24).to_le_bytes()[..3]);
-                        e[5..8].copy_from_slice(&(f.block | 0x80_0000).to_le_bytes()[..3]);
-                        e[8..12].copy_from_slice(&system_flags.to_le_bytes());
-                        e[12..16].copy_from_slice(&graphics_flags.to_le_bytes());
-                    }
-                }
                 file_order.push(fi);
+                file_entry(&files[fi], name_off[n])?
             }
-        }
+        };
         out.extend_from_slice(&e);
     }
     out.extend_from_slice(&names);
     Ok((out, file_order))
+}
+
+/// The name table (padded to 16 bytes) and the offset of every node's name in it.
+fn name_table(nodes: &[Node], order: &[usize]) -> Result<(Vec<u8>, Vec<u32>), RpfError> {
+    let mut names = Vec::new();
+    let mut name_off = vec![0u32; nodes.len()];
+    for &n in order {
+        name_off[n] = names.len() as u32;
+        names.extend_from_slice(nodes[n].name.as_bytes());
+        names.push(0);
+    }
+    while names.len() % 16 != 0 {
+        names.push(0);
+    }
+    if names.len() > MAX_NAMES {
+        return Err(err("name table exceeds 64 KiB"));
+    }
+    Ok((names, name_off))
+}
+
+fn dir_entry(name_off: u32, first_child: u32, children: u32) -> [u8; 16] {
+    let mut e = [0u8; 16];
+    e[0..4].copy_from_slice(&name_off.to_le_bytes());
+    e[4..8].copy_from_slice(&DIR_MARKER.to_le_bytes());
+    e[8..12].copy_from_slice(&first_child.to_le_bytes());
+    e[12..16].copy_from_slice(&children.to_le_bytes());
+    e
+}
+
+fn file_entry(f: &TocFile<'_>, name_off: u32) -> Result<[u8; 16], RpfError> {
+    let mut e = [0u8; 16];
+    if f.block > MAX_BLOCK {
+        return Err(err("archive exceeds 4 GiB"));
+    }
+    e[0..2].copy_from_slice(&(name_off as u16).to_le_bytes());
+    match f.meta {
+        Meta::Binary { stored_len, compressed, size, encrypted } => {
+            let stored = if compressed { stored_len } else { 0 };
+            if stored > MAX_U24 {
+                return Err(err(format!("{}: compressed size too large", f.path)));
+            }
+            e[2..5].copy_from_slice(&stored.to_le_bytes()[..3]);
+            e[5..8].copy_from_slice(&f.block.to_le_bytes()[..3]);
+            e[8..12].copy_from_slice(&size.to_le_bytes());
+            e[12..16].copy_from_slice(&u32::from(encrypted).to_le_bytes());
+        }
+        Meta::Resource { len, system_flags, graphics_flags } => {
+            if len < 16 {
+                return Err(err(format!("{}: resource too short", f.path)));
+            }
+            e[2..5].copy_from_slice(&len.min(MAX_U24).to_le_bytes()[..3]);
+            e[5..8].copy_from_slice(&(f.block | RESOURCE_FLAG).to_le_bytes()[..3]);
+            e[8..12].copy_from_slice(&system_flags.to_le_bytes());
+            e[12..16].copy_from_slice(&graphics_flags.to_le_bytes());
+        }
+    }
+    Ok(e)
 }
 
 /// Patches the in-archive header of a resource ≥ 16 MiB, whose size does not

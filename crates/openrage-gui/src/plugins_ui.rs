@@ -52,6 +52,9 @@ pub(crate) fn after_plugins_change(ui: &AppWindow) {
     }
 }
 
+/// Larger files are not handed to plugins for a preview.
+const PREVIEW_MAX: u64 = 256 << 20;
+
 /// A plugin's preview of a file, if it has one. A fallback plugin (`*`) is
 /// only asked about binary files: text is shown as text.
 pub(crate) fn plugin_preview(
@@ -60,28 +63,47 @@ pub(crate) fn plugin_preview(
     game: &plugins::GameContext,
     vpath: &str,
 ) -> Option<plugins::PreviewResult> {
-    /// Larger files are not handed to plugins for a preview.
-    const MAX: u64 = 256 << 20;
     let dir = game.dir.as_deref()?;
     let node = rage_mods::resolve(dir, vpath, game.keys.clone()).ok()?.0;
-    let data = match node {
-        Node::PlainFile(p) if std::fs::metadata(&p).ok()?.len() <= MAX => std::fs::read(p).ok()?,
-        Node::ArchiveFile(rpf, id) if rpf.entry(id).size() <= MAX => rpf.read(id).ok()?,
-        Node::Rpf8File(rpf, i) => {
-            let entry = rpf.entries()?.get(i)?;
-            if entry.size() > MAX {
-                return None;
-            }
-            rpf.read(entry).ok()?
-        }
-        Node::Gta4File(a, id) if a.entry(id).size() <= MAX => a.read(id).ok()?,
-        Node::Rpf9File(rpf, i) if rpf.entries().ok()?.get(i)?.size <= MAX => rpf.read_at(i).ok()?,
-        _ => return None,
-    };
+    let data = preview_bytes(node)?;
     if !specific && rage_core::text::decode_text(&data, 4096).is_some() {
         return None;
     }
     Some(plugins::preview(id, game, vpath, &data))
+}
+
+/// The file's bytes, unless it is too large to hand to a plugin.
+fn preview_bytes(node: Node) -> Option<Vec<u8>> {
+    match node {
+        Node::PlainFile(p) => read_plain_for_preview(&p),
+        Node::ArchiveFile(rpf, id) if rpf.entry(id).size() <= PREVIEW_MAX => rpf.read(id).ok(),
+        Node::Rpf8File(rpf, i) => read_rpf8_for_preview(&rpf, i),
+        Node::Gta4File(a, id) if a.entry(id).size() <= PREVIEW_MAX => a.read(id).ok(),
+        Node::Rpf9File(rpf, i) => read_rpf9_for_preview(&rpf, i),
+        _ => None,
+    }
+}
+
+fn read_plain_for_preview(path: &Path) -> Option<Vec<u8>> {
+    if std::fs::metadata(path).ok()?.len() > PREVIEW_MAX {
+        return None;
+    }
+    std::fs::read(path).ok()
+}
+
+fn read_rpf8_for_preview(rpf: &rage_rpf::Rpf8, i: usize) -> Option<Vec<u8>> {
+    let entry = rpf.entries()?.get(i)?;
+    if entry.size() > PREVIEW_MAX {
+        return None;
+    }
+    rpf.read(entry).ok()
+}
+
+fn read_rpf9_for_preview(rpf: &rage_rpf::Rpf9, i: usize) -> Option<Vec<u8>> {
+    if rpf.entries().ok()?.get(i)?.size > PREVIEW_MAX {
+        return None;
+    }
+    rpf.read_at(i).ok()
 }
 
 /// Runs a plugin's action on a file, folder or archive: asks for the files
@@ -112,27 +134,7 @@ pub(crate) fn run_plugin_action(ui: &AppWindow, action: plugins::ActionRef, vpat
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let title = action.title.trim_end_matches('…').to_owned();
-        let mut picked = Vec::new();
-        if !action.pick.is_empty() {
-            let exts: Vec<&str> = action.pick.iter().map(String::as_str).collect();
-            let dialog_title = if action.pick_title.is_empty() { title.clone() } else { action.pick_title.clone() };
-            let Some(paths) =
-                rfd::FileDialog::new().set_title(dialog_title).add_filter(exts.join(", "), &exts).pick_files()
-            else {
-                return;
-            };
-            for path in paths {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                match std::fs::read(&path) {
-                    Ok(data) => picked.push(openrage_app::plugins::Picked { name, data }),
-                    Err(e) => {
-                        let msg = format!("Cannot read {}: {e}", path.display());
-                        let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
-                        return;
-                    }
-                }
-            }
-        }
+        let Some(picked) = pick_plugin_files(&action, &title, &weak) else { return };
         let start = format!("{title}…");
         let _ = weak.upgrade_in_event_loop(move |ui| set_busy_cancellable(&ui, start));
         let mut last = Instant::now();
@@ -144,39 +146,10 @@ pub(crate) fn run_plugin_action(ui: &AppWindow, action: plugins::ActionRef, vpat
             }
             !cancel.load(Ordering::Relaxed)
         });
-        let mut mods_changed = false;
-        let msg = match result {
-            Err(e) => format!("{}: {e}", action.plugin_name),
-            Ok(r) if r.cancelled => "Cancelled; nothing was saved or changed.".to_owned(),
-            Ok(r) => {
-                let mut parts = Vec::new();
-                if !r.outputs.is_empty() {
-                    parts.push(save_plugin_outputs(&title, &r.outputs));
-                }
-                if !r.writes.is_empty() {
-                    let description = format!("{}: {title}", action.plugin_name);
-                    let group = openrage_app::plugins::group_name(&description);
-                    match game_dir.as_deref().map(|dir| {
-                        openrage_app::plugins::apply_writes(dir, keys.clone(), &r.writes, &description, &group)
-                    }) {
-                        Some(Ok(done)) => {
-                            mods_changed = true;
-                            parts.push(format!("Changed {} (undo in History)", done.join(", ")));
-                        }
-                        Some(Err(e)) => parts.push(format!("Changing files failed: {e:#}")),
-                        None => parts.push("No game is open to change".to_owned()),
-                    }
-                }
-                if let Some((path, error)) = r.failures.first() {
-                    parts.push(format!("{} of {} files failed ({path}: {error})", r.failures.len(), r.files));
-                }
-                parts.retain(|p| !p.is_empty());
-                if parts.is_empty() && r.outputs.is_empty() {
-                    let last = r.log.last().map(|l| format!(": {}", l.message)).unwrap_or_default();
-                    parts.push(format!("{}: nothing to save or change{last}", action.plugin_name));
-                }
-                parts.join(" · ")
-            }
+        let (msg, mods_changed) = match result {
+            Err(e) => (format!("{}: {e}", action.plugin_name), false),
+            Ok(r) if r.cancelled => ("Cancelled; nothing was saved or changed.".to_owned(), false),
+            Ok(r) => finish_plugin_run(&action, &title, &r, game_dir.as_deref(), &keys),
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if mods_changed {
@@ -185,6 +158,73 @@ pub(crate) fn run_plugin_action(ui: &AppWindow, action: plugins::ActionRef, vpat
             set_busy(&ui, false, msg);
         });
     });
+}
+
+/// Asks for the files the action wants from disk (none: an empty list); `None` when
+/// the user cancelled the dialog or a file could not be read.
+fn pick_plugin_files(
+    action: &plugins::ActionRef,
+    title: &str,
+    weak: &Weak<AppWindow>,
+) -> Option<Vec<openrage_app::plugins::Picked>> {
+    let mut picked = Vec::new();
+    if action.pick.is_empty() {
+        return Some(picked);
+    }
+    let exts: Vec<&str> = action.pick.iter().map(String::as_str).collect();
+    let dialog_title = if action.pick_title.is_empty() { title.to_owned() } else { action.pick_title.clone() };
+    let paths = rfd::FileDialog::new().set_title(dialog_title).add_filter(exts.join(", "), &exts).pick_files()?;
+    for path in paths {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match std::fs::read(&path) {
+            Ok(data) => picked.push(openrage_app::plugins::Picked { name, data }),
+            Err(e) => {
+                let msg = format!("Cannot read {}: {e}", path.display());
+                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
+                return None;
+            }
+        }
+    }
+    Some(picked)
+}
+
+/// Saves the outputs and applies the writes of a finished run; returns the status
+/// text and whether the mods folder changed.
+fn finish_plugin_run(
+    action: &plugins::ActionRef,
+    title: &str,
+    r: &openrage_app::plugins::RunResult,
+    game_dir: Option<&Path>,
+    keys: &Option<Arc<GtaVKeys>>,
+) -> (String, bool) {
+    let mut mods_changed = false;
+    let mut parts = Vec::new();
+    if !r.outputs.is_empty() {
+        parts.push(save_plugin_outputs(title, &r.outputs));
+    }
+    if !r.writes.is_empty() {
+        let description = format!("{}: {title}", action.plugin_name);
+        let group = openrage_app::plugins::group_name(&description);
+        match game_dir
+            .map(|dir| openrage_app::plugins::apply_writes(dir, keys.clone(), &r.writes, &description, &group))
+        {
+            Some(Ok(done)) => {
+                mods_changed = true;
+                parts.push(format!("Changed {} (undo in History)", done.join(", ")));
+            }
+            Some(Err(e)) => parts.push(format!("Changing files failed: {e:#}")),
+            None => parts.push("No game is open to change".to_owned()),
+        }
+    }
+    if let Some((path, error)) = r.failures.first() {
+        parts.push(format!("{} of {} files failed ({path}: {error})", r.failures.len(), r.files));
+    }
+    parts.retain(|p| !p.is_empty());
+    if parts.is_empty() && r.outputs.is_empty() {
+        let last = r.log.last().map(|l| format!(": {}", l.message)).unwrap_or_default();
+        parts.push(format!("{}: nothing to save or change{last}", action.plugin_name));
+    }
+    (parts.join(" · "), mods_changed)
 }
 
 /// Saves the files an action produced; returns the status text ("" if the

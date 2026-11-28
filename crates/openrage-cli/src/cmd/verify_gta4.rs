@@ -517,106 +517,133 @@ pub(crate) fn cmd_verify_gta4_tables(game_dir: &Path, within: &str) -> Result<()
 }
 
 /// Parses every GTA IV texture dictionary (`.wtd`) and decodes every texture.
-pub(crate) fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: bool) -> Result<()> {
-    #[derive(Default)]
-    struct Stats {
-        dicts: usize,
-        textures: usize,
-        decoded: usize,
-        rebuilt: usize,
-        models: usize,
-        identical: usize,
-        formats: std::collections::BTreeMap<String, usize>,
-        errors: Vec<String>,
-    }
-    let (starts, open_errors) = gta4_starts(game_dir, within)?;
-    let started = Instant::now();
-    let all: Vec<Stats> = for_each_gta4_entry_parallel(
-        &starts,
-        false,
-        |a, id| !a.entry(id).is_dir(),
-        |a, id, p, s: &mut Stats| {
-            let e = a.entry(id);
-            let lower = e.name.to_ascii_lowercase();
-            // Texture dictionaries, and models (.wdr) with textures of their own.
-            let model = lower.ends_with(".wdr");
-            if e.resource_type().is_none() || !(lower.ends_with(".wtd") || model) {
-                return;
-            }
-            let read = a.read(id).map_err(anyhow::Error::from).and_then(|raw| {
-                let header = rage_resource::rsc5_header(&raw).context("no RSC5 header")?;
-                let res = rage_resource::Resource::from_rsc5(&raw)?;
-                let root = match model {
-                    true => rage_formats::wdr::embedded_textures(&res, rage_resource::Resource::ROOT).map(|e| e.root),
-                    false => Some(rage_resource::Resource::ROOT),
-                };
-                let dict = root.map(|r| rage_formats::ytd::parse_gta4_at(&res, r)).transpose()?;
-                Ok((header, res, root.zip(dict)))
-            });
-            let ((kind, flags), res, (root, dict)) = match read {
-                Ok((h, r, Some(d))) => (h, r, d),
-                Ok((_, _, None)) => return,
-                Err(err) => return s.errors.push(format!("{p}: {err:#}")),
-            };
-            s.dicts += 1;
-            s.models += model as usize;
-            s.errors.extend(dict.errors.iter().map(|err| format!("{p}: {err}")));
-            if rebuild && dict.errors.is_empty() {
-                // The writer's rebuild must read back to the same textures.
-                let mut same_memory = false;
-                let check = if model {
-                    rage_formats::wtd_write::rebuild_embedded(&res, kind, flags, root, &dict)
-                        .and_then(|file| rage_resource::Resource::from_rsc5(&file))
-                        .and_then(|r| {
-                            // Nothing changed: the model must come out byte for byte.
-                            same_memory = r.system == res.system && r.graphics == res.graphics;
-                            rage_formats::ytd::parse_gta4_at(&r, root)
-                        })
-                } else {
-                    rage_formats::wtd_write::rebuild(&res, kind, flags, &dict)
-                        .and_then(|file| rage_resource::Resource::from_rsc5(&file))
-                        .and_then(|r| rage_formats::ytd::parse_gta4(&r))
-                };
-                s.identical += same_memory as usize;
-                let key = |d: &rage_formats::ytd::TextureDictionary| {
-                    let mut v: Vec<_> = d
-                        .textures
-                        .iter()
-                        .map(|t| (t.name.clone(), t.width, t.height, t.levels, t.format, t.data.clone()))
-                        .collect();
-                    v.sort_by(|x, y| x.0.cmp(&y.0));
-                    v
-                };
-                match check {
-                    Ok(back) if back.errors.is_empty() && key(&back) == key(&dict) => s.rebuilt += 1,
-                    Ok(_) => s.errors.push(format!("{p}: rebuilt dictionary differs")),
-                    Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
-                }
-            }
-            for t in &dict.textures {
-                s.textures += 1;
-                *s.formats.entry(t.format.name()).or_default() += 1;
-                match t.to_rgba() {
-                    Some(_) => s.decoded += 1,
-                    None => s.errors.push(format!("{p}/{}: cannot decode {}", t.name, t.format.name())),
-                }
-            }
-        },
-    );
-    let mut total = Stats { errors: open_errors, ..Default::default() };
-    for s in all {
-        total.dicts += s.dicts;
-        total.textures += s.textures;
-        total.decoded += s.decoded;
-        total.rebuilt += s.rebuilt;
-        total.models += s.models;
-        total.identical += s.identical;
-        total.errors.extend(s.errors);
+#[derive(Default)]
+struct TextureStats {
+    dicts: usize,
+    textures: usize,
+    decoded: usize,
+    rebuilt: usize,
+    models: usize,
+    identical: usize,
+    formats: std::collections::BTreeMap<String, usize>,
+    errors: Vec<String>,
+}
+
+impl TextureStats {
+    fn merge(&mut self, s: TextureStats) {
+        self.dicts += s.dicts;
+        self.textures += s.textures;
+        self.decoded += s.decoded;
+        self.rebuilt += s.rebuilt;
+        self.models += s.models;
+        self.identical += s.identical;
+        self.errors.extend(s.errors);
         for (k, v) in s.formats {
-            *total.formats.entry(k).or_default() += v;
+            *self.formats.entry(k).or_default() += v;
         }
     }
-    total.errors.sort();
+}
+
+/// A parsed GTA IV texture dictionary with what its rebuild needs.
+struct Gta4Dict {
+    kind: u32,
+    flags: u32,
+    res: rage_resource::Resource,
+    root: u64,
+    dict: rage_formats::ytd::TextureDictionary,
+    /// A model (`.wdr`) with textures of its own.
+    model: bool,
+}
+
+/// Reads and parses a dictionary or model; `None` for a model without textures of its own.
+fn read_gta4_dict(a: &rage_rpf::Gta4Archive, id: rage_rpf::Gta4EntryId, model: bool) -> Result<Option<Gta4Dict>> {
+    let raw = a.read(id)?;
+    let (kind, flags) = rage_resource::rsc5_header(&raw).context("no RSC5 header")?;
+    let res = rage_resource::Resource::from_rsc5(&raw)?;
+    let root = if model {
+        rage_formats::wdr::embedded_textures(&res, rage_resource::Resource::ROOT).map(|e| e.root)
+    } else {
+        Some(rage_resource::Resource::ROOT)
+    };
+    let Some(root) = root else { return Ok(None) };
+    let dict = rage_formats::ytd::parse_gta4_at(&res, root)?;
+    Ok(Some(Gta4Dict { kind, flags, res, root, dict, model }))
+}
+
+/// The textures of a dictionary in a form that can be compared.
+fn texture_key(d: &rage_formats::ytd::TextureDictionary) -> impl PartialEq {
+    let mut v: Vec<_> =
+        d.textures.iter().map(|t| (t.name.clone(), t.width, t.height, t.levels, t.format, t.data.clone())).collect();
+    v.sort_by(|x, y| x.0.cmp(&y.0));
+    v
+}
+
+/// The writer's rebuild must read back to the same textures.
+fn check_texture_rebuild(d: &Gta4Dict, p: &str, s: &mut TextureStats) {
+    let Gta4Dict { kind, flags, res, root, dict, model } = d;
+    let mut same_memory = false;
+    let check = if *model {
+        rage_formats::wtd_write::rebuild_embedded(res, *kind, *flags, *root, dict)
+            .and_then(|file| rage_resource::Resource::from_rsc5(&file))
+            .and_then(|r| {
+                // Nothing changed: the model must come out byte for byte.
+                same_memory = r.system == res.system && r.graphics == res.graphics;
+                rage_formats::ytd::parse_gta4_at(&r, *root)
+            })
+    } else {
+        rage_formats::wtd_write::rebuild(res, *kind, *flags, dict)
+            .and_then(|file| rage_resource::Resource::from_rsc5(&file))
+            .and_then(|r| rage_formats::ytd::parse_gta4(&r))
+    };
+    s.identical += same_memory as usize;
+    match check {
+        Ok(back) if back.errors.is_empty() && texture_key(&back) == texture_key(dict) => s.rebuilt += 1,
+        Ok(_) => s.errors.push(format!("{p}: rebuilt dictionary differs")),
+        Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
+    }
+}
+
+/// Counts the textures of a dictionary and decodes each one.
+fn decode_textures(dict: &rage_formats::ytd::TextureDictionary, p: &str, s: &mut TextureStats) {
+    for t in &dict.textures {
+        s.textures += 1;
+        *s.formats.entry(t.format.name()).or_default() += 1;
+        match t.to_rgba() {
+            Some(_) => s.decoded += 1,
+            None => s.errors.push(format!("{p}/{}: cannot decode {}", t.name, t.format.name())),
+        }
+    }
+}
+
+fn check_gta4_texture_entry(
+    rebuild: bool,
+    a: &rage_rpf::Gta4Archive,
+    id: rage_rpf::Gta4EntryId,
+    p: &str,
+    s: &mut TextureStats,
+) {
+    let e = a.entry(id);
+    let lower = e.name.to_ascii_lowercase();
+    // Texture dictionaries, and models (.wdr) with textures of their own.
+    let model = lower.ends_with(".wdr");
+    if e.resource_type().is_none() || !(lower.ends_with(".wtd") || model) {
+        return;
+    }
+    let d = match read_gta4_dict(a, id, model) {
+        Ok(Some(d)) => d,
+        Ok(None) => return,
+        Err(err) => return s.errors.push(format!("{p}: {err:#}")),
+    };
+    s.dicts += 1;
+    s.models += model as usize;
+    s.errors.extend(d.dict.errors.iter().map(|err| format!("{p}: {err}")));
+    if rebuild && d.dict.errors.is_empty() {
+        check_texture_rebuild(&d, p, s);
+    }
+    decode_textures(&d.dict, p, s);
+}
+
+fn print_texture_summary(total: &TextureStats, rebuild: bool, started: Instant) {
     for e in total.errors.iter().take(50) {
         outln!("FAIL {e}");
     }
@@ -639,45 +666,66 @@ pub(crate) fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: b
         total.errors.len(),
         started.elapsed().as_secs_f32()
     );
+}
+
+pub(crate) fn cmd_verify_gta4_textures(game_dir: &Path, within: &str, rebuild: bool) -> Result<()> {
+    let (starts, open_errors) = gta4_starts(game_dir, within)?;
+    let started = Instant::now();
+    let all: Vec<TextureStats> = for_each_gta4_entry_parallel(
+        &starts,
+        false,
+        |a, id| !a.entry(id).is_dir(),
+        |a, id, p, s: &mut TextureStats| check_gta4_texture_entry(rebuild, a, id, p, s),
+    );
+    let mut total = TextureStats { errors: open_errors, ..Default::default() };
+    for s in all {
+        total.merge(s);
+    }
+    total.errors.sort();
+    print_texture_summary(&total, rebuild, started);
     if !total.errors.is_empty() {
         bail!("{} errors", total.errors.len());
     }
     Ok(())
 }
 
-/// Reads every GTA IV cutscene (`.cut`): parses it, puts its animation
-/// together from the dictionaries next to it and looks for its models.
-pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result<()> {
-    use openrage_app::gta4_cutscene;
-    let (starts, mut errors) = gta4_starts(game_dir, within)?;
-    let started = Instant::now();
+struct Checked {
+    sections: usize,
+    actors: usize,
+    no_model: Vec<String>,
+    problems: Vec<String>,
+    seconds: f32,
+    /// Seconds of sound decoded.
+    sound: f32,
+    /// Accessories named, and found.
+    props: (usize, usize),
+    /// Subtitles, and those whose text was found.
+    subtitles: (usize, usize),
+    /// Effects named, and found in the effect lists.
+    effects: (usize, usize),
+    unknown_effects: Vec<String>,
+}
+
+type EffectLibraries = std::collections::HashMap<String, openrage_app::gta4_effects::Library>;
+
+/// The virtual paths of all cutscenes in the archives.
+fn cutscene_paths(starts: &[Gta4Start]) -> Vec<String> {
     let mut cuts: Vec<String> = Vec::new();
-    for (prefix, a, dir) in &starts {
+    for (prefix, a, dir) in starts {
         vfs::walk_gta4(a, *dir, prefix, &mut |id, p| {
             if !a.entry(id).is_dir() && a.entry(id).name.to_ascii_lowercase().ends_with(".cut") {
                 cuts.push(p.to_owned());
             }
         });
     }
-    struct Checked {
-        sections: usize,
-        actors: usize,
-        no_model: Vec<String>,
-        problems: Vec<String>,
-        seconds: f32,
-        /// Seconds of sound decoded.
-        sound: f32,
-        /// Accessories named, and found.
-        props: (usize, usize),
-        /// Subtitles, and those whose text was found.
-        subtitles: (usize, usize),
-        /// Effects named, and found in the effect lists.
-        effects: (usize, usize),
-        unknown_effects: Vec<String>,
-    }
-    // The effect lists, once per episode.
-    let mut libraries: std::collections::HashMap<String, openrage_app::gta4_effects::Library> = Default::default();
-    for vpath in &cuts {
+    cuts
+}
+
+/// The effect lists, once per episode.
+fn load_effect_libraries(game_dir: &Path, cuts: &[String]) -> EffectLibraries {
+    use openrage_app::gta4_cutscene;
+    let mut libraries: EffectLibraries = Default::default();
+    for vpath in cuts {
         let episode = gta4_cutscene::episode(vpath).to_owned();
         if let std::collections::hash_map::Entry::Vacant(slot) = libraries.entry(episode) {
             let (lib, problems) = openrage_app::gta4_effects::Library::load(game_dir, slot.key());
@@ -687,112 +735,135 @@ pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result
             slot.insert(lib);
         }
     }
-    let results: Vec<(String, Result<Checked>)> = cuts
-        .par_iter()
-        .map(|vpath| {
-            let checked = (|| -> Result<Checked> {
-                let (node, _) = rage_mods::resolve(game_dir, vpath, None)?;
-                let Node::Gta4File(a, id) = node else { bail!("not inside a GTA IV archive") };
-                let cut = gta4_cutscene::parse(&a.read(id)?)?;
-                let animated = gta4_cutscene::animation(game_dir, vpath, &cut)?;
-                let actors = cut.actors();
-                let no_model = actors
-                    .iter()
-                    .filter(|(_, m)| gta4_cutscene::find_model(game_dir, vpath, m).is_none())
-                    .map(|(_, m)| m.clone())
-                    .collect();
-                let (sound, missing_sound) = gta4_cutscene::audio(game_dir, vpath, &cut);
-                let mut props = (0, 0);
-                for (key, model) in &actors {
-                    let chosen = cut.props(key);
-                    props.0 += chosen.len();
-                    props.1 += gta4_cutscene::load_props(game_dir, vpath, model, &chosen).len();
-                }
-                let mut problems = animated.problems;
-                problems.extend(missing_sound.into_iter().map(|n| format!("no sound {n}")));
-                let library = &libraries[gta4_cutscene::episode(vpath)];
-                let placed = cut.effects();
-                let unknown_effects: Vec<String> = placed
-                    .iter()
-                    .filter(|e| library.find(&e.effect.name).is_none())
-                    .map(|e| e.effect.name.clone())
-                    .collect();
-                Ok(Checked {
-                    effects: (placed.len(), placed.len() - unknown_effects.len()),
-                    unknown_effects,
-                    sections: cut.sections.len(),
-                    actors: actors.len(),
-                    no_model,
-                    problems,
-                    seconds: cut.duration(),
-                    sound: sound.map_or(0.0, |p| p.duration_secs()),
-                    props,
-                    subtitles: (cut.subtitles.len(), gta4_cutscene::subtitles(game_dir, vpath, &cut).len()),
-                })
-            })();
-            (vpath.clone(), checked)
-        })
+    libraries
+}
+
+fn check_cutscene(game_dir: &Path, vpath: &str, libraries: &EffectLibraries) -> Result<Checked> {
+    use openrage_app::gta4_cutscene;
+    let (node, _) = rage_mods::resolve(game_dir, vpath, None)?;
+    let Node::Gta4File(a, id) = node else { bail!("not inside a GTA IV archive") };
+    let cut = gta4_cutscene::parse(&a.read(id)?)?;
+    let animated = gta4_cutscene::animation(game_dir, vpath, &cut)?;
+    let actors = cut.actors();
+    let no_model = actors
+        .iter()
+        .filter(|(_, m)| gta4_cutscene::find_model(game_dir, vpath, m).is_none())
+        .map(|(_, m)| m.clone())
         .collect();
-    let (mut sections, mut actors, mut seconds, mut no_model, mut problems, mut ok) = (0, 0, 0.0, 0, 0, 0);
-    let mut sound = 0.0;
-    let mut subtitles = (0, 0);
-    let mut silent: Vec<String> = Vec::new();
+    let (sound, missing_sound) = gta4_cutscene::audio(game_dir, vpath, &cut);
     let mut props = (0, 0);
-    let mut effects = (0, 0);
+    for (key, model) in &actors {
+        let chosen = cut.props(key);
+        props.0 += chosen.len();
+        props.1 += gta4_cutscene::load_props(game_dir, vpath, model, &chosen).len();
+    }
+    let mut problems = animated.problems;
+    problems.extend(missing_sound.into_iter().map(|n| format!("no sound {n}")));
+    let library = &libraries[gta4_cutscene::episode(vpath)];
+    let placed = cut.effects();
+    let unknown_effects: Vec<String> =
+        placed.iter().filter(|e| library.find(&e.effect.name).is_none()).map(|e| e.effect.name.clone()).collect();
+    Ok(Checked {
+        effects: (placed.len(), placed.len() - unknown_effects.len()),
+        unknown_effects,
+        sections: cut.sections.len(),
+        actors: actors.len(),
+        no_model,
+        problems,
+        seconds: cut.duration(),
+        sound: sound.map_or(0.0, |p| p.duration_secs()),
+        props,
+        subtitles: (cut.subtitles.len(), gta4_cutscene::subtitles(game_dir, vpath, &cut).len()),
+    })
+}
+
+#[derive(Default)]
+struct CutTotals {
+    ok: usize,
+    sections: usize,
+    actors: usize,
+    seconds: f32,
+    no_model: usize,
+    problems: usize,
+    sound: f32,
+    subtitles: (usize, usize),
+    silent: Vec<String>,
+    props: (usize, usize),
+    effects: (usize, usize),
+}
+
+impl CutTotals {
+    /// Adds one cutscene and prints what is wrong with it.
+    fn add(&mut self, vpath: &str, c: &Checked) {
+        self.ok += 1;
+        self.sections += c.sections;
+        self.actors += c.actors;
+        self.seconds += c.seconds;
+        self.sound += c.sound;
+        if c.sound == 0.0 {
+            self.silent.push(vpath.rsplit('/').next().unwrap_or(vpath).to_owned());
+        }
+        self.props = (self.props.0 + c.props.0, self.props.1 + c.props.1);
+        self.effects = (self.effects.0 + c.effects.0, self.effects.1 + c.effects.1);
+        let mut unknown = c.unknown_effects.clone();
+        unknown.dedup();
+        if !unknown.is_empty() {
+            outln!("{vpath}: effects not in the effect lists: {}", unknown.join(", "));
+        }
+        self.subtitles = (self.subtitles.0 + c.subtitles.0, self.subtitles.1 + c.subtitles.1);
+        self.no_model += c.no_model.len();
+        self.problems += c.problems.len();
+        if !c.no_model.is_empty() {
+            outln!("{vpath}: no model for {}", c.no_model.join(", "));
+        }
+        for p in &c.problems {
+            outln!("{vpath}: {p}");
+        }
+    }
+}
+
+fn print_cutscene_summary(t: &CutTotals, cutscenes: usize, errors: usize, started: Instant) {
+    if !t.silent.is_empty() {
+        outln!("{} cutscenes without sound: {}", t.silent.len(), t.silent.join(", "));
+    }
+    let CutTotals { ok, sections, actors, no_model, problems, .. } = t;
+    outln!(
+        "{cutscenes} cutscenes ({ok} read, {:.0} minutes, {:.0} minutes of sound), {sections} sections, {actors} actors, \
+         {no_model} without a model, {} of {} accessories found, {} of {} effects found, \
+         {} subtitles shown ({} named), {problems} clips, dictionaries or sounds missing, \
+         {errors} errors ({:.1}s)",
+        t.seconds / 60.0,
+        t.sound / 60.0,
+        t.props.1,
+        t.props.0,
+        t.effects.1,
+        t.effects.0,
+        t.subtitles.1,
+        t.subtitles.0,
+        started.elapsed().as_secs_f32()
+    );
+}
+
+/// Reads every GTA IV cutscene (`.cut`): parses it, puts its animation
+/// together from the dictionaries next to it and looks for its models.
+pub(crate) fn cmd_verify_gta4_cutscenes(game_dir: &Path, within: &str) -> Result<()> {
+    let (starts, mut errors) = gta4_starts(game_dir, within)?;
+    let started = Instant::now();
+    let cuts = cutscene_paths(&starts);
+    let libraries = load_effect_libraries(game_dir, &cuts);
+    let results: Vec<(String, Result<Checked>)> =
+        cuts.par_iter().map(|vpath| (vpath.clone(), check_cutscene(game_dir, vpath, &libraries))).collect();
+    let mut totals = CutTotals::default();
     for (vpath, r) in results {
         match r {
-            Ok(c) => {
-                ok += 1;
-                sections += c.sections;
-                actors += c.actors;
-                seconds += c.seconds;
-                sound += c.sound;
-                if c.sound == 0.0 {
-                    silent.push(vpath.rsplit('/').next().unwrap_or(&vpath).to_owned());
-                }
-                props = (props.0 + c.props.0, props.1 + c.props.1);
-                effects = (effects.0 + c.effects.0, effects.1 + c.effects.1);
-                let mut unknown = c.unknown_effects.clone();
-                unknown.dedup();
-                if !unknown.is_empty() {
-                    outln!("{vpath}: effects not in the effect lists: {}", unknown.join(", "));
-                }
-                subtitles = (subtitles.0 + c.subtitles.0, subtitles.1 + c.subtitles.1);
-                no_model += c.no_model.len();
-                problems += c.problems.len();
-                if !c.no_model.is_empty() {
-                    outln!("{vpath}: no model for {}", c.no_model.join(", "));
-                }
-                for p in &c.problems {
-                    outln!("{vpath}: {p}");
-                }
-            }
+            Ok(c) => totals.add(&vpath, &c),
             Err(e) => errors.push(format!("{vpath}: {e:#}")),
         }
     }
     for e in errors.iter().take(50) {
         outln!("FAIL {e}");
     }
-    if !silent.is_empty() {
-        outln!("{} cutscenes without sound: {}", silent.len(), silent.join(", "));
-    }
-    outln!(
-        "{} cutscenes ({ok} read, {:.0} minutes, {:.0} minutes of sound), {sections} sections, {actors} actors, \
-         {no_model} without a model, {} of {} accessories found, {} of {} effects found, \
-         {} subtitles shown ({} named), {problems} clips, dictionaries or sounds missing, \
-         {} errors ({:.1}s)",
-        cuts.len(),
-        seconds / 60.0,
-        sound / 60.0,
-        props.1,
-        props.0,
-        effects.1,
-        effects.0,
-        subtitles.1,
-        subtitles.0,
-        errors.len(),
-        started.elapsed().as_secs_f32()
-    );
+    print_cutscene_summary(&totals, cuts.len(), errors.len(), started);
     if !errors.is_empty() {
         bail!("{} cutscenes could not be read", errors.len());
     }
@@ -804,6 +875,24 @@ pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool,
     use openrage_app::gta4_cutscene;
     let started = Instant::now();
     let scene = gta4_cutscene::load(game_dir, vpath)?;
+    print_cutscene_overview(&scene);
+    print_cutscene_cast(&scene);
+    print_cutscene_wardrobe(game_dir, vpath, &scene);
+    print_cutscene_sound_and_subtitles(&scene);
+    print_cutscene_effects(&scene);
+    outln!("({:.2}s)", started.elapsed().as_secs_f32());
+    if load_models {
+        load_cutscene_models(game_dir, &scene);
+    }
+    if let Some(radius) = map {
+        print_cutscene_map(game_dir, vpath, &scene, radius)?;
+    }
+    Ok(())
+}
+
+type Scene = openrage_app::gta4_cutscene::Scene;
+
+fn print_cutscene_overview(scene: &Scene) {
     let cut = &scene.cut;
     outln!(
         "{:.1} seconds in {} sections, {} actors, {} subtitles ({} with text, table {})",
@@ -827,6 +916,10 @@ pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool,
             s.models.len()
         );
     }
+}
+
+/// The cast with the model and the clip of each, then what is missing.
+fn print_cutscene_cast(scene: &Scene) {
     let dict = &scene.animated.dict;
     for ((actor, location), clip) in scene.cutscene.actors.iter().zip(&scene.models).zip(&dict.clips) {
         let shown = clip.parts.iter().filter(|p| !dict.animations[p.animation].tracks.is_empty()).count();
@@ -842,9 +935,13 @@ pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool,
     for p in &scene.animated.problems {
         outln!("missing: {p}");
     }
+}
+
+/// Accessories and outfit changes of the cast.
+fn print_cutscene_wardrobe(game_dir: &Path, vpath: &str, scene: &Scene) {
     for (actor, props) in scene.cutscene.actors.iter().zip(&scene.props) {
         if !props.is_empty() {
-            let loaded = gta4_cutscene::load_props(game_dir, vpath, &actor.name, props);
+            let loaded = openrage_app::gta4_cutscene::load_props(game_dir, vpath, &actor.name, props);
             let names: Vec<String> = props.iter().filter_map(|p| p.name()).collect();
             outln!("  {} wears {} ({} of {} found)", actor.name, names.join(", "), loaded.len(), props.len());
         }
@@ -855,6 +952,9 @@ pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool,
             outln!("  {} changes outfit at {}", actor.name, at.join(", "));
         }
     }
+}
+
+fn print_cutscene_sound_and_subtitles(scene: &Scene) {
     match &scene.audio {
         Some(pcm) => outln!("sound: {:.1}s, {} Hz", pcm.duration_secs(), pcm.sample_rate),
         None => outln!("sound: none"),
@@ -868,78 +968,86 @@ pub(crate) fn cmd_gta4_cutscene(game_dir: &Path, vpath: &str, load_models: bool,
     if scene.subtitles.len() > 5 {
         outln!("  … {} more subtitles", scene.subtitles.len() - 5);
     }
-    if !scene.effects.is_empty() {
-        let found = scene.effects.iter().filter(|e| scene.effect_library.find(&e.effect.name).is_some()).count();
-        outln!("{} effects, {found} found in the effect lists", scene.effects.len());
-        let mut seen = std::collections::BTreeMap::<String, usize>::new();
-        for e in &scene.effects {
-            *seen.entry(e.effect.name.clone()).or_default() += 1;
-        }
-        for (name, n) in &seen {
-            let state = if scene.effect_library.find(name).is_some() { "" } else { "  (not found)" };
-            outln!("  {n:4}× {name}{state}");
-        }
-        for p in &scene.effect_problems {
-            outln!("problem: effect list {p}");
-        }
+}
+
+fn print_cutscene_effects(scene: &Scene) {
+    if scene.effects.is_empty() {
+        return;
     }
-    outln!("({:.2}s)", started.elapsed().as_secs_f32());
-    if load_models {
-        let started = Instant::now();
-        let loaded: Vec<Result<openrage_app::models::LoadedModel>> = scene
-            .models
-            .par_iter()
-            .zip(&scene.cutscene.actors)
-            .zip(&scene.outfits)
-            .filter_map(|((l, a), outfit)| Some(gta4_cutscene::load_model(game_dir, &a.name, l.as_ref()?, outfit)))
+    let found = scene.effects.iter().filter(|e| scene.effect_library.find(&e.effect.name).is_some()).count();
+    outln!("{} effects, {found} found in the effect lists", scene.effects.len());
+    let mut seen = std::collections::BTreeMap::<String, usize>::new();
+    for e in &scene.effects {
+        *seen.entry(e.effect.name.clone()).or_default() += 1;
+    }
+    for (name, n) in &seen {
+        let state = if scene.effect_library.find(name).is_some() { "" } else { "  (not found)" };
+        outln!("  {n:4}× {name}{state}");
+    }
+    for p in &scene.effect_problems {
+        outln!("problem: effect list {p}");
+    }
+}
+
+/// Loads the model of every actor and reports what the people with an outfit wear.
+fn load_cutscene_models(game_dir: &Path, scene: &Scene) {
+    use openrage_app::gta4_cutscene;
+    let started = Instant::now();
+    let loaded: Vec<Result<openrage_app::models::LoadedModel>> = scene
+        .models
+        .par_iter()
+        .zip(&scene.cutscene.actors)
+        .zip(&scene.outfits)
+        .filter_map(|((l, a), outfit)| Some(gta4_cutscene::load_model(game_dir, &a.name, l.as_ref()?, outfit)))
+        .collect();
+    // What the people with an outfit wear.
+    let dressed = scene.models.iter().zip(&scene.cutscene.actors).zip(&scene.outfits).filter(|((l, _), _)| l.is_some());
+    for (((_, actor), outfit), model) in dressed.zip(&loaded) {
+        let Ok(model) = model else { continue };
+        if outfit.is_empty() {
+            continue;
+        }
+        let shown: Vec<String> = model
+            .parts
+            .iter()
+            .filter(|p| p.visible)
+            .map(|p| {
+                let d = &model.drawables[p.drawable].1;
+                let diffuse =
+                    d.shaders.iter().flat_map(|s| &s.textures).find(|t| t.to_ascii_lowercase().contains("_diff_"));
+                format!("{} ({})", p.name, diffuse.map_or("-", |t| t.as_str()))
+            })
             .collect();
-        // What the people with an outfit wear.
-        let dressed =
-            scene.models.iter().zip(&scene.cutscene.actors).zip(&scene.outfits).filter(|((l, _), _)| l.is_some());
-        for (((_, actor), outfit), model) in dressed.zip(&loaded) {
-            let Ok(model) = model else { continue };
-            if outfit.is_empty() {
-                continue;
-            }
-            let shown: Vec<String> = model
-                .parts
-                .iter()
-                .filter(|p| p.visible)
-                .map(|p| {
-                    let d = &model.drawables[p.drawable].1;
-                    let diffuse =
-                        d.shaders.iter().flat_map(|s| &s.textures).find(|t| t.to_ascii_lowercase().contains("_diff_"));
-                    format!("{} ({})", p.name, diffuse.map_or("-", |t| t.as_str()))
-                })
-                .collect();
-            outln!("  {} wears {}", actor.name, shown.join(", "));
-        }
-        let textures: usize =
-            loaded.iter().flatten().map(|m| m.external.iter().map(|(_, d)| d.textures.len()).sum::<usize>()).sum();
-        for e in loaded.iter().filter_map(|r| r.as_ref().err()) {
-            outln!("FAIL {e:#}");
-        }
-        outln!(
-            "{} of {} models loaded, {textures} textures ({:.2}s)",
-            loaded.iter().filter(|r| r.is_ok()).count(),
-            loaded.len(),
-            started.elapsed().as_secs_f32()
-        );
+        outln!("  {} wears {}", actor.name, shown.join(", "));
     }
-    if let Some(radius) = map {
-        let started = Instant::now();
-        let centres: Vec<[f32; 3]> = cut.sections.iter().map(|s| s.offset).collect();
-        let remove: Vec<([f32; 3], String)> = cut.sections.iter().flat_map(|s| s.remove.iter().cloned()).collect();
-        let episode = gta4_cutscene::episode(vpath);
-        let around = openrage_app::gta4::load_objects_near(game_dir, episode, &centres, radius, &remove, &|_, _| {})?;
-        outln!(
-            "map: {} objects, {} models, {} without a model, {} removed by the cutscene ({:.2}s)",
-            around.objects,
-            around.models.len(),
-            around.missing.iter().map(|(_, n)| n).sum::<usize>(),
-            remove.len(),
-            started.elapsed().as_secs_f32()
-        );
+    let textures: usize =
+        loaded.iter().flatten().map(|m| m.external.iter().map(|(_, d)| d.textures.len()).sum::<usize>()).sum();
+    for e in loaded.iter().filter_map(|r| r.as_ref().err()) {
+        outln!("FAIL {e:#}");
     }
+    outln!(
+        "{} of {} models loaded, {textures} textures ({:.2}s)",
+        loaded.iter().filter(|r| r.is_ok()).count(),
+        loaded.len(),
+        started.elapsed().as_secs_f32()
+    );
+}
+
+/// The map objects around the sections of the cutscene.
+fn print_cutscene_map(game_dir: &Path, vpath: &str, scene: &Scene, radius: f32) -> Result<()> {
+    let started = Instant::now();
+    let cut = &scene.cut;
+    let centres: Vec<[f32; 3]> = cut.sections.iter().map(|s| s.offset).collect();
+    let remove: Vec<([f32; 3], String)> = cut.sections.iter().flat_map(|s| s.remove.iter().cloned()).collect();
+    let episode = openrage_app::gta4_cutscene::episode(vpath);
+    let around = openrage_app::gta4::load_objects_near(game_dir, episode, &centres, radius, &remove, &|_, _| {})?;
+    outln!(
+        "map: {} objects, {} models, {} without a model, {} removed by the cutscene ({:.2}s)",
+        around.objects,
+        around.models.len(),
+        around.missing.iter().map(|(_, n)| n).sum::<usize>(),
+        remove.len(),
+        started.elapsed().as_secs_f32()
+    );
     Ok(())
 }

@@ -21,76 +21,97 @@ pub fn edit_textures(
     edits: &[Edit],
 ) -> Result<(EditResult, PathBuf)> {
     let (node, _) = rage_mods::resolve(game_dir, vpath, keys.clone())?;
-    if let Node::Rpf8File(rpf, i) = node {
-        // RDR2: same-shape replacements, written into the padded layout.
-        let entry = rpf.entries().and_then(|e| e.get(i)).with_context(|| format!("{vpath} not found"))?.clone();
-        let res = rpf.read_resource(&entry)?;
-        let dict = rage_formats::ytd::parse_rdr2(&res).context("reading the texture dictionary")?;
-        let changed = ytd_write::apply_rdr2(&res, &dict, edits)?;
-        let mut file = rpf.resource_file(&entry)?;
-        file.truncate(16);
-        file.extend(&changed.system);
-        file.extend(&changed.graphics);
-        drop(rpf);
-        let applied = apply_at(game_dir, keys, vpath, Op::Set(file.clone()), &describe(vpath, edits))?;
-        let replaced = edits.len();
-        return Ok((EditResult { file, in_place: true, replaced, added: 0, removed: 0 }, applied.path));
+    let result = edit_node(node, vpath, edits)?;
+    let applied = apply_at(game_dir, keys, vpath, Op::Set(result.file.clone()), &describe(vpath, edits))?;
+    Ok((result, applied.path))
+}
+
+fn edit_node(node: Node, vpath: &str, edits: &[Edit]) -> Result<EditResult> {
+    match node {
+        Node::Rpf8File(rpf, i) => edit_rdr2_packed(rpf, i, vpath, edits),
+        Node::PlainFile(path) => {
+            edit_rdr2_replaced(&path, edits).and_then(|r| r.with_context(|| not_in_archive(vpath)))
+        }
+        Node::Gta4File(archive, id) => edit_gta4(archive, id, vpath, edits),
+        Node::ArchiveFile(rpf, id) => edit_gta5(rpf, id, vpath, edits),
+        _ => bail!(not_in_archive(vpath)),
     }
-    if let Node::PlainFile(path) = &node
-        && let Some(res) = std::fs::read(path).ok().as_deref().and_then(rage_rpf::rpf8::parse_resource_file)
-    {
-        // RDR2: a dictionary already replaced in lml/replace (an RSC8 file).
-        let dict = rage_formats::ytd::parse_rdr2(&res).context("reading the texture dictionary")?;
-        let changed = ytd_write::apply_rdr2(&res, &dict, edits)?;
-        let mut file = std::fs::read(path)?;
-        file.truncate(16);
-        file.extend(&changed.system);
-        file.extend(&changed.graphics);
-        let applied = apply_at(game_dir, keys, vpath, Op::Set(file.clone()), &describe(vpath, edits))?;
-        let replaced = edits.len();
-        return Ok((EditResult { file, in_place: true, replaced, added: 0, removed: 0 }, applied.path));
+}
+
+fn not_in_archive(vpath: &str) -> String {
+    format!("{vpath} is not a file inside an archive")
+}
+
+/// The result of rewriting an RDR2 dictionary: `file` is its RSC8 header
+/// followed by the changed pages.
+fn rdr2_result(mut file: Vec<u8>, changed: &rage_resource::Resource, replaced: usize) -> EditResult {
+    file.truncate(16);
+    file.extend(&changed.system);
+    file.extend(&changed.graphics);
+    EditResult { file, in_place: true, replaced, added: 0, removed: 0 }
+}
+
+fn rdr2_rewrite(res: &rage_resource::Resource, edits: &[Edit]) -> Result<rage_resource::Resource> {
+    let dict = rage_formats::ytd::parse_rdr2(res).context("reading the texture dictionary")?;
+    Ok(ytd_write::apply_rdr2(res, &dict, edits)?)
+}
+
+/// RDR2: same-shape replacements, written into the padded layout.
+fn edit_rdr2_packed(rpf: Arc<rage_rpf::Rpf8>, i: usize, vpath: &str, edits: &[Edit]) -> Result<EditResult> {
+    let entry = rpf.entries().and_then(|e| e.get(i)).with_context(|| format!("{vpath} not found"))?.clone();
+    let res = rpf.read_resource(&entry)?;
+    let changed = rdr2_rewrite(&res, edits)?;
+    let file = rpf.resource_file(&entry)?;
+    Ok(rdr2_result(file, &changed, edits.len()))
+}
+
+/// RDR2: a dictionary already replaced in lml/replace (an RSC8 file); `None`
+/// when `path` is not one.
+fn edit_rdr2_replaced(path: &Path, edits: &[Edit]) -> Result<Option<EditResult>> {
+    let Some(res) = std::fs::read(path).ok().as_deref().and_then(rage_rpf::rpf8::parse_resource_file) else {
+        return Ok(None);
+    };
+    let changed = rdr2_rewrite(&res, edits)?;
+    let file = std::fs::read(path)?;
+    Ok(Some(rdr2_result(file, &changed, edits.len())))
+}
+
+/// GTA IV (.wtd): an RSC5 resource inside an image archive.
+fn edit_gta4(
+    archive: Arc<rage_rpf::Gta4Archive>,
+    id: rage_rpf::Gta4EntryId,
+    vpath: &str,
+    edits: &[Edit],
+) -> Result<EditResult> {
+    let raw = archive.read(id)?;
+    let (kind, flags) = rage_resource::rsc5_header(&raw).with_context(|| format!("{vpath} is not a resource"))?;
+    let res = rage_resource::Resource::from_rsc5(&raw)?;
+    if !is_gta4_model(vpath) {
+        let dict = rage_formats::ytd::parse_gta4(&res).context("reading the texture dictionary")?;
+        return Ok(rage_formats::wtd_write::apply(&res, kind, flags, &dict, edits)?);
     }
-    if let Node::Gta4File(archive, id) = node {
-        // GTA IV (.wtd): an RSC5 resource inside an image archive.
-        let raw = archive.read(id)?;
-        let (kind, flags) = rage_resource::rsc5_header(&raw).with_context(|| format!("{vpath} is not a resource"))?;
-        let res = rage_resource::Resource::from_rsc5(&raw)?;
-        let result = if is_gta4_model(vpath) {
-            // A model (.wdr) with its own textures.
-            let embedded = rage_formats::wdr::embedded_textures(&res, rage_resource::Resource::ROOT)
-                .with_context(|| format!("{vpath} has no textures of its own"))?;
-            let dict = rage_formats::ytd::parse_gta4_at(&res, embedded.root).context("reading the model's textures")?;
-            rage_formats::wtd_write::apply_embedded(&res, kind, flags, embedded.root, &embedded.in_use, &dict, edits)?
-        } else {
-            let dict = rage_formats::ytd::parse_gta4(&res).context("reading the texture dictionary")?;
-            rage_formats::wtd_write::apply(&res, kind, flags, &dict, edits)?
-        };
-        drop(archive);
-        let applied = apply_at(game_dir, keys, vpath, Op::Set(result.file.clone()), &describe(vpath, edits))?;
-        return Ok((result, applied.path));
-    }
-    let Node::ArchiveFile(rpf, id) = node else { bail!("{vpath} is not a file inside an archive") };
+    // A model (.wdr) with its own textures.
+    let embedded = rage_formats::wdr::embedded_textures(&res, rage_resource::Resource::ROOT)
+        .with_context(|| format!("{vpath} has no textures of its own"))?;
+    let dict = rage_formats::ytd::parse_gta4_at(&res, embedded.root).context("reading the model's textures")?;
+    Ok(rage_formats::wtd_write::apply_embedded(&res, kind, flags, embedded.root, &embedded.in_use, &dict, edits)?)
+}
+
+fn edit_gta5(rpf: Arc<rage_rpf::Rpf7>, id: rage_rpf::EntryId, vpath: &str, edits: &[Edit]) -> Result<EditResult> {
     let EntryKind::Resource { system_flags, graphics_flags, .. } = rpf.entry(id).kind else {
         bail!("{vpath} is not a resource")
     };
     let res = rpf.read_resource(id)?;
-    let result = match gta5_model_ext(vpath) {
-        // A model (.ydr, .yft, .ydd) with textures of its own.
-        Some(ext) => {
-            let (enhanced, dicts) = rage_formats::drawable::embedded_texture_dicts(&res, ext)?;
-            if dicts.is_empty() {
-                bail!("{vpath} has no textures of its own");
-            }
-            rage_formats::model_textures::apply(&res, system_flags, graphics_flags, enhanced, &dicts, edits)?
-        }
-        None => {
-            let dict = rage_formats::ytd::parse(&res).context("reading the texture dictionary")?;
-            ytd_write::apply(&res, system_flags, graphics_flags, &dict, edits)?
-        }
+    let Some(ext) = gta5_model_ext(vpath) else {
+        let dict = rage_formats::ytd::parse(&res).context("reading the texture dictionary")?;
+        return Ok(ytd_write::apply(&res, system_flags, graphics_flags, &dict, edits)?);
     };
-    drop(rpf);
-    let applied = apply_at(game_dir, keys, vpath, Op::Set(result.file.clone()), &describe(vpath, edits))?;
-    Ok((result, applied.path))
+    // A model (.ydr, .yft, .ydd) with textures of its own.
+    let (enhanced, dicts) = rage_formats::drawable::embedded_texture_dicts(&res, ext)?;
+    if dicts.is_empty() {
+        bail!("{vpath} has no textures of its own");
+    }
+    Ok(rage_formats::model_textures::apply(&res, system_flags, graphics_flags, enhanced, &dicts, edits)?)
 }
 
 /// The textures of a GTA VI dictionary (`.#td`).
@@ -205,8 +226,127 @@ fn model_signature(res: &rage_resource::Resource, ext: &str) -> Result<Vec<Strin
         .collect())
 }
 
-fn texture_key(t: &rage_formats::texture::Texture) -> (String, u32, u32, u32, u32, Vec<u8>) {
+type TextureKey = (String, u32, u32, u32, u32, Vec<u8>);
+
+fn texture_key(t: &rage_formats::texture::Texture) -> TextureKey {
     (t.name.to_ascii_lowercase(), t.width, t.height, t.levels, t.format.0, t.data.clone())
+}
+
+/// Whether the textures of `dict` are, in any order, exactly `expect`.
+fn textures_match(mut expect: Vec<TextureKey>, dict: &rage_formats::ytd::TextureDictionary) -> bool {
+    let mut got: Vec<_> = dict.textures.iter().map(texture_key).collect();
+    expect.sort();
+    got.sort();
+    expect == got
+}
+
+/// The model under check, with what is needed to write and read it back.
+struct ModelCheckCtx<'a> {
+    res: &'a rage_resource::Resource,
+    vpath: &'a str,
+    ext: String,
+    system_flags: u32,
+    graphics_flags: u32,
+    enhanced: bool,
+    dicts: Vec<u64>,
+    signature: Vec<String>,
+}
+
+impl<'a> ModelCheckCtx<'a> {
+    /// The check of `vpath` and its textures as they are; `Err(verdict)` when there is nothing more to check.
+    fn open(
+        res: &'a rage_resource::Resource,
+        vpath: &'a str,
+        flags: (u32, u32),
+    ) -> Result<std::result::Result<(Self, rage_formats::ytd::TextureDictionary), ModelCheck>> {
+        let Some(ext) = gta5_model_ext(vpath).map(str::to_ascii_lowercase) else {
+            return Ok(Err(ModelCheck::NoTextures));
+        };
+        let (enhanced, dicts) = rage_formats::drawable::embedded_texture_dicts(res, &ext)?;
+        let Some(before) = gta5_model_textures(res, vpath).filter(|d| !dicts.is_empty() && !d.textures.is_empty())
+        else {
+            return Ok(Err(ModelCheck::NoTextures));
+        };
+        if let Some(e) = before.errors.first() {
+            return Ok(Err(ModelCheck::Unreadable(e.clone())));
+        }
+        let signature = model_signature(res, &ext)?;
+        let (system_flags, graphics_flags) = flags;
+        Ok(Ok((Self { res, vpath, ext, system_flags, graphics_flags, enhanced, dicts, signature }, before)))
+    }
+
+    fn apply(&self, edits: &[Edit]) -> Result<EditResult, rage_resource::ResourceError> {
+        rage_formats::model_textures::apply(
+            self.res,
+            self.system_flags,
+            self.graphics_flags,
+            self.enhanced,
+            &self.dicts,
+            edits,
+        )
+    }
+
+    fn read_back(&self, file: &[u8]) -> Result<rage_formats::ytd::TextureDictionary> {
+        let back = rage_resource::Resource::from_rsc7(file)?;
+        let dict = gta5_model_textures(&back, self.vpath).context("textures gone")?;
+        if model_signature(&back, &self.ext)? != self.signature {
+            bail!("meshes, shaders or bones changed");
+        }
+        Ok(dict)
+    }
+
+    /// A texture written over with itself: nothing changes.
+    fn check_same(&self, first: &rage_formats::texture::Texture) -> Result<()> {
+        let same = self.apply(&[Edit::Set(first.clone())])?;
+        let back = rage_resource::Resource::from_rsc7(&same.file)?;
+        if !same.in_place || back.system != self.res.system || back.graphics != self.res.graphics {
+            bail!("writing a texture over itself changed the resource");
+        }
+        Ok(())
+    }
+
+    /// A texture of twice the size, into appended pages if they allow it;
+    /// whether they did.
+    fn check_grown(&self, before: &rage_formats::ytd::TextureDictionary) -> Result<bool> {
+        use rage_formats::texture::Texture;
+        let first = &before.textures[0];
+        let mut big = Texture { width: first.width * 2, height: first.height * 2, ..first.clone() };
+        let size = big.expected_size().context("unsupported format")?;
+        big.data = (0..size).map(|i| (i * 7 % 251) as u8).collect();
+        match self.apply(&[Edit::Set(big.clone())]) {
+            Ok(r) => {
+                let dict = self.read_back(&r.file)?;
+                let mut expect: Vec<_> = before.textures.iter().map(texture_key).collect();
+                expect[0] = texture_key(&Texture { name: first.name.clone(), ..big });
+                if !textures_match(expect, &dict) {
+                    bail!("the grown texture or another texture reads back wrong");
+                }
+                Ok(true)
+            }
+            Err(e) if no_room(&e) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// A new texture (models with one texture list).
+    fn check_added(&self, before: &rage_formats::ytd::TextureDictionary) -> Result<()> {
+        use rage_formats::texture::Texture;
+        let first = &before.textures[0];
+        let mut extra = Texture { name: "openrage_check".into(), width: 8, height: 8, levels: 1, ..first.clone() };
+        extra.data = vec![0x5A; extra.expected_size().context("unsupported format")?];
+        let added = match self.apply(&[Edit::Set(extra.clone())]) {
+            Ok(r) => r,
+            Err(e) if no_room(&e) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let dict = self.read_back(&added.file)?;
+        let mut expect: Vec<_> = before.textures.iter().map(texture_key).collect();
+        expect.push(texture_key(&extra));
+        if !textures_match(expect, &dict) {
+            bail!("an added texture or another texture reads back wrong");
+        }
+        Ok(())
+    }
 }
 
 /// Checks the model texture writer on one GTA V model, in memory: a texture
@@ -220,77 +360,14 @@ pub fn check_model_textures(
     system_flags: u32,
     graphics_flags: u32,
 ) -> Result<ModelCheck> {
-    use rage_formats::texture::Texture;
-    let Some(ext) = gta5_model_ext(vpath).map(str::to_ascii_lowercase) else { return Ok(ModelCheck::NoTextures) };
-    let (enhanced, dicts) = rage_formats::drawable::embedded_texture_dicts(res, &ext)?;
-    let Some(before) = gta5_model_textures(res, vpath).filter(|d| !dicts.is_empty() && !d.textures.is_empty()) else {
-        return Ok(ModelCheck::NoTextures);
+    let (ctx, before) = match ModelCheckCtx::open(res, vpath, (system_flags, graphics_flags))? {
+        Ok(opened) => opened,
+        Err(verdict) => return Ok(verdict),
     };
-    if let Some(e) = before.errors.first() {
-        return Ok(ModelCheck::Unreadable(e.clone()));
-    }
-    let signature = model_signature(res, &ext)?;
-    let apply = |edits: &[Edit]| {
-        rage_formats::model_textures::apply(res, system_flags, graphics_flags, enhanced, &dicts, edits)
-    };
-    let read_back = |file: &[u8]| -> Result<(rage_resource::Resource, rage_formats::ytd::TextureDictionary)> {
-        let back = rage_resource::Resource::from_rsc7(file)?;
-        let dict = gta5_model_textures(&back, vpath).context("textures gone")?;
-        if model_signature(&back, &ext)? != signature {
-            bail!("meshes, shaders or bones changed");
-        }
-        Ok((back, dict))
-    };
-    let first = before.textures[0].clone();
-
-    // 1. Written over with itself: nothing changes.
-    let same = apply(&[Edit::Set(first.clone())])?;
-    let back = rage_resource::Resource::from_rsc7(&same.file)?;
-    if !same.in_place || back.system != res.system || back.graphics != res.graphics {
-        bail!("writing a texture over itself changed the resource");
-    }
-
-    // 2. Twice the size: into appended pages, if they allow it.
-    let mut big = Texture { width: first.width * 2, height: first.height * 2, ..first.clone() };
-    let size = big.expected_size().context("unsupported format")?;
-    big.data = (0..size).map(|i| (i * 7 % 251) as u8).collect();
-    let grown = match apply(&[Edit::Set(big.clone())]) {
-        Ok(r) => {
-            let (_, dict) = read_back(&r.file)?;
-            let mut expect: Vec<_> = before.textures.iter().map(texture_key).collect();
-            expect[0] = texture_key(&Texture { name: first.name.clone(), ..big.clone() });
-            let mut got: Vec<_> = dict.textures.iter().map(texture_key).collect();
-            expect.sort();
-            got.sort();
-            if expect != got {
-                bail!("the grown texture or another texture reads back wrong");
-            }
-            true
-        }
-        Err(e) if no_room(&e) => false,
-        Err(e) => return Err(e.into()),
-    };
-
-    // 3. A new texture (models with one texture list).
-    if dicts.len() == 1 {
-        let mut extra = Texture { name: "openrage_check".into(), width: 8, height: 8, levels: 1, ..first.clone() };
-        extra.data = vec![0x5A; extra.expected_size().context("unsupported format")?];
-        let added = match apply(&[Edit::Set(extra.clone())]) {
-            Ok(r) => Some(r),
-            Err(e) if no_room(&e) => None,
-            Err(e) => return Err(e.into()),
-        };
-        if let Some(r) = added {
-            let (_, dict) = read_back(&r.file)?;
-            let mut expect: Vec<_> = before.textures.iter().map(texture_key).collect();
-            expect.push(texture_key(&extra));
-            let mut got: Vec<_> = dict.textures.iter().map(texture_key).collect();
-            expect.sort();
-            got.sort();
-            if expect != got {
-                bail!("an added texture or another texture reads back wrong");
-            }
-        }
+    ctx.check_same(&before.textures[0])?;
+    let grown = ctx.check_grown(&before)?;
+    if ctx.dicts.len() == 1 {
+        ctx.check_added(&before)?;
     }
     Ok(ModelCheck::Ok { grown })
 }

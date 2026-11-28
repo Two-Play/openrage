@@ -130,63 +130,98 @@ pub fn to_dds(tex: &Texture) -> Vec<u8> {
     out
 }
 
-/// Reads a DDS file into a texture named `name`.
-pub fn from_dds(name: &str, file: &[u8]) -> Result<Texture, DdsError> {
-    if file.len() < 128 || &file[0..4] != b"DDS " {
-        return Err(DdsError::NotDds);
-    }
-    let h = |i: usize| u32::from_le_bytes(file[4 + i * 4..8 + i * 4].try_into().unwrap());
-    let (height, width) = (h(2), h(3));
-    let flags = h(1);
-    let levels = if flags & DDSD_MIPMAPCOUNT != 0 { h(6).max(1) } else { 1 };
-    let (pf_flags, cc, bits) = (h(19), h(20), h(21));
-    let masks = [h(22), h(23), h(24), h(25)];
-    let caps2 = h(27);
-    let mut data_start = 128;
-    let mut array_size = 1;
-    let mut dimension = if caps2 & DDSCAPS2_CUBEMAP_ALL != 0 {
+/// Size of the DDS magic plus `DDS_HEADER`; the pixel data starts here without a DX10 header.
+const HEADER_END: usize = 128;
+/// Size of the magic, `DDS_HEADER` and `DDS_HEADER_DXT10`.
+const DX10_HEADER_END: usize = 148;
+
+/// The little-endian word at byte offset `at`.
+fn le32(file: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([file[at], file[at + 1], file[at + 2], file[at + 3]])
+}
+
+/// The fields of a `DDS_HEADER_DXT10` that matter here.
+struct Dx10 {
+    cube: bool,
+    array_size: u32,
+}
+
+fn dimension_of(caps2: u32, dx10: Option<&Dx10>) -> Dimension {
+    if caps2 & DDSCAPS2_CUBEMAP_ALL != 0 || dx10.is_some_and(|d| d.cube) {
         Dimension::Cube
     } else if caps2 & DDSCAPS2_VOLUME != 0 {
         Dimension::Texture3D
     } else {
         Dimension::Texture2D
-    };
-    let format = if pf_flags & DDPF_FOURCC != 0 {
-        match &cc.to_le_bytes() {
-            b"DXT1" => Format::BC1_UNORM,
-            b"DXT2" | b"DXT3" => Format::BC2_UNORM,
-            b"DXT4" | b"DXT5" => Format::BC3_UNORM,
-            b"ATI1" | b"BC4U" => Format::BC4_UNORM,
-            b"ATI2" | b"BC5U" => Format::BC5_UNORM,
-            b"DX10" => {
-                if file.len() < 148 {
-                    return Err(DdsError::TruncatedHeader);
-                }
-                let x = |i: usize| u32::from_le_bytes(file[128 + i * 4..132 + i * 4].try_into().unwrap());
-                data_start = 148;
-                if x(2) & 0x4 != 0 {
-                    dimension = Dimension::Cube;
-                }
-                array_size = x(3).max(1);
-                Format(x(0))
+    }
+}
+
+/// The format named by a FourCC, with the DX10 header fields when it is `DX10`.
+fn fourcc_format(file: &[u8], cc: u32) -> Result<(Format, Option<Dx10>), DdsError> {
+    Ok(match &cc.to_le_bytes() {
+        b"DXT1" => (Format::BC1_UNORM, None),
+        b"DXT2" | b"DXT3" => (Format::BC2_UNORM, None),
+        b"DXT4" | b"DXT5" => (Format::BC3_UNORM, None),
+        b"ATI1" | b"BC4U" => (Format::BC4_UNORM, None),
+        b"ATI2" | b"BC5U" => (Format::BC5_UNORM, None),
+        b"DX10" => {
+            if file.len() < DX10_HEADER_END {
+                return Err(DdsError::TruncatedHeader);
             }
-            other => return Err(DdsError::UnsupportedFourCc(String::from_utf8_lossy(other).into_owned())),
+            let x = |i: usize| le32(file, HEADER_END + i * 4);
+            (Format(x(0)), Some(Dx10 { cube: x(2) & 0x4 != 0, array_size: x(3).max(1) }))
         }
-    } else if pf_flags & DDPF_RGB != 0 && bits == 32 && masks[0] == 0x00FF_0000 {
-        if pf_flags & DDPF_ALPHAPIXELS != 0 { Format::B8G8R8A8_UNORM } else { Format::B8G8R8X8_UNORM }
-    } else if pf_flags & DDPF_RGB != 0 && bits == 32 && masks[0] == 0xFF {
-        Format::R8G8B8A8_UNORM
-    } else if pf_flags & DDPF_RGB != 0 && bits == 16 && masks[0] == 0x7C00 {
-        Format::B5G5R5A1_UNORM
-    } else if pf_flags & DDPF_RGB != 0 && bits == 16 && masks[0] == 0xF800 {
-        Format::B5G6R5_UNORM
-    } else if pf_flags & DDPF_ALPHA != 0 && bits == 8 {
-        Format::A8_UNORM
-    } else if pf_flags & DDPF_LUMINANCE != 0 && bits == 8 {
-        Format::R8_UNORM
-    } else {
-        return Err(DdsError::UnsupportedPixelFormat { flags: pf_flags, bits });
-    };
+        other => return Err(DdsError::UnsupportedFourCc(String::from_utf8_lossy(other).into_owned())),
+    })
+}
+
+/// The RGB format with the given bit count and first (red) mask, if there is one.
+fn rgb_format(pf_flags: u32, bits: u32, red_mask: u32) -> Option<Format> {
+    Some(match (bits, red_mask) {
+        (32, 0x00FF_0000) if pf_flags & DDPF_ALPHAPIXELS != 0 => Format::B8G8R8A8_UNORM,
+        (32, 0x00FF_0000) => Format::B8G8R8X8_UNORM,
+        (32, 0xFF) => Format::R8G8B8A8_UNORM,
+        (16, 0x7C00) => Format::B5G5R5A1_UNORM,
+        (16, 0xF800) => Format::B5G6R5_UNORM,
+        _ => return None,
+    })
+}
+
+/// The format described by a bit-mask pixel format (no FourCC).
+fn masked_format(pf_flags: u32, bits: u32, masks: [u32; 4]) -> Result<Format, DdsError> {
+    if pf_flags & DDPF_RGB != 0
+        && let Some(format) = rgb_format(pf_flags, bits, masks[0])
+    {
+        return Ok(format);
+    }
+    match bits {
+        8 if pf_flags & DDPF_ALPHA != 0 => Ok(Format::A8_UNORM),
+        8 if pf_flags & DDPF_LUMINANCE != 0 => Ok(Format::R8_UNORM),
+        _ => Err(DdsError::UnsupportedPixelFormat { flags: pf_flags, bits }),
+    }
+}
+
+/// The format of the pixel format block of a DDS file, with the DX10 header fields when there is one.
+fn pixel_format(file: &[u8]) -> Result<(Format, Option<Dx10>), DdsError> {
+    let h = |i: usize| le32(file, 4 + i * 4);
+    let (pf_flags, cc, bits) = (h(19), h(20), h(21));
+    if pf_flags & DDPF_FOURCC != 0 {
+        return fourcc_format(file, cc);
+    }
+    Ok((masked_format(pf_flags, bits, [h(22), h(23), h(24), h(25)])?, None))
+}
+
+/// Reads a DDS file into a texture named `name`.
+pub fn from_dds(name: &str, file: &[u8]) -> Result<Texture, DdsError> {
+    if file.len() < HEADER_END || &file[0..4] != b"DDS " {
+        return Err(DdsError::NotDds);
+    }
+    let h = |i: usize| le32(file, 4 + i * 4);
+    let (height, width) = (h(2), h(3));
+    let levels = if h(1) & DDSD_MIPMAPCOUNT != 0 { h(6).max(1) } else { 1 };
+    let (format, dx10) = pixel_format(file)?;
+    let dimension = dimension_of(h(27), dx10.as_ref());
+    let (data_start, array_size) = dx10.map_or((HEADER_END, 1), |d| (DX10_HEADER_END, d.array_size));
     let depth = match dimension {
         Dimension::Cube => 6,
         Dimension::Texture3D => h(5).max(1),

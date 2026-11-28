@@ -76,6 +76,21 @@ pub enum ExeError {
 /// Finds the cipher tables, IV and key start in the bytes of `RDR2.exe`.
 pub fn tables_from_exe(exe: &[u8]) -> Result<ExeTables, ExeError> {
     let pieces = pieces();
+    let found = locate_pieces(exe, &pieces);
+    let missing = pieces.iter().zip(&found).filter(|(p, f)| matches!(p, Piece::Data { .. }) && f.is_none()).count();
+    if missing > 0 {
+        return Err(ExeError::Missing(missing));
+    }
+    let located = Located { exe, pieces: &pieces, found: &found };
+    let ctx = located.assemble_context()?;
+    let iv = located.data(TABLE_PIECES).try_into().expect("16 bytes");
+    let key_start: [u8; KEY_START_LEN] = located.data(TABLE_PIECES + 1).try_into().expect("32 bytes");
+    let keys = keys_starting_with(exe, &key_start);
+    Ok(ExeTables { context: ctx, iv, key_start, keys })
+}
+
+/// The offset in `exe` of every data piece that is there (indexed like `pieces`).
+fn locate_pieces(exe: &[u8], pieces: &[Piece]) -> Vec<Option<usize>> {
     let mut by_pre: HashMap<u64, Vec<usize>> = HashMap::new();
     for (i, p) in pieces.iter().enumerate() {
         if let Piece::Data { pre, .. } = p {
@@ -95,49 +110,61 @@ pub fn tables_from_exe(exe: &[u8]) -> Result<ExeTables, ExeError> {
             }
         }
     }
-    let missing = pieces.iter().zip(&found).filter(|(p, f)| matches!(p, Piece::Data { .. }) && f.is_none()).count();
-    if missing > 0 {
-        return Err(ExeError::Missing(missing));
-    }
-    let data = |i: usize| -> &[u8] {
-        let Piece::Data { len, .. } = pieces[i] else { unreachable!("data piece") };
-        let off = found[i].expect("found");
-        &exe[off..off + len]
-    };
+    found
+}
 
-    // Assemble in the in-memory layout: init tables; 17 rounds of lookup +
-    // 16 × (masks, xor, padding); end masks; end tables; end xor.
-    let mut ctx = Vec::with_capacity(CONTEXT_LEN);
-    ctx.extend(data(0));
-    let mut i = 1;
-    for _ in 0..17 {
-        ctx.extend(data(i));
-        i += 1;
-        for block in 0..16 {
-            let masks_at = found[i].expect("masks");
-            ctx.extend(data(i));
-            let xor_at =
-                if block % 2 == 0 { masks_at + 128 } else { masks_at.checked_sub(8).ok_or(ExeError::Layout)? };
-            let xor = exe.get(xor_at..xor_at + 4).ok_or(ExeError::Layout)?;
-            if u32::from_le_bytes(xor.try_into().expect("4 bytes")) >= 4096 {
-                return Err(ExeError::Layout);
+/// The pieces of the executable and where each data piece was found.
+struct Located<'a> {
+    exe: &'a [u8],
+    pieces: &'a [Piece],
+    found: &'a [Option<usize>],
+}
+
+impl Located<'_> {
+    fn data(&self, i: usize) -> &[u8] {
+        let Piece::Data { len, .. } = self.pieces[i] else { unreachable!("data piece") };
+        let off = self.found[i].expect("found");
+        &self.exe[off..off + len]
+    }
+
+    /// Assembles the pieces in the in-memory layout: init tables; 17 rounds of
+    /// lookup + 16 × (masks, xor, padding); end masks; end tables; end xor.
+    fn assemble_context(&self) -> Result<Vec<u8>, ExeError> {
+        let mut ctx = Vec::with_capacity(CONTEXT_LEN);
+        ctx.extend(self.data(0));
+        let mut i = 1;
+        for _ in 0..17 {
+            ctx.extend(self.data(i));
+            i += 1;
+            for block in 0..16 {
+                self.push_masks_and_xor(&mut ctx, i, block)?;
+                i += 2;
             }
-            ctx.extend(xor);
-            ctx.extend([0u8; 4]);
-            i += 2;
         }
+        for _ in 0..3 {
+            ctx.extend(self.data(i));
+            i += 1;
+        }
+        if ctx.len() != CONTEXT_LEN || i != TABLE_PIECES || rage_tfit2::Context::from_bytes(&ctx).is_none() {
+            return Err(ExeError::Layout);
+        }
+        Ok(ctx)
     }
-    for _ in 0..3 {
-        ctx.extend(data(i));
-        i += 1;
+
+    /// Appends the masks piece `i`, the XOR value stored next to it, and the padding.
+    fn push_masks_and_xor(&self, ctx: &mut Vec<u8>, i: usize, block: usize) -> Result<(), ExeError> {
+        let masks_at = self.found[i].expect("masks");
+        ctx.extend(self.data(i));
+        let xor_at =
+            if block.is_multiple_of(2) { masks_at + 128 } else { masks_at.checked_sub(8).ok_or(ExeError::Layout)? };
+        let xor = self.exe.get(xor_at..xor_at + 4).ok_or(ExeError::Layout)?;
+        if u32::from_le_bytes(xor.try_into().expect("4 bytes")) >= 4096 {
+            return Err(ExeError::Layout);
+        }
+        ctx.extend(xor);
+        ctx.extend([0u8; 4]);
+        Ok(())
     }
-    if ctx.len() != CONTEXT_LEN || i != TABLE_PIECES || rage_tfit2::Context::from_bytes(&ctx).is_none() {
-        return Err(ExeError::Layout);
-    }
-    let iv = data(TABLE_PIECES).try_into().expect("16 bytes");
-    let key_start: [u8; KEY_START_LEN] = data(TABLE_PIECES + 1).try_into().expect("32 bytes");
-    let keys = keys_starting_with(exe, &key_start);
-    Ok(ExeTables { context: ctx, iv, key_start, keys })
 }
 
 /// Every [`KEY_LEN`]-byte block in `data` that starts with `start`.

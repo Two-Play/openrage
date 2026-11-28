@@ -28,76 +28,108 @@ fn unnamed_hash(name: &str) -> Option<u64> {
     is_stand_in.then(|| u64::from_str_radix(hash, 16).ok()).flatten()
 }
 
+/// A file whose name is only known by its hash.
+struct Unnamed {
+    id: i64,
+    vpath: String,
+    name: String,
+}
+
+type UnnamedByHash = HashMap<u64, Vec<Unnamed>>;
+
 impl Index {
     /// Looks for the names of files without one among those of the other
     /// files and the words of the texts, names the files in the index, and
     /// gives the names that were found.
     pub fn learn_gta6_names(&mut self) -> Result<Vec<String>, IndexError> {
-        struct Unnamed {
-            id: i64,
-            vpath: String,
-            name: String,
-        }
-        let mut unnamed: HashMap<u64, Vec<Unnamed>> = HashMap::new();
-        let mut stems: HashSet<String> = HashSet::new();
-        {
-            // Archives keep theirs, as the files in them are found by it.
-            let mut stmt = self.conn.prepare("SELECT id, vpath, name FROM entries WHERE kind >= 2")?;
-            let mut rows = stmt.query([])?;
-            while let Some(r) = rows.next()? {
-                let name: String = r.get(2)?;
-                match unnamed_hash(&name) {
-                    Some(hash) => {
-                        unnamed.entry(hash).or_default().push(Unnamed { id: r.get(0)?, vpath: r.get(1)?, name })
-                    }
-                    None => {
-                        stems.insert(stem(&name).to_owned());
-                    }
-                }
-            }
-            if unnamed.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mut stmt = self.conn.prepare("SELECT string FROM hashes")?;
-            let words = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            for word in words {
-                stems.insert(word?);
-            }
-        }
-        let found: HashMap<u64, String> = stems
-            .par_iter()
-            .flat_map_iter(|stem| {
-                let shorter = stem.rmatch_indices('_').take(2).map(|(at, _)| stem[..at].to_owned());
-                let longer = ENDINGS.iter().map(move |end| format!("{stem}{end}"));
-                longer.chain(shorter).filter_map(|name| {
-                    let hash = hash64(name.as_bytes());
-                    unnamed.contains_key(&hash).then_some((hash, name))
-                })
-            })
-            .collect();
+        let Some((mut unnamed, stems)) = self.collect_unnamed_and_stems()? else {
+            return Ok(Vec::new());
+        };
+        let found = find_names(&stems, &unnamed);
         let tx = self.conn.transaction()?;
-        {
-            let mut taken = tx.prepare("SELECT 1 FROM entries WHERE source = (SELECT source FROM entries WHERE id = ?1) AND name_hash = ?2 AND vpath = ?3")?;
-            let mut rename =
-                tx.prepare("UPDATE entries SET vpath = ?2, name = ?3, name_hash = ?4, stem_hash = ?5 WHERE id = ?1")?;
-            for (hash, name) in &found {
-                for file in unnamed.remove(hash).unwrap_or_default() {
-                    let Some(folder) = file.vpath.strip_suffix(&file.name).and_then(|v| v.strip_suffix(UNNAMED)) else {
-                        continue;
-                    };
-                    let ending = file.name.split_once('.').map_or("", |(_, ending)| ending);
-                    let name = format!("{name}.{ending}");
-                    let vpath = format!("{folder}{name}");
-                    let hash = i64::from(joaat(&name));
-                    if !taken.exists(params![file.id, hash, vpath])? {
-                        rename.execute(params![file.id, vpath, name, hash, i64::from(joaat(stem(&name)))])?;
-                    }
-                }
-            }
-        }
+        rename_files(&tx, &found, &mut unnamed)?;
         tx.commit()?;
         Ok(found.into_values().collect())
     }
+
+    /// The unnamed files by hash, and every stem and word that may name them; `None` if no file lacks a name.
+    fn collect_unnamed_and_stems(&self) -> Result<Option<(UnnamedByHash, HashSet<String>)>, IndexError> {
+        let mut unnamed: UnnamedByHash = HashMap::new();
+        let mut stems: HashSet<String> = HashSet::new();
+        // Archives keep theirs, as the files in them are found by it.
+        let mut stmt = self.conn.prepare("SELECT id, vpath, name FROM entries WHERE kind >= 2")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            sort_entry(r, &mut unnamed, &mut stems)?;
+        }
+        if unnamed.is_empty() {
+            return Ok(None);
+        }
+        self.add_dictionary_words(&mut stems)?;
+        Ok(Some((unnamed, stems)))
+    }
+
+    fn add_dictionary_words(&self, stems: &mut HashSet<String>) -> Result<(), IndexError> {
+        let mut stmt = self.conn.prepare("SELECT string FROM hashes")?;
+        let words = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for word in words {
+            stems.insert(word?);
+        }
+        Ok(())
+    }
+}
+
+/// Files the row of an entry under its hash if it is a stand-in for an unknown name, else under its stem.
+fn sort_entry(r: &rusqlite::Row, unnamed: &mut UnnamedByHash, stems: &mut HashSet<String>) -> rusqlite::Result<()> {
+    let name: String = r.get(2)?;
+    match unnamed_hash(&name) {
+        Some(hash) => unnamed.entry(hash).or_default().push(Unnamed { id: r.get(0)?, vpath: r.get(1)?, name }),
+        None => {
+            stems.insert(stem(&name).to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// The candidate names (stems with and without endings) whose hash is one of an unnamed file.
+fn find_names(stems: &HashSet<String>, unnamed: &UnnamedByHash) -> HashMap<u64, String> {
+    stems
+        .par_iter()
+        .flat_map_iter(|stem| {
+            let shorter = stem.rmatch_indices('_').take(2).map(|(at, _)| stem[..at].to_owned());
+            let longer = ENDINGS.iter().map(move |end| format!("{stem}{end}"));
+            longer.chain(shorter).filter_map(|name| {
+                let hash = hash64(name.as_bytes());
+                unnamed.contains_key(&hash).then_some((hash, name))
+            })
+        })
+        .collect()
+}
+
+/// Gives the files their found names, unless a file of that name is already in the same source.
+fn rename_files(
+    tx: &rusqlite::Transaction,
+    found: &HashMap<u64, String>,
+    unnamed: &mut UnnamedByHash,
+) -> Result<(), IndexError> {
+    let mut taken = tx.prepare("SELECT 1 FROM entries WHERE source = (SELECT source FROM entries WHERE id = ?1) AND name_hash = ?2 AND vpath = ?3")?;
+    let mut rename =
+        tx.prepare("UPDATE entries SET vpath = ?2, name = ?3, name_hash = ?4, stem_hash = ?5 WHERE id = ?1")?;
+    for (hash, name) in found {
+        for file in unnamed.remove(hash).unwrap_or_default() {
+            let Some(folder) = file.vpath.strip_suffix(&file.name).and_then(|v| v.strip_suffix(UNNAMED)) else {
+                continue;
+            };
+            let ending = file.name.split_once('.').map_or("", |(_, ending)| ending);
+            let name = format!("{name}.{ending}");
+            let vpath = format!("{folder}{name}");
+            let hash = i64::from(joaat(&name));
+            if !taken.exists(params![file.id, hash, vpath])? {
+                rename.execute(params![file.id, vpath, name, hash, i64::from(joaat(stem(&name)))])?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

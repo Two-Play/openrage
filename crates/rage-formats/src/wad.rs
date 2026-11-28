@@ -74,88 +74,197 @@ fn is_float_kind(kind: u8) -> bool {
 /// The track a camera's field of view is kept under (GTA V's number for it).
 pub const TRACK_CAMERA_FOV: u8 = 27;
 
+/// Channel types of a raw, a constant and a quantised float.
+const CHANNEL_RAW: u8 = 1;
+const CHANNEL_CONSTANT_FLOAT: u8 = 4;
+const CHANNEL_QUANTISED: u8 = 6;
+
 /// One float channel, decoded for every frame.
 fn float_channel(res: &Resource, ch: u64, frames: usize) -> Result<Vec<f32>, ResourceError> {
     match res.u8(ch + 0x05)? {
-        1 => {
-            let data = ptr(res, ch + 0x08)?;
-            let count = res.u16(ch + 0x0C)? as usize;
-            if count == 0 || count > 1 << 16 {
-                return Err(bad(format!("raw channel with {count} values")));
-            }
-            let raw = res.bytes(data, count * 4)?;
-            let values: Vec<f32> = raw.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
-            Ok((0..frames).map(|f| values[f.min(count - 1)]).collect())
-        }
-        4 => Ok(vec![f32_at(res, ch + 0x08)?; frames]),
-        6 => {
-            let data = ptr(res, ch + 0x08)?;
-            let bits = res.u32(ch + 0x0C)?;
-            let count = res.u32(ch + 0x10)? as usize;
-            let (scale, offset) = (f32_at(res, ch + 0x14)?, f32_at(res, ch + 0x18)?);
-            if bits == 0 || bits > 32 || count == 0 || count > 1 << 16 {
-                return Err(bad(format!("quantised channel: {bits} bits, {count} values")));
-            }
-            let words = (bits as usize * count).div_ceil(32);
-            let raw = res.bytes(data, words * 4)?;
-            let value = |i: usize| -> f32 {
-                let start = i * bits as usize;
-                let mut v = 0u64;
-                for k in 0..((start % 8 + bits as usize).div_ceil(8)) {
-                    v |= (raw.get(start / 8 + k).copied().unwrap_or(0) as u64) << (k * 8);
-                }
-                let q = (v >> (start % 8)) & ((1u64 << bits) - 1);
-                offset + q as f32 * scale
-            };
-            Ok((0..frames).map(|f| value(f.min(count - 1))).collect())
-        }
+        CHANNEL_RAW => raw_channel(res, ch, frames),
+        CHANNEL_CONSTANT_FLOAT => Ok(vec![f32_at(res, ch + 0x08)?; frames]),
+        CHANNEL_QUANTISED => quantised_channel(res, ch, frames),
         t => Err(bad(format!("channel type {t} where a float was expected"))),
     }
+}
+
+fn raw_channel(res: &Resource, ch: u64, frames: usize) -> Result<Vec<f32>, ResourceError> {
+    let data = ptr(res, ch + 0x08)?;
+    let count = res.u16(ch + 0x0C)? as usize;
+    if count == 0 || count > 1 << 16 {
+        return Err(bad(format!("raw channel with {count} values")));
+    }
+    let raw = res.bytes(data, count * 4)?;
+    let values: Vec<f32> = raw.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+    Ok((0..frames).map(|f| values[f.min(count - 1)]).collect())
+}
+
+/// Where a quantised channel's values are, how wide they are and how they map to floats.
+struct Quantised {
+    data: u64,
+    bits: u32,
+    count: usize,
+    scale: f32,
+    offset: f32,
+}
+
+fn read_quantised(res: &Resource, ch: u64) -> Result<Quantised, ResourceError> {
+    let data = ptr(res, ch + 0x08)?;
+    let bits = res.u32(ch + 0x0C)?;
+    let count = res.u32(ch + 0x10)? as usize;
+    let (scale, offset) = (f32_at(res, ch + 0x14)?, f32_at(res, ch + 0x18)?);
+    if bits == 0 || bits > 32 || count == 0 || count > 1 << 16 {
+        return Err(bad(format!("quantised channel: {bits} bits, {count} values")));
+    }
+    Ok(Quantised { data, bits, count, scale, offset })
+}
+
+fn quantised_channel(res: &Resource, ch: u64, frames: usize) -> Result<Vec<f32>, ResourceError> {
+    let Quantised { data, bits, count, scale, offset } = read_quantised(res, ch)?;
+    let words = (bits as usize * count).div_ceil(32);
+    let raw = res.bytes(data, words * 4)?;
+    Ok((0..frames).map(|f| offset + quantised_value(raw, bits, f.min(count - 1)) as f32 * scale).collect())
+}
+
+/// The `i`th of `bits`-wide values packed little-endian into `raw`.
+fn quantised_value(raw: &[u8], bits: u32, i: usize) -> u64 {
+    let start = i * bits as usize;
+    let mut v = 0u64;
+    for k in 0..((start % 8 + bits as usize).div_ceil(8)) {
+        v |= (raw.get(start / 8 + k).copied().unwrap_or(0) as u64) << (k * 8);
+    }
+    (v >> (start % 8)) & ((1u64 << bits) - 1)
 }
 
 /// A bone track with its value for every frame.
 type Track = (BoneTrack, Vec<[f32; 4]>);
 
-/// Values of one track for every frame, or `None` for tracks that are skipped.
-fn track_values(res: &Resource, track: u64, frames: usize) -> Result<Option<Track>, ResourceError> {
-    let kind = res.u8(track)?;
-    let quat = match kind {
+/// Whether a track of this kind holds quaternions (rather than vectors); `None` for kinds that are skipped.
+fn is_rotation_kind(kind: u8) -> Option<bool> {
+    match kind {
         KIND_TRANSLATION
         | KIND_MOVER_TRANSLATION
         | KIND_CAMERA_TRANSLATION
         | TRACK_LIGHT_COLOUR
-        | TRACK_LIGHT_DIRECTION => false,
-        k if is_float_kind(k) => false,
-        KIND_ROTATION | KIND_MOVER_ROTATION | KIND_CAMERA_ROTATION => true,
-        _ => return Ok(None),
-    };
+        | TRACK_LIGHT_DIRECTION => Some(false),
+        k if is_float_kind(k) => Some(false),
+        KIND_ROTATION | KIND_MOVER_ROTATION | KIND_CAMERA_ROTATION => Some(true),
+        _ => None,
+    }
+}
+
+/// Values of one track for every frame, or `None` for tracks that are skipped.
+fn track_values(res: &Resource, track: u64, frames: usize) -> Result<Option<Track>, ResourceError> {
+    let kind = res.u8(track)?;
+    let Some(quat) = is_rotation_kind(kind) else { return Ok(None) };
     let bone = res.u16(track + 0x02)?;
-    // Blocks of `stride + 1` frames, each starting on the last frame of the one before.
+    let layout = read_layout(res, track)?;
+    let Some(values) = layout.values(res, kind, quat, frames)? else { return Ok(None) };
+    let track = match kind {
+        KIND_CAMERA_FOV => BoneTrack { bone, format: 0, track: TRACK_CAMERA_FOV, ..Default::default() },
+        _ => BoneTrack { bone, format: quat as u8, track: kind, ..Default::default() },
+    };
+    Ok(Some((track, values)))
+}
+
+/// How a track's frames are split into blocks.
+struct Layout {
+    /// Blocks of `stride + 1` frames, each starting on the last frame of the one before.
+    stride: usize,
+    blocks: usize,
+    slots: u64,
+}
+
+fn read_layout(res: &Resource, track: u64) -> Result<Layout, ResourceError> {
     let stride = res.u32(track + 0x04)? as usize;
     let blocks = (res.u16(track + 0x0C)? as usize).max(1);
     let slots = ptr(res, track + 0x08)?;
     if stride == 0 && blocks > 1 || blocks > 1 << 12 {
         return Err(bad(format!("track in {blocks} blocks of {stride} frames")));
     }
-    let mut values: Vec<[f32; 4]> = Vec::with_capacity(frames);
-    for b in 0..blocks {
-        let start = b * stride;
-        if start >= frames {
-            break;
+    Ok(Layout { stride, blocks, slots })
+}
+
+impl Layout {
+    /// The values of every block joined, padded to `frames`; `None` for layouts that are skipped.
+    fn values(
+        &self,
+        res: &Resource,
+        kind: u8,
+        quat: bool,
+        frames: usize,
+    ) -> Result<Option<Vec<[f32; 4]>>, ResourceError> {
+        let mut values: Vec<[f32; 4]> = Vec::with_capacity(frames);
+        for b in 0..self.blocks {
+            let start = b * self.stride;
+            if start >= frames {
+                break;
+            }
+            let len = if self.blocks == 1 { frames } else { (self.stride + 1).min(frames - start) };
+            let group = ptr(res, self.slots + b as u64 * 4)?;
+            let Some(block) = block_values(res, group, kind, quat, len)? else { return Ok(None) };
+            // The first frame repeats the previous block's last.
+            values.extend(block.into_iter().skip(usize::from(b > 0)));
         }
-        let len = if blocks == 1 { frames } else { (stride + 1).min(frames - start) };
-        let group = ptr(res, slots + b as u64 * 4)?;
-        let Some(block) = block_values(res, group, kind, quat, len)? else { return Ok(None) };
-        // The first frame repeats the previous block's last.
-        values.extend(block.into_iter().skip(usize::from(b > 0)));
+        let Some(&last) = values.last() else { return Ok(None) };
+        values.resize(frames, last);
+        Ok(Some(values))
     }
-    let Some(&last) = values.last() else { return Ok(None) };
-    values.resize(frames, last);
-    let track = match kind {
-        KIND_CAMERA_FOV => BoneTrack { bone, format: 0, track: TRACK_CAMERA_FOV, ..Default::default() },
-        _ => BoneTrack { bone, format: quat as u8, track: kind, ..Default::default() },
-    };
-    Ok(Some((track, values)))
+}
+
+/// Channel types of a constant quaternion and a constant vector.
+const CHANNEL_CONSTANT_QUATERNION: u8 = 9;
+const CHANNEL_CONSTANT_VECTOR: u8 = 13;
+
+/// A constant quaternion channel, for every frame.
+fn constant_quaternion(res: &Resource, ch: u64, frames: usize) -> Result<Vec<[f32; 4]>, ResourceError> {
+    let at = ptr(res, ch + 0x08)?;
+    let q = [f32_at(res, at)?, f32_at(res, at + 4)?, f32_at(res, at + 8)?, f32_at(res, at + 12)?];
+    Ok(vec![q; frames])
+}
+
+/// A constant vector channel, for every frame.
+fn constant_vector(res: &Resource, ch: u64, frames: usize) -> Result<Vec<[f32; 4]>, ResourceError> {
+    let at = ptr(res, ch + 0x08)?;
+    Ok(vec![[f32_at(res, at)?, f32_at(res, at + 4)?, f32_at(res, at + 8)?, 0.0]; frames])
+}
+
+/// A single channel holding a constant value of the wanted shape, for every frame.
+fn constant_block(res: &Resource, ch: u64, quat: bool, frames: usize) -> Result<Option<Vec<[f32; 4]>>, ResourceError> {
+    let kind = res.u8(ch + 0x05)?;
+    if quat && kind == CHANNEL_CONSTANT_QUATERNION {
+        return constant_quaternion(res, ch, frames).map(Some);
+    }
+    if !quat && kind == CHANNEL_CONSTANT_VECTOR {
+        return constant_vector(res, ch, frames).map(Some);
+    }
+    Ok(None)
+}
+
+/// Four float channels as normalised quaternions.
+fn quaternion_block(res: &Resource, channels: [u64; 4], frames: usize) -> Result<Vec<[f32; 4]>, ResourceError> {
+    let [x, y, z, w] = channels.map(|ch| float_channel(res, ch, frames));
+    let (x, y, z, w) = (x?, y?, z?, w?);
+    Ok((0..frames)
+        .map(|f| {
+            let q = [x[f], y[f], z[f], w[f]];
+            let len = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if len > 1e-6 { q.map(|v| v / len) } else { [0.0, 0.0, 0.0, 1.0] }
+        })
+        .collect())
+}
+
+/// Three float channels as vectors.
+fn vector_block(res: &Resource, [x, y, z]: [u64; 3], frames: usize) -> Result<Vec<[f32; 4]>, ResourceError> {
+    let (x, y, z) = (float_channel(res, x, frames)?, float_channel(res, y, frames)?, float_channel(res, z, frames)?);
+    Ok((0..frames).map(|f| [x[f], y[f], z[f], 0.0]).collect())
+}
+
+/// A float track's block: its single channel as vectors `(value, 0, 0)`.
+fn float_block(res: &Resource, channels: &[u64], frames: usize) -> Result<Option<Vec<[f32; 4]>>, ResourceError> {
+    let [ch] = channels else { return Ok(None) };
+    Ok(Some(float_channel(res, *ch, frames)?.into_iter().map(|v| [v, 0.0, 0.0, 0.0]).collect()))
 }
 
 /// One block of a track: `frames` values from its channel group, or `None`
@@ -170,40 +279,15 @@ fn block_values(
     let count = res.u32(group + 0x14)? as u64;
     let channels: Vec<u64> = (0..count.min(4)).map(|k| ptr(res, group + 0x04 + k * 4)).collect::<Result<_, _>>()?;
     if is_float_kind(kind) {
-        let [ch] = channels.as_slice() else { return Ok(None) };
-        return Ok(Some(float_channel(res, *ch, frames)?.into_iter().map(|v| [v, 0.0, 0.0, 0.0]).collect()));
+        return float_block(res, &channels, frames);
     }
-    let values: Vec<[f32; 4]> = match (quat, channels.as_slice()) {
-        (true, [ch]) if res.u8(ch + 0x05)? == 9 => {
-            let at = ptr(res, ch + 0x08)?;
-            let q = [f32_at(res, at)?, f32_at(res, at + 4)?, f32_at(res, at + 8)?, f32_at(res, at + 12)?];
-            vec![q; frames]
-        }
-        (false, [ch]) if res.u8(ch + 0x05)? == 13 => {
-            let at = ptr(res, ch + 0x08)?;
-            vec![[f32_at(res, at)?, f32_at(res, at + 4)?, f32_at(res, at + 8)?, 0.0]; frames]
-        }
-        (true, [x, y, z, w]) => {
-            let c = [*x, *y, *z, *w].map(|ch| float_channel(res, ch, frames));
-            let [x, y, z, w] = c;
-            let (x, y, z, w) = (x?, y?, z?, w?);
-            (0..frames)
-                .map(|f| {
-                    let q = [x[f], y[f], z[f], w[f]];
-                    let len = q.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    if len > 1e-6 { q.map(|v| v / len) } else { [0.0, 0.0, 0.0, 1.0] }
-                })
-                .collect()
-        }
-        (false, [x, y, z]) => {
-            let (x, y, z) =
-                (float_channel(res, *x, frames)?, float_channel(res, *y, frames)?, float_channel(res, *z, frames)?);
-            (0..frames).map(|f| [x[f], y[f], z[f], 0.0]).collect()
-        }
+    match (quat, channels.as_slice()) {
+        (_, [ch]) => constant_block(res, *ch, quat, frames),
+        (true, [x, y, z, w]) => Ok(Some(quaternion_block(res, [*x, *y, *z, *w], frames)?)),
+        (false, [x, y, z]) => Ok(Some(vector_block(res, [*x, *y, *z], frames)?)),
         // A handful of rotations in Euler form and other rare layouts.
-        _ => return Ok(None),
-    };
-    Ok(Some(values))
+        _ => Ok(None),
+    }
 }
 
 fn read_animation(res: &Resource, a: u64) -> Result<(String, Animation), ResourceError> {

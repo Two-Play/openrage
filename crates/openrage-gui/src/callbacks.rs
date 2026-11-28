@@ -87,6 +87,12 @@ fn wire_navigation(ui: &AppWindow) {
 
 /// Selecting, opening and acting on files in the list.
 fn wire_files(ui: &AppWindow) {
+    wire_file_select(ui);
+    wire_file_open(ui);
+    wire_row_action(ui);
+}
+
+fn wire_file_select(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_file_select(move |i| {
         with_ui(&w, |ui| {
@@ -99,164 +105,188 @@ fn wire_files(ui: &AppWindow) {
             select_row(ui, i as usize)
         })
     });
+}
+
+fn wire_file_open(ui: &AppWindow) {
     let w = ui.as_weak();
-    ui.on_file_open(move |i| {
-        with_ui(&w, |ui| {
-            let is_sound = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                Some(listing.items[*a.visible.get(i as usize)?].kind == ItemKind::Sound)
-            });
-            if is_sound == Some(true) {
-                if ui.get_file_selected() != i {
-                    with_app(|a| a.play_when_ready = true);
-                    select_row(ui, i as usize);
-                } else {
-                    stop_sound(ui);
-                    toggle_sound(ui);
-                }
-                return;
-            }
-            // GTA IV placement files open as a 3D scene (before the text check:
-            // they can also be edited as text, through the context menu).
-            let placement = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(i as usize)?];
-                (item.kind == ItemKind::File && item.name.to_ascii_lowercase().ends_with(".wpl"))
-                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-            });
-            if let Some(vpath) = placement {
-                scene::open_map(ui, vpath);
-                return;
-            }
-            // GTA IV cutscenes play in a scene (their text stays in the context menu).
-            let cutscene = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(i as usize)?];
-                (item.kind == ItemKind::File && item.mark != Some(Mark::Removed) && navigate::is_gta4_cutscene(item))
-                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-            });
-            if let Some(vpath) = cutscene {
-                scene::open_gta4(ui, vpath);
-                return;
-            }
-            let text = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(i as usize)?];
-                is_text_file(item)
-                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-            });
-            if let Some(vpath) = text {
-                open_text_file(ui, vpath);
-                return;
-            }
-            let meta = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(i as usize)?];
-                is_meta_file(item)
-                    .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-            });
-            if let Some(vpath) = meta {
-                open_xml_view(ui, vpath);
-                return;
-            }
-            let script = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(i as usize)?];
-                let name = item.name.to_ascii_lowercase();
-                ((item.kind == ItemKind::Resource && name.ends_with(".ysc"))
-                    || (item.kind == ItemKind::File && name.ends_with(".sco")))
-                .then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-            });
-            if let Some(vpath) = script {
-                open_script_view(ui, vpath);
-                return;
-            }
-            let is_video = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(i as usize)?];
-                Some(item.kind == ItemKind::File && browser::is_video(&item.name) && item.mark != Some(Mark::Removed))
-            });
-            // Or a file without a name that turned out to be one.
-            if is_video == Some(true) || (ui.get_file_selected() == i && ui.get_video_mode()) {
-                if ui.get_file_selected() != i {
-                    select_row(ui, i as usize);
-                }
-                player::open_selected(ui);
-                return;
-            }
-            if ui.get_file_selected() == i && ui.get_preview_loading() && may_be_video(i as usize) {
-                with_app(|a| a.play_when_ready = true);
-                return;
-            }
-            // An audio container with one sound: the row plays it (it is
-            // selected, so the sound is loaded or about to be).
-            let is_container = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(i as usize)?];
-                Some(item.kind == ItemKind::File && item.vpath.is_none() && browser::is_audio(&item.name))
-            });
-            if is_container == Some(true) {
-                if ui.get_file_selected() != i {
-                    select_row(ui, i as usize);
-                }
-                if ui.get_audio_mode() {
-                    toggle_sound(ui);
-                    return;
-                }
-                // Still decoding; a container with several has its list by now.
-                if ui.get_preview_loading() {
-                    with_app(|a| a.play_when_ready = true);
-                    return;
-                }
-            }
-            let is_ycd = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                Some(is_clip_dictionary(&listing.items[*a.visible.get(i as usize)?]))
-            });
-            if is_ycd == Some(true) {
-                if ui.get_file_selected() != i {
-                    select_row(ui, i as usize);
-                }
-                if let Some((model, ycd)) = with_app(|a| Some((a.suggestions.first()?.clone(), a.suggest_ycd.clone())))
-                {
-                    open_model_with_animation(ui, model, ycd);
-                }
-                return;
-            }
-            let viewable = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(i as usize)?];
-                Some(is_viewable(item) && !is_openable(item))
-            });
-            if viewable == Some(true) {
-                if ui.get_file_selected() != i {
-                    select_row(ui, i as usize);
-                }
-                open_viewer(ui);
-                return;
-            }
-            let target = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = &listing.items[*a.visible.get(i as usize)?];
-                if matches!(listing.location, Location::History) {
-                    return None;
-                }
-                if let Some(vpath) = &item.vpath {
-                    // Search hit or change: jump to its location (removed entries: their folder).
-                    return if item.mark == Some(Mark::Removed) { browser::parent(vpath) } else { Some(vpath.clone()) };
-                }
-                let opens = item.kind.is_container()
-                    || (item.kind == ItemKind::Resource && browser::is_texture_dict(&item.name))
-                    || (item.kind == ItemKind::File && browser::is_audio(&item.name));
-                opens.then(|| browser::join(&listing.vpath, &item.name))
-            });
-            if let Some(p) = target {
-                navigate(ui, &p, true);
-            }
-        })
-    });
+    ui.on_file_open(move |i| with_ui(&w, |ui| open_row(ui, i)));
+}
+
+fn wire_row_action(ui: &AppWindow) {
     let w = ui.as_weak();
     ui.on_row_action(move |i, action| with_ui(&w, |ui| row_action(ui, i as usize, &action)));
+}
+
+/// Runs `f` on the listing and the item of the visible row `i`.
+fn with_row<R>(i: i32, f: impl FnOnce(&Listing, &Item) -> Option<R>) -> Option<R> {
+    with_app(|a| {
+        let listing = a.listing.as_ref()?;
+        let item = &listing.items[*a.visible.get(i as usize)?];
+        f(listing, item)
+    })
+}
+
+/// Whether the item of the visible row `i` satisfies `pred`.
+fn row_matches(i: i32, pred: impl FnOnce(&Item) -> bool) -> bool {
+    with_row(i, |_, item| Some(pred(item))) == Some(true)
+}
+
+/// The virtual path of the item of the visible row `i`, if it satisfies `pred`.
+fn row_vpath_if(i: i32, pred: impl FnOnce(&Item) -> bool) -> Option<String> {
+    with_row(i, |listing, item| {
+        pred(item).then(|| item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+    })
+}
+
+fn select_row_if_other(ui: &AppWindow, i: i32) {
+    if ui.get_file_selected() != i {
+        select_row(ui, i as usize);
+    }
+}
+
+/// Double click / Enter on a row.
+fn open_row(ui: &AppWindow, i: i32) {
+    let handled = open_sound_row(ui, i)
+        || open_scene_row(ui, i)
+        || open_document_row(ui, i)
+        || open_video_row(ui, i)
+        || open_audio_container_row(ui, i)
+        || open_clip_dictionary_row(ui, i)
+        || open_viewable_row(ui, i);
+    if handled {
+        return;
+    }
+    if let Some(p) = open_target(i) {
+        navigate(ui, &p, true);
+    }
+}
+
+fn open_sound_row(ui: &AppWindow, i: i32) -> bool {
+    if !row_matches(i, |item| item.kind == ItemKind::Sound) {
+        return false;
+    }
+    if ui.get_file_selected() != i {
+        with_app(|a| a.play_when_ready = true);
+        select_row(ui, i as usize);
+    } else {
+        stop_sound(ui);
+        toggle_sound(ui);
+    }
+    true
+}
+
+fn open_scene_row(ui: &AppWindow, i: i32) -> bool {
+    // GTA IV placement files open as a 3D scene (before the text check:
+    // they can also be edited as text, through the context menu).
+    let placement =
+        row_vpath_if(i, |item| item.kind == ItemKind::File && item.name.to_ascii_lowercase().ends_with(".wpl"));
+    if let Some(vpath) = placement {
+        scene::open_map(ui, vpath);
+        return true;
+    }
+    // GTA IV cutscenes play in a scene (their text stays in the context menu).
+    let cutscene = row_vpath_if(i, |item| {
+        item.kind == ItemKind::File && item.mark != Some(Mark::Removed) && navigate::is_gta4_cutscene(item)
+    });
+    if let Some(vpath) = cutscene {
+        scene::open_gta4(ui, vpath);
+        return true;
+    }
+    false
+}
+
+fn open_document_row(ui: &AppWindow, i: i32) -> bool {
+    if let Some(vpath) = row_vpath_if(i, is_text_file) {
+        open_text_file(ui, vpath);
+        return true;
+    }
+    if let Some(vpath) = row_vpath_if(i, is_meta_file) {
+        open_xml_view(ui, vpath);
+        return true;
+    }
+    let script = row_vpath_if(i, |item| {
+        let name = item.name.to_ascii_lowercase();
+        (item.kind == ItemKind::Resource && name.ends_with(".ysc"))
+            || (item.kind == ItemKind::File && name.ends_with(".sco"))
+    });
+    if let Some(vpath) = script {
+        open_script_view(ui, vpath);
+        return true;
+    }
+    false
+}
+
+fn open_video_row(ui: &AppWindow, i: i32) -> bool {
+    let is_video = row_matches(i, |item| {
+        item.kind == ItemKind::File && browser::is_video(&item.name) && item.mark != Some(Mark::Removed)
+    });
+    // Or a file without a name that turned out to be one.
+    if is_video || (ui.get_file_selected() == i && ui.get_video_mode()) {
+        select_row_if_other(ui, i);
+        player::open_selected(ui);
+        return true;
+    }
+    if ui.get_file_selected() == i && ui.get_preview_loading() && may_be_video(i as usize) {
+        with_app(|a| a.play_when_ready = true);
+        return true;
+    }
+    false
+}
+
+/// An audio container with one sound: the row plays it (it is
+/// selected, so the sound is loaded or about to be).
+fn open_audio_container_row(ui: &AppWindow, i: i32) -> bool {
+    if !row_matches(i, |item| item.kind == ItemKind::File && item.vpath.is_none() && browser::is_audio(&item.name)) {
+        return false;
+    }
+    select_row_if_other(ui, i);
+    if ui.get_audio_mode() {
+        toggle_sound(ui);
+        return true;
+    }
+    // Still decoding; a container with several has its list by now.
+    if ui.get_preview_loading() {
+        with_app(|a| a.play_when_ready = true);
+        return true;
+    }
+    false
+}
+
+fn open_clip_dictionary_row(ui: &AppWindow, i: i32) -> bool {
+    if !row_matches(i, is_clip_dictionary) {
+        return false;
+    }
+    select_row_if_other(ui, i);
+    if let Some((model, ycd)) = with_app(|a| Some((a.suggestions.first()?.clone(), a.suggest_ycd.clone()))) {
+        open_model_with_animation(ui, model, ycd);
+    }
+    true
+}
+
+fn open_viewable_row(ui: &AppWindow, i: i32) -> bool {
+    if !row_matches(i, |item| is_viewable(item) && !is_openable(item)) {
+        return false;
+    }
+    select_row_if_other(ui, i);
+    open_viewer(ui);
+    true
+}
+
+/// Where a row that opens like a folder (or jumps elsewhere) leads.
+fn open_target(i: i32) -> Option<String> {
+    with_row(i, |listing, item| {
+        if matches!(listing.location, Location::History) {
+            return None;
+        }
+        if let Some(vpath) = &item.vpath {
+            // Search hit or change: jump to its location (removed entries: their folder).
+            return if item.mark == Some(Mark::Removed) { browser::parent(vpath) } else { Some(vpath.clone()) };
+        }
+        let opens = item.kind.is_container()
+            || (item.kind == ItemKind::Resource && browser::is_texture_dict(&item.name))
+            || (item.kind == ItemKind::File && browser::is_audio(&item.name));
+        opens.then(|| browser::join(&listing.vpath, &item.name))
+    })
 }
 
 /// Sorting, filtering, search, language, the mods overlay and extracting.
@@ -763,159 +793,164 @@ pub(crate) fn theme_mode(name: Option<&str>) -> i32 {
     }
 }
 
+/// The virtual path of the item of `row`.
+fn row_vpath(row: usize) -> Option<String> {
+    with_app(|a| {
+        let listing = a.listing.as_ref()?;
+        let item = listing.items.get(*a.visible.get(row)?)?;
+        Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
+    })
+}
+
 /// Context-menu action on a file row.
 pub(crate) fn row_action(ui: &AppWindow, row: usize, action: &str) {
     if ui.get_file_selected() != row as i32 {
         select_row(ui, row);
     }
     if let Some(index) = action.strip_prefix("plugin:").and_then(|i| i.parse::<usize>().ok()) {
-        let target = with_app(|a| {
-            let listing = a.listing.as_ref()?;
-            let item = listing.items.get(*a.visible.get(row)?)?;
-            let vpath = item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name));
-            Some((item.name.clone(), vpath, plugin_target(item)?))
-        });
-        if let Some((name, vpath, folder)) = target {
-            match plugins::action_at(&name, folder, index) {
-                Some(action) => run_plugin_action(ui, action, vpath),
-                None => ui.set_status("This plugin action is no longer available.".into()),
-            }
-        }
+        row_plugin_action(ui, row, index);
         return;
     }
+    match action {
+        "open" | "play" | "view" | "edit" | "system" | "extract" | "gltf" | "openformats-import" | "png" => {
+            row_view_action(ui, row, action)
+        }
+        "swf" | "text-export" | "xml-view" | "xml" | "openformats-export" => row_export_action(ui, row, action),
+        "replace" | "rename" | "delete" | "uninstall" => row_archive_action(ui, action),
+        "copy-hash" | "search-name" | "show-in-folder" => row_name_action(ui, row, action),
+        "copy-name" | "copy-path" => row_copy_action(ui, row, action),
+        _ => {}
+    }
+}
+
+fn row_plugin_action(ui: &AppWindow, row: usize, index: usize) {
+    let target = with_app(|a| {
+        let listing = a.listing.as_ref()?;
+        let item = listing.items.get(*a.visible.get(row)?)?;
+        let vpath = item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name));
+        Some((item.name.clone(), vpath, plugin_target(item)?))
+    });
+    if let Some((name, vpath, folder)) = target {
+        match plugins::action_at(&name, folder, index) {
+            Some(action) => run_plugin_action(ui, action, vpath),
+            None => ui.set_status("This plugin action is no longer available.".into()),
+        }
+    }
+}
+
+fn row_view_action(ui: &AppWindow, row: usize, action: &str) {
     match action {
         "open" => ui.invoke_file_open(row as i32),
         "play" => player::open_selected(ui),
         "view" => open_viewer(ui),
-        "edit" | "system" => {
-            let vpath = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = listing.items.get(*a.visible.get(row)?)?;
-                Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-            });
-            if let Some(vpath) = vpath {
-                if action == "edit" {
-                    open_editor(ui, vpath);
-                } else {
-                    open_with_system(ui, vpath);
-                }
-            }
-        }
-        "swf" => {
-            let vpath = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = listing.items.get(*a.visible.get(row)?)?;
-                Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-            });
-            if let Some(vpath) = vpath {
-                export_swf(ui, vpath);
-            }
-        }
-        "text-export" => {
-            let vpath = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = listing.items.get(*a.visible.get(row)?)?;
-                Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-            });
-            if let Some(vpath) = vpath {
-                export_text_table(ui, vpath);
-            }
-        }
-        "xml-view" | "xml" => {
-            let vpath = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = listing.items.get(*a.visible.get(row)?)?;
-                Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-            });
-            if let Some(vpath) = vpath {
-                if action == "xml" {
-                    export_xml(ui, vpath);
-                } else {
-                    open_xml_view(ui, vpath);
-                }
-            }
-        }
+        "edit" | "system" => row_edit_action(ui, row, action),
         "extract" => ui.invoke_extract_selected(),
-        "gltf" => {
-            if with_app(|a| a.model.is_some()) {
-                ui.invoke_export_gltf();
-            } else {
-                ui.set_status("The model is still loading.".into());
-            }
-        }
-        "openformats-export" => {
-            let vpath = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = listing.items.get(*a.visible.get(row)?)?;
-                Some(item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name)))
-            });
-            if let Some(vpath) = vpath {
-                openformats_ui::export(ui, vpath);
-            }
-        }
+        "gltf" => export_gltf_when_loaded(ui),
         "openformats-import" => openformats_ui::import(ui),
         "png" => ui.invoke_save_png(),
+        _ => {}
+    }
+}
+
+fn row_edit_action(ui: &AppWindow, row: usize, action: &str) {
+    if let Some(vpath) = row_vpath(row) {
+        if action == "edit" {
+            open_editor(ui, vpath);
+        } else {
+            open_with_system(ui, vpath);
+        }
+    }
+}
+
+fn export_gltf_when_loaded(ui: &AppWindow) {
+    if with_app(|a| a.model.is_some()) {
+        ui.invoke_export_gltf();
+    } else {
+        ui.set_status("The model is still loading.".into());
+    }
+}
+
+fn row_export_action(ui: &AppWindow, row: usize, action: &str) {
+    let Some(vpath) = row_vpath(row) else { return };
+    match action {
+        "swf" => export_swf(ui, vpath),
+        "text-export" => export_text_table(ui, vpath),
+        "xml" => export_xml(ui, vpath),
+        "xml-view" => open_xml_view(ui, vpath),
+        "openformats-export" => openformats_ui::export(ui, vpath),
+        _ => {}
+    }
+}
+
+fn row_archive_action(ui: &AppWindow, action: &str) {
+    match action {
         "replace" if ui.get_texture_mode() => ui.invoke_texture_replace(),
         "replace" => ui.invoke_archive_replace(),
         "rename" => ui.invoke_archive_rename(),
         "delete" if ui.get_texture_mode() => ui.invoke_texture_remove(),
         "delete" => ui.invoke_archive_delete(),
         "uninstall" => ui.invoke_uninstall_group(),
-        "copy-hash" | "search-name" | "show-in-folder" => {
-            let item = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = listing.items.get(*a.visible.get(row)?)?;
-                Some((item.name.clone(), item.vpath.clone()))
-            });
-            let Some((name, vpath)) = item else { return };
-            let stem = name.split('.').next().unwrap_or(&name).to_owned();
-            match action {
-                "copy-hash" => {
-                    let text = format!("0x{:08X}", rage_core::hash::joaat(&stem.to_ascii_lowercase()));
-                    let msg = match copy_to_clipboard(&text) {
-                        Ok(()) => format!("Copied {text} (hash of {stem})"),
-                        Err(e) => format!("Cannot copy to the clipboard: {e}"),
-                    };
-                    ui.set_status(msg.into());
-                }
-                "search-name" => start_search(ui, stem, true),
-                _ => {
-                    if let Some(v) = vpath {
-                        let folder = browser::parent(&v).unwrap_or_default();
-                        let file = v.rsplit('/').next().unwrap_or(&v).to_owned();
-                        navigate_then(ui, &folder, true, move |ui| {
-                            let row = with_app(|a| {
-                                let l = a.listing.as_ref()?;
-                                a.visible
-                                    .iter()
-                                    .position(|&i| l.items.get(i).is_some_and(|it| it.name.eq_ignore_ascii_case(&file)))
-                            });
-                            if let Some(row) = row {
-                                ui.invoke_select_row(row as i32);
-                            }
-                        });
-                    }
-                }
-            }
-        }
-        "copy-name" | "copy-path" => {
-            let text = with_app(|a| {
-                let listing = a.listing.as_ref()?;
-                let item = listing.items.get(*a.visible.get(row)?)?;
-                Some(if action == "copy-name" {
-                    item.name.clone()
-                } else {
-                    item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name))
-                })
-            });
-            if let Some(text) = text {
-                let msg = match copy_to_clipboard(&text) {
-                    Ok(()) => format!("Copied {text}"),
-                    Err(e) => format!("Cannot copy to the clipboard: {e}"),
-                };
-                ui.set_status(msg.into());
-            }
-        }
         _ => {}
+    }
+}
+
+fn row_name_action(ui: &AppWindow, row: usize, action: &str) {
+    let item = with_app(|a| {
+        let listing = a.listing.as_ref()?;
+        let item = listing.items.get(*a.visible.get(row)?)?;
+        Some((item.name.clone(), item.vpath.clone()))
+    });
+    let Some((name, vpath)) = item else { return };
+    let stem = name.split('.').next().unwrap_or(&name).to_owned();
+    match action {
+        "copy-hash" => copy_hash(ui, &stem),
+        "search-name" => start_search(ui, stem, true),
+        _ => {
+            if let Some(v) = vpath {
+                show_in_folder(ui, &v);
+            }
+        }
+    }
+}
+
+fn copy_hash(ui: &AppWindow, stem: &str) {
+    let text = format!("0x{:08X}", rage_core::hash::joaat(&stem.to_ascii_lowercase()));
+    let msg = match copy_to_clipboard(&text) {
+        Ok(()) => format!("Copied {text} (hash of {stem})"),
+        Err(e) => format!("Cannot copy to the clipboard: {e}"),
+    };
+    ui.set_status(msg.into());
+}
+
+fn show_in_folder(ui: &AppWindow, v: &str) {
+    let folder = browser::parent(v).unwrap_or_default();
+    let file = v.rsplit('/').next().unwrap_or(v).to_owned();
+    navigate_then(ui, &folder, true, move |ui| {
+        let row = with_app(|a| {
+            let l = a.listing.as_ref()?;
+            a.visible.iter().position(|&i| l.items.get(i).is_some_and(|it| it.name.eq_ignore_ascii_case(&file)))
+        });
+        if let Some(row) = row {
+            ui.invoke_select_row(row as i32);
+        }
+    });
+}
+
+fn row_copy_action(ui: &AppWindow, row: usize, action: &str) {
+    let text = with_app(|a| {
+        let listing = a.listing.as_ref()?;
+        let item = listing.items.get(*a.visible.get(row)?)?;
+        Some(if action == "copy-name" {
+            item.name.clone()
+        } else {
+            item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name))
+        })
+    });
+    if let Some(text) = text {
+        let msg = match copy_to_clipboard(&text) {
+            Ok(()) => format!("Copied {text}"),
+            Err(e) => format!("Cannot copy to the clipboard: {e}"),
+        };
+        ui.set_status(msg.into());
     }
 }

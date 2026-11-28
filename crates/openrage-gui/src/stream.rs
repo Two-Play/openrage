@@ -124,15 +124,17 @@ pub fn ready(loaded: Vec<Loaded>) -> Vec<(u32, Arc<ModelPreview>)> {
     keys.into_iter().zip(previews).collect()
 }
 
+fn kept(preview: Arc<ModelPreview>, far: bool) -> Kept {
+    Kept { look: scene_look(&preview), preview, drawn: 0, far, best: false }
+}
+
 fn work(
     lod: &Lod,
     far: HashMap<u32, Arc<ModelPreview>>,
     wish: &(Mutex<Wish>, Condvar),
     show: &dyn Fn(Drawn, bool) -> bool,
 ) {
-    let keep =
-        |preview: Arc<ModelPreview>, far| Kept { look: scene_look(&preview), preview, drawn: 0, far, best: false };
-    let mut models: HashMap<u32, Kept> = far.into_iter().map(|(m, p)| (m, keep(p, true))).collect();
+    let mut models: HashMap<u32, Kept> = far.into_iter().map(|(m, p)| (m, kept(p, true))).collect();
     // Models that cannot be read are not tried again.
     let mut failed: HashSet<u32> = HashSet::new();
     let mut close: HashMap<u32, Close> = HashMap::new();
@@ -140,80 +142,116 @@ fn work(
     let mut turn = 0u64;
     let mut more = false;
     loop {
-        {
-            let (lock, changed) = wish;
-            let mut now = lock.lock().unwrap_or_else(|e| e.into_inner());
-            loop {
-                if now.stop {
-                    return;
-                }
-                if let Some(wanted) = now.from.take() {
-                    from = Some(wanted);
-                    break;
-                }
-                if more {
-                    break;
-                }
-                now = changed.wait(now).unwrap_or_else(|e| e.into_inner());
-            }
+        if !wait_for_wish(wish, &mut from, more) {
+            return;
         }
         let Some((eye, range)) = from else { continue };
         turn += 1;
         let near = lod.near(&eye, range);
         close.retain(|file, _| near.contains(file));
-        let unread: Vec<u32> = near.iter().filter(|f| !close.contains_key(f)).copied().take(FILES_AT_ONCE).collect();
-        let files_left = !unread.is_empty();
-        close.extend(lod.read(&unread));
-        // A file that cannot be read stays away from the next round, too.
-        for file in unread {
-            close.entry(file).or_default();
-        }
+        let files_left = read_close_files(lod, &mut close, &near);
         let cut = lod.cut(&eye, range, &|m| models.contains_key(&m), &|m| failed.contains(&m), close.values());
-        let mut better: Vec<u32> = Vec::new();
-        let drawn: Drawn = cut
-            .draw
-            .into_iter()
-            .filter_map(|(m, places)| {
-                let kept = models.get_mut(&m)?;
-                kept.drawn = turn;
-                if !kept.best && places.iter().any(|t| near_to(&eye, t)) {
-                    better.push(m);
-                }
-                Some((Arc::clone(&kept.preview), kept.look.clone(), places))
-            })
-            .collect();
+        let (drawn, mut better) = drawn_models(&mut models, cut.draw, &eye, turn);
         let wanted: Vec<u32> = cut.wanted.into_iter().take(AT_ONCE).collect();
         better.truncate(if wanted.is_empty() { AT_ONCE } else { 8 });
         more = files_left || !wanted.is_empty() || !better.is_empty();
         if !show(drawn, more) {
             return;
         }
-        // The ones not drawn for longest go first.
-        let mut idle: Vec<(u64, u32)> =
-            models.iter().filter(|(_, k)| !k.far && k.drawn < turn).map(|(m, k)| (k.drawn, *m)).collect();
-        if idle.len() > KEPT {
-            idle.sort_unstable();
-            for (_, m) in &idle[..idle.len() - KEPT] {
-                models.remove(m);
+        drop_idle(&mut models, turn);
+        load_models(lod, &mut models, &mut failed, (&wanted, &better), turn);
+    }
+}
+
+/// Waits until the camera moved or there is more to load; false when the stream is to stop.
+fn wait_for_wish(wish: &(Mutex<Wish>, Condvar), from: &mut Option<From>, more: bool) -> bool {
+    let (lock, changed) = wish;
+    let mut now = lock.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if now.stop {
+            return false;
+        }
+        if let Some(wanted) = now.from.take() {
+            *from = Some(wanted);
+            return true;
+        }
+        if more {
+            return true;
+        }
+        now = changed.wait(now).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Reads the next map files near the camera; true if there were any to read.
+fn read_close_files(lod: &Lod, close: &mut HashMap<u32, Close>, near: &HashSet<u32>) -> bool {
+    let unread: Vec<u32> = near.iter().filter(|f| !close.contains_key(f)).copied().take(FILES_AT_ONCE).collect();
+    let files_left = !unread.is_empty();
+    close.extend(lod.read(&unread));
+    // A file that cannot be read stays away from the next round, too.
+    for file in unread {
+        close.entry(file).or_default();
+    }
+    files_left
+}
+
+/// What to draw of the models kept, and those near the camera that could have better textures.
+fn drawn_models(
+    models: &mut HashMap<u32, Kept>,
+    draw: HashMap<u32, Vec<Mat4>>,
+    eye: &[f32; 3],
+    turn: u64,
+) -> (Drawn, Vec<u32>) {
+    let mut better: Vec<u32> = Vec::new();
+    let drawn: Drawn = draw
+        .into_iter()
+        .filter_map(|(m, places)| {
+            let kept = models.get_mut(&m)?;
+            kept.drawn = turn;
+            if !kept.best && places.iter().any(|t| near_to(eye, t)) {
+                better.push(m);
             }
+            Some((Arc::clone(&kept.preview), kept.look.clone(), places))
+        })
+        .collect();
+    (drawn, better)
+}
+
+/// The ones not drawn for longest go first.
+fn drop_idle(models: &mut HashMap<u32, Kept>, turn: u64) {
+    let mut idle: Vec<(u64, u32)> =
+        models.iter().filter(|(_, k)| !k.far && k.drawn < turn).map(|(m, k)| (k.drawn, *m)).collect();
+    if idle.len() > KEPT {
+        idle.sort_unstable();
+        for (_, m) in &idle[..idle.len() - KEPT] {
+            models.remove(m);
         }
-        let quiet = &|_, _| {};
-        let loaded = ready(lod.load(&wanted, Quality::Near, quiet));
-        for (m, preview) in ready(lod.load(&better, Quality::Close, quiet)) {
-            if let Some(kept) = models.get_mut(&m) {
-                (kept.look, kept.preview, kept.best) = (scene_look(&preview), preview, true);
-            }
+    }
+}
+
+/// Loads the `wanted` models and better versions of the `better` ones.
+fn load_models(
+    lod: &Lod,
+    models: &mut HashMap<u32, Kept>,
+    failed: &mut HashSet<u32>,
+    (wanted, better): (&[u32], &[u32]),
+    turn: u64,
+) {
+    let quiet = &|_, _| {};
+    let loaded = ready(lod.load(wanted, Quality::Near, quiet));
+    for (m, preview) in ready(lod.load(better, Quality::Close, quiet)) {
+        if let Some(kept) = models.get_mut(&m) {
+            (kept.look, kept.preview, kept.best) = (scene_look(&preview), preview, true);
         }
-        // Those that could not be read again are not tried for ever.
-        for m in &better {
-            if let Some(kept) = models.get_mut(m) {
-                kept.best = true;
-            }
+    }
+    // Those that could not be read again are not tried for ever.
+    for m in better {
+        if let Some(kept) = models.get_mut(m) {
+            kept.best = true;
         }
-        failed.extend(wanted.iter().copied());
-        for (m, preview) in loaded {
-            failed.remove(&m);
-            models.insert(m, Kept { drawn: turn, ..keep(preview, false) });
-        }
+    }
+    failed.extend(wanted.iter().copied());
+    for (m, preview) in loaded {
+        failed.remove(&m);
+        models.insert(m, Kept { drawn: turn, ..kept(preview, false) });
     }
 }

@@ -3,19 +3,7 @@
 use crate::*;
 
 pub(crate) fn start_index_update(ui: &AppWindow) {
-    let Some((game_dir, keys, cancel)) = with_app(|a| {
-        let dir = a.game_dir.clone()?;
-        if let Some((running, cancel)) = &a.index_running {
-            if *running == dir {
-                return None;
-            }
-            // Another game was opened meanwhile: its index comes first.
-            cancel.store(true, Ordering::Relaxed);
-        }
-        let cancel = Arc::new(AtomicBool::new(false));
-        a.index_running = Some((dir.clone(), Arc::clone(&cancel)));
-        Some((dir, a.keys.clone(), cancel))
-    }) else {
+    let Some((game_dir, keys, cancel)) = with_app(claim_index_run) else {
         return;
     };
     let weak = ui.as_weak();
@@ -25,50 +13,7 @@ pub(crate) fn start_index_update(ui: &AppWindow) {
     ui.set_index_progress(-1.0);
     std::thread::spawn(move || {
         let current = Arc::clone(&cancel);
-        let status = |text: String, progress: f32| {
-            if !cancel.load(Ordering::Relaxed) {
-                let _ = weak.upgrade_in_event_loop(move |ui| {
-                    ui.set_index_status(text.into());
-                    ui.set_index_progress(progress);
-                });
-            }
-        };
-        let mut stopped = false;
-        let result = (|| -> Result<rage_index::IndexStats, rage_index::IndexError> {
-            // One update at a time: a stopped one still writes what it has.
-            static UPDATING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let _updating = UPDATING.lock().unwrap_or_else(|e| e.into_inner());
-            let path = index_path(&game_dir).ok_or_else(|| std::io::Error::other("no cache directory"))?;
-            let mut index = Index::open(&path)?;
-            let mut last = Instant::now();
-            let stats = index.update(&game_dir, keys, &cancel, &mut |p| {
-                if last.elapsed() > Duration::from_millis(200) {
-                    last = Instant::now();
-                    let part = p.bytes_done as f32 / p.bytes_total.max(1) as f32;
-                    status(
-                        format!(
-                            "Indexing: {:.0} % · {} of {} archives · {} entries",
-                            (part * 100.0).floor(),
-                            p.archives_done,
-                            p.archives_total,
-                            p.entries
-                        ),
-                        part,
-                    );
-                }
-            })?;
-            stopped = stats.cancelled;
-            let due = stats.archives_indexed > 0 || !openrage_app::rpf9::knows_names();
-            if !stopped && due && detect::is_gta6_dir(&game_dir) {
-                // Names are a help, not needed.
-                let _ = openrage_app::rpf9::learn_names(&mut index);
-            }
-            // Names of models, textures, … so hashes in metadata read as names.
-            if let Ok(names) = index.known_names() {
-                rage_formats::names::register(names);
-            }
-            index.stats()
-        })();
+        let (result, stopped) = run_index_update(&game_dir, keys, &cancel, &weak);
         let text = match result {
             Ok(s) if stopped => format!("Index stopped: {} entries so far", s.entries),
             Ok(s) => format!("Index: {} entries", s.entries),
@@ -90,6 +35,91 @@ pub(crate) fn start_index_update(ui: &AppWindow) {
             }
         });
     });
+}
+
+type IndexRun = (PathBuf, Option<Arc<GtaVKeys>>, Arc<AtomicBool>);
+
+/// Registers a new index run for the open game; `None` when there is no game or it is being indexed already.
+fn claim_index_run(a: &mut App) -> Option<IndexRun> {
+    let dir = a.game_dir.clone()?;
+    if let Some((running, cancel)) = &a.index_running {
+        if *running == dir {
+            return None;
+        }
+        // Another game was opened meanwhile: its index comes first.
+        cancel.store(true, Ordering::Relaxed);
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    a.index_running = Some((dir.clone(), Arc::clone(&cancel)));
+    Some((dir, a.keys.clone(), cancel))
+}
+
+/// Updates the index on the calling (worker) thread, reporting to the window; also tells whether it was stopped.
+fn run_index_update(
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    cancel: &Arc<AtomicBool>,
+    weak: &Weak<AppWindow>,
+) -> (Result<rage_index::IndexStats, rage_index::IndexError>, bool) {
+    let status = |text: String, progress: f32| {
+        if !cancel.load(Ordering::Relaxed) {
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                ui.set_index_status(text.into());
+                ui.set_index_progress(progress);
+            });
+        }
+    };
+    let mut stopped = false;
+    let result = update_index(game_dir, keys, cancel, &status, &mut stopped);
+    (result, stopped)
+}
+
+type StatusFn<'a> = &'a dyn Fn(String, f32);
+
+fn update_index(
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    cancel: &Arc<AtomicBool>,
+    status: StatusFn,
+    stopped: &mut bool,
+) -> Result<rage_index::IndexStats, rage_index::IndexError> {
+    // One update at a time: a stopped one still writes what it has.
+    static UPDATING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _updating = UPDATING.lock().unwrap_or_else(|e| e.into_inner());
+    let path = index_path(game_dir).ok_or_else(|| std::io::Error::other("no cache directory"))?;
+    let mut index = Index::open(&path)?;
+    let mut last = Instant::now();
+    let stats = index.update(game_dir, keys, cancel, &mut |p| {
+        if last.elapsed() > Duration::from_millis(200) {
+            last = Instant::now();
+            report_index_progress(p, status);
+        }
+    })?;
+    *stopped = stats.cancelled;
+    let due = stats.archives_indexed > 0 || !openrage_app::rpf9::knows_names();
+    if !*stopped && due && detect::is_gta6_dir(game_dir) {
+        // Names are a help, not needed.
+        let _ = openrage_app::rpf9::learn_names(&mut index);
+    }
+    // Names of models, textures, … so hashes in metadata read as names.
+    if let Ok(names) = index.known_names() {
+        rage_formats::names::register(names);
+    }
+    index.stats()
+}
+
+fn report_index_progress(p: &rage_index::Progress, status: StatusFn) {
+    let part = p.bytes_done as f32 / p.bytes_total.max(1) as f32;
+    status(
+        format!(
+            "Indexing: {:.0} % · {} of {} archives · {} entries",
+            (part * 100.0).floor(),
+            p.archives_done,
+            p.archives_total,
+            p.entries
+        ),
+        part,
+    );
 }
 
 /// Stops the update of the index; what is read by then stays in it.

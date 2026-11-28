@@ -56,6 +56,13 @@ struct Layout {
     positions: Vec<(BlockId, u64)>,
 }
 
+/// Most pages of each size class, largest pages first.
+const PAGE_LIMITS: [usize; 5] = [0x7F, 0x3F, 0xF, 0x3, 0x1];
+const MAX_SHIFT: u32 = 0xF;
+
+/// Where each block is: size class, page in it, and offset in the page.
+type Placed = Vec<(BlockId, usize, usize, u64)>;
+
 fn layout(blocks: &[(BlockId, u64)], max_pages: usize) -> Result<Layout, ResourceError> {
     if blocks.is_empty() {
         return Ok(Layout { flags: 0, size: 0, pages: 0, positions: Vec::new() });
@@ -64,7 +71,7 @@ fn layout(blocks: &[(BlockId, u64)], max_pages: usize) -> Result<Layout, Resourc
     let min_block = blocks.iter().map(|b| b.1).min().unwrap_or(0);
     let mut shift = 0u32;
     let mut base = 0x2000u64;
-    while (base < min_block || base * 16 < max_block) && shift < 0xF {
+    while (base < min_block || base * 16 < max_block) && shift < MAX_SHIFT {
         shift += 1;
         base = 0x2000 << shift;
     }
@@ -77,77 +84,90 @@ fn layout(blocks: &[(BlockId, u64)], max_pages: usize) -> Result<Layout, Resourc
     order.insert(0, blocks[0]);
 
     loop {
-        let mut largest = 0usize;
-        let mut largest_size = base;
-        while largest_size < max_block {
-            largest += 1;
-            largest_size *= 2;
-        }
-        let mut pages: [Vec<u64>; 5] = Default::default(); // used bytes per page, per size class
-        let mut placed: Vec<(BlockId, usize, usize, u64)> = Vec::new();
-        for (i, &(id, size)) in order.iter().enumerate() {
-            if i == 0 {
-                pages[largest].push(size);
-                placed.push((id, largest, 0, 0));
-                continue;
-            }
-            let mut class = 0usize;
-            let mut class_size = base;
-            while size > class_size && class < largest {
-                class += 1;
-                class_size *= 2;
-            }
-            let mut slot = None;
-            let (mut c, mut c_size) = (class, class_size);
-            while slot.is_none() && c <= largest {
-                for (p, used) in pages[c].iter_mut().enumerate() {
-                    let offset = used.div_ceil(ALIGN) * ALIGN;
-                    if offset + size <= c_size {
-                        *used = offset + size;
-                        slot = Some((c, p, offset));
-                        break;
-                    }
-                }
-                c += 1;
-                c_size *= 2;
-            }
-            let (c, p, offset) = slot.unwrap_or_else(|| {
-                pages[class].push(size);
-                (class, pages[class].len() - 1, 0)
-            });
-            placed.push((id, c, p, offset));
-        }
+        let (pages, placed) = pack_blocks(&order, base, max_block);
         let counts: Vec<usize> = pages.iter().map(Vec::len).collect();
-        let total: usize = counts.iter().sum();
-        let fits = total <= max_pages
-            && counts[0] <= 0x7F
-            && counts[1] <= 0x3F
-            && counts[2] <= 0xF
-            && counts[3] <= 0x3
-            && counts[4] <= 0x1;
-        if fits {
-            let mut class_offset = [0u64; 5];
-            let mut offset = 0u64;
-            for c in (0..5).rev() {
-                class_offset[c] = offset;
-                offset += (base << c) * counts[c] as u64;
-            }
-            let positions =
-                placed.into_iter().map(|(id, c, p, o)| (id, class_offset[c] + (base << c) * p as u64 + o)).collect();
-            let flags = shift
-                | (counts[4] as u32 & 0x1) << 4
-                | (counts[3] as u32 & 0x3) << 5
-                | (counts[2] as u32 & 0xF) << 7
-                | (counts[1] as u32 & 0x3F) << 11
-                | (counts[0] as u32 & 0x7F) << 17;
-            return Ok(Layout { flags, size: offset, pages: total, positions });
+        if counts.iter().sum::<usize>() <= max_pages && counts.iter().zip(PAGE_LIMITS).all(|(&n, max)| n <= max) {
+            return Ok(finish_layout(placed, &counts, shift, base));
         }
-        if shift >= 0xF {
+        if shift >= MAX_SHIFT {
             return Err(ResourceError::Format("cannot fit blocks into resource pages".into()));
         }
         shift += 1;
         base = 0x2000 << shift;
     }
+}
+
+/// Puts the blocks into pages of the size classes of `base`; gives the bytes used per page, per size class.
+fn pack_blocks(order: &[(BlockId, u64)], base: u64, max_block: u64) -> ([Vec<u64>; 5], Placed) {
+    let mut largest = 0usize;
+    let mut largest_size = base;
+    while largest_size < max_block {
+        largest += 1;
+        largest_size *= 2;
+    }
+    let mut pages: [Vec<u64>; 5] = Default::default();
+    let mut placed: Placed = Vec::new();
+    for (i, &(id, size)) in order.iter().enumerate() {
+        if i == 0 {
+            pages[largest].push(size);
+            placed.push((id, largest, 0, 0));
+            continue;
+        }
+        let (c, p, offset) = place_block(&mut pages, size, base, largest);
+        placed.push((id, c, p, offset));
+    }
+    (pages, placed)
+}
+
+/// Puts a block into the smallest page that fits, or into a new page of its own class.
+fn place_block(pages: &mut [Vec<u64>; 5], size: u64, base: u64, largest: usize) -> (usize, usize, u64) {
+    let mut class = 0usize;
+    let mut class_size = base;
+    while size > class_size && class < largest {
+        class += 1;
+        class_size *= 2;
+    }
+    let (mut c, mut c_size) = (class, class_size);
+    while c <= largest {
+        if let Some((p, offset)) = fit_in_class(&mut pages[c], size, c_size) {
+            return (c, p, offset);
+        }
+        c += 1;
+        c_size *= 2;
+    }
+    pages[class].push(size);
+    (class, pages[class].len() - 1, 0)
+}
+
+/// The first page of a class with room for the block, and the block's offset in it.
+fn fit_in_class(pages: &mut [u64], size: u64, class_size: u64) -> Option<(usize, u64)> {
+    for (p, used) in pages.iter_mut().enumerate() {
+        let offset = used.div_ceil(ALIGN) * ALIGN;
+        if offset + size <= class_size {
+            *used = offset + size;
+            return Some((p, offset));
+        }
+    }
+    None
+}
+
+/// The flags, size and block positions of pages that fit: larger pages come first.
+fn finish_layout(placed: Placed, counts: &[usize], shift: u32, base: u64) -> Layout {
+    let mut class_offset = [0u64; 5];
+    let mut offset = 0u64;
+    for c in (0..5).rev() {
+        class_offset[c] = offset;
+        offset += (base << c) * counts[c] as u64;
+    }
+    let positions =
+        placed.into_iter().map(|(id, c, p, o)| (id, class_offset[c] + (base << c) * p as u64 + o)).collect();
+    let flags = shift
+        | (counts[4] as u32 & 0x1) << 4
+        | (counts[3] as u32 & 0x3) << 5
+        | (counts[2] as u32 & 0xF) << 7
+        | (counts[1] as u32 & 0x3F) << 11
+        | (counts[0] as u32 & 0x7F) << 17;
+    Layout { flags, size: offset, pages: counts.iter().sum(), positions }
 }
 
 impl Builder {

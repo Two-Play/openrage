@@ -130,6 +130,14 @@ pub struct Gta4Archive {
 /// Names for the hashes RPF3 (audio) packages store instead of names.
 pub type AudioNames = std::collections::HashMap<u32, String>;
 
+/// The NUL-terminated name starting at `off` in the name table (empty when out of range).
+fn name_at(names: &[u8], off: u32) -> String {
+    let start = off as usize;
+    let Some(rest) = names.get(start..) else { return String::new() };
+    let end = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+    String::from_utf8_lossy(&rest[..end]).into_owned()
+}
+
 fn audio_names_slot() -> &'static std::sync::RwLock<Option<Arc<AudioNames>>> {
     static NAMES: std::sync::OnceLock<std::sync::RwLock<Option<Arc<AudioNames>>>> = std::sync::OnceLock::new();
     NAMES.get_or_init(Default::default)
@@ -305,6 +313,16 @@ impl Gta4Archive {
         let count = word(head, 8) as usize;
         self.toc_encrypted = word(head, 16) != 0;
         self.data_encrypted = format == Gta4Format::Rpf2 && word(head, 20) != 0;
+        let toc = self.read_rpf_toc(toc_len, count)?;
+        let file_len = self.file.metadata()?.len();
+        let entries = self.rpf_entries(&toc, count, file_len)?;
+        self.check_folders_disjoint(&entries, count)?;
+        self.entries = entries;
+        Ok(())
+    }
+
+    /// Reads the table of an RPF2/RPF3 package (decrypting it if needed) after checking its size.
+    fn read_rpf_toc(&self, toc_len: usize, count: usize) -> Result<Vec<u8>, RpfError> {
         if count == 0 || count > MAX_ENTRIES || toc_len > MAX_TOC || toc_len < count * 16 {
             return Err(self.corrupt(format!("{count} entries in a {toc_len}-byte table")));
         }
@@ -313,59 +331,75 @@ impl Gta4Archive {
         if self.toc_encrypted {
             self.need_key()?.decrypt(&mut toc);
         }
+        Ok(toc)
+    }
+
+    /// Decodes the `count` entries of the decrypted table `toc` of an RPF2/RPF3 package.
+    fn rpf_entries(&mut self, toc: &[u8], count: usize, file_len: u64) -> Result<Vec<Gta4Entry>, RpfError> {
         let names = &toc[count * 16..];
-        let name_at = |off: u32| -> String {
-            let start = off as usize;
-            let Some(rest) = names.get(start..) else { return String::new() };
-            let end = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
-            String::from_utf8_lossy(&rest[..end]).into_owned()
-        };
-        let file_len = self.file.metadata()?.len();
         let audio_names =
-            if format == Gta4Format::Rpf3 { audio_names_slot().read().ok().and_then(|n| n.clone()) } else { None };
+            if self.format == Gta4Format::Rpf3 { audio_names_slot().read().ok().and_then(|n| n.clone()) } else { None };
         let mut entries = Vec::with_capacity(count);
         for i in 0..count {
             let e = &toc[i * 16..i * 16 + 16];
-            let (w0, w1, w2, w3) = (word(e, 0), word(e, 4), word(e, 8), word(e, 12));
-            let name = if i == 0 {
-                String::new()
-            } else if format == Gta4Format::Rpf3 {
-                self.hashes.resize(i, 0);
-                self.hashes.push(w0);
-                audio_names.as_ref().and_then(|n| n.get(&w0)).cloned().unwrap_or_else(|| format!("{w0:08x}"))
-            } else {
-                name_at(w0)
-            };
-            let kind = if w2 & 0x8000_0000 != 0 {
-                let first = (w2 & 0x7FFF_FFFF) as usize;
-                // Bit 30 of the count is a flag in some audio archives.
-                let n = (w3 & 0x3FFF_FFFF) as usize;
-                if first <= i || first + n > count {
-                    return Err(self.corrupt(format!("folder {i} lists entries {first}..{}", first + n)));
-                }
-                Gta4EntryKind::Dir { children: first..first + n }
-            } else if w3 & 0xC000_0000 == 0xC000_0000 {
-                let offset = (w2 & 0x7FFF_FF00) as u64;
-                Gta4EntryKind::Resource { offset, stored: w1 as u64, resource_type: w2 & 0xFF, flags: w3 }
-            } else {
-                let compressed = w3 & 0x4000_0000 != 0;
-                let stored = (w3 & 0xBFFF_FFFF) as u64;
-                Gta4EntryKind::File { offset: w2 as u64, stored, size: w1 as u64, compressed }
-            };
-            if let Gta4EntryKind::File { offset, stored, .. } | Gta4EntryKind::Resource { offset, stored, .. } = kind
+            let entry = self.rpf_entry(i, e, names, audio_names.as_ref(), count)?;
+            if let Gta4EntryKind::File { offset, stored, .. } | Gta4EntryKind::Resource { offset, stored, .. } =
+                entry.kind
                 && offset + stored > file_len
             {
-                return Err(RpfError::OutOfBounds { archive: self.display.clone(), entry: name });
+                return Err(RpfError::OutOfBounds { archive: self.display.clone(), entry: entry.name });
             }
-            entries.push(Gta4Entry { name, kind });
+            entries.push(entry);
         }
         if !entries[0].is_dir() {
             return Err(self.corrupt("the first entry is not a folder"));
         }
-        // Every entry belongs to one folder. Folders sharing entries would make
-        // a walk over the tree exponential in the number of folders.
+        Ok(entries)
+    }
+
+    /// Decodes table entry `i` (16 bytes `e`) of an RPF2/RPF3 package.
+    fn rpf_entry(
+        &mut self,
+        i: usize,
+        e: &[u8],
+        names: &[u8],
+        audio_names: Option<&Arc<AudioNames>>,
+        count: usize,
+    ) -> Result<Gta4Entry, RpfError> {
+        let (w0, w1, w2, w3) = (word(e, 0), word(e, 4), word(e, 8), word(e, 12));
+        let name = if i == 0 {
+            String::new()
+        } else if self.format == Gta4Format::Rpf3 {
+            self.hashes.resize(i, 0);
+            self.hashes.push(w0);
+            audio_names.and_then(|n| n.get(&w0)).cloned().unwrap_or_else(|| format!("{w0:08x}"))
+        } else {
+            name_at(names, w0)
+        };
+        let kind = if w2 & 0x8000_0000 != 0 {
+            let first = (w2 & 0x7FFF_FFFF) as usize;
+            // Bit 30 of the count is a flag in some audio archives.
+            let n = (w3 & 0x3FFF_FFFF) as usize;
+            if first <= i || first + n > count {
+                return Err(self.corrupt(format!("folder {i} lists entries {first}..{}", first + n)));
+            }
+            Gta4EntryKind::Dir { children: first..first + n }
+        } else if w3 & 0xC000_0000 == 0xC000_0000 {
+            let offset = (w2 & 0x7FFF_FF00) as u64;
+            Gta4EntryKind::Resource { offset, stored: w1 as u64, resource_type: w2 & 0xFF, flags: w3 }
+        } else {
+            let compressed = w3 & 0x4000_0000 != 0;
+            let stored = (w3 & 0xBFFF_FFFF) as u64;
+            Gta4EntryKind::File { offset: w2 as u64, stored, size: w1 as u64, compressed }
+        };
+        Ok(Gta4Entry { name, kind })
+    }
+
+    /// Every entry belongs to one folder. Folders sharing entries would make
+    /// a walk over the tree exponential in the number of folders.
+    fn check_folders_disjoint(&self, entries: &[Gta4Entry], count: usize) -> Result<(), RpfError> {
         let mut claimed = vec![false; count];
-        for e in &entries {
+        for e in entries {
             if let Gta4EntryKind::Dir { children } = &e.kind {
                 for c in children.clone() {
                     if std::mem::replace(&mut claimed[c], true) {
@@ -374,7 +408,6 @@ impl Gta4Archive {
                 }
             }
         }
-        self.entries = entries;
         Ok(())
     }
 

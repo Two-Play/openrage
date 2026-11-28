@@ -1036,110 +1036,177 @@ struct Built {
 /// Every part of the model (placements baked into the vertices), with its
 /// textures uploaded.
 fn build(gpu: &Gpu, preview: &Arc<crate::ModelPreview>) -> Built {
-    let (model, materials) = (&preview.loaded, &preview.materials);
-    let (mut all_vertices, mut all_indices): (Vec<Vertex>, Vec<u32>) = (Vec::new(), Vec::new());
-    let mut textures = vec![plain_bind_group(gpu, &gpu.white)];
-    // Pictures → bind group.
-    let mut texture_of: HashMap<[usize; 4], usize> = HashMap::new();
-    let mut draws = Vec::new();
+    let model = &preview.loaded;
+    let mut asm = Assembly {
+        gpu,
+        model,
+        materials: &preview.materials,
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        textures: vec![plain_bind_group(gpu, &gpu.white)],
+        // Pictures → bind group.
+        texture_of: HashMap::new(),
+        draws: Vec::new(),
+    };
     for (part_index, part) in model.parts.iter().enumerate() {
         let Some((_, d)) = model.drawables.get(part.drawable) else { continue };
         for mesh in &d.meshes {
-            if mesh.positions.is_empty() || mesh.indices.is_empty() {
-                continue;
-            }
-            let has_n = mesh.normals.len() == mesh.positions.len();
-            let has_uv = mesh.uvs.len() == mesh.positions.len();
-            let has_uv1 = mesh.uvs1.len() == mesh.positions.len();
-            // The second layer runs like the first.
-            let layered = d
-                .shaders
-                .get(usize::from(mesh.shader))
-                .is_some_and(|s| s.sampler(param::LAYER_1_TEX).is_some() && s.sampler(param::DIFFUSE_TEX2).is_none());
-            let skinned = mesh.bone_weights.len() == mesh.positions.len();
-            let bone = part.bone.map(|b| b as u16);
-            let vertices: Vec<Vertex> = (0..mesh.positions.len())
-                .map(|i| Vertex {
-                    pos: math::transform_point(&part.transform, mesh.positions[i]),
-                    normal: if has_n {
-                        small_normal(math::transform_dir(&part.transform, mesh.normals[i]))
-                    } else {
-                        [0; 4]
-                    },
-                    uv: if has_uv { mesh.uvs[i] } else { [0.0; 2] },
-                    // Parts attached to a bone follow it; others use the mesh's weights.
-                    weights: match bone {
-                        Some(_) => [255, 0, 0, 0],
-                        None if skinned => small_weights(mesh.bone_weights[i]),
-                        None => [0; 4],
-                    },
-                    joints: match bone {
-                        Some(b) => [b, 0, 0, 0],
-                        None if skinned => mesh.bone_indices[i],
-                        None => [0; 4],
-                    },
-                    uv1: match (layered, has_uv1) {
-                        (true, _) if has_uv => mesh.uvs[i],
-                        (false, true) => mesh.uvs1[i],
-                        _ => [0.0; 2],
-                    },
-                    shading: mesh.shading.get(i).copied().unwrap_or([255; 4]),
-                })
-                .collect();
-            let usable = [has_uv, has_uv1 || (layered && has_uv), has_uv, has_uv];
-            let mut pictures = materials.pictures(part.drawable, mesh.shader);
-            pictures.iter_mut().zip(usable).for_each(|(p, usable)| *p = p.filter(|_| usable));
-            // A shader without a picture among others of its material that have
-            // one, whose colour says nothing about it.
-            let plain = pictures[0].is_none()
-                && model
-                    .material_index(part.drawable, mesh.shader)
-                    .and_then(|m| model.materials.get(m))
-                    .is_some_and(|m| m.textured);
-            let decal = d
-                .shaders
-                .get(usize::from(mesh.shader))
-                .is_some_and(|s| rage_formats::names::value(s.name_hash).contains("decal"));
-            if plain && decal {
-                continue;
-            }
-            let mut key = pictures.map(|p| p.map_or(0, |p| Arc::as_ptr(p) as usize));
-            key[0] = if plain { 1 } else { key[0] };
-            let texture = *texture_of.entry(key).or_insert_with(|| {
-                let [base, overlay, normal, specular] = pictures.map(|p| p.and_then(|p| picture_view(gpu, p)));
-                textures.push(texture_bind_group(
-                    gpu,
-                    base.as_ref().unwrap_or(if plain { &gpu.grey } else { &gpu.white }),
-                    overlay.as_ref().unwrap_or(&gpu.clear),
-                    normal.as_ref().unwrap_or(&gpu.flat),
-                    specular.as_ref().unwrap_or(&gpu.clear),
-                ));
-                textures.len() - 1
-            });
-            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-            for v in &vertices {
-                for k in 0..3 {
-                    lo[k] = lo[k].min(v.pos[k]);
-                    hi[k] = hi[k].max(v.pos[k]);
-                }
-            }
-            let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
-            let radius = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt() / 2.0;
-            draws.push(Draw {
-                sphere: (centre, radius),
-                part: part_index,
-                drawable: part.drawable,
-                shader: mesh.shader,
-                base_vertex: all_vertices.len() as i32,
-                indices: all_indices.len() as u32..(all_indices.len() + mesh.indices.len()) as u32,
-                texture,
-                decal,
-            });
-            all_vertices.extend_from_slice(&vertices);
-            all_indices.extend_from_slice(&mesh.indices);
+            asm.add_mesh(part_index, part, d, mesh);
         }
     }
-    Built { owner: Arc::downgrade(preview), draws, vertices: all_vertices, indices: all_indices, textures }
+    Built {
+        owner: Arc::downgrade(preview),
+        draws: asm.draws,
+        vertices: asm.vertices,
+        indices: asm.indices,
+        textures: asm.textures,
+    }
+}
+
+/// What [`build`] collects while it walks the model's meshes.
+struct Assembly<'a> {
+    gpu: &'a Gpu,
+    model: &'a openrage_app::models::LoadedModel,
+    materials: &'a openrage_app::render::Materials,
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+    textures: Vec<wgpu::BindGroup>,
+    texture_of: HashMap<[usize; 4], usize>,
+    draws: Vec<Draw>,
+}
+
+impl Assembly<'_> {
+    /// Adds one mesh of `part` to the buffers and the draw list (skipping decals on plain materials).
+    fn add_mesh(
+        &mut self,
+        part_index: usize,
+        part: &openrage_app::models::Part,
+        d: &rage_formats::drawable::Drawable,
+        mesh: &rage_formats::drawable::Mesh,
+    ) {
+        if mesh.positions.is_empty() || mesh.indices.is_empty() {
+            return;
+        }
+        let has_uv = mesh.uvs.len() == mesh.positions.len();
+        let has_uv1 = mesh.uvs1.len() == mesh.positions.len();
+        // The second layer runs like the first.
+        let layered = d
+            .shaders
+            .get(usize::from(mesh.shader))
+            .is_some_and(|s| s.sampler(param::LAYER_1_TEX).is_some() && s.sampler(param::DIFFUSE_TEX2).is_none());
+        let vertices = placed_vertices(part, mesh, layered);
+        let usable = [has_uv, has_uv1 || (layered && has_uv), has_uv, has_uv];
+        let mut pictures = self.materials.pictures(part.drawable, mesh.shader);
+        pictures.iter_mut().zip(usable).for_each(|(p, usable)| *p = p.filter(|_| usable));
+        // A shader without a picture among others of its material that have
+        // one, whose colour says nothing about it.
+        let plain = pictures[0].is_none()
+            && self
+                .model
+                .material_index(part.drawable, mesh.shader)
+                .and_then(|m| self.model.materials.get(m))
+                .is_some_and(|m| m.textured);
+        let decal = d
+            .shaders
+            .get(usize::from(mesh.shader))
+            .is_some_and(|s| rage_formats::names::value(s.name_hash).contains("decal"));
+        if plain && decal {
+            return;
+        }
+        let mut key = pictures.map(|p| p.map_or(0, |p| Arc::as_ptr(p) as usize));
+        key[0] = if plain { 1 } else { key[0] };
+        let (gpu, textures) = (self.gpu, &mut self.textures);
+        let texture = *self.texture_of.entry(key).or_insert_with(|| push_texture_group(gpu, textures, pictures, plain));
+        self.draws.push(Draw {
+            sphere: bounding_sphere(&vertices),
+            part: part_index,
+            drawable: part.drawable,
+            shader: mesh.shader,
+            base_vertex: self.vertices.len() as i32,
+            indices: self.indices.len() as u32..(self.indices.len() + mesh.indices.len()) as u32,
+            texture,
+            decal,
+        });
+        self.vertices.extend_from_slice(&vertices);
+        self.indices.extend_from_slice(&mesh.indices);
+    }
+}
+
+/// Parts attached to a bone follow it; others use the mesh's weights.
+fn skin_weights(bone: Option<u16>, mesh: &rage_formats::drawable::Mesh, i: usize) -> [u8; 4] {
+    match bone {
+        Some(_) => [255, 0, 0, 0],
+        None if mesh.bone_weights.len() == mesh.positions.len() => small_weights(mesh.bone_weights[i]),
+        None => [0; 4],
+    }
+}
+
+/// The bones of vertex `i`: the part's own bone, or the mesh's skinning.
+fn skin_joints(bone: Option<u16>, mesh: &rage_formats::drawable::Mesh, i: usize) -> [u16; 4] {
+    match bone {
+        Some(b) => [b, 0, 0, 0],
+        None if mesh.bone_weights.len() == mesh.positions.len() => mesh.bone_indices[i],
+        None => [0; 4],
+    }
+}
+
+/// The mesh's vertices with the part's placement baked in.
+fn placed_vertices(
+    part: &openrage_app::models::Part,
+    mesh: &rage_formats::drawable::Mesh,
+    layered: bool,
+) -> Vec<Vertex> {
+    let has_n = mesh.normals.len() == mesh.positions.len();
+    let has_uv = mesh.uvs.len() == mesh.positions.len();
+    let has_uv1 = mesh.uvs1.len() == mesh.positions.len();
+    let bone = part.bone.map(|b| b as u16);
+    (0..mesh.positions.len())
+        .map(|i| Vertex {
+            pos: math::transform_point(&part.transform, mesh.positions[i]),
+            normal: if has_n { small_normal(math::transform_dir(&part.transform, mesh.normals[i])) } else { [0; 4] },
+            uv: if has_uv { mesh.uvs[i] } else { [0.0; 2] },
+            weights: skin_weights(bone, mesh, i),
+            joints: skin_joints(bone, mesh, i),
+            uv1: match (layered, has_uv1) {
+                (true, _) if has_uv => mesh.uvs[i],
+                (false, true) => mesh.uvs1[i],
+                _ => [0.0; 2],
+            },
+            shading: mesh.shading.get(i).copied().unwrap_or([255; 4]),
+        })
+        .collect()
+}
+
+/// Uploads the pictures of one material as a bind group and returns its index in `textures`.
+fn push_texture_group(
+    gpu: &Gpu,
+    textures: &mut Vec<wgpu::BindGroup>,
+    pictures: [Option<&Arc<Picture>>; 4],
+    plain: bool,
+) -> usize {
+    let [base, overlay, normal, specular] = pictures.map(|p| p.and_then(|p| picture_view(gpu, p)));
+    textures.push(texture_bind_group(
+        gpu,
+        base.as_ref().unwrap_or(if plain { &gpu.grey } else { &gpu.white }),
+        overlay.as_ref().unwrap_or(&gpu.clear),
+        normal.as_ref().unwrap_or(&gpu.flat),
+        specular.as_ref().unwrap_or(&gpu.clear),
+    ));
+    textures.len() - 1
+}
+
+/// Centre and radius of the box around the vertices.
+fn bounding_sphere(vertices: &[Vertex]) -> ([f32; 3], f32) {
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for v in vertices {
+        for k in 0..3 {
+            lo[k] = lo[k].min(v.pos[k]);
+            hi[k] = hi[k].max(v.pos[k]);
+        }
+    }
+    let centre = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+    let radius = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt() / 2.0;
+    (centre, radius)
 }
 
 /// Bytes of vertices or indices that share a buffer.
@@ -1381,302 +1448,414 @@ pub struct Around<'a> {
 /// Renders several models (each with its own placement and pose) and
 /// particles from `camera`, e.g. all actors of a cutscene.
 pub fn render_scene(items: &[SceneItem], around: &Around, camera: &Camera, w: u32, h: u32) -> Option<slint::Image> {
-    let &Around { lights, sprites, outdoors, live } = around;
     STATE.with(|state| {
         let mut st = state.borrow_mut();
-        let st = &mut *st;
-        let gpu = GPU.as_ref()?;
-        let (w, h) = (w.clamp(1, 8192), h.clamp(1, 8192));
+        render_in(&mut st, items, around, camera, (w, h))
+    })
+}
 
-        // Upload once per model; forget models that are gone. A scene places
-        // the same model many times: look models up by pointer, not by a scan
-        // of every uploaded model for every placement.
-        st.models.append(&mut READY.lock().unwrap_or_else(|e| e.into_inner()));
-        st.models.retain(|m| m.owner.strong_count() > 0);
-        let mut known: HashSet<*const crate::ModelPreview> = st.models.iter().map(|m| m.owner.as_ptr()).collect();
-        let new: Vec<&Arc<crate::ModelPreview>> =
-            items.iter().map(|item| item.preview).filter(|p| known.insert(Arc::as_ptr(p))).collect();
-        if !new.is_empty() {
-            st.models.extend(upload(gpu, new.into_iter().map(|p| build(gpu, p)).collect()));
-        }
+fn render_in(
+    st: &mut State,
+    items: &[SceneItem],
+    around: &Around,
+    camera: &Camera,
+    (w, h): (u32, u32),
+) -> Option<slint::Image> {
+    let &Around { lights, sprites, outdoors, live } = around;
+    let gpu = GPU.as_ref()?;
+    let (w, h) = (w.clamp(1, 8192), h.clamp(1, 8192));
+    sync_resources(gpu, st, items, sprites, (w, h));
+    let t = st.targets.as_mut()?;
 
-        st.sprite_textures.retain(|(owner, _)| owner.strong_count() > 0);
-        for sprite in sprites {
-            let ptr = Arc::as_ptr(&sprite.texture);
-            if !st.sprite_textures.iter().any(|(o, _)| o.as_ptr() == ptr) {
-                let t = &sprite.texture;
-                let view = upload_texture(&gpu.device, &gpu.queue, t.width, t.height, &t.rgba);
-                st.sprite_textures.push((Arc::downgrade(t), plain_bind_group(gpu, &view)));
-            }
-        }
-        if st.targets.as_ref().is_none_or(|t| t.size != (w, h)) {
-            st.targets = Some(targets(gpu, w, h));
-        }
-        let t = st.targets.as_mut()?;
+    let globals = scene_globals(camera, lights, outdoors, (w, h));
+    let globals_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("globals"),
+        contents: bytemuck::bytes_of(&globals),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let globals_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &gpu.globals_layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals_buffer.as_entire_binding() }],
+    });
 
-        let near = (camera.distance * 0.01).max(0.001);
-        let far = camera.distance + camera.radius * 4.0 + 1.0;
-        let mut gpu_lights = [<GpuLight as bytemuck::Zeroable>::zeroed(); MAX_LIGHTS];
-        for (slot, l) in gpu_lights.iter_mut().zip(lights) {
-            let (dir, cos) = match l.spot {
-                Some((d, cone)) => (d, (cone.to_radians() / 2.0).cos()),
-                None => ([0.0, 0.0, -1.0], -1.0),
-            };
-            *slot = GpuLight {
-                position: [l.position[0], l.position[1], l.position[2], l.range],
-                color: [l.color[0], l.color[1], l.color[2], if l.spot.is_some() { 1.0 } else { 0.0 }],
-                direction: [dir[0], dir[1], dir[2], cos],
-            };
+    let cull = Cull::new(camera, outdoors, &globals.view_proj, (w, h));
+    let shown = shown_draws(items, &st.models, &cull);
+    let instances: Vec<Instance> = shown.iter().map(|(_, i)| *i).collect();
+    let instance_buffer = vertex_buffer(gpu, "instances", &instances);
+
+    let rest_pose = &*st.rest_pose.get_or_insert_with(|| palette_group(gpu, None));
+    let skin_groups: Vec<Option<wgpu::BindGroup>> =
+        items.iter().map(|item| item.skin.map(|s| palette_group(gpu, Some(s)))).collect();
+
+    let (sprite_vertices, sprite_runs) = sprite_vertices(sprites, camera);
+    let sprite_buffer = vertex_buffer(gpu, "sprites", &sprite_vertices);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    let frame = Frame {
+        gpu,
+        outdoors,
+        globals_group: &globals_group,
+        instance_buffer: instance_buffer.as_ref(),
+        shown: &shown,
+        models: &st.models,
+        skin_groups: &skin_groups,
+        rest_pose,
+        sprite_buffer: sprite_buffer.as_ref(),
+        sprite_runs: &sprite_runs,
+        sprite_textures: &st.sprite_textures,
+    };
+    record_pass(&mut encoder, t, &frame);
+    let here = t.pending.as_ref().map_or(0, |(_, other, _)| 1 - other);
+    let submitted = submit_readback(gpu, encoder, t, (w, h), here);
+    let taken = take_picture(gpu, t, here, submitted, live)?;
+    let pixels = read_pixels(t, taken, (w, h))?;
+    if t.pending.as_ref().is_none_or(|(_, kept, _)| *kept != taken) {
+        t.readback[taken].unmap();
+    }
+    Some(slint::Image::from_rgba8_premultiplied(pixels))
+}
+
+/// Uploads what the scene needs and is not there yet: models (forgetting
+/// those that are gone), particle textures and the render targets.
+fn sync_resources(gpu: &Gpu, st: &mut State, items: &[SceneItem], sprites: &[Sprite], (w, h): (u32, u32)) {
+    // Upload once per model; forget models that are gone. A scene places
+    // the same model many times: look models up by pointer, not by a scan
+    // of every uploaded model for every placement.
+    st.models.append(&mut READY.lock().unwrap_or_else(|e| e.into_inner()));
+    st.models.retain(|m| m.owner.strong_count() > 0);
+    let mut known: HashSet<*const crate::ModelPreview> = st.models.iter().map(|m| m.owner.as_ptr()).collect();
+    let new: Vec<&Arc<crate::ModelPreview>> =
+        items.iter().map(|item| item.preview).filter(|p| known.insert(Arc::as_ptr(p))).collect();
+    if !new.is_empty() {
+        st.models.extend(upload(gpu, new.into_iter().map(|p| build(gpu, p)).collect()));
+    }
+
+    st.sprite_textures.retain(|(owner, _)| owner.strong_count() > 0);
+    for sprite in sprites {
+        let ptr = Arc::as_ptr(&sprite.texture);
+        if !st.sprite_textures.iter().any(|(o, _)| o.as_ptr() == ptr) {
+            let t = &sprite.texture;
+            let view = upload_texture(&gpu.device, &gpu.queue, t.width, t.height, &t.rgba);
+            st.sprite_textures.push((Arc::downgrade(t), plain_bind_group(gpu, &view)));
         }
-        // How long the sides of the picture are, one away from the camera.
+    }
+    if st.targets.as_ref().is_none_or(|t| t.size != (w, h)) {
+        st.targets = Some(targets(gpu, w, h));
+    }
+}
+
+/// The lights of a scene in the layout the shader reads.
+fn gpu_lights(lights: &[SceneLight]) -> [GpuLight; MAX_LIGHTS] {
+    let mut gpu_lights = [<GpuLight as bytemuck::Zeroable>::zeroed(); MAX_LIGHTS];
+    for (slot, l) in gpu_lights.iter_mut().zip(lights) {
+        let (dir, cos) = match l.spot {
+            Some((d, cone)) => (d, (cone.to_radians() / 2.0).cos()),
+            None => ([0.0, 0.0, -1.0], -1.0),
+        };
+        *slot = GpuLight {
+            position: [l.position[0], l.position[1], l.position[2], l.range],
+            color: [l.color[0], l.color[1], l.color[2], if l.spot.is_some() { 1.0 } else { 0.0 }],
+            direction: [dir[0], dir[1], dir[2], cos],
+        };
+    }
+    gpu_lights
+}
+
+/// The shader's globals for one picture of `w` × `h`.
+fn scene_globals(camera: &Camera, lights: &[SceneLight], outdoors: Option<Outdoors>, (w, h): (u32, u32)) -> Globals {
+    let near = (camera.distance * 0.01).max(0.001);
+    let far = camera.distance + camera.radius * 4.0 + 1.0;
+    let gpu_lights = gpu_lights(lights);
+    // How long the sides of the picture are, one away from the camera.
+    let tan = (camera.fov / 2.0).tan();
+    let short = w.min(h) as f32;
+    let edge = |axis: [f32; 3], side: u32, last: f32| {
+        let reach = tan * side as f32 / short;
+        [axis[0] * reach, axis[1] * reach, axis[2] * reach, last]
+    };
+    let light = light_at(outdoors.map_or(12.0, |o| o.hour));
+    let wide = |v: [f32; 3], last: f32| [v[0], v[1], v[2], last];
+    Globals {
+        view_proj: view_projection(camera, w, h, near, far),
+        forward: [camera.forward[0], camera.forward[1], camera.forward[2], lights.len().min(MAX_LIGHTS) as f32],
+        lights: gpu_lights,
+        eye: [camera.eye[0], camera.eye[1], camera.eye[2], outdoors.map_or(0.0, |o| o.haze)],
+        right: edge(camera.right, w, if outdoors.is_some() { 1.0 } else { 0.0 }),
+        up: edge(camera.up, h, 0.0),
+        sun: wide(light.towards, outdoors.map_or(0.0, |o| o.seconds)),
+        sun_colour: wide(light.colour, light.lamps),
+        ambient: wide(light.ambient, outdoors.map_or(1.0, |o| o.brightness)),
+        zenith: wide(light.zenith, 0.0),
+        horizon: wide(light.horizon, 0.0),
+        below: wide(light.below, 0.0),
+    }
+}
+
+/// What decides whether a draw is left out of a scene as too far or outside the view.
+struct Cull<'a> {
+    camera: &'a Camera,
+    outdoors: Option<Outdoors>,
+    planes: [[f32; 4]; 6],
+    /// Pixels of something as large as it is far.
+    pixels: f32,
+}
+
+impl<'a> Cull<'a> {
+    fn new(camera: &'a Camera, outdoors: Option<Outdoors>, view_proj: &[f32; 16], (w, h): (u32, u32)) -> Self {
         let tan = (camera.fov / 2.0).tan();
         let short = w.min(h) as f32;
-        let edge = |axis: [f32; 3], side: u32, last: f32| {
-            let reach = tan * side as f32 / short;
-            [axis[0] * reach, axis[1] * reach, axis[2] * reach, last]
-        };
-        let light = light_at(outdoors.map_or(12.0, |o| o.hour));
-        let wide = |v: [f32; 3], last: f32| [v[0], v[1], v[2], last];
-        let globals = Globals {
-            view_proj: view_projection(camera, w, h, near, far),
-            forward: [camera.forward[0], camera.forward[1], camera.forward[2], lights.len().min(MAX_LIGHTS) as f32],
-            lights: gpu_lights,
-            eye: [camera.eye[0], camera.eye[1], camera.eye[2], outdoors.map_or(0.0, |o| o.haze)],
-            right: edge(camera.right, w, if outdoors.is_some() { 1.0 } else { 0.0 }),
-            up: edge(camera.up, h, 0.0),
-            sun: wide(light.towards, outdoors.map_or(0.0, |o| o.seconds)),
-            sun_colour: wide(light.colour, light.lamps),
-            ambient: wide(light.ambient, outdoors.map_or(1.0, |o| o.brightness)),
-            zenith: wide(light.zenith, 0.0),
-            horizon: wide(light.horizon, 0.0),
-            below: wide(light.below, 0.0),
-        };
-        let globals_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("globals"),
-            contents: bytemuck::bytes_of(&globals),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let globals_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &gpu.globals_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals_buffer.as_entire_binding() }],
-        });
+        Cull { camera, outdoors, planes: frustum_planes(view_proj), pixels: short / 2.0 / tan }
+    }
 
-        // Shown draws of every item with their colours (hidden parts and
-        // materials left out, and unskinned ones outside the view).
-        let model_of: HashMap<usize, usize> =
-            st.models.iter().enumerate().map(|(i, m)| (m.owner.as_ptr() as usize, i)).collect();
-        let planes = frustum_planes(&globals.view_proj);
-        // Pixels of something as large as it is far.
-        let pixels = short / 2.0 / tan;
-        let too_small = |model: &math::Mat4, (centre, radius): ([f32; 3], f32)| {
-            let c = math::transform_point(model, centre);
-            let far = (0..3).map(|k| (c[k] - camera.eye[k]).powi(2)).sum::<f32>().sqrt();
-            radius * scale_of(model) * pixels < SMALLEST * (far - radius).max(0.0)
-        };
-        // Whether it lies on others (those come last), the skinned item it is
-        // (or none), the model, the draw; the same ones are drawn together.
-        type Key = (bool, usize, usize, usize);
-        const NO_SKIN: usize = usize::MAX;
-        let models = &st.models;
-        let mut shown: Vec<(Key, Instance)> = items
-            .par_iter()
-            .enumerate()
-            .flat_map_iter(|(index, item)| {
-                let number = model_of.get(&(Arc::as_ptr(item.preview) as usize)).copied();
-                let draws = number.map_or(&[][..], |n| &models[n].draws[..]);
-                let skin = if item.skin.is_some() { index } else { NO_SKIN };
-                let (planes, too_small) = (&planes, &too_small);
-                draws.iter().enumerate().filter_map(move |(k, d)| {
-                    if !item.look.parts.get(d.part).copied().unwrap_or(false) {
-                        return None;
-                    }
-                    if item.skin.is_none()
-                        && (!sphere_visible(planes, &item.model, d.sphere)
-                            || (outdoors.is_some() && too_small(&item.model, d.sphere)))
-                    {
-                        return None;
-                    }
-                    let tint = item.preview.loaded.tint(item.look, d.drawable, d.shader)?;
-                    Some(((d.decal, skin, number?, k), Instance { model: item.model, tint }))
-                })
-            })
-            .collect();
-        shown.par_sort_unstable_by_key(|(key, _)| *key);
-        let instances: Vec<Instance> = shown.iter().map(|(_, i)| *i).collect();
-        let instance_buffer = (!instances.is_empty()).then(|| {
-            gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("instances"),
-                contents: bytemuck::cast_slice(&instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
-        });
+    fn too_small(&self, model: &math::Mat4, (centre, radius): ([f32; 3], f32)) -> bool {
+        let c = math::transform_point(model, centre);
+        let far = (0..3).map(|k| (c[k] - self.camera.eye[k]).powi(2)).sum::<f32>().sqrt();
+        radius * scale_of(model) * self.pixels < SMALLEST * (far - radius).max(0.0)
+    }
+}
 
-        // A bone palette per skinned item; the others share the rest pose.
-        let palette_group = |skin: Option<&[math::Mat4]>| {
-            let mut palette = vec![math::IDENTITY; gpu.bones];
-            for (slot, m) in palette.iter_mut().zip(skin.unwrap_or_default()) {
-                *slot = *m;
-            }
-            let buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("skin"),
-                contents: bytemuck::cast_slice(&palette),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &gpu.skin_layout,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
-            })
-        };
-        let rest_pose = &*st.rest_pose.get_or_insert_with(|| palette_group(None));
-        let skin_groups: Vec<Option<wgpu::BindGroup>> =
-            items.iter().map(|item| item.skin.map(|s| palette_group(Some(s)))).collect();
+// Whether it lies on others (those come last), the skinned item it is
+// (or none), the model, the draw; the same ones are drawn together.
+type Key = (bool, usize, usize, usize);
+const NO_SKIN: usize = usize::MAX;
 
-        let (sprite_vertices, sprite_runs) = sprite_vertices(sprites, camera);
-        let sprite_buffer = (!sprite_vertices.is_empty()).then(|| {
-            gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("sprites"),
-                contents: bytemuck::cast_slice(&sprite_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
-        });
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("model"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.msaa,
-                    depth_slice: None,
-                    resolve_target: Some(&t.resolve_view),
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Discard,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &t.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(0, &globals_group, &[]);
-            if let Some(buffer) = &instance_buffer {
-                pass.set_pipeline(&gpu.pipeline);
-                pass.set_vertex_buffer(1, buffer.slice(..));
-                let mut last = (None, None, None);
-                let mut first = 0;
-                let mut decals = false;
-                for run in shown.chunk_by(|a, b| a.0 == b.0) {
-                    let (decal, skin, number, k) = run[0].0;
-                    if decal && !decals {
-                        pass.set_pipeline(&gpu.decal);
-                        decals = true;
-                    }
-                    let model = &st.models[number];
-                    let d = &model.draws[k];
-                    // Only what changes is set.
-                    if last.0 != Some(skin) {
-                        let group = skin_groups.get(skin).and_then(Option::as_ref).unwrap_or(rest_pose);
-                        pass.set_bind_group(2, group, &[]);
-                    }
-                    if last.1 != Some(model.batch) {
-                        pass.set_vertex_buffer(0, model.vertices.slice(..));
-                        pass.set_index_buffer(model.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    }
-                    if last.2 != Some((number, d.texture)) {
-                        pass.set_bind_group(1, &model.textures[d.texture], &[]);
-                    }
-                    last = (Some(skin), Some(model.batch), Some((number, d.texture)));
-                    let count = run.len() as u32;
-                    pass.draw_indexed(d.indices.clone(), d.base_vertex, first..first + count);
-                    first += count;
-                }
-            }
-            if outdoors.is_some() {
-                pass.set_pipeline(&gpu.sky);
-                pass.draw(0..3, 0..1);
-                if outdoors.is_some_and(|o| o.sea) {
-                    pass.set_pipeline(&gpu.sea);
-                    pass.draw(0..4, 0..1);
-                }
-            }
-            // Particles last, over what they are in front of.
-            if let Some(buffer) = &sprite_buffer {
-                pass.set_vertex_buffer(0, buffer.slice(..));
-                for &(first, count, additive, texture) in &sprite_runs {
-                    let Some((_, group)) = st.sprite_textures.iter().find(|(o, _)| o.as_ptr() == texture) else {
-                        continue;
-                    };
-                    pass.set_pipeline(if additive { &gpu.sprite_add } else { &gpu.sprite_blend });
-                    pass.set_bind_group(1, group, &[]);
-                    let range = (first * 6) as u32..((first + count) * 6) as u32;
-                    pass.draw(range, 0..1);
-                }
-            }
-        }
-        let here = t.pending.as_ref().map_or(0, |(_, other, _)| 1 - other);
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &t.resolve,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &t.readback[here],
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(t.padded_row),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        let submitted = gpu.queue.submit([encoder.finish()]);
+/// Whether a draw of `item` is in view and large enough to be worth drawing.
+fn is_in_view(item: &SceneItem, d: &Draw, cull: &Cull) -> bool {
+    if item.skin.is_some() {
+        return true;
+    }
+    sphere_visible(&cull.planes, &item.model, d.sphere)
+        && !(cull.outdoors.is_some() && cull.too_small(&item.model, d.sphere))
+}
 
-        t.readback[here].map_async(wgpu::MapMode::Read, .., |_| {});
-        let wait = |index: &wgpu::SubmissionIndex| {
-            let wait = wgpu::PollType::Wait { submission_index: Some(index.clone()), timeout: None };
-            gpu.device.poll(wait).ok()
-        };
-        // While things move, the picture before is taken: it is there by now,
-        // and the graphics card works while the next one is put together.
-        let before = t.pending.take();
-        let taken = match (live, before) {
-            (Some(id), Some((of, other, index))) if of == id => {
-                wait(&index)?;
-                t.pending = Some((id, here, submitted));
-                other
-            }
-            (_, before) => {
-                wait(&submitted)?;
-                if let Some((_, other, _)) = before {
-                    t.readback[other].unmap();
+/// Shown draws of every item with their colours (hidden parts and
+/// materials left out, and unskinned ones outside the view), sorted by key.
+fn shown_draws(items: &[SceneItem], models: &[GpuModel], cull: &Cull) -> Vec<(Key, Instance)> {
+    let model_of: HashMap<usize, usize> =
+        models.iter().enumerate().map(|(i, m)| (m.owner.as_ptr() as usize, i)).collect();
+    let mut shown: Vec<(Key, Instance)> = items
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(index, item)| {
+            let number = model_of.get(&(Arc::as_ptr(item.preview) as usize)).copied();
+            let draws = number.map_or(&[][..], |n| &models[n].draws[..]);
+            let skin = if item.skin.is_some() { index } else { NO_SKIN };
+            draws.iter().enumerate().filter_map(move |(k, d)| {
+                if !item.look.parts.get(d.part).copied().unwrap_or(false) || !is_in_view(item, d, cull) {
+                    return None;
                 }
-                // The first of several is shown twice.
-                t.pending = live.map(|id| (id, here, submitted));
-                here
-            }
-        };
-        let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
-        {
-            let data = t.readback[taken].get_mapped_range(..).ok()?;
-            let out = pixels.make_mut_bytes();
-            let row = (4 * w) as usize;
-            for y in 0..h as usize {
-                let src = y * t.padded_row as usize;
-                out[y * row..(y + 1) * row].copy_from_slice(&data[src..src + row]);
-            }
-        }
-        if t.pending.as_ref().is_none_or(|(_, kept, _)| *kept != taken) {
-            t.readback[taken].unmap();
-        }
-        Some(slint::Image::from_rgba8_premultiplied(pixels))
+                let tint = item.preview.loaded.tint(item.look, d.drawable, d.shader)?;
+                Some(((d.decal, skin, number?, k), Instance { model: item.model, tint }))
+            })
+        })
+        .collect();
+    shown.par_sort_unstable_by_key(|(key, _)| *key);
+    shown
+}
+
+/// A vertex buffer holding `data`; `None` if there is nothing.
+fn vertex_buffer<T: bytemuck::NoUninit>(gpu: &Gpu, label: &str, data: &[T]) -> Option<wgpu::Buffer> {
+    (!data.is_empty()).then(|| {
+        gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::VERTEX,
+        })
     })
+}
+
+/// A bone palette per skinned item; the others share the rest pose.
+fn palette_group(gpu: &Gpu, skin: Option<&[math::Mat4]>) -> wgpu::BindGroup {
+    let mut palette = vec![math::IDENTITY; gpu.bones];
+    for (slot, m) in palette.iter_mut().zip(skin.unwrap_or_default()) {
+        *slot = *m;
+    }
+    let buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("skin"),
+        contents: bytemuck::cast_slice(&palette),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &gpu.skin_layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+    })
+}
+
+/// Everything the render pass of a scene draws from.
+struct Frame<'a> {
+    gpu: &'a Gpu,
+    outdoors: Option<Outdoors>,
+    globals_group: &'a wgpu::BindGroup,
+    instance_buffer: Option<&'a wgpu::Buffer>,
+    shown: &'a [(Key, Instance)],
+    models: &'a [GpuModel],
+    skin_groups: &'a [Option<wgpu::BindGroup>],
+    rest_pose: &'a wgpu::BindGroup,
+    sprite_buffer: Option<&'a wgpu::Buffer>,
+    sprite_runs: &'a [SpriteRun],
+    sprite_textures: &'a [(Weak<Image>, wgpu::BindGroup)],
+}
+
+fn record_pass(encoder: &mut wgpu::CommandEncoder, t: &Targets, frame: &Frame) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("model"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &t.msaa,
+            depth_slice: None,
+            resolve_target: Some(&t.resolve_view),
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Discard,
+            },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: &t.depth,
+            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_bind_group(0, frame.globals_group, &[]);
+    if let Some(buffer) = frame.instance_buffer {
+        draw_models(&mut pass, frame, buffer);
+    }
+    if frame.outdoors.is_some() {
+        pass.set_pipeline(&frame.gpu.sky);
+        pass.draw(0..3, 0..1);
+        if frame.outdoors.is_some_and(|o| o.sea) {
+            pass.set_pipeline(&frame.gpu.sea);
+            pass.draw(0..4, 0..1);
+        }
+    }
+    // Particles last, over what they are in front of.
+    if let Some(buffer) = frame.sprite_buffer {
+        draw_sprites(&mut pass, frame, buffer);
+    }
+}
+
+fn draw_models(pass: &mut wgpu::RenderPass, frame: &Frame, buffer: &wgpu::Buffer) {
+    pass.set_pipeline(&frame.gpu.pipeline);
+    pass.set_vertex_buffer(1, buffer.slice(..));
+    let mut last = (None, None, None);
+    let mut first = 0;
+    let mut decals = false;
+    for run in frame.shown.chunk_by(|a, b| a.0 == b.0) {
+        let (decal, skin, number, k) = run[0].0;
+        if decal && !decals {
+            pass.set_pipeline(&frame.gpu.decal);
+            decals = true;
+        }
+        let model = &frame.models[number];
+        let d = &model.draws[k];
+        // Only what changes is set.
+        if last.0 != Some(skin) {
+            let group = frame.skin_groups.get(skin).and_then(Option::as_ref).unwrap_or(frame.rest_pose);
+            pass.set_bind_group(2, group, &[]);
+        }
+        if last.1 != Some(model.batch) {
+            pass.set_vertex_buffer(0, model.vertices.slice(..));
+            pass.set_index_buffer(model.indices.slice(..), wgpu::IndexFormat::Uint32);
+        }
+        if last.2 != Some((number, d.texture)) {
+            pass.set_bind_group(1, &model.textures[d.texture], &[]);
+        }
+        last = (Some(skin), Some(model.batch), Some((number, d.texture)));
+        let count = run.len() as u32;
+        pass.draw_indexed(d.indices.clone(), d.base_vertex, first..first + count);
+        first += count;
+    }
+}
+
+fn draw_sprites(pass: &mut wgpu::RenderPass, frame: &Frame, buffer: &wgpu::Buffer) {
+    pass.set_vertex_buffer(0, buffer.slice(..));
+    for &(first, count, additive, texture) in frame.sprite_runs {
+        let Some((_, group)) = frame.sprite_textures.iter().find(|(o, _)| o.as_ptr() == texture) else {
+            continue;
+        };
+        pass.set_pipeline(if additive { &frame.gpu.sprite_add } else { &frame.gpu.sprite_blend });
+        pass.set_bind_group(1, group, &[]);
+        let range = (first * 6) as u32..((first + count) * 6) as u32;
+        pass.draw(range, 0..1);
+    }
+}
+
+/// Copies the rendered picture into readback buffer `here` and submits.
+fn submit_readback(
+    gpu: &Gpu,
+    mut encoder: wgpu::CommandEncoder,
+    t: &Targets,
+    (w, h): (u32, u32),
+    here: usize,
+) -> wgpu::SubmissionIndex {
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &t.resolve,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &t.readback[here],
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(t.padded_row),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    gpu.queue.submit([encoder.finish()])
+}
+
+/// Waits for a picture and returns the readback buffer to take it from.
+fn take_picture(
+    gpu: &Gpu,
+    t: &mut Targets,
+    here: usize,
+    submitted: wgpu::SubmissionIndex,
+    live: Option<u64>,
+) -> Option<usize> {
+    t.readback[here].map_async(wgpu::MapMode::Read, .., |_| {});
+    let wait = |index: &wgpu::SubmissionIndex| {
+        let wait = wgpu::PollType::Wait { submission_index: Some(index.clone()), timeout: None };
+        gpu.device.poll(wait).ok()
+    };
+    // While things move, the picture before is taken: it is there by now,
+    // and the graphics card works while the next one is put together.
+    let before = t.pending.take();
+    match (live, before) {
+        (Some(id), Some((of, other, index))) if of == id => {
+            wait(&index)?;
+            t.pending = Some((id, here, submitted));
+            Some(other)
+        }
+        (_, before) => {
+            wait(&submitted)?;
+            if let Some((_, other, _)) = before {
+                t.readback[other].unmap();
+            }
+            // The first of several is shown twice.
+            t.pending = live.map(|id| (id, here, submitted));
+            Some(here)
+        }
+    }
+}
+
+/// The pixels of readback buffer `taken`, without the row padding.
+fn read_pixels(t: &Targets, taken: usize, (w, h): (u32, u32)) -> Option<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
+    let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
+    let data = t.readback[taken].get_mapped_range(..).ok()?;
+    let out = pixels.make_mut_bytes();
+    let row = (4 * w) as usize;
+    for y in 0..h as usize {
+        let src = y * t.padded_row as usize;
+        out[y * row..(y + 1) * row].copy_from_slice(&data[src..src + row]);
+    }
+    drop(data);
+    Some(pixels)
 }
 
 /// Releases all GPU resources. Must run before the program exits: wgpu's own

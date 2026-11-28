@@ -211,53 +211,78 @@ fn read_blend(r1: &mut Reader, quaternion: bool) -> Result<Op, ResourceError> {
     Ok(Op::Blend { quaternion, sources })
 }
 
+/// The operations both games read the same way (`None` for another code).
+fn read_basic_op(code: u8, r1: &mut Reader, r2: &mut Reader) -> Option<Result<Op, ResourceError>> {
+    Some(match code {
+        0x00..=0x04 => Ok(read_constant_op(code)),
+        0x05 => r2.f32().map(|v| Op::Push([v; 4])),
+        0x0B => r1.vec4().map(Op::Push),
+        0x06..=0x0A | 0x20 | 0x23 | 0x26..=0x2A => read_track_op(code, r2),
+        0x42 | 0x43 => read_variable_op(code, r2),
+        0x2B..=0x2D => read_jump_op(code, r2),
+        _ => return None,
+    })
+}
+
+/// The operations without operands (0x00 to 0x04).
+fn read_constant_op(code: u8) -> Op {
+    match code {
+        0x00 => Op::End,
+        0x01 => Op::Pop,
+        0x02 => Op::Dup,
+        0x03 => Op::Push([0.0; 4]),
+        _ => Op::Push([1.0; 4]),
+    }
+}
+
+fn read_track_op(code: u8, r2: &mut Reader) -> Result<Op, ResourceError> {
+    let track = r2.u16()?;
+    let _bone = r2.u16()?;
+    let _track_type = r2.u8()?;
+    let _format = r2.u8()?;
+    let component = r2.u8()?;
+    let defaults = r2.u8()? != 0;
+    Ok(Op::Track { kind: code, track, component, defaults })
+}
+
+fn read_variable_op(code: u8, r2: &mut Reader) -> Result<Op, ResourceError> {
+    let _hash = r2.u32()?;
+    let index = r2.u32()?;
+    Ok(if code == 0x43 { Op::SetVariable(index) } else { Op::GetVariable(index) })
+}
+
+fn read_jump_op(code: u8, r2: &mut Reader) -> Result<Op, ResourceError> {
+    let _ = (r2.u32()?, r2.u32()?);
+    Ok(Op::Jump { kind: code, target: r2.u32()? as usize })
+}
+
 fn read_ops(d1: &[u8], d2: &[u8], d3: &[u8]) -> Result<Vec<Op>, ResourceError> {
     let (mut r1, mut r2) = (Reader { data: d1, at: 0 }, Reader { data: d2, at: 0 });
     let mut ops = Vec::with_capacity(d3.len());
     for &code in d3 {
-        let op = match code {
-            0x00 => Op::End,
-            0x01 => Op::Pop,
-            0x02 => Op::Dup,
-            0x03 => Op::Push([0.0; 4]),
-            0x04 => Op::Push([1.0; 4]),
-            0x05 => Op::Push([r2.f32()?; 4]),
-            0x0B => Op::Push(r1.vec4()?),
-            0x06..=0x0A | 0x20 | 0x23 | 0x26..=0x2A => {
-                let track = r2.u16()?;
-                let _bone = r2.u16()?;
-                let _track_type = r2.u8()?;
-                let _format = r2.u8()?;
-                let component = r2.u8()?;
-                let defaults = r2.u8()? != 0;
-                Op::Track { kind: code, track, component, defaults }
-            }
-            0x42 | 0x43 => {
-                let _hash = r2.u32()?;
-                let index = r2.u32()?;
-                if code == 0x42 { Op::GetVariable(index) } else { Op::SetVariable(index) }
-            }
-            0x2B..=0x2D => {
-                let _ = (r2.u32()?, r2.u32()?);
-                Op::Jump { kind: code, target: r2.u32()? as usize }
-            }
-            0x0E => {
-                r1.take(160 + 16)?;
-                Op::Spring
-            }
-            0x3E => {
-                let _offset = r1.vec4()?;
-                let look_axis = r1.u32()?;
-                let up_axis = r1.u32()?;
-                let _ = (r1.u32()?, r1.u32()?);
-                Op::LookAt { look_axis, up_axis }
-            }
-            0x44 | 0x45 => read_blend(&mut r1, code == 0x45)?,
-            other => Op::Simple(other),
-        };
-        ops.push(op);
+        ops.push(read_op(code, &mut r1, &mut r2)?);
     }
     Ok(ops)
+}
+
+fn read_op(code: u8, r1: &mut Reader, r2: &mut Reader) -> Result<Op, ResourceError> {
+    if let Some(op) = read_basic_op(code, r1, r2) {
+        return op;
+    }
+    match code {
+        0x0E => r1.take(160 + 16).map(|_| Op::Spring),
+        0x3E => read_look_at_op(r1),
+        0x44 | 0x45 => read_blend(r1, code == 0x45),
+        other => Ok(Op::Simple(other)),
+    }
+}
+
+fn read_look_at_op(r1: &mut Reader) -> Result<Op, ResourceError> {
+    let _offset = r1.vec4()?;
+    let look_axis = r1.u32()?;
+    let up_axis = r1.u32()?;
+    let _ = (r1.u32()?, r1.u32()?);
+    Ok(Op::LookAt { look_axis, up_axis })
 }
 
 /// RDR2 operations: (operand bytes in the vector data, in the other data,
@@ -293,65 +318,57 @@ fn read_ops_rdr2(d1: &[u8], d2: &[u8], d3: &[u8]) -> Result<Vec<Op>, ResourceErr
     let (mut r1, mut r2) = (Reader { data: d1, at: 0 }, Reader { data: d2, at: 0 });
     let mut ops = Vec::with_capacity(d3.len());
     for &code in d3 {
-        let op = match code {
-            0x00 => Op::End,
-            0x01 => Op::Pop,
-            0x02 => Op::Dup,
-            0x03 => Op::Push([0.0; 4]),
-            0x04 => Op::Push([1.0; 4]),
-            0x05 => Op::Push([r2.f32()?; 4]),
-            0x0B => Op::Push(r1.vec4()?),
-            0x06..=0x0A | 0x20 | 0x23 | 0x26..=0x2A => {
-                let track = r2.u16()?;
-                let _bone = r2.u16()?;
-                let _track_type = r2.u8()?;
-                let _format = r2.u8()?;
-                let component = r2.u8()?;
-                let defaults = r2.u8()? != 0;
-                Op::Track { kind: code, track, component, defaults }
-            }
-            0x42 | 0x43 | 0x67 => {
-                let _hash = r2.u32()?;
-                let index = r2.u32()?;
-                if code == 0x43 { Op::SetVariable(index) } else { Op::GetVariable(index) }
-            }
-            0x2B | 0x2C | 0x2D | 0x70 => {
-                let _ = (r2.u32()?, r2.u32()?);
-                Op::Jump { kind: code, target: r2.u32()? as usize }
-            }
-            0x52 => Op::Store(r2.u32()?),
-            0x50 => {
-                let start = r1.at;
-                let length = r1.u32()? as usize;
-                let groups = r1.u32()? as usize;
-                let _ = (r1.u32()?, r1.u32()?);
-                if groups > 1024 || length != 32 + 48 * groups + 16 * groups.div_ceil(2) {
-                    return Err(ResourceError::Format("expression register blend of unexpected size".into()));
-                }
-                let offset = r1.vec4()?;
-                let groups_data = (0..groups)
-                    .map(|_| Ok([r1.vec4()?, r1.vec4()?, r1.vec4()?]))
-                    .collect::<Result<Vec<_>, ResourceError>>()?;
-                let registers =
-                    (0..groups.div_ceil(2) * 8).map(|_| r1.u16()).collect::<Result<Vec<_>, ResourceError>>()?;
-                debug_assert_eq!(r1.at - start, length);
-                Op::LinearBlend { offset, groups: groups_data, registers }
-            }
-            0x0F..=0x12 | 0x1B..=0x1F | 0x21 | 0x22 | 0x2E..=0x33 | 0x35..=0x3D | 0x40 | 0x48 | 0x49 => {
-                Op::Simple(code)
-            }
-            other => {
-                let Some((n1, n2, pops, pushes)) = rdr2_shape(other) else {
-                    return Err(ResourceError::Format(format!("unknown RDR2 expression operation {other:#04x}")));
-                };
-                r1.take(n1)?;
-                r2.take(n2)?;
-                Op::Unknown { code: other, pops, pushes }
-            }
-        };
-        ops.push(op);
+        ops.push(read_op_rdr2(code, &mut r1, &mut r2)?);
     }
     Ok(ops)
+}
+
+fn read_op_rdr2(code: u8, r1: &mut Reader, r2: &mut Reader) -> Result<Op, ResourceError> {
+    if let Some(op) = read_basic_op(code, r1, r2) {
+        return op;
+    }
+    match code {
+        0x67 => read_variable_op(code, r2),
+        0x70 => read_jump_op(code, r2),
+        0x52 => r2.u32().map(Op::Store),
+        0x50 => read_linear_blend_op(r1),
+        0x0F..=0x12 | 0x1B..=0x1F | 0x21 | 0x22 | 0x2E..=0x33 | 0x35..=0x3D | 0x40 | 0x48 | 0x49 => {
+            Ok(Op::Simple(code))
+        }
+        other => read_unknown_op(other, r1, r2),
+    }
+}
+
+fn read_linear_blend_op(r1: &mut Reader) -> Result<Op, ResourceError> {
+    let start = r1.at;
+    let (length, groups) = read_linear_blend_header(r1)?;
+    let offset = r1.vec4()?;
+    let groups_data =
+        (0..groups).map(|_| Ok([r1.vec4()?, r1.vec4()?, r1.vec4()?])).collect::<Result<Vec<_>, ResourceError>>()?;
+    let registers = (0..groups.div_ceil(2) * 8).map(|_| r1.u16()).collect::<Result<Vec<_>, ResourceError>>()?;
+    debug_assert_eq!(r1.at - start, length);
+    Ok(Op::LinearBlend { offset, groups: groups_data, registers })
+}
+
+/// Byte length and group count of a register blend; the size has to add up.
+fn read_linear_blend_header(r1: &mut Reader) -> Result<(usize, usize), ResourceError> {
+    let length = r1.u32()? as usize;
+    let groups = r1.u32()? as usize;
+    let _ = (r1.u32()?, r1.u32()?);
+    if groups > 1024 || length != 32 + 48 * groups + 16 * groups.div_ceil(2) {
+        return Err(ResourceError::Format("expression register blend of unexpected size".into()));
+    }
+    Ok((length, groups))
+}
+
+/// An operation known only by its [`rdr2_shape`]: its operands are skipped.
+fn read_unknown_op(code: u8, r1: &mut Reader, r2: &mut Reader) -> Result<Op, ResourceError> {
+    let Some((n1, n2, pops, pushes)) = rdr2_shape(code) else {
+        return Err(ResourceError::Format(format!("unknown RDR2 expression operation {code:#04x}")));
+    };
+    r1.take(n1)?;
+    r2.take(n2)?;
+    Ok(Op::Unknown { code, pops, pushes })
 }
 
 /// (pointer, count) of a 64-bit resource list.
@@ -369,24 +386,33 @@ fn read_expression_at(res: &Resource, e: u64, shift: u64) -> Result<Expression, 
     let (tracks_ptr, track_count) = list(res, e + 0x30 + shift)?;
     let (_, variables) = list(res, e + 0x50 + shift)?;
     let name = res.string(res.u64(e + 0x60 + shift)?).unwrap_or_default();
-    let tracks = (0..track_count)
-        .map(|i| {
-            let t = tracks_ptr + i * 4;
-            Ok(Track { bone: res.u16(t)?, track: res.u8(t + 2)?, format: res.u8(t + 3)? & 0x7F })
-        })
-        .collect::<Result<_, ResourceError>>()?;
+    let tracks = (0..track_count).map(|i| read_track(res, tracks_ptr + i * 4)).collect::<Result<_, _>>()?;
     let mut streams = Vec::with_capacity(stream_count as usize);
     for i in 0..stream_count {
-        let s = res.u64(streams_ptr + i * 8)?;
-        let name = res.u32(s)?;
-        let (l1, l2, l3) = (res.u32(s + 4)? as usize, res.u32(s + 8)? as usize, res.u16(s + 12)? as usize);
-        let d1 = res.bytes(s + 16, l1)?;
-        let d2 = res.bytes(s + 16 + l1 as u64, l2)?;
-        let d3 = res.bytes(s + 16 + (l1 + l2) as u64, l3)?;
-        let ops = if shift == 0 { read_ops(d1, d2, d3)? } else { read_ops_rdr2(d1, d2, d3)? };
-        streams.push(Stream { name, ops });
+        streams.push(read_stream(res, res.u64(streams_ptr + i * 8)?, shift)?);
     }
     Ok(Expression { name, tracks, streams, variables: variables as usize })
+}
+
+fn read_track(res: &Resource, t: u64) -> Result<Track, ResourceError> {
+    Ok(Track { bone: res.u16(t)?, track: res.u8(t + 2)?, format: res.u8(t + 3)? & 0x7F })
+}
+
+/// The three data blocks of the stream at `s`, one after the other behind its header.
+fn stream_data(res: &Resource, s: u64) -> Result<[&[u8]; 3], ResourceError> {
+    let (l1, l2, l3) = (res.u32(s + 4)? as usize, res.u32(s + 8)? as usize, res.u16(s + 12)? as usize);
+    let d1 = res.bytes(s + 16, l1)?;
+    let d2 = res.bytes(s + 16 + l1 as u64, l2)?;
+    let d3 = res.bytes(s + 16 + (l1 + l2) as u64, l3)?;
+    Ok([d1, d2, d3])
+}
+
+/// A stream: its name hash and the operations from its three data blocks (RDR2 when `shift` is set).
+fn read_stream(res: &Resource, s: u64, shift: u64) -> Result<Stream, ResourceError> {
+    let name = res.u32(s)?;
+    let [d1, d2, d3] = stream_data(res, s)?;
+    let ops = if shift == 0 { read_ops(d1, d2, d3)? } else { read_ops_rdr2(d1, d2, d3)? };
+    Ok(Stream { name, ops })
 }
 
 /// Reads an expression dictionary (`.yed`).

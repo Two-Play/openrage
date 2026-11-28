@@ -295,6 +295,15 @@ fn f32_at(d: &[u8], o: usize) -> f32 {
     d.f32_at(o).unwrap_or(0.0)
 }
 
+/// `N` consecutive floats from `at`.
+pub(crate) fn floats<const N: usize>(res: &Resource, at: u64) -> Result<[f32; N], ResourceError> {
+    let mut out = [0.0; N];
+    for (k, v) in out.iter_mut().enumerate() {
+        *v = f32::from_bits(res.u32(at + k as u64 * 4)?);
+    }
+    Ok(out)
+}
+
 pub(crate) fn vec3(res: &Resource, ptr: u64) -> Result<[f32; 3], ResourceError> {
     let b = res.bytes(ptr, 12)?;
     Ok([f32_at(b, 0), f32_at(b, 4), f32_at(b, 8)])
@@ -429,11 +438,8 @@ pub(crate) fn legacy_layout(res: &Resource, decl: u64, stride: usize) -> Result<
     Ok(layout)
 }
 
-fn gen9_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayout, ResourceError> {
-    let offsets = res.bytes(decl, 52 * 4)?;
-    let types = res.bytes(decl + 52 * 4 + 52, 52)?;
-    let mut layout = VertexLayout { stride, ..Default::default() };
-    let enc = |t: u8| match t {
+fn gen9_encoding(t: u8) -> Option<Encoding> {
+    match t {
         2 => Some(Encoding::Float4),
         6 => Some(Encoding::Float3),
         10 => Some(Encoding::Half4),
@@ -443,27 +449,195 @@ fn gen9_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayout,
         30 => Some(Encoding::Uint8x4),
         34 => Some(Encoding::Half2),
         _ => None,
-    };
-    // Slots: 0 position, 4 normal, 16 blend weights, 20 blend indices, 24 colour, 28 uv0, 29 uv1.
-    for (slot, target) in [(0usize, 0u8), (4, 1), (24, 2), (28, 3), (16, 4), (20, 5), (29, 6)] {
+    }
+}
+
+/// The layout attribute a `GEN9_SLOTS` target number stands for.
+fn gen9_target(layout: &mut VertexLayout, target: u8) -> &mut Option<(usize, Encoding)> {
+    match target {
+        0 => &mut layout.position,
+        1 => &mut layout.normal,
+        2 => &mut layout.color,
+        3 => &mut layout.uv,
+        4 => &mut layout.weights,
+        5 => &mut layout.indices,
+        _ => &mut layout.uv1,
+    }
+}
+
+/// Declaration slots and the attribute (`gen9_target`) each holds: 0 position, 4 normal, 16 blend weights,
+/// 20 blend indices, 24 colour, 28 uv0, 29 uv1.
+const GEN9_SLOTS: [(usize, u8); 7] = [(0, 0), (4, 1), (24, 2), (28, 3), (16, 4), (20, 5), (29, 6)];
+
+fn gen9_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayout, ResourceError> {
+    let offsets = res.bytes(decl, 52 * 4)?;
+    let types = res.bytes(decl + 52 * 4 + 52, 52)?;
+    let mut layout = VertexLayout { stride, ..Default::default() };
+    for (slot, target) in GEN9_SLOTS {
         let t = types[slot];
         if t == 0 {
             continue;
         }
         let off = u32::from_le_bytes(offsets[slot * 4..slot * 4 + 4].try_into().unwrap()) as usize;
-        let Some(e) = enc(t) else { continue };
-        let v = Some((off, e));
-        match target {
-            0 => layout.position = v,
-            1 => layout.normal = v,
-            2 => layout.color = v,
-            3 => layout.uv = v,
-            4 => layout.weights = v,
-            5 => layout.indices = v,
-            _ => layout.uv1 = v,
-        }
+        let Some(e) = gen9_encoding(t) else { continue };
+        *gen9_target(&mut layout, target) = Some((off, e));
     }
     Ok(layout)
+}
+
+/// Vertex count, stride, data pointer and layout of a geometry's vertex buffer at `vb`.
+fn read_vertex_buffer(
+    res: &Resource,
+    vb: u64,
+    layout_gen: Gen,
+) -> Result<(usize, usize, u64, VertexLayout), ResourceError> {
+    if layout_gen.sga() { read_vertex_buffer_gen9(res, vb) } else { read_vertex_buffer_legacy(res, vb) }
+}
+
+fn read_vertex_buffer_gen9(res: &Resource, vb: u64) -> Result<(usize, usize, u64, VertexLayout), ResourceError> {
+    let count = res.u32(vb + 0x08)? as usize;
+    let stride = res.u16(vb + 0x0C)? as usize;
+    let data = res.u64(vb + 0x18)?;
+    Ok((count, stride, data, gen9_layout(res, res.u64(vb + 0x38)?, stride)?))
+}
+
+fn read_vertex_buffer_legacy(res: &Resource, vb: u64) -> Result<(usize, usize, u64, VertexLayout), ResourceError> {
+    let stride = res.u16(vb + 0x08)? as usize;
+    let data = res.u64(vb + 0x10)?;
+    let count = res.u32(vb + 0x18)? as usize;
+    Ok((count, stride, data, legacy_layout(res, res.u64(vb + 0x30)?, stride)?))
+}
+
+/// The vertex bytes of a geometry and where its attributes lie in them.
+struct VertexReader<'a> {
+    layout: &'a VertexLayout,
+    bytes: &'a [u8],
+    count: usize,
+}
+
+impl VertexReader<'_> {
+    /// Where attribute (offset, encoding) of vertex i starts, if inside the buffer.
+    fn at(&self, (o, e): (usize, Encoding), i: usize) -> Option<usize> {
+        if self.layout.streamed {
+            let start = o + i * e.size();
+            (o + self.count * e.size() <= self.bytes.len()).then_some(start)
+        } else {
+            (o + e.size() <= self.layout.stride).then_some(i * self.layout.stride + o)
+        }
+    }
+
+    fn attr(&self, slot: Option<(usize, Encoding)>, i: usize) -> Option<[f32; 4]> {
+        slot.and_then(|s| Some(s.1.decode(&self.bytes[self.at(s, i)?..])))
+    }
+
+    fn read_into(&self, mesh: &mut Mesh, pos_slot: (usize, Encoding)) -> Result<(), ResourceError> {
+        for i in 0..self.count {
+            let Some(p_at) = self.at(pos_slot, i) else { return Err(bad("position outside vertex")) };
+            let p = pos_slot.1.decode(&self.bytes[p_at..]);
+            mesh.positions.push([p[0], p[1], p[2]]);
+            self.push_attributes(mesh, i);
+        }
+        Ok(())
+    }
+
+    fn push_attributes(&self, mesh: &mut Mesh, i: usize) {
+        let layout = self.layout;
+        if let Some(n) = self.attr(layout.normal, i) {
+            mesh.normals.push([n[0], n[1], n[2]]);
+        }
+        if let Some(t) = self.attr(layout.uv, i) {
+            mesh.uvs.push([t[0], t[1]]);
+        }
+        if let Some(t) = self.attr(layout.uv1, i) {
+            mesh.uvs1.push([t[0], t[1]]);
+        }
+        if let Some(c) = self.attr(layout.color, i) {
+            mesh.colors.push(c);
+        }
+        if let (Some(w), Some(b)) = (self.attr(layout.weights, i), self.attr(layout.indices, i)) {
+            mesh.bone_weights.push(w);
+            mesh.bone_indices.push(b.map(|v| v as u16));
+        }
+    }
+}
+
+/// Addresses a bone table of RDR2 can have.
+const RDR2_BONE_TABLE: std::ops::Range<u64> = 0x5000_0000..0x7000_0000;
+
+/// Blend indices point into the geometry's bone table (skeleton indices).
+/// RDR2 keeps the table at 0x18 without a count: look up just the entries used.
+fn remap_bones_rdr2(res: &Resource, g: u64, mesh: &mut Mesh) -> Result<(), ResourceError> {
+    let table = res.u64(g + 0x18)?;
+    if RDR2_BONE_TABLE.contains(&table) {
+        let used = mesh.bone_indices.iter().flatten().copied().max().unwrap_or(0) as u64 + 1;
+        if let Ok(ids) = (0..used).map(|i| res.u16(table + i * 2)).collect::<Result<Vec<u16>, _>>() {
+            for b in &mut mesh.bone_indices {
+                *b = b.map(|i| ids.get(i as usize).copied().unwrap_or(0));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remap_bones(res: &Resource, g: u64, mesh: &mut Mesh) -> Result<(), ResourceError> {
+    let table = res.u64(g + 0x68)?;
+    let count = res.u16(g + 0x72)? as u64;
+    if table != 0 && count > 0 && count <= 1024 {
+        let ids: Vec<u16> = (0..count).map(|i| res.u16(table + i * 2)).collect::<Result<_, _>>()?;
+        for b in &mut mesh.bone_indices {
+            *b = b.map(|i| ids.get(i as usize).copied().unwrap_or(0));
+        }
+    }
+    Ok(())
+}
+
+fn remap_blend_indices(res: &Resource, g: u64, layout_gen: Gen, mesh: &mut Mesh) -> Result<(), ResourceError> {
+    if mesh.bone_indices.is_empty() {
+        Ok(())
+    } else if layout_gen == Gen::Rdr2 {
+        remap_bones_rdr2(res, g, mesh)
+    } else {
+        remap_bones(res, g, mesh)
+    }
+}
+
+fn read_indices(res: &Resource, ib: u64, layout_gen: Gen) -> Result<Vec<u32>, ResourceError> {
+    let index_count = res.u32(ib + 0x08)? as usize;
+    let (index_ptr, index_size) = if layout_gen.sga() {
+        (res.u64(ib + 0x18)?, res.u16(ib + 0x0C)?.max(2) as usize)
+    } else {
+        (res.u64(ib + 0x10)?, 2)
+    };
+    let ib_bytes = res.bytes(index_ptr, index_count * index_size)?;
+    Ok(if index_size == 4 {
+        ib_bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect()
+    } else {
+        ib_bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c) as u32).collect()
+    })
+}
+
+/// The RDR2 vertex buffer keeps normals as unsigned 10:10:10:2.
+fn fix_rdr2_normal(layout: &mut VertexLayout) {
+    if let Some((o, Encoding::R10G10B10A2)) = layout.normal {
+        layout.normal = Some((o, Encoding::R10G10B10A2Unorm));
+    }
+}
+
+/// The vertices of a geometry's vertex buffer at `vb`, and their count.
+fn read_vertices(res: &Resource, vb: u64, layout_gen: Gen) -> Result<(Mesh, usize), ResourceError> {
+    let (count, stride, data, mut layout) = read_vertex_buffer(res, vb, layout_gen)?;
+    if stride == 0 || count > 1 << 22 {
+        return Err(bad("implausible vertex buffer"));
+    }
+    layout.streamed = layout_gen == Gen::Rdr2;
+    if layout_gen == Gen::Rdr2 {
+        fix_rdr2_normal(&mut layout);
+    }
+    let bytes = res.bytes(data, count * stride)?;
+    let pos_slot = layout.position.ok_or_else(|| bad("vertices without positions"))?;
+    let mut mesh = Mesh::default();
+    VertexReader { layout: &layout, bytes, count }.read_into(&mut mesh, pos_slot)?;
+    Ok((mesh, count))
 }
 
 fn read_geometry(res: &Resource, g: u64, layout_gen: Gen) -> Result<Mesh, ResourceError> {
@@ -472,99 +646,59 @@ fn read_geometry(res: &Resource, g: u64, layout_gen: Gen) -> Result<Mesh, Resour
     } else {
         (res.u64(g + 0x18)?, res.u64(g + 0x38)?)
     };
-    let (count, stride, data, mut layout) = if layout_gen.sga() {
-        let count = res.u32(vb + 0x08)? as usize;
-        let stride = res.u16(vb + 0x0C)? as usize;
-        let data = res.u64(vb + 0x18)?;
-        (count, stride, data, gen9_layout(res, res.u64(vb + 0x38)?, stride)?)
-    } else {
-        let stride = res.u16(vb + 0x08)? as usize;
-        let data = res.u64(vb + 0x10)?;
-        let count = res.u32(vb + 0x18)? as usize;
-        (count, stride, data, legacy_layout(res, res.u64(vb + 0x30)?, stride)?)
-    };
-    if stride == 0 || count > 1 << 22 {
-        return Err(bad("implausible vertex buffer"));
-    }
-    layout.streamed = layout_gen == Gen::Rdr2;
-    if layout_gen == Gen::Rdr2
-        && let Some((o, Encoding::R10G10B10A2)) = layout.normal
-    {
-        layout.normal = Some((o, Encoding::R10G10B10A2Unorm));
-    }
-    let bytes = res.bytes(data, count * stride)?;
-    let (pos_off, pos_enc) = layout.position.ok_or_else(|| bad("vertices without positions"))?;
-    // Where attribute (offset, encoding) of vertex i starts, if inside the buffer.
-    let at = |(o, e): (usize, Encoding), i: usize| -> Option<usize> {
-        if layout.streamed {
-            let start = o + i * e.size();
-            (o + count * e.size() <= bytes.len()).then_some(start)
-        } else {
-            (o + e.size() <= layout.stride).then_some(i * layout.stride + o)
-        }
-    };
-    let attr = |slot: Option<(usize, Encoding)>, i: usize| slot.and_then(|s| Some(s.1.decode(&bytes[at(s, i)?..])));
-    let mut mesh = Mesh::default();
-    for i in 0..count {
-        let Some(p_at) = at((pos_off, pos_enc), i) else { return Err(bad("position outside vertex")) };
-        let p = pos_enc.decode(&bytes[p_at..]);
-        mesh.positions.push([p[0], p[1], p[2]]);
-        if let Some(n) = attr(layout.normal, i) {
-            mesh.normals.push([n[0], n[1], n[2]]);
-        }
-        if let Some(t) = attr(layout.uv, i) {
-            mesh.uvs.push([t[0], t[1]]);
-        }
-        if let Some(t) = attr(layout.uv1, i) {
-            mesh.uvs1.push([t[0], t[1]]);
-        }
-        if let Some(c) = attr(layout.color, i) {
-            mesh.colors.push(c);
-        }
-        if let (Some(w), Some(b)) = (attr(layout.weights, i), attr(layout.indices, i)) {
-            mesh.bone_weights.push(w);
-            mesh.bone_indices.push(b.map(|v| v as u16));
-        }
-    }
-    // Blend indices point into the geometry's bone table (skeleton indices).
-    // RDR2 keeps the table at 0x18 without a count: look up just the entries used.
-    if !mesh.bone_indices.is_empty() && layout_gen == Gen::Rdr2 {
-        let table = res.u64(g + 0x18)?;
-        if (0x5000_0000..0x7000_0000).contains(&table) {
-            let used = mesh.bone_indices.iter().flatten().copied().max().unwrap_or(0) as u64 + 1;
-            if let Ok(ids) = (0..used).map(|i| res.u16(table + i * 2)).collect::<Result<Vec<u16>, _>>() {
-                for b in &mut mesh.bone_indices {
-                    *b = b.map(|i| ids.get(i as usize).copied().unwrap_or(0));
-                }
-            }
-        }
-    } else if !mesh.bone_indices.is_empty() {
-        let table = res.u64(g + 0x68)?;
-        let count = res.u16(g + 0x72)? as u64;
-        if table != 0 && count > 0 && count <= 1024 {
-            let ids: Vec<u16> = (0..count).map(|i| res.u16(table + i * 2)).collect::<Result<_, _>>()?;
-            for b in &mut mesh.bone_indices {
-                *b = b.map(|i| ids.get(i as usize).copied().unwrap_or(0));
-            }
-        }
-    }
+    let (mut mesh, count) = read_vertices(res, vb, layout_gen)?;
+    remap_blend_indices(res, g, layout_gen, &mut mesh)?;
 
-    let index_count = res.u32(ib + 0x08)? as usize;
-    let (index_ptr, index_size) = if layout_gen.sga() {
-        (res.u64(ib + 0x18)?, res.u16(ib + 0x0C)?.max(2) as usize)
-    } else {
-        (res.u64(ib + 0x10)?, 2)
-    };
-    let ib_bytes = res.bytes(index_ptr, index_count * index_size)?;
-    mesh.indices = if index_size == 4 {
-        ib_bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect()
-    } else {
-        ib_bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c) as u32).collect()
-    };
+    mesh.indices = read_indices(res, ib, layout_gen)?;
     if mesh.indices.iter().any(|&i| i as usize >= count) {
         return Err(bad("index outside the vertex buffer"));
     }
     mesh.indices.truncate(mesh.indices.len() / 3 * 3);
+    Ok(mesh)
+}
+
+/// What a model says about its geometries.
+struct ModelInfo {
+    geoms: u64,
+    count: u64,
+    mapping: u64,
+    /// The bone a rigidly attached model sits on.
+    bone: Option<usize>,
+    tags: Vec<u16>,
+}
+
+/// The bone tags of a skinned RDR2 model (`binding & 0xFF` of them, from the table at `0x28`).
+fn read_model_tags(res: &Resource, model: u64, binding: u32) -> Result<Vec<u16>, ResourceError> {
+    let table = res.u64(model + 0x28)?;
+    if !RDR2_BONE_TABLE.contains(&table) {
+        return Ok(Vec::new());
+    }
+    (0..(binding & 0xFF) as u64).map(|k| res.u16(table + k * 2)).collect()
+}
+
+fn read_model_info(res: &Resource, model: u64, layout_gen: Gen) -> Result<ModelInfo, ResourceError> {
+    let geoms = res.u64(model + 0x08)?;
+    let count = res.u16(model + 0x10)? as u64;
+    let mapping = res.u64(model + 0x20)?;
+    // RDR2 keeps a pointer at 0x28 (the bone tags of a part without a
+    // skeleton of its own) and the binding at 0x30.
+    let rdr2 = layout_gen == Gen::Rdr2;
+    let binding = res.u32(model + if rdr2 { 0x30 } else { 0x28 })?;
+    let skinned = (binding >> 8) & 0xFF != 0;
+    let bone = (!skinned && binding >> 24 != 0).then_some((binding >> 24) as usize);
+    let tags = if rdr2 && skinned { read_model_tags(res, model, binding)? } else { Vec::new() };
+    Ok(ModelInfo { geoms, count, mapping, bone, tags })
+}
+
+/// Geometry `i` of a model.
+fn read_model_mesh(res: &Resource, info: &ModelInfo, i: u64, layout_gen: Gen) -> Result<Mesh, ResourceError> {
+    let g = res.u64(info.geoms + i * 8)?;
+    let mut mesh = read_geometry(res, g, layout_gen)?;
+    mesh.shader = if info.mapping != 0 { res.u16(info.mapping + i * 2)? } else { 0 };
+    // Without a bone table of its own the geometry's indices point into the model's tags.
+    if !info.tags.is_empty() && !mesh.bone_indices.is_empty() && res.u64(g + 0x18)? == 0 {
+        mesh.bone_tags = info.tags.clone();
+    }
     Ok(mesh)
 }
 
@@ -583,30 +717,9 @@ fn read_models(
         if model == 0 {
             continue;
         }
-        let geoms = res.u64(model + 0x08)?;
-        let gcount = res.u16(model + 0x10)? as u64;
-        let mapping = res.u64(model + 0x20)?;
-        // RDR2 keeps a pointer at 0x28 (the bone tags of a part without a
-        // skeleton of its own) and the binding at 0x30.
-        let rdr2 = layout_gen == Gen::Rdr2;
-        let binding = res.u32(model + if rdr2 { 0x30 } else { 0x28 })?;
-        let skinned = (binding >> 8) & 0xFF != 0;
-        let bone = (!skinned && binding >> 24 != 0).then_some((binding >> 24) as usize);
-        let tags: Vec<u16> = match (rdr2 && skinned).then(|| res.u64(model + 0x28)).transpose()? {
-            Some(table) if (0x5000_0000..0x7000_0000).contains(&table) => {
-                (0..(binding & 0xFF) as u64).map(|k| res.u16(table + k * 2)).collect::<Result<_, _>>()?
-            }
-            _ => Vec::new(),
-        };
-        for i in 0..gcount {
-            let g = res.u64(geoms + i * 8)?;
-            let mut mesh = read_geometry(res, g, layout_gen)?;
-            mesh.shader = if mapping != 0 { res.u16(mapping + i * 2)? } else { 0 };
-            // Without a bone table of its own the geometry's indices point into the model's tags.
-            if !tags.is_empty() && !mesh.bone_indices.is_empty() && res.u64(g + 0x18)? == 0 {
-                mesh.bone_tags = tags.clone();
-            }
-            out.push((mesh, bone));
+        let info = read_model_info(res, model, layout_gen)?;
+        for i in 0..info.count {
+            out.push((read_model_mesh(res, &info, i, layout_gen)?, info.bone));
         }
     }
     Ok(())
@@ -618,77 +731,119 @@ fn texture_name(res: &Resource, tex: u64) -> Option<String> {
     (!name.is_empty() && name.len() < 128 && name.chars().all(|c| c.is_ascii_graphic())).then_some(name)
 }
 
+/// Most shaders and, per shader, textures and parameters read.
+const MAX_SHADERS: u64 = 512;
+const MAX_SHADER_TEXTURES: u64 = 32;
+const MAX_SHADER_PARAMETERS: u64 = 128;
+
+/// (parameter hash or 0, texture structure) per texture reference.
+type TextureRefs = Vec<(u32, u64)>;
+
+/// The name hashes of the texture slots of an Enhanced shader, from its parameter info block at `infos`.
+/// The block has the number of textures at 1, the number of parameters at 4 and from 8 on
+/// (name hash, slot) pairs; the low two bits of a slot are its kind (0 = texture), the rest its index.
+fn sga_texture_hashes(res: &Resource, infos: u64) -> Vec<u32> {
+    let (num, total) = if infos != 0 {
+        (res.u8(infos + 1).unwrap_or(0) as u64, res.u8(infos + 4).unwrap_or(0) as u64)
+    } else {
+        (0, 0)
+    };
+    let mut hashes = vec![0u32; num.min(MAX_SHADER_TEXTURES) as usize];
+    for k in 0..total.min(MAX_SHADER_PARAMETERS) {
+        let (Ok(hash), Ok(slot)) = (res.u32(infos + 8 + k * 8), res.u32(infos + 12 + k * 8)) else { break };
+        if slot & 3 == 0
+            && let Some(h) = hashes.get_mut((slot >> 2) as usize)
+        {
+            *h = hash;
+        }
+    }
+    hashes
+}
+
+/// Name hash and texture references of the Enhanced / RDR2 shader at `s`.
+fn read_sga_shader(res: &Resource, s: u64) -> Result<(u32, TextureRefs), ResourceError> {
+    let name_hash = res.u32(s)?;
+    // Texture references: a pointer array at 0x10, the parameter info block at 0x20.
+    let ptrs = res.u64(s + 0x10)?;
+    let infos = res.u64(s + 0x20)?;
+    let hashes = sga_texture_hashes(res, infos);
+    let mut refs = TextureRefs::new();
+    if ptrs != 0 {
+        for (t, hash) in hashes.into_iter().enumerate() {
+            if let Some(p) = res.u64(ptrs + t as u64 * 8).ok().filter(|&p| p != 0) {
+                refs.push((hash, p));
+            }
+        }
+    }
+    Ok((name_hash, refs))
+}
+
+/// Name hash and texture references of the Legacy shader at `s`.
+fn read_legacy_shader(res: &Resource, s: u64) -> Result<(u32, TextureRefs), ResourceError> {
+    // Parameters: 16 bytes each (data type at 0, 0 = texture; data
+    // pointer at 8), then the data of the other parameters (data type
+    // × 16 bytes each), then one name hash per parameter.
+    let params = res.u64(s)?;
+    let name_hash = res.u32(s + 0x08)?;
+    let pcount = res.u8(s + 0x10)? as u64;
+    let types = (0..pcount).map(|p| res.u8(params + p * 16).map(u64::from)).collect::<Result<Vec<u64>, _>>()?;
+    let data: u64 = types.iter().sum::<u64>() * 16;
+    let hashes = params + pcount * 16 + data;
+    let mut refs = TextureRefs::new();
+    for (p, &t) in types.iter().enumerate() {
+        let p = p as u64;
+        if t == 0
+            && let Some(ptr) = res.u64(params + p * 16 + 8).ok().filter(|&ptr| ptr != 0)
+        {
+            refs.push((res.u32(hashes + p * 4).unwrap_or(0), ptr));
+        }
+    }
+    Ok((name_hash, refs))
+}
+
+fn read_shader(res: &Resource, s: u64, layout_gen: Gen) -> Result<Shader, ResourceError> {
+    let (name_hash, refs) = if layout_gen.sga() { read_sga_shader(res, s)? } else { read_legacy_shader(res, s)? };
+    let mut shader = Shader { name_hash, ..Default::default() };
+    for (hash, ptr) in refs {
+        if let Some(name) = texture_name(res, ptr) {
+            shader.samplers.push((hash, name.clone()));
+            if !shader.textures.contains(&name) {
+                shader.textures.push(name);
+            }
+        }
+    }
+    Ok(shader)
+}
+
 fn read_shaders(res: &Resource, group: u64, layout_gen: Gen) -> Result<Vec<Shader>, ResourceError> {
     let list = res.u64(group + 0x10)?;
     let count = res.u16(group + 0x18)? as u64;
-    let mut shaders = Vec::new();
-    for i in 0..count.min(512) {
-        let s = res.u64(list + i * 8)?;
-        let mut shader = Shader::default();
-        // (parameter hash or 0, texture structure) per texture reference.
-        let mut refs: Vec<(u32, u64)> = Vec::new();
-        if layout_gen.sga() {
-            shader.name_hash = res.u32(s)?;
-            // Texture references: a pointer array at 0x10. The parameter info
-            // block (0x20) has the number of textures at 1, the number of
-            // parameters at 4 and from 8 on (name hash, slot) pairs; the low
-            // two bits of a slot are its kind (0 = texture), the rest its index.
-            let ptrs = res.u64(s + 0x10)?;
-            let infos = res.u64(s + 0x20)?;
-            let (num, total) = if infos != 0 {
-                (res.u8(infos + 1).unwrap_or(0) as u64, res.u8(infos + 4).unwrap_or(0) as u64)
-            } else {
-                (0, 0)
-            };
-            let mut hashes = vec![0u32; num.min(32) as usize];
-            for k in 0..total.min(128) {
-                let (Ok(hash), Ok(slot)) = (res.u32(infos + 8 + k * 8), res.u32(infos + 12 + k * 8)) else { break };
-                if slot & 3 == 0
-                    && let Some(h) = hashes.get_mut((slot >> 2) as usize)
-                {
-                    *h = hash;
-                }
-            }
-            if ptrs != 0 {
-                for (t, hash) in hashes.into_iter().enumerate() {
-                    if let Some(p) = res.u64(ptrs + t as u64 * 8).ok().filter(|&p| p != 0) {
-                        refs.push((hash, p));
-                    }
-                }
-            }
-        } else {
-            // Parameters: 16 bytes each (data type at 0, 0 = texture; data
-            // pointer at 8), then the data of the other parameters (data type
-            // × 16 bytes each), then one name hash per parameter.
-            let params = res.u64(s)?;
-            shader.name_hash = res.u32(s + 0x08)?;
-            let pcount = res.u8(s + 0x10)? as u64;
-            let mut types = Vec::new();
-            for p in 0..pcount {
-                types.push(res.u8(params + p * 16)? as u64);
-            }
-            let data: u64 = types.iter().sum::<u64>() * 16;
-            let hashes = params + pcount * 16 + data;
-            for (p, &t) in types.iter().enumerate() {
-                let p = p as u64;
-                if t == 0
-                    && let Some(ptr) = res.u64(params + p * 16 + 8).ok().filter(|&ptr| ptr != 0)
-                {
-                    refs.push((res.u32(hashes + p * 4).unwrap_or(0), ptr));
-                }
-            }
-        }
-        for (hash, ptr) in refs {
-            if let Some(name) = texture_name(res, ptr) {
-                shader.samplers.push((hash, name.clone()));
-                if !shader.textures.contains(&name) {
-                    shader.textures.push(name);
-                }
-            }
-        }
-        shaders.push(shader);
-    }
-    Ok(shaders)
+    (0..count.min(MAX_SHADERS)).map(|i| read_shader(res, res.u64(list + i * 8)?, layout_gen)).collect()
+}
+
+/// Where a skeleton and its bones keep what we read.
+struct BoneLayout {
+    /// Pointer to the bones list, in the skeleton.
+    list: u64,
+    /// Name pointer, tag and parent, in a bone.
+    name: u64,
+    tag: u64,
+    parent: u64,
+}
+
+const BONES_GTA5: BoneLayout = BoneLayout { list: 0x20, name: 0x38, tag: 0x44, parent: 0x32 };
+const BONES_RDR2: BoneLayout = BoneLayout { list: 0x28, name: 0x30, tag: 0x4A, parent: 0x46 };
+
+fn read_bone_gen(res: &Resource, b: u64, layout: &BoneLayout) -> Result<Bone, ResourceError> {
+    let name_ptr = res.u64(b + layout.name)?;
+    Ok(Bone {
+        name: if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() },
+        tag: res.u16(b + layout.tag)?,
+        parent: res.u16(b + layout.parent)? as i16,
+        rotation: floats(res, b)?,
+        translation: floats(res, b + 0x10)?,
+        scale: floats(res, b + 0x20)?,
+    })
 }
 
 /// A skeleton: GTA V's bones list is at 0x20 (parent at bone+0x32, tag at
@@ -696,25 +851,15 @@ fn read_shaders(res: &Resource, group: u64, layout_gen: Gen) -> Result<Vec<Shade
 /// bone count at 0x5E and 0x50-byte bones with rotation, translation,
 /// scale and name pointer first.
 fn read_skeleton_gen(res: &Resource, ptr: u64, layout_gen: Gen) -> Result<Skeleton, ResourceError> {
-    let rdr2 = layout_gen == Gen::Rdr2;
-    let bones = res.u64(ptr + if rdr2 { 0x28 } else { 0x20 })?;
+    let layout = if layout_gen == Gen::Rdr2 { &BONES_RDR2 } else { &BONES_GTA5 };
+    let bones = res.u64(ptr + layout.list)?;
     let count = res.u16(ptr + 0x5E)? as u64;
     if bones == 0 || count > 2048 {
         return Err(bad("invalid skeleton"));
     }
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let b = bones + i * 0x50;
-        let f = |o: u64| -> Result<f32, ResourceError> { Ok(f32::from_bits(res.u32(b + o)?)) };
-        let name_ptr = res.u64(b + if rdr2 { 0x30 } else { 0x38 })?;
-        out.push(Bone {
-            name: if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() },
-            tag: res.u16(b + if rdr2 { 0x4A } else { 0x44 })?,
-            parent: res.u16(b + if rdr2 { 0x46 } else { 0x32 })? as i16,
-            rotation: [f(0x00)?, f(0x04)?, f(0x08)?, f(0x0C)?],
-            translation: [f(0x10)?, f(0x14)?, f(0x18)?],
-            scale: [f(0x20)?, f(0x24)?, f(0x28)?],
-        });
+        out.push(read_bone_gen(res, bones + i * 0x50, layout)?);
     }
     Ok(Skeleton { bones: out })
 }
@@ -777,10 +922,26 @@ fn is_enhanced(version: u32) -> Result<bool, ResourceError> {
     }
 }
 
-/// The texture dictionaries a GTA V model carries (`ext`: `ydr`, `yft`
-/// with its parts, or `ydd`), each once, and whether the model is Enhanced.
-pub fn embedded_texture_dicts(res: &Resource, ext: &str) -> Result<(bool, Vec<u64>), ResourceError> {
-    let enhanced = is_enhanced(res.version)?;
+/// Adds the drawables of the parts (wheels, doors, …) of a GTA V `.yft` that carry their own.
+fn push_part_drawables(res: &Resource, drawables: &mut Vec<u64>) {
+    if let Ok(group) = res.u64(Resource::ROOT + 0xF0)
+        && group != 0
+        && let Some(lod) = (0..3).filter_map(|i| res.u64(group + 0x10 + i * 8).ok()).find(|&p| p != 0)
+        && let (Ok(list), Ok(count)) = (res.u64(lod + 0xD0), res.u8(lod + 0x11E))
+    {
+        for i in 0..count as u64 {
+            if let Ok(child) = res.u64(list + i * 8)
+                && child != 0
+                && let Ok(d) = res.u64(child + 0xA0)
+            {
+                drawables.push(d);
+            }
+        }
+    }
+}
+
+/// The drawables of a GTA V model (`ext`: `ydr`, `yft` with its parts, or `ydd`).
+fn model_drawables(res: &Resource, ext: &str) -> Result<Vec<u64>, ResourceError> {
     let root = Resource::ROOT;
     let mut drawables = Vec::new();
     match ext.to_ascii_lowercase().as_str() {
@@ -788,20 +949,7 @@ pub fn embedded_texture_dicts(res: &Resource, ext: &str) -> Result<(bool, Vec<u6
         "yft" => {
             drawables.push(res.u64(root + 0x30)?);
             // Parts (wheels, doors, …) can carry their own.
-            if let Ok(group) = res.u64(root + 0xF0)
-                && group != 0
-                && let Some(lod) = (0..3).filter_map(|i| res.u64(group + 0x10 + i * 8).ok()).find(|&p| p != 0)
-                && let (Ok(list), Ok(count)) = (res.u64(lod + 0xD0), res.u8(lod + 0x11E))
-            {
-                for i in 0..count as u64 {
-                    if let Ok(child) = res.u64(list + i * 8)
-                        && child != 0
-                        && let Ok(d) = res.u64(child + 0xA0)
-                    {
-                        drawables.push(d);
-                    }
-                }
-            }
+            push_part_drawables(res, &mut drawables);
         }
         "ydd" => {
             let list = res.u64(root + 0x30)?;
@@ -811,14 +959,28 @@ pub fn embedded_texture_dicts(res: &Resource, ext: &str) -> Result<(bool, Vec<u6
         }
         other => return Err(bad(format!("{other} files have no drawables"))),
     }
+    Ok(drawables)
+}
+
+/// The texture dictionary of the drawable at `d`, if it has one.
+fn texture_dict_of(res: &Resource, d: u64) -> Result<Option<u64>, ResourceError> {
+    let group = res.u64(d + 0x10)?;
+    if group == 0 {
+        return Ok(None);
+    }
+    Ok(Some(res.u64(group + 0x08)?).filter(|&txd| txd != 0))
+}
+
+/// The texture dictionaries a GTA V model carries (`ext`: `ydr`, `yft`
+/// with its parts, or `ydd`), each once, and whether the model is Enhanced.
+pub fn embedded_texture_dicts(res: &Resource, ext: &str) -> Result<(bool, Vec<u64>), ResourceError> {
+    let enhanced = is_enhanced(res.version)?;
+    let drawables = model_drawables(res, ext)?;
     let mut dicts = Vec::new();
     for d in drawables.into_iter().filter(|&d| d != 0) {
-        let group = res.u64(d + 0x10)?;
-        if group == 0 {
-            continue;
-        }
-        let txd = res.u64(group + 0x08)?;
-        if txd != 0 && !dicts.contains(&txd) {
+        if let Some(txd) = texture_dict_of(res, d)?
+            && !dicts.contains(&txd)
+        {
             dicts.push(txd);
         }
     }
@@ -918,56 +1080,94 @@ fn read_fragment_children_rdr2(
     body: &Drawable,
     cloths: &[u64],
 ) -> Result<Vec<FragmentChild>, ResourceError> {
-    let ok = |p: u64| (0x5000_0000..0x6000_0000).contains(&p);
-    let group = res.u64(Resource::ROOT + 0x90)?;
-    if !ok(group) {
-        return Ok(Vec::new());
-    }
-    let Some(lod) = (0..3).map(|i| res.u64(group + 0x10 + i * 8)).find_map(|p| p.ok().filter(|&p| ok(p))) else {
-        return Ok(Vec::new());
-    };
-    let (groups, group_of, list) = (res.u64(lod + 0xC8)?, res.u64(lod + 0x110)?, res.u64(lod + 0x118)?);
-    let (group_count, count) = (res.u8(lod + 0x140)? as u64, res.u8(lod + 0x146)? as u64);
-    if !ok(groups) || !ok(group_of) || !ok(list) {
-        return Ok(Vec::new());
-    }
-    let skeleton = body.skeleton.as_ref();
-    // The bone of group `g`: by its name, else its parent's (at most 64 steps up).
-    let bone_of = |mut g: u64| -> Option<u16> {
-        let skeleton = skeleton?;
-        for _ in 0..64 {
-            if g >= group_count {
-                return None;
-            }
-            let at = res.u64(groups + g * 8).ok().filter(|&p| ok(p))?;
-            let name = res.string(at + 0x4F).ok()?;
-            if let Some(b) = skeleton.find_name(&name) {
-                return Some(skeleton.bones[b].tag);
-            }
-            g = res.u8(at + 0x06).ok().filter(|&p| p != 0xFF)? as u64;
-        }
-        None
-    };
+    let Some(lod) = Rdr2ChildLod::read(res, body.skeleton.as_ref())? else { return Ok(Vec::new()) };
     let mut seen = cloths.to_vec();
     let mut out = Vec::new();
-    for i in 0..count {
-        let ptr = res.u64(list + i * 8)?;
-        if !ok(ptr) || seen.contains(&ptr) {
+    for i in 0..lod.count {
+        let ptr = res.u64(lod.list + i * 8)?;
+        if !is_rdr2_pointer(ptr) || seen.contains(&ptr) {
             continue;
         }
         seen.push(ptr);
-        let mut drawable = read_drawable_gen(res, ptr, Gen::Rdr2)?;
+        if let Some(child) = lod.read_child(body, i, ptr)? {
+            out.push(child);
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `p` points into the system part of an RDR2 resource.
+fn is_rdr2_pointer(p: u64) -> bool {
+    (0x5000_0000..0x6000_0000).contains(&p)
+}
+
+/// The first physics LOD of an RDR2 fragment: its drawables and the groups that name their bones.
+struct Rdr2ChildLod<'a> {
+    res: &'a Resource,
+    skeleton: Option<&'a Skeleton>,
+    groups: u64,
+    group_count: u64,
+    group_of: u64,
+    list: u64,
+    count: u64,
+}
+
+impl<'a> Rdr2ChildLod<'a> {
+    /// The first LOD of the physics LOD group; `None` if the fragment has none.
+    fn first_lod(res: &Resource) -> Result<Option<u64>, ResourceError> {
+        let group = res.u64(Resource::ROOT + 0x90)?;
+        if !is_rdr2_pointer(group) {
+            return Ok(None);
+        }
+        Ok((0..3).map(|i| res.u64(group + 0x10 + i * 8)).find_map(|p| p.ok().filter(|&p| is_rdr2_pointer(p))))
+    }
+
+    /// The groups and drawables lists of the LOD at `lod`.
+    fn at(res: &'a Resource, skeleton: Option<&'a Skeleton>, lod: u64) -> Result<Self, ResourceError> {
+        let (groups, group_of, list) = (res.u64(lod + 0xC8)?, res.u64(lod + 0x110)?, res.u64(lod + 0x118)?);
+        let (group_count, count) = (res.u8(lod + 0x140)? as u64, res.u8(lod + 0x146)? as u64);
+        Ok(Self { res, skeleton, groups, group_count, group_of, list, count })
+    }
+
+    /// `None` if the fragment has no such LOD or its lists do not point into the resource.
+    fn read(res: &'a Resource, skeleton: Option<&'a Skeleton>) -> Result<Option<Self>, ResourceError> {
+        let Some(lod) = Self::first_lod(res)? else { return Ok(None) };
+        let this = Self::at(res, skeleton, lod)?;
+        let lists = [this.groups, this.group_of, this.list];
+        Ok(lists.into_iter().all(is_rdr2_pointer).then_some(this))
+    }
+
+    /// The bone of group `g`: by its name, else its parent's (at most 64 steps up).
+    fn bone_of(&self, mut g: u64) -> Option<u16> {
+        let skeleton = self.skeleton?;
+        for _ in 0..64 {
+            if g >= self.group_count {
+                return None;
+            }
+            let at = self.res.u64(self.groups + g * 8).ok().filter(|&p| is_rdr2_pointer(p))?;
+            let name = self.res.string(at + 0x4F).ok()?;
+            if let Some(b) = skeleton.find_name(&name) {
+                return Some(skeleton.bones[b].tag);
+            }
+            g = self.res.u8(at + 0x06).ok().filter(|&p| p != 0xFF)? as u64;
+        }
+        None
+    }
+
+    /// Child `i`, whose drawable is at `ptr`; `None` if it has no meshes.
+    fn read_child(&self, body: &Drawable, i: u64, ptr: u64) -> Result<Option<FragmentChild>, ResourceError> {
+        let mut drawable = read_drawable_gen(self.res, ptr, Gen::Rdr2)?;
         if drawable.meshes.is_empty() {
-            continue;
+            return Ok(None);
         }
         if drawable.shaders.is_empty() {
             drawable.shaders = body.shaders.clone();
         }
-        let g = res.u16(group_of + i * 2)? as u64;
-        let bone_tag = bone_of(g).or_else(|| skeleton.and_then(|s| s.bones.first()).map(|b| b.tag)).unwrap_or(0);
-        out.push(FragmentChild { bone_tag, drawable });
+        let g = self.res.u16(self.group_of + i * 2)? as u64;
+        let first_bone = || self.skeleton.and_then(|s| s.bones.first()).map(|b| b.tag);
+        let bone_tag = self.bone_of(g).or_else(first_bone).unwrap_or(0);
+        Ok(Some(FragmentChild { bone_tag, drawable }))
     }
-    Ok(out)
 }
 
 pub fn parse_fragment(res: &Resource) -> Result<Fragment, ResourceError> {

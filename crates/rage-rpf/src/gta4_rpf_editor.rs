@@ -385,6 +385,77 @@ pub fn rebuild_toc(path: &Path, key: Option<&Gta4Key>) -> Result<(Vec<u8>, Vec<u
     Ok((original, rebuilt))
 }
 
+/// A file's place after a commit: (offset if kept, bytes to write).
+type Placed = Vec<(Option<u64>, Option<Vec<u8>>)>;
+
+/// The package may not grow past this (2 GiB less slack).
+const MAX_PACKAGE_END: u64 = 0x7FFF_FF00;
+
+/// Sizes the table, then moves entries starting inside it to the end.
+fn plan_placement(pkg: &Package, file: &File, stats: &mut CommitStats) -> Result<(usize, Placed), RpfError> {
+    let order = pkg.layout();
+    let toc_len = pkg.toc_len_for(&order);
+    let toc_end = TOC_OFFSET + toc_len as u64;
+    let mut placed: Placed = Vec::with_capacity(order.len());
+    for (node, _) in &order {
+        placed.push(match &node.kind {
+            Kind::Dir { .. } => (None, None),
+            Kind::File { data: Data::Archive { offset, stored }, .. } if *offset < toc_end => {
+                let mut bytes = vec![0u8; *stored as usize];
+                read_exact_at(file, &mut bytes, *offset)?;
+                stats.relocated += 1;
+                (None, Some(bytes))
+            }
+            Kind::File { data: Data::Archive { offset, .. }, .. } => (Some(*offset), None),
+            Kind::File { data: Data::Raw(bytes), .. } => (None, Some(bytes.clone())),
+        });
+    }
+    Ok((toc_len, placed))
+}
+
+/// The bytes a file takes up in the package: whole blocks, at least one.
+fn padded_len(len: usize) -> u64 {
+    (len as u64).div_ceil(BLOCK).max(1) * BLOCK
+}
+
+/// The offset of every file (appended ones from `end` on) and the new end.
+fn assign_offsets(placed: &Placed, mut end: u64) -> Result<(Vec<u64>, u64), RpfError> {
+    let mut offsets = Vec::with_capacity(placed.len());
+    for (kept, bytes) in placed {
+        offsets.push(match (kept, bytes) {
+            (Some(o), _) => *o,
+            (None, Some(b)) => {
+                let at = end;
+                end += padded_len(b.len());
+                at
+            }
+            (None, None) => 0,
+        });
+    }
+    if end > MAX_PACKAGE_END {
+        return Err(RpfError::Edit("the package would grow past 2 GiB".into()));
+    }
+    Ok((offsets, end))
+}
+
+/// Writes the appended and relocated data, zero-padded to whole blocks.
+fn write_placed(
+    file: &mut File,
+    placed: &mut Placed,
+    offsets: &[u64],
+    stats: &mut CommitStats,
+) -> Result<(), RpfError> {
+    for ((_, bytes), offset) in placed.iter_mut().zip(offsets) {
+        let Some(bytes) = bytes.take() else { continue };
+        file.seek(SeekFrom::Start(*offset))?;
+        file.write_all(&bytes)?;
+        let padded = padded_len(bytes.len());
+        file.write_all(&vec![0u8; (padded - bytes.len() as u64) as usize])?;
+        stats.appended += padded;
+    }
+    Ok(())
+}
+
 /// Applies `edits` to the package at `path`. `key` decrypts and encrypts the
 /// table (and data where the archive encrypts it). `before` receives the
 /// backup before anything is written; an error there leaves the file untouched.
@@ -394,55 +465,14 @@ pub fn commit_rpf_with(
     edits: &[RpfEdit],
     before: &mut dyn FnMut(&Backup) -> Result<(), RpfError>,
 ) -> Result<CommitStats, RpfError> {
-    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-    let old_len = file.metadata()?.len();
-    let mut pkg = read_package(&file, path, key)?;
+    let (mut file, old_len, mut pkg) = open_package(path, key)?;
     let old_toc_end = TOC_OFFSET + pkg.toc_len as u64;
-    for edit in edits {
-        pkg.apply(edit)?;
-    }
-    pkg.sort();
+    apply_edits(&mut pkg, edits)?;
     let mut stats = CommitStats { changed: !edits.is_empty(), ..Default::default() };
 
-    // Size the table, then move entries starting inside it to the end.
-    let (toc_len, mut placed) = {
-        let order = pkg.layout();
-        let toc_len = pkg.toc_len_for(&order);
-        let toc_end = TOC_OFFSET + toc_len as u64;
-        // (offset if kept, bytes to write)
-        let mut placed: Vec<(Option<u64>, Option<Vec<u8>>)> = Vec::with_capacity(order.len());
-        for (node, _) in &order {
-            placed.push(match &node.kind {
-                Kind::Dir { .. } => (None, None),
-                Kind::File { data: Data::Archive { offset, stored }, .. } if *offset < toc_end => {
-                    let mut bytes = vec![0u8; *stored as usize];
-                    read_exact_at(&file, &mut bytes, *offset)?;
-                    stats.relocated += 1;
-                    (None, Some(bytes))
-                }
-                Kind::File { data: Data::Archive { offset, .. }, .. } => (Some(*offset), None),
-                Kind::File { data: Data::Raw(bytes), .. } => (None, Some(bytes.clone())),
-            });
-        }
-        (toc_len, placed)
-    };
+    let (toc_len, mut placed) = plan_placement(&pkg, &file, &mut stats)?;
     let new_toc_end = TOC_OFFSET + toc_len as u64;
-    let mut end = old_len.max(new_toc_end).div_ceil(BLOCK) * BLOCK;
-    let mut offsets = Vec::with_capacity(placed.len());
-    for (kept, bytes) in &placed {
-        offsets.push(match (kept, bytes) {
-            (Some(o), _) => *o,
-            (None, Some(b)) => {
-                let at = end;
-                end += (b.len() as u64).div_ceil(BLOCK).max(1) * BLOCK;
-                at
-            }
-            (None, None) => 0,
-        });
-    }
-    if end > 0x7FFF_FF00 {
-        return Err(RpfError::Edit("the package would grow past 2 GiB".into()));
-    }
+    let (offsets, end) = assign_offsets(&placed, old_len.max(new_toc_end).div_ceil(BLOCK) * BLOCK)?;
     let new_len = end.max(new_toc_end);
     let mut toc = {
         let order = pkg.layout();
@@ -451,32 +481,68 @@ pub fn commit_rpf_with(
 
     // Back up the start region before writing anything.
     let region_len = old_toc_end.max(new_toc_end).min(old_len);
-    let mut region = vec![0u8; region_len as usize];
-    read_exact_at(&file, &mut region, 0)?;
-    before(&Backup { old_len, new_len, region })?;
+    take_backup(&file, (old_len, new_len, region_len), before)?;
 
-    for ((_, bytes), offset) in placed.iter_mut().zip(&offsets) {
-        let Some(bytes) = bytes.take() else { continue };
-        file.seek(SeekFrom::Start(*offset))?;
-        file.write_all(&bytes)?;
-        let padded = (bytes.len() as u64).div_ceil(BLOCK).max(1) * BLOCK;
-        file.write_all(&vec![0u8; (padded - bytes.len() as u64) as usize])?;
-        stats.appended += padded;
-    }
-    if let Some(k) = &pkg.toc_key {
-        k.encrypt(&mut toc);
-    }
-    let mut head = pkg.head;
-    head[4..8].copy_from_slice(&(toc_len as u32).to_le_bytes());
-    head[8..12].copy_from_slice(&(offsets.len() as u32).to_le_bytes());
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&head)?;
-    file.seek(SeekFrom::Start(TOC_OFFSET))?;
-    file.write_all(&toc)?;
-    file.set_len(new_len)?;
-    file.sync_all()?;
+    write_placed(&mut file, &mut placed, &offsets, &mut stats)?;
+    write_head_and_toc(&mut file, &pkg, &mut toc, (toc_len, offsets.len()), new_len)?;
     stats.new_len = new_len;
     Ok(stats)
+}
+
+/// The file opened for writing, its length and its table.
+fn open_package(path: &Path, key: Option<&Gta4Key>) -> Result<(File, u64, Package), RpfError> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    let old_len = file.metadata()?.len();
+    let pkg = read_package(&file, path, key)?;
+    Ok((file, old_len, pkg))
+}
+
+fn apply_edits(pkg: &mut Package, edits: &[RpfEdit]) -> Result<(), RpfError> {
+    for edit in edits {
+        pkg.apply(edit)?;
+    }
+    pkg.sort();
+    Ok(())
+}
+
+/// The header with the table size and the entry count filled in.
+fn counted_head(mut head: [u8; 24], toc_len: usize, count: usize) -> [u8; 24] {
+    head[4..8].copy_from_slice(&(toc_len as u32).to_le_bytes());
+    head[8..12].copy_from_slice(&(count as u32).to_le_bytes());
+    head
+}
+
+/// Hands `before` the backup of the start of the file; `lens` are (old length, new length, region length).
+fn take_backup(
+    file: &File,
+    lens: (u64, u64, u64),
+    before: &mut dyn FnMut(&Backup) -> Result<(), RpfError>,
+) -> Result<(), RpfError> {
+    let (old_len, new_len, region_len) = lens;
+    let mut region = vec![0u8; region_len as usize];
+    read_exact_at(file, &mut region, 0)?;
+    before(&Backup { old_len, new_len, region })
+}
+
+/// Encrypts the table if the package does, writes it with the header (`sizes` are the table
+/// size and the entry count), cuts the file to `new_len` and syncs it.
+fn write_head_and_toc(
+    file: &mut File,
+    pkg: &Package,
+    toc: &mut [u8],
+    sizes: (usize, usize),
+    new_len: u64,
+) -> Result<(), RpfError> {
+    if let Some(k) = &pkg.toc_key {
+        k.encrypt(toc);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&counted_head(pkg.head, sizes.0, sizes.1))?;
+    file.seek(SeekFrom::Start(TOC_OFFSET))?;
+    file.write_all(toc)?;
+    file.set_len(new_len)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 /// Like [`commit_rpf_with`], returning the backup.

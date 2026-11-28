@@ -57,38 +57,77 @@ pub fn resolve(root: &Path, vpath: &str, keys: Option<Arc<GtaVKeys>>) -> Result<
     let mut components = full.components().map(|c| c.as_os_str().to_string_lossy().into_owned());
     let mut phys = PathBuf::new();
     let mut archive: Option<Arc<Rpf7>> = None;
-    for comp in components.by_ref() {
-        let next = match_case_insensitive(&phys, &comp).ok_or_else(|| RpfError::NotFound(vpath.to_owned()))?;
-        if next.is_dir() {
-            phys = next;
-            continue;
-        }
-        if crate::gta4::is_archive_name(&comp) && Gta4Archive::file_is_gta4(&next) {
-            let rest: Vec<String> = components.collect();
-            return resolve_gta4(Arc::new(Gta4Archive::open_default(&next)?), &rest, vpath);
-        }
-        if is_rpf(&comp) {
-            #[cfg(feature = "rdr2")]
-            if Rpf8::file_is_rpf8(&next) {
-                let rest: Vec<String> = components.collect();
-                return resolve_rpf8(Arc::new(Rpf8::open_default(&next)?), &rest, vpath);
+    while let Some(comp) = components.next() {
+        match disk_step(&phys, &comp, &mut components, (vpath, &keys))? {
+            Step::Dir(next) => phys = next,
+            Step::Done(node) => return Ok(node),
+            Step::Archive(a) => {
+                archive = Some(a);
+                break;
             }
-            if Rpf9::file_is_rpf9(&next) {
-                let rest: Vec<String> = components.collect();
-                return resolve_rpf9(Arc::new(Rpf9::open(&next)?), &rest, vpath);
-            }
-            archive = Some(Arc::new(Rpf7::open(&next, keys.clone())?));
-            break;
         }
-        return match components.next() {
-            None => Ok(Node::PlainFile(next)),
-            Some(_) => Err(RpfError::NotFound(vpath.to_owned())),
-        };
     }
 
-    let Some(mut archive) = archive else { return Ok(Node::Dir(phys)) };
-    let mut cur = Rpf7::ROOT;
+    let Some(archive) = archive else { return Ok(Node::Dir(phys)) };
     let rest: Vec<String> = components.collect();
+    resolve_in_archive(archive, &rest, vpath)
+}
+
+/// What one component of a path on disk turned out to be.
+enum Step {
+    /// A directory; the walk goes on inside it.
+    Dir(PathBuf),
+    /// The path is resolved.
+    Done(Node),
+    /// An RPF7 archive; the rest of the path is inside it.
+    Archive(Arc<Rpf7>),
+}
+
+/// Looks up `comp` in the directory `phys`. `components` yields the rest of the path.
+fn disk_step(
+    phys: &Path,
+    comp: &str,
+    components: &mut impl Iterator<Item = String>,
+    (vpath, keys): (&str, &Option<Arc<GtaVKeys>>),
+) -> Result<Step, RpfError> {
+    let next = match_case_insensitive(phys, comp).ok_or_else(|| RpfError::NotFound(vpath.to_owned()))?;
+    if next.is_dir() {
+        return Ok(Step::Dir(next));
+    }
+    if crate::gta4::is_archive_name(comp) && Gta4Archive::file_is_gta4(&next) {
+        let rest: Vec<String> = components.collect();
+        return resolve_gta4(Arc::new(Gta4Archive::open_default(&next)?), &rest, vpath).map(Step::Done);
+    }
+    if is_rpf(comp) {
+        return disk_rpf(next, components, (vpath, keys));
+    }
+    match components.next() {
+        None => Ok(Step::Done(Node::PlainFile(next))),
+        Some(_) => Err(RpfError::NotFound(vpath.to_owned())),
+    }
+}
+
+/// An `.rpf` file on disk, in whichever of the formats it turns out to be.
+fn disk_rpf(
+    next: PathBuf,
+    components: &mut impl Iterator<Item = String>,
+    (vpath, keys): (&str, &Option<Arc<GtaVKeys>>),
+) -> Result<Step, RpfError> {
+    #[cfg(feature = "rdr2")]
+    if Rpf8::file_is_rpf8(&next) {
+        let rest: Vec<String> = components.collect();
+        return resolve_rpf8(Arc::new(Rpf8::open_default(&next)?), &rest, vpath).map(Step::Done);
+    }
+    if Rpf9::file_is_rpf9(&next) {
+        let rest: Vec<String> = components.collect();
+        return resolve_rpf9(Arc::new(Rpf9::open(&next)?), &rest, vpath).map(Step::Done);
+    }
+    Ok(Step::Archive(Arc::new(Rpf7::open(&next, keys.clone())?)))
+}
+
+/// Walks the rest of a path inside an RPF7 archive; nested archives are entered.
+fn resolve_in_archive(mut archive: Arc<Rpf7>, rest: &[String], vpath: &str) -> Result<Node, RpfError> {
+    let mut cur = Rpf7::ROOT;
     for (i, comp) in rest.iter().enumerate() {
         let child = archive.find_child(cur, comp).ok_or_else(|| RpfError::NotFound(vpath.to_owned()))?;
         let entry = archive.entry(child);

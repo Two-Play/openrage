@@ -502,6 +502,198 @@ fn load(
     Ok((dict, previews))
 }
 
+/// Per cut actor, in the cutscene's order, what [`cast_actors`] dresses it from.
+struct ActorInputs {
+    previews: Vec<Option<ModelPreview>>,
+    clips: Vec<Option<usize>>,
+    costumes: Vec<Vec<(f32, ModelPreview)>>,
+    props: Vec<Vec<(ModelPreview, &'static str)>>,
+    paints: Vec<Option<[[f32; 3]; 3]>>,
+}
+
+/// One actor's outfit changes, accessories and paint.
+struct ActorExtras {
+    costumes: Vec<(f32, ModelPreview)>,
+    worn: Vec<(ModelPreview, &'static str)>,
+    paint: Option<[[f32; 3]; 3]>,
+}
+
+/// The actors that have a model and a clip, and what is missing.
+struct Casting {
+    actors: Vec<SceneActor>,
+    /// Per cut actor: its place in `actors` (effects attach to them).
+    actor_of: Vec<Option<usize>>,
+    missing: Missing,
+}
+
+/// How many cut actors have no model or no animation.
+#[derive(Clone, Copy, Default)]
+struct Missing {
+    model: usize,
+    clip: usize,
+}
+
+fn cast_actors(cut: &Cutscene, dict: &ClipDictionary, inputs: ActorInputs) -> Casting {
+    let ActorInputs { previews, clips, costumes, props, paints } = inputs;
+    let mut cast = Casting { actors: Vec::new(), actor_of: Vec::new(), missing: Missing::default() };
+    let mut costumes = costumes.into_iter();
+    let mut props = props.into_iter();
+    let mut paints = paints.into_iter();
+    for ((actor, preview), clip) in cut.actors.iter().zip(previews).zip(clips) {
+        cast.actor_of.push(None);
+        let extras = ActorExtras {
+            costumes: costumes.next().unwrap_or_default(),
+            worn: props.next().unwrap_or_default(),
+            paint: paints.next().flatten(),
+        };
+        if actor.kind.model_extensions().is_empty() {
+            continue;
+        }
+        let Some(preview) = preview else {
+            cast.missing.model += 1;
+            continue;
+        };
+        let Some(clip) = clip else {
+            cast.missing.clip += 1;
+            continue;
+        };
+        cast.actors.push(scene_actor(actor, dict, preview, clip, extras));
+        if let Some(last) = cast.actor_of.last_mut() {
+            *last = Some(cast.actors.len() - 1);
+        }
+    }
+    cast
+}
+
+fn scene_actor(
+    actor: &Actor,
+    dict: &ClipDictionary,
+    preview: ModelPreview,
+    clip: usize,
+    extras: ActorExtras,
+) -> SceneActor {
+    let bindings = clip_bindings(dict, &preview, clip);
+    let mut look = dressed_look(actor, &preview);
+    if let Some(colours) = &extras.paint {
+        openrage_app::gta4_cutscene::paint(&preview.loaded, &mut look, colours);
+    }
+    let costumes = extras
+        .costumes
+        .into_iter()
+        .map(|(from, p)| {
+            let look = dressed_look(actor, &p);
+            (from, Arc::new(p), look)
+        })
+        .collect();
+    let attachments = worn_attachments(&preview, extras.worn);
+    SceneActor { preview: Arc::new(preview), look, costumes, attachments, clip, bindings }
+}
+
+/// Bone binding per part (section) of the clip; empty without a skeleton.
+fn clip_bindings(dict: &ClipDictionary, preview: &ModelPreview, clip: usize) -> Vec<Option<Binding>> {
+    match &preview.loaded.skeleton {
+        Some(sk) => dict.clips[clip]
+            .parts
+            .iter()
+            .map(|p| {
+                dict.animations
+                    .get(p.animation)
+                    .map(|a| Binding::new(sk, a).with_expressions(sk, a, &preview.loaded.expressions))
+            })
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn dressed_look(actor: &Actor, preview: &ModelPreview) -> Look {
+    let mut look = preview.loaded.default_look();
+    if actor.kind == cutscene::Kind::Ped {
+        hide_oversized_parts(preview, &mut look);
+    }
+    look
+}
+
+/// The accessories that sit on bones the skeleton has, with the bone's rest pose.
+fn worn_attachments(
+    preview: &ModelPreview,
+    worn: Vec<(ModelPreview, &'static str)>,
+) -> Vec<(Arc<ModelPreview>, Look, usize, Mat4)> {
+    match &preview.loaded.skeleton {
+        Some(sk) => {
+            let rest = sk.world_transforms();
+            worn.into_iter()
+                .filter_map(|(p, bone)| {
+                    let b = sk.find_name(bone)?;
+                    let look = p.loaded.default_look();
+                    Some((Arc::new(p), look, b, rest[b]))
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Bounds for the free camera: where the actors stand at the start.
+fn stage_bounds(dict: &ClipDictionary, actors: &[SceneActor]) -> ([f32; 3], [f32; 3]) {
+    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+    for a in actors {
+        if !on_stage(dict, &dict.clips[a.clip], 0.0) {
+            continue;
+        }
+        let m = cutscene::mover(dict, &dict.clips[a.clip], 0.0);
+        let p = [m[12], m[13], m[14]];
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k] - 1.0);
+            hi[k] = hi[k].max(p[k] + 1.0);
+        }
+    }
+    if lo[0] > hi[0] {
+        (lo, hi) = ([-1.0; 3], [1.0; 3]);
+    }
+    (lo, hi)
+}
+
+fn loaded_status(
+    actor_count: usize,
+    missing: Missing,
+    effect_count: usize,
+    unknown_effects: usize,
+    problems: &[String],
+) -> String {
+    let mut status = format!("{actor_count} actors");
+    if missing.model > 0 {
+        status.push_str(&format!(" · {} models not found", missing.model));
+    }
+    if missing.clip > 0 {
+        status.push_str(&format!(" · {} without animation", missing.clip));
+    }
+    if effect_count > 0 || unknown_effects > 0 {
+        status.push_str(&format!(" · {effect_count} effects"));
+        if unknown_effects > 0 {
+            status.push_str(&format!(" ({unknown_effects} not in the effect lists)"));
+        }
+    }
+    if !problems.is_empty() {
+        status.push_str(&format!(" · missing in the game's files: {}", problems.join(", ")));
+    }
+    status.push_str(" · drag to turn the free camera, scroll to zoom, Space plays");
+    status
+}
+
+/// The brightest any animated light gets, sampled every half second.
+fn brightest_light(dict: &ClipDictionary, light_clips: &[usize]) -> f32 {
+    light_clips
+        .iter()
+        .filter_map(|&c| dict.clips.get(c))
+        .flat_map(|clip| {
+            (0..=(clip.duration() * 2.0) as usize)
+                .filter_map(|k| openrage_app::gta4_cutscene::light_at(dict, clip, k as f32 / 2.0))
+                .map(|l| l.intensity)
+                .collect::<Vec<_>>()
+        })
+        .fold(0.0f32, f32::max)
+}
+
 fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded: Loaded, progress: Arc<LoadProgress>) {
     let Loaded {
         dict,
@@ -519,129 +711,19 @@ fn start(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, id: u64, loaded:
         effects,
     } = loaded;
     let cut = &cut;
-    let mut actors = Vec::new();
-    let (mut missing_model, mut missing_clip) = (0, 0);
-    let mut costumes = costumes.into_iter();
-    let mut props = props.into_iter();
-    let mut paints = paints.into_iter();
-    // Per cut actor: its place in `actors` (effects attach to them).
-    let mut actor_of: Vec<Option<usize>> = Vec::new();
-    for ((actor, preview), clip) in cut.actors.iter().zip(previews).zip(clips) {
-        actor_of.push(None);
-        let later = costumes.next().unwrap_or_default();
-        let worn = props.next().unwrap_or_default();
-        let paint = paints.next().flatten();
-        if actor.kind.model_extensions().is_empty() {
-            continue;
-        }
-        let Some(preview) = preview else {
-            missing_model += 1;
-            continue;
-        };
-        let Some(clip) = clip else {
-            missing_clip += 1;
-            continue;
-        };
-        let bindings = match &preview.loaded.skeleton {
-            Some(sk) => dict.clips[clip]
-                .parts
-                .iter()
-                .map(|p| {
-                    dict.animations
-                        .get(p.animation)
-                        .map(|a| Binding::new(sk, a).with_expressions(sk, a, &preview.loaded.expressions))
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-        let dress = |preview: &ModelPreview| {
-            let mut look = preview.loaded.default_look();
-            if actor.kind == cutscene::Kind::Ped {
-                hide_oversized_parts(preview, &mut look);
-            }
-            look
-        };
-        let mut look = dress(&preview);
-        if let Some(colours) = &paint {
-            openrage_app::gta4_cutscene::paint(&preview.loaded, &mut look, colours);
-        }
-        let costumes = later
-            .into_iter()
-            .map(|(from, p)| {
-                let look = dress(&p);
-                (from, Arc::new(p), look)
-            })
-            .collect();
-        let attachments = match &preview.loaded.skeleton {
-            Some(sk) => {
-                let rest = sk.world_transforms();
-                worn.into_iter()
-                    .filter_map(|(p, bone)| {
-                        let b = sk.find_name(bone)?;
-                        let look = p.loaded.default_look();
-                        Some((Arc::new(p), look, b, rest[b]))
-                    })
-                    .collect()
-            }
-            None => Vec::new(),
-        };
-        actors.push(SceneActor { preview: Arc::new(preview), look, costumes, attachments, clip, bindings });
-        if let Some(last) = actor_of.last_mut() {
-            *last = Some(actors.len() - 1);
-        }
-    }
+    let Casting { actors, actor_of, missing } =
+        cast_actors(cut, &dict, ActorInputs { previews, clips, costumes, props, paints });
     let duration = dict.clips.iter().map(|c| c.duration()).fold(cut.duration, f32::max);
     let camera_clip = cutscene::camera_clip(&dict);
     let dict = Arc::new(dict);
     let (instances, unknown_effects) = place_effects(&dict, &actors, &actor_of, &effects);
-    // Bounds for the free camera: where the actors stand at the start.
-    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-    for a in &actors {
-        if !on_stage(&dict, &dict.clips[a.clip], 0.0) {
-            continue;
-        }
-        let m = cutscene::mover(&dict, &dict.clips[a.clip], 0.0);
-        let p = [m[12], m[13], m[14]];
-        for k in 0..3 {
-            lo[k] = lo[k].min(p[k] - 1.0);
-            hi[k] = hi[k].max(p[k] + 1.0);
-        }
-    }
-    if lo[0] > hi[0] {
-        (lo, hi) = ([-1.0; 3], [1.0; 3]);
-    }
-    let mut status = format!("{} actors", actors.len());
-    if missing_model > 0 {
-        status.push_str(&format!(" · {missing_model} models not found"));
-    }
-    if missing_clip > 0 {
-        status.push_str(&format!(" · {missing_clip} without animation"));
-    }
-    if !instances.is_empty() || unknown_effects > 0 {
-        status.push_str(&format!(" · {} effects", instances.len()));
-        if unknown_effects > 0 {
-            status.push_str(&format!(" ({unknown_effects} not in the effect lists)"));
-        }
-    }
-    if !problems.is_empty() {
-        status.push_str(&format!(" · missing in the game's files: {}", problems.join(", ")));
-    }
-    status.push_str(" · drag to turn the free camera, scroll to zoom, Space plays");
+    let (lo, hi) = stage_bounds(&dict, &actors);
+    let status = loaded_status(actors.len(), missing, instances.len(), unknown_effects, &problems);
     win.set_status(status.into());
     win.set_loading(false);
     win.set_has_camera(camera_clip.is_some());
     let has_lights = !cut.lights.is_empty() || !light_clips.is_empty();
-    // The brightest any animated light gets, sampled every half second.
-    let brightest_light = light_clips
-        .iter()
-        .filter_map(|&c| dict.clips.get(c))
-        .flat_map(|clip| {
-            (0..=(clip.duration() * 2.0) as usize)
-                .filter_map(|k| openrage_app::gta4_cutscene::light_at(&dict, clip, k as f32 / 2.0))
-                .map(|l| l.intensity)
-                .collect::<Vec<_>>()
-        })
-        .fold(0.0f32, f32::max);
+    let brightest_light = brightest_light(&dict, &light_clips);
     win.set_has_lights(has_lights);
     // Debug snapshots stay silent.
     let sound_on = !(cfg!(debug_assertions) && std::env::var_os("OPENRAGE_SNAPSHOT").is_some());
@@ -983,12 +1065,7 @@ fn render_frame(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
 
 /// The same; `moving` if it is drawn again soon.
 fn draw(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, moving: bool) {
-    if let Some(st) = state.borrow_mut().as_mut() {
-        let eye = st.free_camera().eye;
-        if let Some(stream) = &mut st.stream {
-            stream.look_from(eye, st.outdoors.map_or(1.0, |w| w.range));
-        }
-    }
+    steer_stream(state);
     let st = state.borrow();
     let Some(st) = st.as_ref() else { return };
     let (width, height) = (win.get_area_width().max(64.0), win.get_area_height().max(64.0));
@@ -996,6 +1073,42 @@ fn draw(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, moving: bool) {
     // for a smooth flight.
     let scale = (MOST_PIXELS / (width * height)).sqrt().min(1.0);
     let (width, height) = ((width * scale) as u32, (height * scale) as u32);
+    let posed = pose_actors(st);
+    let items = posed.gpu_items(st);
+    let camera = if st.cut_camera { cut_camera(st) } else { None }.unwrap_or_else(|| st.free_camera());
+    let gpu = if std::env::var_os("OPENRAGE_SOFTWARE_RENDERER").is_none() {
+        gpu_frame(st, &items, &camera, (width, height), moving)
+    } else {
+        None
+    };
+    match gpu {
+        Some(img) => win.set_frame(img),
+        None => win.set_frame(soft_frame(st, &posed, &camera, (width, height))),
+    }
+    win.set_time(st.time);
+    win.set_time_text(format!("{:.1} / {:.1} s", st.time, st.duration).into());
+    let subtitle = st.subtitles.iter().find(|(start, end, _)| (*start..*end).contains(&st.time)).map(|(_, _, t)| t);
+    win.set_subtitle(subtitle.map(|t| t.as_str()).unwrap_or_default().into());
+}
+
+/// Tells the map stream where the free camera is.
+fn steer_stream(state: &Rc<RefCell<Option<State>>>) {
+    if let Some(st) = state.borrow_mut().as_mut() {
+        let eye = st.free_camera().eye;
+        if let Some(stream) = &mut st.stream {
+            stream.look_from(eye, st.outdoors.map_or(1.0, |w| w.range));
+        }
+    }
+}
+
+/// The actors in the picture with their poses, and their accessories.
+struct Posed<'a> {
+    shown: Vec<&'a SceneActor>,
+    poses: Vec<(Mat4, Option<Vec<Mat4>>)>,
+    worn: Vec<(&'a Arc<ModelPreview>, &'a Look, Mat4)>,
+}
+
+fn pose_actors(st: &State) -> Posed<'_> {
     let mut poses: Vec<(Mat4, Option<Vec<Mat4>>)> = Vec::with_capacity(st.actors.len());
     // Actors the current section does not have stay out of the picture.
     let shown: Vec<&SceneActor> =
@@ -1021,109 +1134,126 @@ fn draw(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>, moving: bool) {
             })
         })
         .collect();
-    let mut items: Vec<crate::gpu::SceneItem> = shown
+    Posed { shown, poses, worn }
+}
+
+/// The objects of the map around the scene that are switched on, with where each stands.
+fn surroundings_shown(st: &State) -> impl Iterator<Item = (&Arc<ModelPreview>, &Look, &Mat4)> {
+    st.surroundings
         .iter()
-        .zip(&poses)
-        .map(|(a, (model, skin))| {
-            let (preview, look) = a.dressed(st.time);
-            crate::gpu::SceneItem { preview, look, model: *model, skin: skin.as_deref() }
-        })
-        .chain(worn.iter().map(|(preview, look, at)| crate::gpu::SceneItem { preview, look, model: *at, skin: None }))
-        .collect();
-    if st.show_surroundings {
-        for (k, (preview, look, placements)) in st.surroundings.iter().enumerate() {
-            if !st.object_shown.get(k).copied().unwrap_or(true) {
-                continue;
-            }
-            for t in placements {
-                items.push(crate::gpu::SceneItem { preview, look, model: *t, skin: None });
-            }
+        .enumerate()
+        .filter(|(k, _)| st.object_shown.get(*k).copied().unwrap_or(true))
+        .flat_map(|(_, (preview, look, placements))| placements.iter().map(move |t| (preview, look, t)))
+}
+
+impl<'a> Posed<'a> {
+    fn gpu_items<'b>(&'b self, st: &'b State) -> Vec<crate::gpu::SceneItem<'b>> {
+        let mut items: Vec<crate::gpu::SceneItem> = self
+            .shown
+            .iter()
+            .zip(&self.poses)
+            .map(|(a, (model, skin))| {
+                let (preview, look) = a.dressed(st.time);
+                crate::gpu::SceneItem { preview, look, model: *model, skin: skin.as_deref() }
+            })
+            .chain(self.worn.iter().map(|(preview, look, at)| crate::gpu::SceneItem {
+                preview,
+                look,
+                model: *at,
+                skin: None,
+            }))
+            .collect();
+        if st.show_surroundings {
+            items.extend(surroundings_shown(st).map(|(preview, look, t)| crate::gpu::SceneItem {
+                preview,
+                look,
+                model: *t,
+                skin: None,
+            }));
         }
+        items
     }
-    let camera = if st.cut_camera { cut_camera(st) } else { None }.unwrap_or_else(|| st.free_camera());
-    let gpu = if std::env::var_os("OPENRAGE_SOFTWARE_RENDERER").is_none() {
-        // Animated lights (GTA IV) where they are now.
-        let animated: Vec<crate::gpu::SceneLight>;
-        let lights: &[crate::gpu::SceneLight] = if !st.show_lights {
-            &[]
-        } else if st.light_clips.is_empty() {
-            &st.lights
-        } else {
-            let now: Vec<cutscene::Light> = st
-                .light_clips
-                .iter()
-                .filter_map(|&c| openrage_app::gta4_cutscene::light_at(&st.dict, st.dict.clips.get(c)?, st.time))
-                .collect();
-            animated = scene_lights_scaled(&now, st.brightest_light);
-            &animated
-        };
-        let sprites = gta4_effects::sprites_at(&st.effect_library, &st.effects, st.time);
-        // Seen from above, haze would hide a whole map.
-        let outdoors = st.outdoors.map(|w| crate::gpu::Outdoors {
-            haze: if st.fly.is_some() { w.haze * w.haze / 1000.0 } else { 0.0 },
-            hour: w.hour,
-            brightness: w.brightness,
-            seconds: w.since.elapsed().as_secs_f32(),
-            sea: w.sea,
-        });
-        let live = moving.then_some(st.number);
-        let around = crate::gpu::Around { lights, sprites: &sprites, outdoors, live };
-        crate::gpu::render_scene(&items, &around, &camera, width, height)
-    } else {
-        None
-    };
-    match gpu {
-        Some(img) => win.set_frame(img),
-        None => {
-            // No GPU: the software renderer, at a smaller size to stay responsive.
-            let (sw, sh) = ((width / 2).max(64) as usize, (height / 2).max(64) as usize);
-            let mut soft: Vec<render::SceneItem> = shown
-                .iter()
-                .zip(&poses)
-                .map(|(a, (model, skin))| {
-                    let (preview, look) = a.dressed(st.time);
-                    render::SceneItem {
-                        model: &preview.loaded,
-                        look,
-                        materials: &preview.materials,
-                        transform: *model,
-                        skin: skin.as_deref(),
-                    }
-                })
-                .chain(worn.iter().map(|(preview, look, at)| render::SceneItem {
+
+    fn soft_items<'b>(&'b self, st: &'b State) -> Vec<render::SceneItem<'b>> {
+        let mut soft: Vec<render::SceneItem> = self
+            .shown
+            .iter()
+            .zip(&self.poses)
+            .map(|(a, (model, skin))| {
+                let (preview, look) = a.dressed(st.time);
+                render::SceneItem {
                     model: &preview.loaded,
                     look,
                     materials: &preview.materials,
-                    transform: *at,
-                    skin: None,
-                }))
-                .collect();
-            // A map scene is all surroundings.
-            if st.actors.is_empty() && st.show_surroundings {
-                for (k, (preview, look, placements)) in st.surroundings.iter().enumerate() {
-                    if !st.object_shown.get(k).copied().unwrap_or(true) {
-                        continue;
-                    }
-                    for t in placements {
-                        soft.push(render::SceneItem {
-                            model: &preview.loaded,
-                            look,
-                            materials: &preview.materials,
-                            transform: *t,
-                            skin: None,
-                        });
-                    }
+                    transform: *model,
+                    skin: skin.as_deref(),
                 }
-            }
-            let rgba = render::render_scene(&soft, &camera, sw, sh);
-            let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, sw as u32, sh as u32);
-            win.set_frame(slint::Image::from_rgba8_premultiplied(buffer));
+            })
+            .chain(self.worn.iter().map(|(preview, look, at)| render::SceneItem {
+                model: &preview.loaded,
+                look,
+                materials: &preview.materials,
+                transform: *at,
+                skin: None,
+            }))
+            .collect();
+        // A map scene is all surroundings.
+        if st.actors.is_empty() && st.show_surroundings {
+            soft.extend(surroundings_shown(st).map(|(preview, look, t)| render::SceneItem {
+                model: &preview.loaded,
+                look,
+                materials: &preview.materials,
+                transform: *t,
+                skin: None,
+            }));
         }
+        soft
     }
-    win.set_time(st.time);
-    win.set_time_text(format!("{:.1} / {:.1} s", st.time, st.duration).into());
-    let subtitle = st.subtitles.iter().find(|(start, end, _)| (*start..*end).contains(&st.time)).map(|(_, _, t)| t);
-    win.set_subtitle(subtitle.map(|t| t.as_str()).unwrap_or_default().into());
+}
+
+/// The scene on the graphics card, `None` if there is no usable one.
+fn gpu_frame(
+    st: &State,
+    items: &[crate::gpu::SceneItem],
+    camera: &Camera,
+    (width, height): (u32, u32),
+    moving: bool,
+) -> Option<slint::Image> {
+    // Animated lights (GTA IV) where they are now.
+    let animated = (st.show_lights && !st.light_clips.is_empty()).then(|| {
+        let now: Vec<cutscene::Light> = st
+            .light_clips
+            .iter()
+            .filter_map(|&c| openrage_app::gta4_cutscene::light_at(&st.dict, st.dict.clips.get(c)?, st.time))
+            .collect();
+        scene_lights_scaled(&now, st.brightest_light)
+    });
+    let lights: &[crate::gpu::SceneLight] = match &animated {
+        Some(animated) => animated,
+        None if st.show_lights => &st.lights,
+        None => &[],
+    };
+    let sprites = gta4_effects::sprites_at(&st.effect_library, &st.effects, st.time);
+    // Seen from above, haze would hide a whole map.
+    let outdoors = st.outdoors.map(|w| crate::gpu::Outdoors {
+        haze: if st.fly.is_some() { w.haze * w.haze / 1000.0 } else { 0.0 },
+        hour: w.hour,
+        brightness: w.brightness,
+        seconds: w.since.elapsed().as_secs_f32(),
+        sea: w.sea,
+    });
+    let live = moving.then_some(st.number);
+    let around = crate::gpu::Around { lights, sprites: &sprites, outdoors, live };
+    crate::gpu::render_scene(items, &around, camera, width, height)
+}
+
+/// No GPU: the software renderer, at a smaller size to stay responsive.
+fn soft_frame(st: &State, posed: &Posed, camera: &Camera, (width, height): (u32, u32)) -> slint::Image {
+    let (sw, sh) = ((width / 2).max(64) as usize, (height / 2).max(64) as usize);
+    let soft = posed.soft_items(st);
+    let rgba = render::render_scene(&soft, camera, sw, sh);
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, sw as u32, sh as u32);
+    slint::Image::from_rgba8_premultiplied(buffer)
 }
 
 /// Whether an actor is in the scene at `time`: its part of the clip there
@@ -1387,7 +1517,18 @@ fn wire_map(win: &SceneWindow, state: &Shared, main: slint::Weak<AppWindow>, nam
     });
 }
 
-fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
+fn wire(win: &SceneWindow, state: &Shared) {
+    wire_view(win, state);
+    wire_fly(win, state);
+    wire_fly_release(win, state);
+    wire_playback(win, state);
+    wire_sound_and_camera(win, state);
+    wire_camera(win, state);
+    wire_toggles(win, state);
+}
+
+/// Weather sliders.
+fn wire_view(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_view_changed(move || {
         let Some(win) = w.upgrade() else { return };
@@ -1403,6 +1544,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         move_water(&win, &s);
         render_frame(&win, &s);
     });
+}
+
+/// Fly mode: the toggle and pressed keys.
+fn wire_fly(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_fly(move || toggle_fly(&w, &s));
     let (w, s) = (win.as_weak(), Rc::clone(state));
@@ -1425,6 +1570,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
             });
         }
     });
+}
+
+/// Fly mode: releasing keys and losing focus.
+fn wire_fly_release(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_key_up(move |text, shift| {
         let mut stopped = false;
@@ -1448,6 +1597,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
             st.fly_timer.stop();
         }
     });
+}
+
+/// Play and seek.
+fn wire_playback(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_play(move || {
         let Some(win) = w.upgrade() else { return };
@@ -1468,6 +1621,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         }
         render_frame(&win, &s);
     });
+}
+
+/// Sound and the cutscene camera.
+fn wire_sound_and_camera(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_sound(move || {
         let Some(win) = w.upgrade() else { return };
@@ -1486,6 +1643,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         }
         render_frame(&win, &s);
     });
+}
+
+/// Orbit and zoom.
+fn wire_camera(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_rotate(move |dx, dy| {
         let Some(win) = w.upgrade() else { return };
@@ -1519,6 +1680,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         }
         render_frame(&win, &s);
     });
+}
+
+/// Lights, surroundings and resizing.
+fn wire_toggles(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_lights({
         let (w, s) = (w.clone(), Rc::clone(&s));

@@ -238,25 +238,43 @@ pub fn open(ui: &AppWindow, doc: Document) {
         return;
     }
     let Ok(win) = EditorWindow::new() else { return };
-    win.set_overlay_folder(crate::overlay_name().into());
-    win.set_write_in_game(crate::writes_in_game());
-    win.set_theme_mode(ui.get_theme_mode());
-    crate::accent::apply(&win);
-    win.set_mono_font(ui.get_mono_font());
-    win.set_heading(doc.name.clone().into());
-    win.set_path(doc.vpath.clone().into());
-    win.set_text(doc.text.clone().into());
-    win.set_editable(ui.get_edit_mode());
-    win.set_locked_reason(doc.locked_reason.clone().into());
-    win.set_status(status_line(&doc).into());
-    win.set_has_tabs(doc.tab_mark);
+    fill_window(&win, ui, &doc);
     let id = NEXT_ID.with(|n| {
         n.set(n.get() + 1);
         n.get()
     });
     let doc = Rc::new(RefCell::new(doc));
 
-    let (w, d, main) = (win.as_weak(), Rc::clone(&doc), ui.as_weak());
+    wire_save(&win, ui, &doc);
+    wire_main_window_links(&win, ui);
+    wire_toggle_tabs(&win, &doc);
+    wire_reload(&win, ui, &doc);
+    wire_close(&win, id);
+
+    if win.show().is_ok() {
+        reset_view_soon(&win);
+        OPEN.with(|o| o.borrow_mut().push((id, win)));
+    }
+}
+
+/// Sets the initial look and content of a new editor window.
+fn fill_window(win: &EditorWindow, ui: &AppWindow, doc: &Document) {
+    win.set_overlay_folder(crate::overlay_name().into());
+    win.set_write_in_game(crate::writes_in_game());
+    win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(win);
+    win.set_mono_font(ui.get_mono_font());
+    win.set_heading(doc.name.clone().into());
+    win.set_path(doc.vpath.clone().into());
+    win.set_text(doc.text.clone().into());
+    win.set_editable(ui.get_edit_mode());
+    win.set_locked_reason(doc.locked_reason.clone().into());
+    win.set_status(status_line(doc).into());
+    win.set_has_tabs(doc.tab_mark);
+}
+
+fn wire_save(win: &EditorWindow, ui: &AppWindow, doc: &Rc<RefCell<Document>>) {
+    let (w, d, main) = (win.as_weak(), Rc::clone(doc), ui.as_weak());
     win.on_save(move || {
         let (Some(win), Some(ui)) = (w.upgrade(), main.upgrade()) else { return };
         let text = win.get_text().to_string();
@@ -286,6 +304,10 @@ pub fn open(ui: &AppWindow, doc: Document) {
             }
         });
     });
+}
+
+/// The edit-mode toggle (owned by the main window) and the path copy button.
+fn wire_main_window_links(win: &EditorWindow, ui: &AppWindow) {
     let main = ui.as_weak();
     win.on_set_edit_mode(move |on| {
         // The main window owns the edit mode; it tells every editor.
@@ -303,7 +325,10 @@ pub fn open(ui: &AppWindow, doc: Document) {
         };
         win.set_status(msg.into());
     });
-    let (w, d) = (win.as_weak(), Rc::clone(&doc));
+}
+
+fn wire_toggle_tabs(win: &EditorWindow, doc: &Rc<RefCell<Document>>) {
+    let (w, d) = (win.as_weak(), Rc::clone(doc));
     win.on_toggle_tabs(move || {
         let Some(win) = w.upgrade() else { return };
         if !d.borrow().tab_mark {
@@ -313,25 +338,32 @@ pub fn open(ui: &AppWindow, doc: Document) {
         win.set_text(show_tabs(&win.get_text(), shown).into());
         win.set_tabs_shown(shown);
     });
-    let (w, d, main) = (win.as_weak(), Rc::clone(&doc), ui.as_weak());
+}
+
+/// Reads the file again the way it was first opened: `Ok(None)` when it is no longer text.
+fn read_document(ui: &AppWindow, vpath: String, converted: bool) -> anyhow::Result<Option<Document>> {
+    if converted && openrage_app::texttable::is_rdr2_text_table(&vpath) {
+        crate::read_rdr2_text_table(&vpath).map(|text| Some(Document::rdr2_text_table(vpath, text)))
+    } else if converted
+        && (vpath.to_ascii_lowercase().ends_with(".ysc") || vpath.to_ascii_lowercase().ends_with(".sco"))
+    {
+        crate::read_script_listing(ui, &vpath).map(|text| Some(Document::script(vpath, text)))
+    } else if converted {
+        crate::read_xml(ui, &vpath).map(|x| Some(Document::converted(vpath, x.text, x.encoding.name())))
+    } else {
+        crate::read_file(ui, &vpath).map(|data| Document::from_file(vpath, &data).ok())
+    }
+}
+
+fn wire_reload(win: &EditorWindow, ui: &AppWindow, doc: &Rc<RefCell<Document>>) {
+    let (w, d, main) = (win.as_weak(), Rc::clone(doc), ui.as_weak());
     win.on_reload(move || {
         let (Some(win), Some(ui)) = (w.upgrade(), main.upgrade()) else { return };
         let (vpath, converted) = {
             let doc = d.borrow();
             (doc.vpath.clone(), doc.converted.is_some())
         };
-        let new = if converted && openrage_app::texttable::is_rdr2_text_table(&vpath) {
-            crate::read_rdr2_text_table(&vpath).map(|text| Some(Document::rdr2_text_table(vpath, text)))
-        } else if converted
-            && (vpath.to_ascii_lowercase().ends_with(".ysc") || vpath.to_ascii_lowercase().ends_with(".sco"))
-        {
-            crate::read_script_listing(&ui, &vpath).map(|text| Some(Document::script(vpath, text)))
-        } else if converted {
-            crate::read_xml(&ui, &vpath).map(|x| Some(Document::converted(vpath, x.text, x.encoding.name())))
-        } else {
-            crate::read_file(&ui, &vpath).map(|data| Document::from_file(vpath, &data).ok())
-        };
-        match new {
+        match read_document(&ui, vpath, converted) {
             Ok(Some(new)) => {
                 win.set_text(show_tabs(&new.text, win.get_tabs_shown()).into());
                 reset_view_soon(&win);
@@ -345,6 +377,9 @@ pub fn open(ui: &AppWindow, doc: Document) {
             Err(e) => win.set_status(format!("Cannot read the file: {e:#}").into()),
         }
     });
+}
+
+fn wire_close(win: &EditorWindow, id: u64) {
     let w = win.as_weak();
     win.on_discard_and_close(move || {
         if let Some(win) = w.upgrade() {
@@ -362,11 +397,6 @@ pub fn open(ui: &AppWindow, doc: Document) {
         forget(id);
         slint::CloseRequestResponse::HideWindow
     });
-
-    if win.show().is_ok() {
-        reset_view_soon(&win);
-        OPEN.with(|o| o.borrow_mut().push((id, win)));
-    }
 }
 
 /// Scrolls to the top left once the window has its size.

@@ -367,40 +367,52 @@ impl Places {
                 continue;
             }
             match group {
-                Group::First | Group::Four => {
-                    if group == Group::First {
-                        self.list[at] = (place + 4, Group::Rest);
-                    } else {
-                        self.list[at] = (0, Group::Done);
+                Group::First | Group::Four | Group::One => {
+                    let slot = at;
+                    if group != Group::First {
                         at += 1;
                     }
-                    for place in place..place + 4 {
-                        if bits.bit() {
-                            self.start -= 1;
-                            self.list[self.start] = (place, Group::One);
-                        } else if !value(bits, place as usize) {
-                            return false;
-                        }
-                    }
-                }
-                Group::Rest => {
-                    self.list[at] = (place, Group::Four);
-                    for i in 1..4 {
-                        self.list[self.end] = (place + 4 * i, Group::Four);
-                        self.end += 1;
-                    }
-                }
-                Group::One => {
-                    self.list[at] = (0, Group::Done);
-                    at += 1;
-                    if !value(bits, place as usize) {
+                    if !self.expand(slot, (place, group), bits, &mut value) {
                         return false;
                     }
                 }
+                Group::Rest => self.split_rest(at, place),
                 Group::Done => {}
             }
         }
         true
+    }
+
+    /// Takes the group at `slot` off the list and reads its places: the ones set go in front of the list, the
+    /// others are given to `value`.
+    fn expand(
+        &mut self,
+        slot: usize,
+        (place, group): (u8, Group),
+        bits: &mut Bits,
+        value: &mut impl FnMut(&mut Bits, usize) -> bool,
+    ) -> bool {
+        self.list[slot] = if group == Group::First { (place + 4, Group::Rest) } else { (0, Group::Done) };
+        if group == Group::One {
+            return value(bits, place as usize);
+        }
+        for place in place..place + 4 {
+            if bits.bit() {
+                self.start -= 1;
+                self.list[self.start] = (place, Group::One);
+            } else if !value(bits, place as usize) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn split_rest(&mut self, at: usize, place: u8) {
+        self.list[at] = (place, Group::Four);
+        for i in 1..4 {
+            self.list[self.end] = (place + 4 * i, Group::Four);
+            self.end += 1;
+        }
     }
 }
 
@@ -524,6 +536,65 @@ impl Plane {
     }
 }
 
+/// The picture before, where blocks are copied from.
+struct Source<'a> {
+    last: &'a Plane,
+    stride: usize,
+    highest: usize,
+}
+
+impl Source<'_> {
+    #[inline]
+    fn moved(&self, b: &mut Bundles, at: usize) -> Result<[u8; 64]> {
+        let (x, y) = (b.x.get(), b.y.get());
+        let from = at as i64 + i64::from(x) + i64::from(y) * self.stride as i64;
+        match usize::try_from(from).ok().filter(|&from| from <= self.highest).and_then(|from| self.last.get(from)) {
+            Some(block) => Ok(block),
+            None => bad("a block comes from outside the picture"),
+        }
+    }
+
+    #[inline]
+    fn block(&self, b: &mut Bundles, bits: &mut Bits, at: usize, kind: i32) -> Result<[u8; 64]> {
+        Ok(match kind {
+            0 => self.last.get(at).expect("a block of the plane"),
+            2 => self.moved(b, at)?,
+            4 => {
+                let block = self.moved(b, at)?;
+                let add = residue(bits);
+                std::array::from_fn(|i| block[i].wrapping_add(add[i] as u8))
+            }
+            7 => {
+                let block = self.moved(b, at)?;
+                let dc = b.inter_dc.get();
+                let add = transformed(&coefficients(bits, dc, &INTER_QUANT));
+                std::array::from_fn(|i| block[i].wrapping_add(add[i] as u8))
+            }
+            _ => basic_block(b, bits, kind).unwrap_or_else(|| bad(&format!("block of type {kind}")))?,
+        })
+    }
+}
+
+/// The kinds of block that need nothing from the picture before; `None` for the others.
+#[inline]
+fn basic_block(b: &mut Bundles, bits: &mut Bits, kind: i32) -> Option<Result<[u8; 64]>> {
+    Some(match kind {
+        3 => b.run_block(bits),
+        5 => Ok(b.intra_block(bits)),
+        6 => Ok([b.colours.get() as u8; 64]),
+        8 => Ok(b.pattern_block()),
+        9 => Ok(b.raw_block()),
+        _ => return None,
+    })
+}
+
+/// A block of the half-size grid, drawn at twice its size.
+#[inline]
+fn large_block(b: &mut Bundles, bits: &mut Bits) -> Result<[u8; 64]> {
+    let kind = b.sub_types.get();
+    basic_block(b, bits, kind).unwrap_or_else(|| bad(&format!("large block of type {kind}")))
+}
+
 pub struct Decoder {
     revision: u8,
     has_alpha: bool,
@@ -552,28 +623,29 @@ impl Decoder {
     /// Decodes a frame. A damaged one leaves the picture before.
     pub fn decode(&mut self, data: &[u8]) -> Result<()> {
         let mut bits = Bits::new(data);
-        let sized = self.revision >= b'i';
-        if self.has_alpha {
-            if sized {
-                bits.read(32);
-            }
-            self.plane(&mut bits, 3)?;
-        }
-        if sized {
-            bits.read(32);
-        }
-        for plane in if self.revision >= b'h' { [0, 2, 1] } else { [0, 1, 2] } {
-            self.plane(&mut bits, plane)?;
-            if bits.left() == 0 {
-                break;
-            }
-        }
+        self.read_planes(&mut bits)?;
         for (last, plane) in self.last.iter_mut().zip(&mut self.planes) {
             std::mem::swap(last, plane);
         }
         // Planes the frame does not have stay.
         for (last, plane) in self.planes.iter_mut().zip(&self.last) {
             last.data.copy_from_slice(&plane.data);
+        }
+        Ok(())
+    }
+
+    fn read_planes(&mut self, bits: &mut Bits) -> Result<()> {
+        let sized = self.revision >= b'i';
+        if self.has_alpha {
+            skip_size(bits, sized);
+            self.plane(bits, 3)?;
+        }
+        skip_size(bits, sized);
+        for plane in if self.revision >= b'h' { [0, 2, 1] } else { [0, 1, 2] } {
+            self.plane(bits, plane)?;
+            if bits.left() == 0 {
+                break;
+            }
         }
         Ok(())
     }
@@ -602,15 +674,7 @@ impl Decoder {
         let (b, out, last) = (&mut self.bundles, &mut self.planes[index], &self.last[index]);
         b.start(bits, width, bw);
         let stride = out.stride;
-        let highest = (bw - 1 + stride * (bh - 1)) * 8;
-        let moved = |b: &mut Bundles, at: usize| {
-            let (x, y) = (b.x.get(), b.y.get());
-            let from = at as i64 + i64::from(x) + i64::from(y) * stride as i64;
-            match usize::try_from(from).ok().filter(|&from| from <= highest).and_then(|from| last.get(from)) {
-                Some(block) => Ok(block),
-                None => bad("a block comes from outside the picture"),
-            }
-        };
+        let source = Source { last, stride, highest: (bw - 1 + stride * (bh - 1)) * 8 };
         for by in 0..bh {
             b.read(bits, self.revision)?;
             let mut bx = 0;
@@ -622,41 +686,12 @@ impl Decoder {
                     bx += 2;
                     continue;
                 }
-                let block = match kind {
-                    0 => last.get(at).expect("a block of the plane"),
-                    1 => {
-                        let block = match b.sub_types.get() {
-                            3 => b.run_block(bits)?,
-                            5 => b.intra_block(bits),
-                            6 => [b.colours.get() as u8; 64],
-                            8 => b.pattern_block(),
-                            9 => b.raw_block(),
-                            kind => return bad(&format!("large block of type {kind}")),
-                        };
-                        out.put_scaled(at, &block);
-                        bx += 2;
-                        continue;
-                    }
-                    2 => moved(b, at)?,
-                    3 => b.run_block(bits)?,
-                    4 => {
-                        let block = moved(b, at)?;
-                        let add = residue(bits);
-                        std::array::from_fn(|i| block[i].wrapping_add(add[i] as u8))
-                    }
-                    5 => b.intra_block(bits),
-                    6 => [b.colours.get() as u8; 64],
-                    7 => {
-                        let block = moved(b, at)?;
-                        let dc = b.inter_dc.get();
-                        let add = transformed(&coefficients(bits, dc, &INTER_QUANT));
-                        std::array::from_fn(|i| block[i].wrapping_add(add[i] as u8))
-                    }
-                    8 => b.pattern_block(),
-                    9 => b.raw_block(),
-                    _ => return bad(&format!("block of type {kind}")),
-                };
-                out.put(at, &block);
+                if kind == 1 {
+                    out.put_scaled(at, &large_block(b, bits)?);
+                    bx += 2;
+                    continue;
+                }
+                out.put(at, &source.block(b, bits, at, kind)?);
                 bx += 1;
             }
             if bits.overread() {
@@ -682,6 +717,13 @@ impl Decoder {
             cr: crop(2),
             a: self.has_alpha.then(|| crop(3)),
         }
+    }
+}
+
+/// Skips the frame size field of the revisions that have one.
+fn skip_size(bits: &mut Bits, sized: bool) {
+    if sized {
+        bits.read(32);
     }
 }
 

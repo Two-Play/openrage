@@ -98,21 +98,25 @@ fn u32_at(b: &[u8], at: usize) -> Option<usize> {
     Some(u32::from_le_bytes(b.get(at..at.checked_add(4)?)?.try_into().ok()?) as usize)
 }
 
-pub(crate) fn decode_header(cipher: &Cipher, h: &mut [u8]) -> Option<()> {
-    if h.len() < 64 || h.get(..4)? != b"9FPR" {
-        return None;
-    }
-    if h[0x2e] == 0 {
-        return Some(());
-    }
-    // The supported Scarlett build uses selector 9: two metadata spans
-    // share one CBC chain, leaving the secondary transform prefix intact.
-    if h[0x2e] != 9 {
-        return None;
-    }
+/// Where the pieces of a selector-9 header lie: the descriptor directory
+/// ends at `blob`, the first CBC span at `prefix`, the second at `split`.
+struct HeaderLayout {
+    count: usize,
+    blob: usize,
+    prefix: usize,
+    split: usize,
+}
+
+/// The entry count and the offset where the descriptor blob starts.
+fn directory_end(h: &[u8]) -> Option<(usize, usize)> {
     let count = u16_at(h, 0x1a)?;
     let directory_len = count.checked_mul(8)?.checked_add(15)? & !15;
     let blob = 64usize.checked_add(directory_len)?;
+    Some((count, blob))
+}
+
+fn header_layout(h: &[u8]) -> Option<HeaderLayout> {
+    let (count, blob) = directory_end(h)?;
     let metadata_end = blob.checked_add(u32_at(h, 0x1c)?)?;
     let tail = u32_at(h, 0x30)?;
     let prefix = metadata_end.checked_sub(tail)?;
@@ -120,23 +124,65 @@ pub(crate) fn decode_header(cipher: &Cipher, h: &mut [u8]) -> Option<()> {
     if prefix < blob || split < metadata_end || split > h.len() {
         return None;
     }
-    let mut iv = cipher.header_iv();
-    cipher.decrypt_cbc(0x10000001, h.get_mut(64..blob)?, &mut iv)?;
-    cipher.decrypt_cbc(0x10000001, h.get_mut(blob..prefix)?, &mut iv)?;
-    let descriptor = (0..count).find_map(|i| {
+    Some(HeaderLayout { count, blob, prefix, split })
+}
+
+/// The offset of the type-1 descriptor.
+fn find_descriptor(h: &[u8], layout: &HeaderLayout) -> Option<usize> {
+    (0..layout.count).find_map(|i| {
         let at = 64 + i * 8;
-        (u16_at(h, at)? == 1).then(|| blob.checked_add(u32_at(h, at + 4)?)).flatten()
-    })?;
+        (u16_at(h, at)? == 1).then(|| layout.blob.checked_add(u32_at(h, at + 4)?)).flatten()
+    })
+}
+
+/// The key id and the initial counter of a descriptor.
+fn descriptor_key(h: &[u8], descriptor: usize) -> Option<(u32, [u8; 16])> {
     let key = u32_at(h, descriptor)? as u32;
     if u16_at(h, descriptor + 4)? != 16 {
         return None;
     }
     let initial: [u8; 16] = h.get(descriptor + 6..descriptor + 22)?.try_into().ok()?;
+    Some((key, initial))
+}
+
+fn decrypt_payload(cipher: &Cipher, h: &mut [u8], layout: &HeaderLayout, descriptor: usize) -> Option<()> {
+    let (key, initial) = descriptor_key(h, descriptor)?;
     let mut iv = initial;
-    cipher.decrypt_cbc(key, h.get_mut(prefix..split)?, &mut iv)?;
+    cipher.decrypt_cbc(key, h.get_mut(layout.prefix..layout.split)?, &mut iv)?;
     let mut iv = initial;
-    cipher.decrypt_cbc(key, h.get_mut(split..)?, &mut iv)?;
+    cipher.decrypt_cbc(key, h.get_mut(layout.split..)?, &mut iv)?;
     Some(())
+}
+
+/// The transform selector of a header, if it has the magic and its fixed part.
+fn header_selector(h: &[u8]) -> Option<u8> {
+    if h.len() < 64 || h.get(..4)? != b"9FPR" {
+        return None;
+    }
+    Some(h[0x2e])
+}
+
+/// Decrypts the descriptor directory and the first metadata span, which share one CBC chain.
+fn decrypt_directory(cipher: &Cipher, h: &mut [u8], layout: &HeaderLayout) -> Option<()> {
+    let mut iv = cipher.header_iv();
+    cipher.decrypt_cbc(0x10000001, h.get_mut(64..layout.blob)?, &mut iv)?;
+    cipher.decrypt_cbc(0x10000001, h.get_mut(layout.blob..layout.prefix)?, &mut iv)
+}
+
+pub(crate) fn decode_header(cipher: &Cipher, h: &mut [u8]) -> Option<()> {
+    let selector = header_selector(h)?;
+    if selector == 0 {
+        return Some(());
+    }
+    // The supported Scarlett build uses selector 9: two metadata spans
+    // share one CBC chain, leaving the secondary transform prefix intact.
+    if selector != 9 {
+        return None;
+    }
+    let layout = header_layout(h)?;
+    decrypt_directory(cipher, h, &layout)?;
+    let descriptor = find_descriptor(h, &layout)?;
+    decrypt_payload(cipher, h, &layout, descriptor)
 }
 
 impl NativeArchive {

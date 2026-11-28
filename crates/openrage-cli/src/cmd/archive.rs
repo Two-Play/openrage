@@ -2,6 +2,9 @@
 
 use crate::*;
 
+mod info;
+pub(crate) use info::cmd_info;
+
 pub(crate) fn cmd_gta4_keys(game_dir: &Path) -> Result<()> {
     let (_, report) = openrage_app::gta4::derive_key(game_dir)?;
     outln!("GTA IV archive key found in {} ({:.1}s).", report.exe.display(), report.scan_seconds);
@@ -127,259 +130,137 @@ pub(crate) fn cmd_ls(game_dir: &Path, path: &str, recursive: bool, keys: Option<
     let node = vfs::resolve(game_dir, path, keys)?;
     let mut out = Rows::start();
     match node {
-        Node::Dir(dir) => {
-            let mut items: Vec<_> = fs::read_dir(&dir)?.flatten().collect();
-            items.sort_by_key(|e| e.file_name());
-            for item in items {
-                let meta = item.metadata()?;
-                let name = item.file_name().to_string_lossy().into_owned();
-                let lower = name.to_ascii_lowercase();
-                let kind = if meta.is_dir() {
-                    "dir"
-                } else if lower.ends_with(".rpf") {
-                    "rpf"
-                } else if lower.ends_with(".img") && rage_rpf::Gta4Archive::file_is_gta4(&item.path()) {
-                    "img"
-                } else {
-                    "file"
-                };
-                ls_row(&mut out, kind, Some(meta.len()), "", &name, kind != "file");
-            }
-        }
-        Node::PlainFile(p) => {
-            ls_row(&mut out, "file", Some(fs::metadata(&p)?.len()), "", &p.display().to_string(), false)
-        }
-        Node::ArchiveFile(rpf, id) => print_entry(&mut out, &rpf, id, &rpf.path_of(id)),
-        Node::Rpf8File(rpf, i) => print_rpf8_entry(&mut out, &rpf, i, &rpf.entry_name(i)),
-        Node::Rpf8Dir(rpf, dir) => {
-            let (dirs, files) = rpf.list_dir(&dir);
-            for d in dirs {
-                ls_row(&mut out, "dir", None, "", &d, true);
-            }
-            for i in files {
-                let name = rpf.entry_name(i);
-                print_rpf8_entry(&mut out, &rpf, i, name.rsplit('/').next().unwrap_or(&name));
-            }
-        }
-        Node::Rpf9File(rpf, i) => {
-            let entries = rpf.entries()?;
-            print_rpf9_entry(&mut out, &rpf, &entries[i], &rpf.entry_name(&entries[i]));
-        }
-        Node::Rpf9Dir(rpf, dir) => {
-            let entries = rpf.entries()?;
-            openrage_app::rpf9::names_now(&rpf);
-            if recursive {
-                let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
-                for e in entries.iter() {
-                    let name = rpf.entry_name(e);
-                    let below = name.get(..prefix.len()).is_some_and(|s| s.eq_ignore_ascii_case(&prefix));
-                    if let Some(rel) = name.get(prefix.len()..).filter(|_| below) {
-                        print_rpf9_entry(&mut out, &rpf, e, rel);
-                    }
-                }
-            } else {
-                let (dirs, files) = rpf.list_dir(&entries, &dir);
-                for d in dirs {
-                    ls_row(&mut out, "dir", None, "", &d, true);
-                }
-                for i in files {
-                    let name = rpf.entry_name(&entries[i]);
-                    print_rpf9_entry(&mut out, &rpf, &entries[i], name.rsplit('/').next().unwrap_or(&name));
-                }
-            }
-        }
-        Node::Gta4File(a, id) => print_gta4_entry(&mut out, &a, id, &a.entry_path(id)),
-        Node::Gta4Dir(a, dir) => {
-            if recursive {
-                vfs::walk_gta4(&a, dir, "", &mut |id, p| print_gta4_entry(&mut out, &a, id, p));
-            } else {
-                for id in a.children(dir) {
-                    print_gta4_entry(&mut out, &a, id, &a.entry(id).name);
-                }
-            }
-        }
-        Node::ArchiveDir(rpf, dir) => {
-            if recursive {
-                vfs::walk(&rpf, dir, "", true, &mut |a, id, p| print_entry(&mut out, a, id, p), &mut |e| {
-                    eprintln!("warning: {e}")
-                });
-            } else {
-                for id in rpf.children(dir) {
-                    print_entry(&mut out, &rpf, id, &rpf.entry(id).name);
-                }
-            }
-        }
+        node @ (Node::Dir(..) | Node::PlainFile(..)) => ls_disk(&mut out, node)?,
+        node @ (Node::ArchiveFile(..) | Node::ArchiveDir(..)) => ls_rpf7(&mut out, node, recursive),
+        node @ (Node::Rpf8File(..) | Node::Rpf8Dir(..)) => ls_rpf8(&mut out, node),
+        node @ (Node::Rpf9File(..) | Node::Rpf9Dir(..)) => ls_rpf9(&mut out, node, recursive)?,
+        node @ (Node::Gta4File(..) | Node::Gta4Dir(..)) => ls_gta4(&mut out, node, recursive),
         _ => bail!("{path}: not supported"),
     }
     out.finish();
     Ok(())
 }
 
-pub(crate) fn cmd_info(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
-    match vfs::resolve(game_dir, path, keys)? {
-        Node::ArchiveDir(rpf, dir) if dir == Rpf7::ROOT => {
-            let (mut dirs, mut files, mut resources, mut archives) = (0, 0, 0, 0);
-            for e in rpf.entries() {
-                match e.kind_label() {
-                    "dir" => dirs += 1,
-                    "rpf" => archives += 1,
-                    "resource" => resources += 1,
-                    _ => files += 1,
-                }
-            }
-            outln!("Archive:     {}", rpf.display_path());
-            outln!("Format:      RPF7");
-            outln!("Size:        {} ({} bytes)", human(rpf.size()), rpf.size());
-            outln!("Encryption:  {:?}", rpf.encryption());
-            outln!(
-                "Entries:     {} ({dirs} dirs, {files} files, {resources} resources, {archives} archives)",
-                rpf.entries().len()
-            );
-        }
-        Node::ArchiveFile(rpf, id) | Node::ArchiveDir(rpf, id) => {
-            let e = rpf.entry(id);
-            outln!("Path:        {}/{}", rpf.display_path(), rpf.path_of(id));
-            outln!("Kind:        {}", e.kind_label());
-            outln!("Details:     {:?}", e.kind);
-            if let Some(v) = e.resource_version() {
-                outln!("Resource version: {v}");
-            }
-        }
-        Node::Rpf8Dir(rpf, dir) => {
-            let h = rpf.header();
-            outln!("Archive:     {}", rpf.display_name());
-            outln!("Format:      RPF8 (Red Dead Redemption 2)");
-            outln!("Size:        {} ({} bytes)", human(rpf.size()), rpf.size());
-            outln!(
-                "Table:       {}",
-                if h.is_encrypted() { format!("encrypted (key {})", h.decryption_tag) } else { "plaintext".into() }
-            );
-            outln!("Entries:     {}", h.entry_count);
-            if !dir.is_empty() {
-                outln!("Folder:      {dir}");
-            }
-        }
-        Node::Rpf9Dir(rpf, dir) => {
-            outln!("Archive:     {}", rpf.display_name());
-            outln!("Format:      RPF9 (Grand Theft Auto VI)");
-            outln!("Size:        {} ({} bytes)", human(rpf.size()), rpf.size());
-            outln!("Index slots: {} (declared in header; distinct from recovered streams)", rpf.header().entry_count);
-            outln!("TOC tag:     {:#04x} (native transform selector)", rpf.header().toc_transform);
-            if rpf.is_native() {
-                outln!("Table:       read with the game's executable");
-            } else {
-                outln!("Table:       encrypted, not read (file names and folders are unknown)");
-            }
-            outln!("Data:        from offset {:#x}, {}", rpf.header().data_offset, human(rpf.data_len()));
-            // The archive itself is described without reading all of it.
-            let known = openrage_app::rpf9::known_entries(&rpf);
-            let entries = if dir.is_empty() { known } else { Some(rpf.entries()?) };
-            match entries {
-                Some(entries) => {
-                    let c = openrage_app::rpf9::coverage(&rpf, &entries);
-                    outln!(
-                        "{}   {} files, {} in the archive, {} unpacked",
-                        if rpf.is_native() { "Contents: " } else { "Recovered:" },
-                        c.files,
-                        human(c.stored),
-                        human(c.unpacked)
-                    );
-                    if !rpf.is_native() {
-                        outln!(
-                            "Not read:    {} (padding, and data that is neither zlib, Bink 2 nor an audio container)",
-                            human(c.unread)
-                        );
-                    }
-                }
-                None => outln!("Recovered:   not indexed yet; `openrage ls` on the archive reads all of it once"),
-            }
-            if !dir.is_empty() {
-                outln!("Folder:      {dir}");
-            }
-        }
-        Node::Rpf9File(rpf, i) => {
-            let entries = rpf.entries()?;
-            let e = &entries[i];
-            outln!("Path:        {}/{}", rpf.display_name(), rpf.entry_name(e));
-            if rpf.is_native() {
-                outln!("Kind:        {}", if rpf.resource_parts(e).is_some() { "resource" } else { "file" });
-            } else {
-                outln!("Kind:        recovered file (its name is its offset; the real name is unknown)");
-            }
-            outln!("Offset:      {:#x}", e.offset);
-            outln!("Size:        {} ({} on disk)", human(e.size), human(e.stored));
-            match e.kind {
-                rage_rpf::rpf9::Kind::Zlib => outln!("Stored as:   {} zlib stream(s)", e.streams),
-                rage_rpf::rpf9::Kind::Bink2 => outln!("Stored as:   Bink 2 video"),
-                rage_rpf::rpf9::Kind::Awc => outln!("Stored as:   audio container"),
-                rage_rpf::rpf9::Kind::Native { slot } => {
-                    outln!("Slot:        {slot}");
-                    if let Some((system, graphics)) = rpf.resource_parts(e) {
-                        outln!("Parts:       {} system, {} graphics", human(system), human(graphics));
-                    }
-                }
-            }
-        }
-        Node::Rpf8File(rpf, i) => {
-            let e = &rpf.entries().expect("entries")[i];
-            outln!("Path:        {}/{}", rpf.display_name(), rpf.entry_name(i));
-            outln!("Kind:        {}", if e.is_resource { "resource" } else { "file" });
-            outln!("Size:        {} ({} on disk)", human(e.size()), human(e.size_on_disk));
-            outln!("Compression: {:?}", e.compression);
-            outln!("Encrypted:   {}", if e.is_encrypted() { format!("yes (key {})", e.key_id) } else { "no".into() });
-            if let Some(v) = e.resource_version() {
-                outln!("Resource version: {v}");
-                outln!(
-                    "Pages:       {} virtual, {} physical",
-                    e.size_or_flags & 0xFFFF_FFF0,
-                    e.size_or_flags >> 32 & 0xFFFF_FFF0
-                );
-            }
-        }
-        Node::Gta4Dir(a, dir) if dir == rage_rpf::Gta4Archive::ROOT => {
-            let size = fs::metadata(a.path())?.len();
-            let ids = 1..a.len();
-            let dirs = ids.clone().filter(|&i| a.entry(i).is_dir()).count();
-            let resources = ids.clone().filter(|&i| a.entry(i).resource_type().is_some()).count();
-            outln!("Archive:     {}", a.display_name());
-            outln!("Format:      {} (GTA IV)", a.format().name());
-            outln!("Size:        {} ({size} bytes)", human(size));
-            outln!("Table:       {}", if a.is_encrypted() { "encrypted (AES)" } else { "plaintext" });
-            outln!(
-                "Entries:     {} ({dirs} dirs, {} files, {resources} resources)",
-                a.len() - 1,
-                a.len() - 1 - dirs - resources
-            );
-        }
-        Node::Gta4Dir(a, id) | Node::Gta4File(a, id) => {
-            let e = a.entry(id);
-            outln!("Path:        {}/{}", a.display_name(), a.entry_path(id));
-            outln!("Kind:        {}", openrage_app::gta4::kind_label(&a, id));
-            match e.kind {
-                rage_rpf::Gta4EntryKind::Dir { ref children } => outln!("Entries:     {}", children.len()),
-                rage_rpf::Gta4EntryKind::File { stored, size, compressed, .. } => {
-                    outln!(
-                        "Size:        {} ({} stored{})",
-                        human(size),
-                        human(stored),
-                        if compressed { ", zlib" } else { "" }
-                    )
-                }
-                rage_rpf::Gta4EntryKind::Resource { stored, resource_type, .. } => {
-                    let (sys, gfx) = e.resource_sizes().unwrap_or_default();
-                    outln!("Size:        {} (RSC5, zlib)", human(stored));
-                    outln!(
-                        "Resource:    type {resource_type} ({})",
-                        openrage_app::gta4::resource_type_name(resource_type)
-                    );
-                    outln!("Memory:      {} system, {} graphics", human(sys as u64), human(gfx as u64));
-                }
-            }
-        }
-        Node::Dir(p) | Node::PlainFile(p) => outln!("{} is not inside an archive", p.display()),
-        _ => outln!("{path}: not supported"),
+fn ls_disk(out: &mut Rows, node: Node) -> Result<()> {
+    match node {
+        Node::Dir(dir) => ls_disk_dir(out, &dir)?,
+        Node::PlainFile(p) => ls_row(out, "file", Some(fs::metadata(&p)?.len()), "", &p.display().to_string(), false),
+        _ => {}
     }
     Ok(())
+}
+
+fn ls_rpf7(out: &mut Rows, node: Node, recursive: bool) {
+    match node {
+        Node::ArchiveFile(rpf, id) => print_entry(out, &rpf, id, &rpf.path_of(id)),
+        Node::ArchiveDir(rpf, dir) => ls_archive_dir(out, &rpf, dir, recursive),
+        _ => {}
+    }
+}
+
+fn ls_rpf8(out: &mut Rows, node: Node) {
+    match node {
+        Node::Rpf8File(rpf, i) => print_rpf8_entry(out, &rpf, i, &rpf.entry_name(i)),
+        Node::Rpf8Dir(rpf, dir) => ls_rpf8_dir(out, &rpf, &dir),
+        _ => {}
+    }
+}
+
+fn ls_rpf9(out: &mut Rows, node: Node, recursive: bool) -> Result<()> {
+    match node {
+        Node::Rpf9File(rpf, i) => {
+            let entries = rpf.entries()?;
+            print_rpf9_entry(out, &rpf, &entries[i], &rpf.entry_name(&entries[i]));
+            Ok(())
+        }
+        Node::Rpf9Dir(rpf, dir) => ls_rpf9_dir(out, &rpf, &dir, recursive),
+        _ => Ok(()),
+    }
+}
+
+fn ls_gta4(out: &mut Rows, node: Node, recursive: bool) {
+    match node {
+        Node::Gta4File(a, id) => print_gta4_entry(out, &a, id, &a.entry_path(id)),
+        Node::Gta4Dir(a, dir) => ls_gta4_dir(out, &a, dir, recursive),
+        _ => {}
+    }
+}
+
+fn ls_disk_dir(out: &mut Rows, dir: &Path) -> Result<()> {
+    let mut items: Vec<_> = fs::read_dir(dir)?.flatten().collect();
+    items.sort_by_key(|e| e.file_name());
+    for item in items {
+        let meta = item.metadata()?;
+        let name = item.file_name().to_string_lossy().into_owned();
+        let lower = name.to_ascii_lowercase();
+        let kind = if meta.is_dir() {
+            "dir"
+        } else if lower.ends_with(".rpf") {
+            "rpf"
+        } else if lower.ends_with(".img") && rage_rpf::Gta4Archive::file_is_gta4(&item.path()) {
+            "img"
+        } else {
+            "file"
+        };
+        ls_row(out, kind, Some(meta.len()), "", &name, kind != "file");
+    }
+    Ok(())
+}
+
+fn ls_rpf8_dir(out: &mut Rows, rpf: &rage_rpf::Rpf8, dir: &str) {
+    let (dirs, files) = rpf.list_dir(dir);
+    for d in dirs {
+        ls_row(out, "dir", None, "", &d, true);
+    }
+    for i in files {
+        let name = rpf.entry_name(i);
+        print_rpf8_entry(out, rpf, i, name.rsplit('/').next().unwrap_or(&name));
+    }
+}
+
+fn ls_rpf9_dir(out: &mut Rows, rpf: &rage_rpf::Rpf9, dir: &str, recursive: bool) -> Result<()> {
+    let entries = rpf.entries()?;
+    openrage_app::rpf9::names_now(rpf);
+    if recursive {
+        let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+        for e in entries.iter() {
+            let name = rpf.entry_name(e);
+            let below = name.get(..prefix.len()).is_some_and(|s| s.eq_ignore_ascii_case(&prefix));
+            if let Some(rel) = name.get(prefix.len()..).filter(|_| below) {
+                print_rpf9_entry(out, rpf, e, rel);
+            }
+        }
+    } else {
+        let (dirs, files) = rpf.list_dir(&entries, dir);
+        for d in dirs {
+            ls_row(out, "dir", None, "", &d, true);
+        }
+        for i in files {
+            let name = rpf.entry_name(&entries[i]);
+            print_rpf9_entry(out, rpf, &entries[i], name.rsplit('/').next().unwrap_or(&name));
+        }
+    }
+    Ok(())
+}
+
+fn ls_gta4_dir(out: &mut Rows, a: &rage_rpf::Gta4Archive, dir: rage_rpf::Gta4EntryId, recursive: bool) {
+    if recursive {
+        vfs::walk_gta4(a, dir, "", &mut |id, p| print_gta4_entry(out, a, id, p));
+    } else {
+        for id in a.children(dir) {
+            print_gta4_entry(out, a, id, &a.entry(id).name);
+        }
+    }
+}
+
+fn ls_archive_dir(out: &mut Rows, rpf: &Rpf7, dir: EntryId, recursive: bool) {
+    if recursive {
+        vfs::walk(rpf, dir, "", true, &mut |a, id, p| print_entry(out, a, id, p), &mut |e| eprintln!("warning: {e}"));
+    } else {
+        for id in rpf.children(dir) {
+            print_entry(out, rpf, id, &rpf.entry(id).name);
+        }
+    }
 }
 
 pub(crate) fn report_rpf8_extract(rpf: &rage_rpf::Rpf8, dir: &str, file: Option<usize>, out: &Path) -> Result<()> {

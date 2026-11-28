@@ -343,13 +343,17 @@ fn blok_record(fields: &[String]) -> Result<Vec<u8>, String> {
     Ok(rec)
 }
 
-/// Reads the text of [`to_text`] back into a placement file. Model names
-/// become their hash (`hash`; `0x…` is taken as written). Lines that read
-/// exactly as a record of `original` did keep that record's bytes. Errors
-/// name the line.
-pub fn from_text(text: &str, hash: impl Fn(&str) -> u32, original: Option<&Wpl>) -> Result<Wpl, WplError> {
-    // Original records by (section, text line), to reuse unchanged ones.
-    let mut known: std::collections::HashMap<(String, String), Vec<Vec<u8>>> = Default::default();
+/// Original records by (section, text line), to reuse unchanged ones.
+type Known = std::collections::HashMap<(String, String), Vec<Vec<u8>>>;
+
+const VERSION_PREFIX: &str = "# GTA IV placement file, version ";
+
+fn at_line(n: usize, m: String) -> WplError {
+    WplError::Invalid(format!("line {}: {m}", n + 1))
+}
+
+fn known_records(original: Option<&Wpl>) -> Known {
+    let mut known = Known::default();
     if let Some(o) = original {
         for (section, records) in &o.other {
             for r in records {
@@ -359,77 +363,133 @@ pub fn from_text(text: &str, hash: impl Fn(&str) -> u32, original: Option<&Wpl>)
         }
         known.values_mut().for_each(|v| v.reverse());
     }
-    let mut wpl = Wpl {
+    known
+}
+
+/// A model field: a hash as `0x…`, else a name for `hash`.
+fn model_hash(model: &str, hash: &impl Fn(&str) -> u32) -> Result<u32, String> {
+    match model.strip_prefix("0x").or_else(|| model.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).map_err(|_| format!("{model:?} is not a hash")),
+        None if model.is_empty() => Err("the model name is empty".into()),
+        None => Ok(hash(model)),
+    }
+}
+
+/// A record of a section other than `inst` from its fields.
+fn section_record(name: &str, fields: &[String], size: usize) -> Result<Vec<u8>, String> {
+    if name == "blok" { blok_record(fields) } else { generic_record(fields, size) }
+}
+
+fn float_fields<const N: usize>(fields: &[String]) -> Result<[f32; N], String> {
+    let mut out = [0.0; N];
+    for (v, f) in out.iter_mut().zip(fields) {
+        *v = parse_float(f)?;
+    }
+    Ok(out)
+}
+
+/// An `inst` line from its fields (see [`to_text`]).
+fn instance_from_fields(fields: &[String], hash: &impl Fn(&str) -> u32) -> Result<Instance, String> {
+    if fields.len() != 12 {
+        return Err(format!("an inst line has 12 fields, not {}", fields.len()));
+    }
+    let w = |i: usize| parse_word(&fields[i]);
+    let model_hash = model_hash(&fields[7], hash)?;
+    Ok(Instance {
+        position: float_fields(&fields[0..3])?,
+        rotation: float_fields(&fields[3..7])?,
+        model_hash,
+        flags: w(8)?,
+        lod: w(9)? as i32,
+        extra: [w(10)?, w(11)?],
+    })
+}
+
+/// The state while reading the lines of a placement text.
+struct TextReader {
+    wpl: Wpl,
+    /// The open section and its record size.
+    section: Option<(&'static str, usize)>,
+    known: Known,
+}
+
+impl TextReader {
+    fn line(&mut self, n: usize, raw: &str, hash: &impl Fn(&str) -> u32) -> Result<(), WplError> {
+        let line = raw.trim();
+        if let Some(v) = line.strip_prefix(VERSION_PREFIX) {
+            return self.version(n, v);
+        }
+        if line.is_empty() || line.starts_with('#') {
+            return Ok(());
+        }
+        let Some((name, size)) = self.section else { return self.open_section(n, line) };
+        if line.eq_ignore_ascii_case("end") {
+            self.section = None;
+            return Ok(());
+        }
+        let fields = split_fields(line).map_err(|m| at_line(n, m))?;
+        if name == "inst" { self.instance(n, &fields, hash) } else { self.record(n, name, size, &fields) }
+    }
+
+    fn version(&mut self, n: usize, v: &str) -> Result<(), WplError> {
+        self.wpl.version = v.trim().parse().map_err(|_| at_line(n, format!("{v:?} is not a version number")))?;
+        Ok(())
+    }
+
+    fn open_section(&mut self, n: usize, line: &str) -> Result<(), WplError> {
+        let found = SECTIONS.iter().find(|(_, n, _)| n.eq_ignore_ascii_case(line));
+        let &(_, name, size) =
+            found.ok_or_else(|| at_line(n, format!("{line:?} is not a section (inst, cars, zone, …)")))?;
+        if name != "inst" && self.wpl.other.iter().any(|(n, _)| *n == name)
+            || name == "inst" && !self.wpl.instances.is_empty()
+        {
+            return Err(at_line(n, format!("section {name} appears twice")));
+        }
+        if name != "inst" {
+            self.wpl.other.push((name, Vec::new()));
+        }
+        self.section = Some((name, size));
+        Ok(())
+    }
+
+    fn instance(&mut self, n: usize, fields: &[String], hash: &impl Fn(&str) -> u32) -> Result<(), WplError> {
+        let instance = instance_from_fields(fields, hash).map_err(|m| at_line(n, m))?;
+        self.wpl.instances.push(instance);
+        Ok(())
+    }
+
+    /// A record of another section: an unchanged one keeps its original bytes.
+    fn record(&mut self, n: usize, name: &'static str, size: usize, fields: &[String]) -> Result<(), WplError> {
+        let normalized = fields.join(", ");
+        let reused = self.known.get_mut(&(name.to_string(), normalized)).and_then(Vec::pop);
+        let rec = match reused {
+            Some(r) => r,
+            None => section_record(name, fields, size).map_err(|m| at_line(n, m))?,
+        };
+        self.wpl.other.last_mut().expect("section pushed").1.push(rec);
+        Ok(())
+    }
+}
+
+/// Reads the text of [`to_text`] back into a placement file. Model names
+/// become their hash (`hash`; `0x…` is taken as written). Lines that read
+/// exactly as a record of `original` did keep that record's bytes. Errors
+/// name the line.
+pub fn from_text(text: &str, hash: impl Fn(&str) -> u32, original: Option<&Wpl>) -> Result<Wpl, WplError> {
+    let wpl = Wpl {
         version: original.map_or(3, |o| o.version),
         instances: Vec::new(),
         other: Vec::new(),
         trailing: original.map(|o| o.trailing.clone()).unwrap_or_default(),
     };
-    let mut section: Option<(&'static str, usize)> = None;
+    let mut reader = TextReader { wpl, section: None, known: known_records(original) };
     for (n, raw) in text.lines().enumerate() {
-        let err = |m: String| WplError::Invalid(format!("line {}: {m}", n + 1));
-        let line = raw.trim();
-        if let Some(v) = line.strip_prefix("# GTA IV placement file, version ") {
-            wpl.version = v.trim().parse().map_err(|_| err(format!("{v:?} is not a version number")))?;
-            continue;
-        }
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((name, size)) = section else {
-            let found = SECTIONS.iter().find(|(_, n, _)| n.eq_ignore_ascii_case(line));
-            let &(_, name, size) =
-                found.ok_or_else(|| err(format!("{line:?} is not a section (inst, cars, zone, …)")))?;
-            if name != "inst" && wpl.other.iter().any(|(n, _)| *n == name)
-                || name == "inst" && !wpl.instances.is_empty()
-            {
-                return Err(err(format!("section {name} appears twice")));
-            }
-            if name != "inst" {
-                wpl.other.push((name, Vec::new()));
-            }
-            section = Some((name, size));
-            continue;
-        };
-        if line.eq_ignore_ascii_case("end") {
-            section = None;
-            continue;
-        }
-        let fields = split_fields(line).map_err(err)?;
-        if name == "inst" {
-            if fields.len() != 12 {
-                return Err(err(format!("an inst line has 12 fields, not {}", fields.len())));
-            }
-            let f = |i: usize| parse_float(&fields[i]).map_err(err);
-            let w = |i: usize| parse_word(&fields[i]).map_err(err);
-            let model = &fields[7];
-            let model_hash = match model.strip_prefix("0x").or_else(|| model.strip_prefix("0X")) {
-                Some(hex) => u32::from_str_radix(hex, 16).map_err(|_| err(format!("{model:?} is not a hash")))?,
-                None if model.is_empty() => return Err(err("the model name is empty".into())),
-                None => hash(model),
-            };
-            wpl.instances.push(Instance {
-                position: [f(0)?, f(1)?, f(2)?],
-                rotation: [f(3)?, f(4)?, f(5)?, f(6)?],
-                model_hash,
-                flags: w(8)?,
-                lod: w(9)? as i32,
-                extra: [w(10)?, w(11)?],
-            });
-            continue;
-        }
-        let normalized = fields.join(", ");
-        let reused = known.get_mut(&(name.to_string(), normalized)).and_then(Vec::pop);
-        let rec = match reused {
-            Some(r) => r,
-            None if name == "blok" => blok_record(&fields).map_err(err)?,
-            None => generic_record(&fields, size).map_err(err)?,
-        };
-        wpl.other.last_mut().expect("section pushed").1.push(rec);
+        reader.line(n, raw, &hash)?;
     }
-    if let Some((name, _)) = section {
+    if let Some((name, _)) = reader.section {
         return Err(WplError::Invalid(format!("section {name} has no end")));
     }
+    let mut wpl = reader.wpl;
     // Sections in file order.
     wpl.other.sort_by_key(|(name, _)| SECTIONS.iter().position(|(_, n, _)| n == name));
     Ok(wpl)

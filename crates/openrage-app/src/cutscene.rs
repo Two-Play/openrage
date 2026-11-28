@@ -163,6 +163,55 @@ pub fn prop_textures(
     Some((ytd_name, dict))
 }
 
+/// First child element of `n` named `name`.
+fn child<'a, 'i>(n: roxmltree::Node<'a, 'i>, name: &str) -> Option<roxmltree::Node<'a, 'i>> {
+    n.children().find(|c| c.has_tag_name(name))
+}
+
+/// An element's `x`/`y`/`z` attributes.
+fn xyz(n: roxmltree::Node) -> Option<[f32; 3]> {
+    Some([n.attribute("x")?.parse().ok()?, n.attribute("y")?.parse().ok()?, n.attribute("z")?.parse().ok()?])
+}
+
+/// The `Item` children of `pCutsceneObjects`, if the element exists.
+fn cutscene_items<'a, 'i>(root: roxmltree::Node<'a, 'i>) -> impl Iterator<Item = roxmltree::Node<'a, 'i>> {
+    child(root, "pCutsceneObjects")
+        .into_iter()
+        .flat_map(|objects| objects.children().filter(|c| c.has_tag_name("Item")))
+}
+
+/// The actor of one cutscene object `Item`, unless it has no name or is of an unsupported kind.
+fn actor_of(item: roxmltree::Node) -> Option<Actor> {
+    let object_type = item.attribute("type").unwrap_or_default().to_owned();
+    let kind = Kind::of(&object_type);
+    let text = |name: &str| child(item, name).and_then(|n| n.text()).map(str::trim).filter(|t| !t.is_empty());
+    let name = text("StreamingName").or_else(|| text("cName"))?;
+    if matches!(kind, Kind::Other) {
+        return None;
+    }
+    let type_file = text("typeFile").map(str::to_owned);
+    Some(Actor { kind, name: name.to_owned(), object_type, type_file })
+}
+
+/// The light of one cutscene object `Item`, unless it is not a light or has no position.
+fn light_of(item: roxmltree::Node) -> Option<Light> {
+    let v3 = |n: roxmltree::Node, name: &str| -> Option<[f32; 3]> { xyz(child(n, name)?) };
+    let f = |n: roxmltree::Node, name: &str| -> Option<f32> { child(n, name)?.attribute("value")?.parse().ok() };
+    if Kind::of(item.attribute("type").unwrap_or_default()) != Kind::Light {
+        return None;
+    }
+    let position = v3(item, "vPosition")?;
+    Some(Light {
+        position,
+        direction: v3(item, "vDirection").unwrap_or([0.0, 0.0, -1.0]),
+        color: v3(item, "vColour").unwrap_or([1.0; 3]),
+        intensity: f(item, "fIntensity").unwrap_or(1.0),
+        range: f(item, "fFallOff").unwrap_or(5.0).max(0.1),
+        cone: f(item, "fConeAngle").unwrap_or(60.0),
+        spot: f(item, "iLightType").is_some_and(|t| t == 2.0),
+    })
+}
+
 /// Reads the cast and length from a cutscene's XML.
 pub fn from_xml(xml: &str) -> Result<Cutscene> {
     let doc = roxmltree::Document::parse_with_options(
@@ -170,53 +219,11 @@ pub fn from_xml(xml: &str) -> Result<Cutscene> {
         roxmltree::ParsingOptions { allow_dtd: false, nodes_limit: u32::MAX, ..Default::default() },
     )?;
     let root = doc.root_element();
-    fn child<'a, 'i>(n: roxmltree::Node<'a, 'i>, name: &str) -> Option<roxmltree::Node<'a, 'i>> {
-        n.children().find(|c| c.has_tag_name(name))
-    }
     let duration = child(root, "fTotalDuration").and_then(|d| d.attribute("value")).and_then(|v| v.parse().ok());
-    let mut actors = Vec::new();
-    if let Some(objects) = child(root, "pCutsceneObjects") {
-        for item in objects.children().filter(|c| c.has_tag_name("Item")) {
-            let object_type = item.attribute("type").unwrap_or_default().to_owned();
-            let kind = Kind::of(&object_type);
-            let text = |name: &str| child(item, name).and_then(|n| n.text()).map(str::trim).filter(|t| !t.is_empty());
-            let Some(name) = text("StreamingName").or_else(|| text("cName")) else { continue };
-            if matches!(kind, Kind::Other) {
-                continue;
-            }
-            let type_file = text("typeFile").map(str::to_owned);
-            actors.push(Actor { kind, name: name.to_owned(), object_type, type_file });
-        }
-    }
-    let offset = child(root, "vOffset")
-        .and_then(|n| {
-            Some([n.attribute("x")?.parse().ok()?, n.attribute("y")?.parse().ok()?, n.attribute("z")?.parse().ok()?])
-        })
-        .unwrap_or([0.0; 3]);
+    let actors = cutscene_items(root).filter_map(actor_of).collect();
+    let offset = child(root, "vOffset").and_then(xyz).unwrap_or([0.0; 3]);
     let rotation = child(root, "fRotation").and_then(|n| n.attribute("value")?.parse().ok()).unwrap_or(0.0);
-    let mut lights = Vec::new();
-    if let Some(objects) = child(root, "pCutsceneObjects") {
-        let v3 = |n: roxmltree::Node, name: &str| -> Option<[f32; 3]> {
-            let c = child(n, name)?;
-            Some([c.attribute("x")?.parse().ok()?, c.attribute("y")?.parse().ok()?, c.attribute("z")?.parse().ok()?])
-        };
-        let f = |n: roxmltree::Node, name: &str| -> Option<f32> { child(n, name)?.attribute("value")?.parse().ok() };
-        for item in objects.children().filter(|c| c.has_tag_name("Item")) {
-            if Kind::of(item.attribute("type").unwrap_or_default()) != Kind::Light {
-                continue;
-            }
-            let Some(position) = v3(item, "vPosition") else { continue };
-            lights.push(Light {
-                position,
-                direction: v3(item, "vDirection").unwrap_or([0.0, 0.0, -1.0]),
-                color: v3(item, "vColour").unwrap_or([1.0; 3]),
-                intensity: f(item, "fIntensity").unwrap_or(1.0),
-                range: f(item, "fFallOff").unwrap_or(5.0).max(0.1),
-                cone: f(item, "fConeAngle").unwrap_or(60.0),
-                spot: f(item, "iLightType").is_some_and(|t| t == 2.0),
-            });
-        }
-    }
+    let lights = cutscene_items(root).filter_map(light_of).collect();
     Ok(Cutscene { duration: duration.unwrap_or(0.0), offset, rotation, actors, lights })
 }
 

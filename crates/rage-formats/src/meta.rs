@@ -149,70 +149,120 @@ pub fn is_gta6(system: &[u8]) -> bool {
     system.get(0x10..0x18) == Some(b"0DRP\x7a\0\0\0")
 }
 
-pub fn parse(res: &Resource) -> Result<Meta, MetaError> {
+/// Size of a structure info, an entry, an enum info and a data block info.
+const STRUCT_INFO_SIZE: u64 = 32;
+const ENTRY_SIZE: u64 = 16;
+const ENUM_INFO_SIZE: u64 = 24;
+const BLOCK_INFO_SIZE: u64 = 16;
+/// Most structures, enums and blocks a file may list; most values an enum may list.
+const MAX_LIST: usize = 0x10000;
+
+/// The counts of the structure, enum and block lists.
+fn list_counts(res: &Resource) -> Result<(usize, usize, usize), MetaError> {
     let root = Resource::ROOT;
     let i16_at = |off: u64| -> Result<usize, MetaError> { Ok((res.u16(root + off)? as i16).max(0) as usize) };
     let (struct_count, enum_count, block_count) = (i16_at(0x48)?, i16_at(0x4A)?, i16_at(0x4C)?);
-    if block_count == 0 || block_count > 0x10000 || struct_count > 0x10000 || enum_count > 0x10000 {
+    if block_count == 0 || block_count > MAX_LIST || struct_count > MAX_LIST || enum_count > MAX_LIST {
         return Err(MetaError::Invalid(format!("{block_count} blocks, {struct_count} structures")));
     }
-    let shift = if res.version == VERSION_RDR2 { 8 } else { 0 };
-    let root_block = res.u32(root + if res.version == VERSION_RDR2 { 0x20 } else { 0x1C })? as usize;
-    let name_ptr = res.u64(root + 0x38 + shift)?;
+    Ok((struct_count, enum_count, block_count))
+}
+
+/// The name of the file, empty when it has none.
+fn meta_name(res: &Resource, shift: u64) -> Result<String, MetaError> {
+    let name_ptr = res.u64(Resource::ROOT + 0x38 + shift)?;
     // GTA VI has a list in place of the name.
-    let name =
-        if name_ptr != 0 && !is_gta6(&res.system) { res.string(name_ptr).unwrap_or_default() } else { String::new() };
+    Ok(if name_ptr != 0 && !is_gta6(&res.system) { res.string(name_ptr).unwrap_or_default() } else { String::new() })
+}
 
+fn read_struct(res: &Resource, at: u64) -> Result<(u32, StructInfo), MetaError> {
+    let entries_ptr = res.u64(at + 0x10)?;
+    let size = res.u32(at + 0x18)? as usize;
+    let count = (res.u16(at + 0x1E)? as i16).max(0) as u64;
+    let mut entries = Vec::with_capacity(count as usize);
+    for e in 0..count {
+        let p = entries_ptr + e * ENTRY_SIZE;
+        entries.push(Entry {
+            name: res.u32(p)?,
+            offset: res.u32(p + 4)? as i32 as usize,
+            kind: res.u8(p + 8)?,
+            key: res.u32(p + 12)?,
+        });
+    }
+    Ok((res.u32(at)?, StructInfo { size, entries }))
+}
+
+fn read_structs(res: &Resource, infos: u64, count: usize) -> Result<HashMap<u32, StructInfo>, MetaError> {
     let mut structs = HashMap::new();
-    let infos = res.u64(root + 0x20 + shift)?;
-    for i in 0..struct_count as u64 {
-        let at = infos + i * 32;
-        let entries_ptr = res.u64(at + 0x10)?;
-        let size = res.u32(at + 0x18)? as usize;
-        let count = (res.u16(at + 0x1E)? as i16).max(0) as u64;
-        let mut entries = Vec::with_capacity(count as usize);
-        for e in 0..count {
-            let p = entries_ptr + e * 16;
-            entries.push(Entry {
-                name: res.u32(p)?,
-                offset: res.u32(p + 4)? as i32 as usize,
-                kind: res.u8(p + 8)?,
-                key: res.u32(p + 12)?,
-            });
-        }
-        structs.insert(res.u32(at)?, StructInfo { size, entries });
+    for i in 0..count as u64 {
+        let (name, info) = read_struct(res, infos + i * STRUCT_INFO_SIZE)?;
+        structs.insert(name, info);
     }
+    Ok(structs)
+}
 
+/// One enum value as (name, value).
+fn read_enum_value(res: &Resource, entries_ptr: u64, e: u64) -> Result<(u32, i32), MetaError> {
+    // GTA V: (name, value), 8 bytes; RDR2: (value, name), 16 bytes.
+    if res.version == VERSION_RDR2 {
+        let p = entries_ptr + e * 16;
+        Ok((res.u32(p + 8)?, res.u32(p)? as i32))
+    } else {
+        let p = entries_ptr + e * 8;
+        Ok((res.u32(p)?, res.u32(p + 4)? as i32))
+    }
+}
+
+fn read_enum(res: &Resource, at: u64) -> Result<(u32, Vec<(u32, i32)>), MetaError> {
+    let entries_ptr = res.u64(at + 8)?;
+    let count = res.u32(at + 0x10)? as u64;
+    let mut entries = Vec::with_capacity(count.min(MAX_LIST as u64) as usize);
+    for e in 0..count.min(MAX_LIST as u64) {
+        entries.push(read_enum_value(res, entries_ptr, e)?);
+    }
+    Ok((res.u32(at)?, entries))
+}
+
+fn read_enums(res: &Resource, infos: u64, count: usize) -> Result<HashMap<u32, Vec<(u32, i32)>>, MetaError> {
     let mut enums = HashMap::new();
-    let infos = res.u64(root + 0x28 + shift)?;
-    for i in 0..enum_count as u64 {
-        let at = infos + i * 24;
-        let entries_ptr = res.u64(at + 8)?;
-        let count = res.u32(at + 0x10)? as u64;
-        let mut entries = Vec::with_capacity(count.min(0x10000) as usize);
-        for e in 0..count.min(0x10000) {
-            // GTA V: (name, value), 8 bytes; RDR2: (value, name), 16 bytes.
-            if res.version == VERSION_RDR2 {
-                let p = entries_ptr + e * 16;
-                entries.push((res.u32(p + 8)?, res.u32(p)? as i32));
-            } else {
-                let p = entries_ptr + e * 8;
-                entries.push((res.u32(p)?, res.u32(p + 4)? as i32));
-            }
-        }
-        enums.insert(res.u32(at)?, entries);
+    for i in 0..count as u64 {
+        let (name, values) = read_enum(res, infos + i * ENUM_INFO_SIZE)?;
+        enums.insert(name, values);
     }
+    Ok(enums)
+}
 
-    let mut blocks = Vec::with_capacity(block_count);
-    let infos = res.u64(root + 0x30 + shift)?;
-    for i in 0..block_count as u64 {
-        let at = infos + i * 16;
+fn read_blocks(res: &Resource, infos: u64, count: usize) -> Result<Vec<Block>, MetaError> {
+    let mut blocks = Vec::with_capacity(count);
+    for i in 0..count as u64 {
+        let at = infos + i * BLOCK_INFO_SIZE;
         let len = res.u32(at + 4)? as usize;
         let ptr = res.u64(at + 8)?;
         let data = if len == 0 { Vec::new() } else { res.bytes(ptr, len)?.to_vec() };
         blocks.push(Block { name: res.u32(at)?, data });
     }
-    let offset_shift = if res.version == VERSION_RDR2 { 20 } else { 12 };
+    Ok(blocks)
+}
+
+/// The structures, enums and blocks the lists at `0x20`, `0x28` and `0x30` hold.
+type Lists = (HashMap<u32, StructInfo>, HashMap<u32, Vec<(u32, i32)>>, Vec<Block>);
+
+fn read_lists(res: &Resource, shift: u64, (structs, enums, blocks): (usize, usize, usize)) -> Result<Lists, MetaError> {
+    let root = Resource::ROOT;
+    let structs = read_structs(res, res.u64(root + 0x20 + shift)?, structs)?;
+    let enums = read_enums(res, res.u64(root + 0x28 + shift)?, enums)?;
+    let blocks = read_blocks(res, res.u64(root + 0x30 + shift)?, blocks)?;
+    Ok((structs, enums, blocks))
+}
+
+pub fn parse(res: &Resource) -> Result<Meta, MetaError> {
+    let counts = list_counts(res)?;
+    let rdr2 = res.version == VERSION_RDR2;
+    let shift = if rdr2 { 8 } else { 0 };
+    let root_block = res.u32(Resource::ROOT + if rdr2 { 0x20 } else { 0x1C })? as usize;
+    let name = meta_name(res, shift)?;
+    let (structs, enums, blocks) = read_lists(res, shift, counts)?;
+    let offset_shift = if rdr2 { 20 } else { 12 };
     Ok(Meta { name, root_block, structs, enums, blocks, offset_shift })
 }
 
@@ -263,6 +313,227 @@ fn vector_attrs(name: &str, v: &[f32]) -> String {
 /// A 64-bit name hash; nothing for 0.
 fn hash64_text(hash: u64) -> String {
     if hash == 0 { String::new() } else { format!("hash_{hash:016X}") }
+}
+
+/// Where an entry is read: the output level, the block it lives in, and the position.
+#[derive(Clone, Copy)]
+struct Site<'a> {
+    level: usize,
+    block_id: usize,
+    data: &'a [u8],
+    at: usize,
+    depth: usize,
+}
+
+/// The entry being read, the array info before it and the structure it belongs to.
+#[derive(Clone, Copy)]
+struct EntryCtx<'a> {
+    entry: &'a Entry,
+    array_info: &'a Entry,
+    owner: &'a StructInfo,
+}
+
+/// Where an array is: its packed pointer, its item count, and the output level and depth.
+#[derive(Clone, Copy)]
+struct ArrayRef {
+    ptr: u64,
+    count: usize,
+    level: usize,
+    depth: usize,
+}
+
+type ItemText = fn(&[u8]) -> String;
+
+/// How the items of a number array are read: their size, the numbers per line
+/// (`None`: one `Item` element per line) and how one is written.
+struct ArrayItems {
+    size: usize,
+    columns: Option<usize>,
+    text: ItemText,
+}
+
+/// Four little-endian floats in 16 bytes.
+fn float4_text(b: &[u8]) -> String {
+    b.as_chunks::<4>().0.iter().map(|c| xml::float(f32::from_le_bytes(*c))).collect::<Vec<_>>().join(", ")
+}
+
+fn integer_items(kind: u8) -> Option<ArrayItems> {
+    let (size, text): (usize, ItemText) = match kind {
+        ty::UINT => (4, |b| u32::from_le_bytes(b.try_into().unwrap_or_default()).to_string()),
+        ty::USHORT => (2, |b| u16::from_le_bytes(b.try_into().unwrap_or_default()).to_string()),
+        ty::UBYTE => (1, |b| b[0].to_string()),
+        ty::ULONG | ty::ULONG2 => (8, |b| u64::from_le_bytes(b.try_into().unwrap_or_default()).to_string()),
+        ty::SINT => (4, |b| i32::from_le_bytes(b.try_into().unwrap_or_default()).to_string()),
+        ty::SSHORT => (2, |b| i16::from_le_bytes(b.try_into().unwrap_or_default()).to_string()),
+        _ => return None,
+    };
+    Some(ArrayItems { size, columns: Some(10), text })
+}
+
+fn other_items(kind: u8) -> Option<ArrayItems> {
+    let (size, columns, text): (usize, Option<usize>, ItemText) = match kind {
+        ty::FLOAT => (4, Some(10), |b| xml::float(f32::from_le_bytes(b.try_into().unwrap_or_default()))),
+        ty::FLOAT_XYZ | ty::FLOAT_XYZW => (16, None, float4_text),
+        ty::HASH64 => (8, None, |b| hash64_text(u64::from_le_bytes(b.try_into().unwrap_or_default()))),
+        ty::HASH | ty::HASH2 => (4, None, |b| names::value(u32::from_le_bytes(b.try_into().unwrap_or_default()))),
+        _ => return None,
+    };
+    Some(ArrayItems { size, columns, text })
+}
+
+fn array_items(kind: u8) -> Option<ArrayItems> {
+    integer_items(kind).or_else(|| other_items(kind))
+}
+
+/// What the pairs of one map share.
+struct MapPairs<'a> {
+    level: usize,
+    id: usize,
+    block: &'a Block,
+    stride: usize,
+    key_kind: u8,
+    value_entry: Entry,
+    value_info: Entry,
+    owner: &'a StructInfo,
+    depth: usize,
+}
+
+fn matrix_entry(w: &mut Writer, site: &Site, kind: u8, ename: &str) -> Result<(), String> {
+    let Site { level, data, at, .. } = *site;
+    if kind == ty::MATRIX {
+        let m = vector(data, at, 16)?;
+        let rows: Vec<String> =
+            m.chunks(4).map(|r| r.iter().map(|v| xml::float(*v)).collect::<Vec<_>>().join(" ")).collect();
+        w.raw_array(level, ename, &rows, 1);
+    } else {
+        let v: Vec<String> = vector(data, at, 12)?.into_iter().map(xml::float).collect();
+        w.raw_array(level, ename, &v, 4);
+    }
+    Ok(())
+}
+
+fn opaque_entry(w: &mut Writer, site: &Site, kind: u8, ename: &str) -> Result<(), String> {
+    let Site { level, data, at, .. } = *site;
+    let size = if kind == ty::OPAQUE32 { 32 } else { 16 };
+    let b: Vec<String> =
+        (0..size).map(|i| byte_at(data, at + i).map(|v| format!("{v:02X}"))).collect::<Result<_, _>>()?;
+    w.raw_array(level, ename, &b, 16);
+    Ok(())
+}
+
+fn chars_entry(w: &mut Writer, site: &Site, n: usize, ename: &str) {
+    let Site { level, data, at, .. } = *site;
+    let bytes = data.get(at..(at + n).min(data.len())).unwrap_or_default();
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    w.text(level, ename, &String::from_utf8_lossy(&bytes[..end]));
+}
+
+fn byte_at(data: &[u8], at: usize) -> Result<u8, String> {
+    data.get(at).copied().ok_or_else(|| format!("offset {at:#x} beyond block"))
+}
+
+/// The items of an `ARRAY_OF_BYTES` entry as text, by the type of its items.
+fn byte_array_text(data: &[u8], at: usize, n: usize, item_kind: u8) -> Result<Vec<String>, String> {
+    let items = |size: usize, f: &dyn Fn(usize) -> Result<String, String>| (0..n).map(|i| f(at + i * size)).collect();
+    match item_kind {
+        ty::SBYTE => items(1, &|p| byte_at(data, p).map(|b| (b as i8).to_string())),
+        ty::UBYTE => items(1, &|p| byte_at(data, p).map(|b| b.to_string())),
+        ty::SSHORT => items(2, &|p| u16_at(data, p).map(|v| (v as i16).to_string())),
+        ty::USHORT => items(2, &|p| u16_at(data, p).map(|v| v.to_string())),
+        ty::SINT => items(4, &|p| u32_at(data, p).map(|v| (v as i32).to_string())),
+        ty::UINT => items(4, &|p| u32_at(data, p).map(|v| v.to_string())),
+        ty::FLOAT => items(4, &|p| f32_at(data, p).map(xml::float)),
+        _ => {
+            Ok(vec![(0..n).map(|i| byte_at(data, at + i).map(|b| format!("{b:02X}"))).collect::<Result<String, _>>()?])
+        }
+    }
+}
+
+/// How many floats a vector entry has.
+fn vector_len(kind: u8) -> Option<usize> {
+    match kind {
+        ty::FLOAT_XYZ | ty::VEC3_PADDED | ty::VEC3 => Some(3),
+        ty::FLOAT_XYZW => Some(4),
+        ty::VEC2 => Some(2),
+        _ => None,
+    }
+}
+
+/// The text of a plain number (or boolean) entry; `None` for other kinds.
+fn number_text(kind: u8, ename: &str, data: &[u8], at: usize) -> Result<Option<String>, String> {
+    let text = match kind {
+        ty::BOOLEAN | ty::BYTE_ENUM | ty::UBYTE | ty::SBYTE => byte_text(kind, data, at)?,
+        ty::HALF | ty::SHORT_ENUM | ty::USHORT | ty::SSHORT => short_text(kind, data, at)?,
+        ty::FLOAT | ty::SINT | ty::UINT => word_text(kind, ename, data, at)?,
+        ty::ULONG | ty::ULONG2 => u64_at(data, at)?.to_string(),
+        _ => return Ok(None),
+    };
+    Ok(Some(text))
+}
+
+fn byte_text(kind: u8, data: &[u8], at: usize) -> Result<String, String> {
+    let b = byte_at(data, at)?;
+    Ok(match kind {
+        ty::BOOLEAN => (if b != 0 { "true" } else { "false" }).to_owned(),
+        ty::SBYTE => (b as i8).to_string(),
+        _ => b.to_string(),
+    })
+}
+
+fn short_text(kind: u8, data: &[u8], at: usize) -> Result<String, String> {
+    let v = u16_at(data, at)?;
+    Ok(match kind {
+        ty::HALF => xml::float(f16_to_f32(v)),
+        ty::SSHORT => (v as i16).to_string(),
+        _ => v.to_string(),
+    })
+}
+
+fn word_text(kind: u8, ename: &str, data: &[u8], at: usize) -> Result<String, String> {
+    if kind == ty::FLOAT {
+        return Ok(xml::float(f32_at(data, at)?));
+    }
+    let v = u32_at(data, at)?;
+    Ok(match kind {
+        ty::SINT => (v as i32).to_string(),
+        _ if ename == "color" => format!("0x{v:08X}"),
+        _ => v.to_string(),
+    })
+}
+
+/// The pointer, group count (hash tables only) and pair count of a map.
+#[derive(Clone, Copy)]
+struct MapHeader {
+    ptr: u64,
+    groups: usize,
+    count: usize,
+}
+
+fn map_header(data: &[u8], at: usize, table: bool) -> Result<MapHeader, String> {
+    let ptr = u64_at(data, at + 8)?;
+    // A hash table has its groups of 16 places and its count in front.
+    let groups = if table { u32_at(data, at)? as usize } else { 0 };
+    let count = if table { u32_at(data, at + 4)? as usize } else { u16_at(data, at + 16)? as usize };
+    Ok(MapHeader { ptr, groups, count })
+}
+
+/// The key and value entry indices of a map entry's key; a hash table has them the other way round.
+fn map_entry_indices(key: u32, table: bool) -> (usize, usize) {
+    let (ki, vi) = ((key >> 16) as usize, (key & 0xFFFF) as usize);
+    if table { (vi, ki) } else { (ki, vi) }
+}
+
+/// Where a hash table's pairs are: its used places. Each group is 16 control
+/// bytes (the top bit set: unused), then 16 places.
+fn hash_table_pairs(block: &Block, off: usize, groups: usize, stride: usize) -> Result<Vec<usize>, String> {
+    let group = 16 + 16 * stride;
+    let end = groups.checked_mul(group).and_then(|len| off.checked_add(len));
+    let bytes = end.and_then(|end| block.data.get(off..end)).ok_or("hash table beyond its block")?;
+    let used = |g: usize| {
+        let at = off + g * group;
+        (0..16).filter(move |i| bytes[g * group + i] < 0x80).map(move |i| at + 16 + i * stride)
+    };
+    Ok((0..groups).flat_map(used).collect())
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -398,16 +669,9 @@ impl Meta {
                 continue;
             }
             let ename = names::field(entry.name);
-            if let Err(e) = self.entry(
-                w,
-                inner,
-                block_id,
-                &block.data,
-                offset + entry.offset,
-                (entry, &array_info, info),
-                &ename,
-                depth,
-            ) {
+            let site = Site { level: inner, block_id, data: &block.data, at: offset + entry.offset, depth };
+            let ctx = EntryCtx { entry, array_info: &array_info, owner: info };
+            if let Err(e) = self.entry(w, &site, &ctx, &ename) {
                 w.error(inner, format!("{ename}: {e}"));
             }
         }
@@ -416,140 +680,115 @@ impl Meta {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn entry(
-        &self,
-        w: &mut Writer,
-        level: usize,
-        block_id: usize,
-        data: &[u8],
-        at: usize,
-        (entry, array_info, owner): (&Entry, &Entry, &StructInfo),
-        ename: &str,
-        depth: usize,
-    ) -> Result<(), String> {
-        let byte = |at: usize| data.get(at).copied().ok_or_else(|| format!("offset {at:#x} beyond block"));
+    fn entry(&self, w: &mut Writer, site: &Site, ctx: &EntryCtx, ename: &str) -> Result<(), String> {
+        let Site { level, data, at, .. } = *site;
+        let EntryCtx { entry, array_info, owner } = *ctx;
         match entry.kind {
-            ty::ARRAY => self.array_node(w, level, data, at, array_info, ename, depth)?,
-            ty::MAP | ty::HASH_TABLE => self.map_node(w, level, data, at, entry, owner, ename, depth)?,
+            ty::ARRAY => self.array_node(w, site, array_info, ename),
+            ty::MAP | ty::HASH_TABLE => self.map_node(w, site, entry, owner, ename),
             ty::ARRAY_OF_BYTES => {
-                let n = entry.key as usize;
-                let text = match array_info.kind {
-                    ty::SBYTE => {
-                        (0..n).map(|i| byte(at + i).map(|b| (b as i8).to_string())).collect::<Result<Vec<_>, _>>()?
-                    }
-                    ty::UBYTE => (0..n).map(|i| byte(at + i).map(|b| b.to_string())).collect::<Result<Vec<_>, _>>()?,
-                    ty::SSHORT => (0..n)
-                        .map(|i| u16_at(data, at + i * 2).map(|v| (v as i16).to_string()))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    ty::USHORT => (0..n)
-                        .map(|i| u16_at(data, at + i * 2).map(|v| v.to_string()))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    ty::SINT => (0..n)
-                        .map(|i| u32_at(data, at + i * 4).map(|v| (v as i32).to_string()))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    ty::UINT => (0..n)
-                        .map(|i| u32_at(data, at + i * 4).map(|v| v.to_string()))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    ty::FLOAT => {
-                        (0..n).map(|i| f32_at(data, at + i * 4).map(xml::float)).collect::<Result<Vec<_>, _>>()?
-                    }
-                    _ => vec![(0..n).map(|i| byte(at + i).map(|b| format!("{b:02X}"))).collect::<Result<String, _>>()?],
-                };
+                let text = byte_array_text(data, at, entry.key as usize, array_info.kind)?;
                 w.text(level, ename, &text.join(" "));
+                Ok(())
             }
             ty::ARRAY_OF_CHARS => {
-                let n = entry.key as usize;
-                let bytes = data.get(at..(at + n).min(data.len())).unwrap_or_default();
-                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                w.text(level, ename, &String::from_utf8_lossy(&bytes[..end]));
+                chars_entry(w, site, entry.key as usize, ename);
+                Ok(())
             }
-            ty::BOOLEAN => w.value(level, ename, if byte(at)? != 0 { "true" } else { "false" }),
-            ty::BYTE_ENUM | ty::UBYTE => w.value(level, ename, &byte(at)?.to_string()),
-            ty::SBYTE => w.value(level, ename, &(byte(at)? as i8).to_string()),
-            ty::CHAR_POINTER => {
-                let ptr = u64_at(data, at)?;
-                let len = u16_at(data, at + 8)? as usize;
-                let text = if ptr == 0 || len == 0 { String::new() } else { self.string(ptr, len)? };
-                w.text(level, ename, &text);
-            }
-            ty::STRING_POINTER => {
-                let ptr = u64_at(data, at)?;
-                let text = if ptr == 0 { String::new() } else { self.string(ptr, MAX_STRING)? };
-                w.text(level, ename, &text);
-            }
-            ty::DATA_BLOCK_POINTER => {
-                let (id, _) = self.unpack(u64_at(data, at)?);
-                let bytes: Vec<String> = match self.block(id) {
-                    Some(b) => b.data.iter().map(|b| format!("{b:02X}")).collect(),
-                    None => Vec::new(),
-                };
-                w.raw_array(level, ename, &bytes, 32);
-            }
-            ty::FLOAT => w.value(level, ename, &xml::float(f32_at(data, at)?)),
-            ty::FLOAT_XYZ => w.empty(level, &vector_attrs(ename, &vector(data, at, 3)?)),
-            ty::FLOAT_XYZW => w.empty(level, &vector_attrs(ename, &vector(data, at, 4)?)),
-            ty::HASH | ty::HASH2 => w.string(level, ename, &names::value(u32_at(data, at)?)),
-            // RDR2's 0x63 flags are a single byte.
-            ty::INT_FLAGS1 if self.offset_shift == 20 => {
-                w.string(level, ename, &self.enum_string(entry, i32::from(byte(at)?)));
-            }
-            ty::INT_ENUM | ty::INT_FLAGS1 | ty::INT_FLAGS2 => {
-                let v = u32_at(data, at)? as i32;
-                w.string(level, ename, &self.enum_string(entry, v));
-            }
-            ty::SHORT_FLAGS => {
-                let v = u16_at(data, at)? as i16 as i32;
-                w.string(level, ename, &self.enum_string(entry, v));
-            }
-            ty::ULONG | ty::ULONG2 => w.value(level, ename, &u64_at(data, at)?.to_string()),
-            ty::HALF => w.value(level, ename, &xml::float(f16_to_f32(u16_at(data, at)?))),
-            ty::VEC3_PADDED => w.empty(level, &vector_attrs(ename, &vector(data, at, 3)?)),
-            ty::MATRIX => {
-                let m = vector(data, at, 16)?;
-                let rows: Vec<String> =
-                    m.chunks(4).map(|r| r.iter().map(|v| xml::float(*v)).collect::<Vec<_>>().join(" ")).collect();
-                w.raw_array(level, ename, &rows, 1);
-            }
-            ty::VEC2 => w.empty(level, &vector_attrs(ename, &vector(data, at, 2)?)),
-            ty::VEC3 => w.empty(level, &vector_attrs(ename, &vector(data, at, 3)?)),
-            ty::MATRIX34 => {
-                let v: Vec<String> = vector(data, at, 12)?.into_iter().map(xml::float).collect();
-                w.raw_array(level, ename, &v, 4);
-            }
-            ty::HASH64 => w.text(level, ename, &hash64_text(u64_at(data, at)?)),
-            ty::SHORT_ENUM => w.value(level, ename, &u16_at(data, at)?.to_string()),
-            ty::OPAQUE32 | ty::OPAQUE16 | ty::OPAQUE16B => {
-                let size = if entry.kind == ty::OPAQUE32 { 32 } else { 16 };
-                let b: Vec<String> =
-                    (0..size).map(|i| byte(at + i).map(|v| format!("{v:02X}"))).collect::<Result<_, _>>()?;
-                w.raw_array(level, ename, &b, 16);
-            }
-            ty::SINT => w.value(level, ename, &(u32_at(data, at)? as i32).to_string()),
-            ty::SSHORT => w.value(level, ename, &(u16_at(data, at)? as i16).to_string()),
-            ty::USHORT => w.value(level, ename, &u16_at(data, at)?.to_string()),
-            ty::UINT => {
-                let v = u32_at(data, at)?;
-                let text = if ename == "color" { format!("0x{v:08X}") } else { v.to_string() };
-                w.value(level, ename, &text);
-            }
-            ty::STRUCTURE => {
-                w.open(level, ename);
-                self.node(w, level, block_id, at, Tag::None, entry.key, depth + 1);
+            ty::CHAR_POINTER => self.char_pointer(w, site, ename),
+            ty::STRING_POINTER => self.string_pointer(w, site, ename),
+            ty::DATA_BLOCK_POINTER => self.data_block_pointer(w, site, ename),
+            ty::STRUCTURE | ty::STRUCTURE_POINTER => self.structure_entry(w, site, entry, ename),
+            _ => self.scalar_entry(w, site, entry, ename),
+        }
+    }
+
+    fn char_pointer(&self, w: &mut Writer, site: &Site, ename: &str) -> Result<(), String> {
+        let Site { level, data, at, .. } = *site;
+        let ptr = u64_at(data, at)?;
+        let len = u16_at(data, at + 8)? as usize;
+        let text = if ptr == 0 || len == 0 { String::new() } else { self.string(ptr, len)? };
+        w.text(level, ename, &text);
+        Ok(())
+    }
+
+    fn string_pointer(&self, w: &mut Writer, site: &Site, ename: &str) -> Result<(), String> {
+        let ptr = u64_at(site.data, site.at)?;
+        let text = if ptr == 0 { String::new() } else { self.string(ptr, MAX_STRING)? };
+        w.text(site.level, ename, &text);
+        Ok(())
+    }
+
+    fn data_block_pointer(&self, w: &mut Writer, site: &Site, ename: &str) -> Result<(), String> {
+        let (id, _) = self.unpack(u64_at(site.data, site.at)?);
+        let bytes: Vec<String> = match self.block(id) {
+            Some(b) => b.data.iter().map(|b| format!("{b:02X}")).collect(),
+            None => Vec::new(),
+        };
+        w.raw_array(site.level, ename, &bytes, 32);
+        Ok(())
+    }
+
+    /// Nested structures, inline or through a pointer.
+    fn structure_entry(&self, w: &mut Writer, site: &Site, entry: &Entry, ename: &str) -> Result<(), String> {
+        let Site { level, block_id, data, at, depth } = *site;
+        if entry.kind == ty::STRUCTURE {
+            w.open(level, ename);
+            self.node(w, level, block_id, at, Tag::None, entry.key, depth + 1);
+            w.close(level, ename);
+            return Ok(());
+        }
+        let ptr = u64_at(data, at)?;
+        let (id, off) = self.unpack(ptr);
+        match self.block(id) {
+            Some(b) if ptr != 0 => {
+                w.open(level, &format!("{ename} type=\"{}\"", names::field(b.name)));
+                self.node(w, level, id, off, Tag::None, 0, depth + 1);
                 w.close(level, ename);
             }
-            ty::STRUCTURE_POINTER => {
-                let ptr = u64_at(data, at)?;
-                let (id, off) = self.unpack(ptr);
-                match self.block(id) {
-                    Some(b) if ptr != 0 => {
-                        w.open(level, &format!("{ename} type=\"{}\"", names::field(b.name)));
-                        self.node(w, level, id, off, Tag::None, 0, depth + 1);
-                        w.close(level, ename);
-                    }
-                    _ => w.empty(level, ename),
-                }
-            }
+            _ => w.empty(level, ename),
+        }
+        Ok(())
+    }
+
+    /// Entries that are a plain value, a vector or an enum.
+    fn scalar_entry(&self, w: &mut Writer, site: &Site, entry: &Entry, ename: &str) -> Result<(), String> {
+        let Site { level, data, at, .. } = *site;
+        if let Some(text) = number_text(entry.kind, ename, data, at)? {
+            w.value(level, ename, &text);
+            return Ok(());
+        }
+        if let Some(n) = vector_len(entry.kind) {
+            w.empty(level, &vector_attrs(ename, &vector(data, at, n)?));
+            return Ok(());
+        }
+        if let Some(text) = self.enum_text(entry, data, at)? {
+            w.string(level, ename, &text);
+            return Ok(());
+        }
+        self.blob_entry(w, site, entry.kind, ename)
+    }
+
+    /// Enum and flag values as their names.
+    fn enum_text(&self, entry: &Entry, data: &[u8], at: usize) -> Result<Option<String>, String> {
+        let value = match entry.kind {
+            // RDR2's 0x63 flags are a single byte.
+            ty::INT_FLAGS1 if self.offset_shift == 20 => i32::from(byte_at(data, at)?),
+            ty::INT_ENUM | ty::INT_FLAGS1 | ty::INT_FLAGS2 => u32_at(data, at)? as i32,
+            ty::SHORT_FLAGS => u16_at(data, at)? as i16 as i32,
+            _ => return Ok(None),
+        };
+        Ok(Some(self.enum_string(entry, value)))
+    }
+
+    /// Hashes, matrices and opaque byte blocks; anything else is an error.
+    fn blob_entry(&self, w: &mut Writer, site: &Site, kind: u8, ename: &str) -> Result<(), String> {
+        let Site { level, data, at, .. } = *site;
+        match kind {
+            ty::HASH | ty::HASH2 => w.string(level, ename, &names::value(u32_at(data, at)?)),
+            ty::HASH64 => w.text(level, ename, &hash64_text(u64_at(data, at)?)),
+            ty::MATRIX | ty::MATRIX34 => matrix_entry(w, site, kind, ename)?,
+            ty::OPAQUE32 | ty::OPAQUE16 | ty::OPAQUE16B => opaque_entry(w, site, kind, ename)?,
             other => return Err(format!("unexpected data type {other:#04x}")),
         }
         Ok(())
@@ -566,36 +805,66 @@ impl Meta {
     /// An RDR2 map: `1`, pointer at +8, count at +16. Each pair is the key
     /// (4 bytes, padded to 8) and the value; the entry's key names the
     /// owner's type entries for key (high 16 bits) and value (low 16 bits).
-    #[allow(clippy::too_many_arguments)]
     fn map_node(
         &self,
         w: &mut Writer,
-        level: usize,
-        data: &[u8],
-        at: usize,
+        site: &Site,
         entry: &Entry,
         owner: &StructInfo,
         ename: &str,
-        depth: usize,
     ) -> Result<(), String> {
-        let ptr = u64_at(data, at + 8)?;
-        // A hash table has its groups of 16 places and its count in front.
+        let Site { level, data, at, depth, .. } = *site;
         let table = entry.kind == ty::HASH_TABLE;
-        let groups = if table { u32_at(data, at)? as usize } else { 0 };
-        let count = if table { u32_at(data, at + 4)? as usize } else { u16_at(data, at + 16)? as usize };
-        if count == 0 {
+        let header = map_header(data, at, table)?;
+        if header.count == 0 {
             w.empty(level, ename);
             return Ok(());
         }
-        let (mut ki, mut vi) = ((entry.key >> 16) as usize, (entry.key & 0xFFFF) as usize);
-        if table {
-            std::mem::swap(&mut ki, &mut vi);
+        let (pairs_at, pairs) = self.map_places(entry, owner, header, level + 1, depth + 1)?;
+        w.open(level, ename);
+        for (i, pair) in pairs.into_iter().enumerate() {
+            if !self.map_pair(w, &pairs_at, i, pair)? {
+                break;
+            }
         }
+        w.close(level, ename);
+        Ok(())
+    }
+
+    /// What the pairs of a map share, and where each pair is.
+    fn map_places<'a>(
+        &'a self,
+        entry: &Entry,
+        owner: &'a StructInfo,
+        header: MapHeader,
+        level: usize,
+        depth: usize,
+    ) -> Result<(MapPairs<'a>, Vec<usize>), String> {
+        let MapHeader { ptr, groups, count } = header;
+        let table = entry.kind == ty::HASH_TABLE;
+        let (ki, vi) = map_entry_indices(entry.key, table);
         let key_entry = *owner.entries.get(ki).ok_or("map key type not found")?;
         let value_entry = *owner.entries.get(vi).ok_or("map value type not found")?;
         // An array value's item type is the type entry before it.
         let value_info = vi.checked_sub(1).and_then(|i| owner.entries.get(i)).copied().unwrap_or_default();
-        let value_size = match value_entry.kind {
+        let stride = (8 + self.map_value_size(&value_entry)).next_multiple_of(8);
+        let (id, off) = self.unpack(ptr);
+        let block = self.block(id).ok_or_else(|| format!("map block {id} not found"))?;
+        let pairs: Vec<usize> = if table {
+            hash_table_pairs(block, off, groups, stride)?
+        } else {
+            (0..count).map(|i| off + i * stride).collect()
+        };
+        if pairs.len() != count {
+            return Err(format!("{} places used, the table names {count}", pairs.len()));
+        }
+        let key_kind = key_entry.kind;
+        Ok((MapPairs { level, id, block, stride, key_kind, value_entry, value_info, owner, depth }, pairs))
+    }
+
+    /// The size of a map value, which sets the stride of the pairs.
+    fn map_value_size(&self, value_entry: &Entry) -> usize {
+        match value_entry.kind {
             ty::ARRAY => 16,
             ty::STRUCTURE => self.structs.get(&value_entry.key).map_or(8, |s| s.size),
             ty::INT_FLAGS1 if self.offset_shift == 20 => 1,
@@ -606,168 +875,94 @@ impl Meta {
             ty::USHORT | ty::SSHORT | ty::SHORT_FLAGS => 2,
             ty::FLOAT_XYZ | ty::FLOAT_XYZW => 16,
             _ => 8,
-        };
-        let stride = (8 + value_size).next_multiple_of(8);
-        let (id, off) = self.unpack(ptr);
-        let block = self.block(id).ok_or_else(|| format!("map block {id} not found"))?;
-        // Where the pairs are: one after the other, or in a hash table's used
-        // places. Each group is 16 control bytes (the top bit set: unused),
-        // then 16 places.
-        let pairs: Vec<usize> = if table {
-            let group = 16 + 16 * stride;
-            let end = groups.checked_mul(group).and_then(|len| off.checked_add(len));
-            let bytes = end.and_then(|end| block.data.get(off..end)).ok_or("hash table beyond its block")?;
-            let used = |g: usize| {
-                let at = off + g * group;
-                (0..16).filter(move |i| bytes[g * group + i] < 0x80).map(move |i| at + 16 + i * stride)
-            };
-            (0..groups).flat_map(used).collect()
-        } else {
-            (0..count).map(|i| off + i * stride).collect()
-        };
-        if pairs.len() != count {
-            return Err(format!("{} places used, the table names {count}", pairs.len()));
         }
-        w.open(level, ename);
-        for (i, pair) in pairs.into_iter().enumerate() {
-            if pair + stride > block.data.len() {
-                w.error(level + 1, format!("map pair {i} beyond its block"));
-                break;
+    }
+
+    /// One key/value pair of a map; `false` when it lies beyond its block, which ends the map.
+    fn map_pair(&self, w: &mut Writer, m: &MapPairs, i: usize, pair: usize) -> Result<bool, String> {
+        if pair + m.stride > m.block.data.len() {
+            w.error(m.level, format!("map pair {i} beyond its block"));
+            return Ok(false);
+        }
+        let key = match m.key_kind {
+            ty::HASH | ty::UINT | ty::INT_ENUM => names::value(u32_at(&m.block.data, pair)?),
+            _ => u32_at(&m.block.data, pair)?.to_string(),
+        };
+        w.open(m.level, &format!("Item key=\"{}\"", xml::escape(&key)));
+        let site = Site { level: m.level + 1, block_id: m.id, data: &m.block.data, at: pair + 8, depth: m.depth };
+        if let Err(e) = self.entry(
+            w,
+            &site,
+            &EntryCtx { entry: &m.value_entry, array_info: &m.value_info, owner: m.owner },
+            "Value",
+        ) {
+            w.error(m.level + 1, format!("map value: {e}"));
+        }
+        w.close(m.level, "Item");
+        Ok(true)
+    }
+
+    fn array_node(&self, w: &mut Writer, site: &Site, item: &Entry, ename: &str) -> Result<(), String> {
+        let Site { level, data, at, depth, .. } = *site;
+        let loc = ArrayRef { ptr: u64_at(data, at)?, count: u16_at(data, at + 8)? as usize, level, depth };
+        match item.kind {
+            ty::STRUCTURE => self.structure_array(w, &loc, item, ename),
+            ty::STRUCTURE_POINTER => self.structure_pointer_array(w, &loc, ename),
+            kind => self.number_array(w, &loc, kind, ename),
+        }
+    }
+
+    fn structure_array(&self, w: &mut Writer, loc: &ArrayRef, item: &Entry, ename: &str) -> Result<(), String> {
+        let ArrayRef { ptr, count, level, depth } = *loc;
+        let tag = format!("{ename} itemType=\"{}\"", names::field(item.key));
+        if count == 0 {
+            w.empty(level, &tag);
+            return Ok(());
+        }
+        let info = self.structs.get(&item.key).ok_or("array item structure not found")?;
+        let (mut id, mut off) = self.unpack(ptr);
+        w.open(level, &tag);
+        for n in 0..count {
+            self.node(w, level + 1, id, off, Tag::Item, item.key, depth + 1);
+            off += info.size;
+            if n + 1 < count && self.block(id).is_some_and(|b| off >= b.data.len()) {
+                id += 1;
+                off = 0;
             }
-            let key = match key_entry.kind {
-                ty::HASH | ty::UINT | ty::INT_ENUM => names::value(u32_at(&block.data, pair)?),
-                _ => u32_at(&block.data, pair)?.to_string(),
-            };
-            w.open(level + 1, &format!("Item key=\"{}\"", xml::escape(&key)));
-            if let Err(e) = self.entry(
-                w,
-                level + 2,
-                id,
-                &block.data,
-                pair + 8,
-                (&value_entry, &value_info, owner),
-                "Value",
-                depth + 1,
-            ) {
-                w.error(level + 2, format!("map value: {e}"));
-            }
-            w.close(level + 1, "Item");
         }
         w.close(level, ename);
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn array_node(
-        &self,
-        w: &mut Writer,
-        level: usize,
-        data: &[u8],
-        at: usize,
-        item: &Entry,
-        ename: &str,
-        depth: usize,
-    ) -> Result<(), String> {
-        let ptr = u64_at(data, at)?;
-        let count = u16_at(data, at + 8)? as usize;
-        let numbers = |size: usize, fmt: &dyn Fn(&[u8]) -> String| -> Result<Vec<String>, String> {
-            Ok(self.array(ptr, count, size)?.chunks_exact(size).map(fmt).collect())
-        };
-        match item.kind {
-            ty::STRUCTURE => {
-                let tag = format!("{ename} itemType=\"{}\"", names::field(item.key));
-                if count == 0 {
-                    w.empty(level, &tag);
-                    return Ok(());
-                }
-                let info = self.structs.get(&item.key).ok_or("array item structure not found")?;
-                let (mut id, mut off) = self.unpack(ptr);
-                w.open(level, &tag);
-                for n in 0..count {
-                    self.node(w, level + 1, id, off, Tag::Item, item.key, depth + 1);
-                    off += info.size;
-                    if n + 1 < count && self.block(id).is_some_and(|b| off >= b.data.len()) {
-                        id += 1;
-                        off = 0;
-                    }
-                }
-                w.close(level, ename);
+    fn structure_pointer_array(&self, w: &mut Writer, loc: &ArrayRef, ename: &str) -> Result<(), String> {
+        let ArrayRef { ptr, count, level, depth } = *loc;
+        if count == 0 {
+            w.empty(level, ename);
+            return Ok(());
+        }
+        let ptrs = self.array(ptr, count, 8)?;
+        w.open(level, ename);
+        for p in ptrs.as_chunks::<8>().0 {
+            let p = u64::from_le_bytes(*p);
+            let (id, off) = self.unpack(p);
+            if p == 0 {
+                w.empty(level + 1, "Item");
+            } else {
+                self.node(w, level + 1, id, off, Tag::ItemAndType, 0, depth + 1);
             }
-            ty::STRUCTURE_POINTER => {
-                if count == 0 {
-                    w.empty(level, ename);
-                    return Ok(());
-                }
-                let ptrs = self.array(ptr, count, 8)?;
-                w.open(level, ename);
-                for p in ptrs.as_chunks::<8>().0 {
-                    let p = u64::from_le_bytes(*p);
-                    let (id, off) = self.unpack(p);
-                    if p == 0 {
-                        w.empty(level + 1, "Item");
-                    } else {
-                        self.node(w, level + 1, id, off, Tag::ItemAndType, 0, depth + 1);
-                    }
-                }
-                w.close(level, ename);
-            }
-            ty::UINT => {
-                let v = numbers(4, &|b| u32::from_le_bytes(b.try_into().unwrap_or_default()).to_string())?;
-                w.raw_array(level, ename, &v, 10);
-            }
-            ty::USHORT => {
-                let v = numbers(2, &|b| u16::from_le_bytes(b.try_into().unwrap_or_default()).to_string())?;
-                w.raw_array(level, ename, &v, 10);
-            }
-            ty::UBYTE => {
-                let v = numbers(1, &|b| b[0].to_string())?;
-                w.raw_array(level, ename, &v, 10);
-            }
-            ty::FLOAT => {
-                let v = numbers(4, &|b| xml::float(f32::from_le_bytes(b.try_into().unwrap_or_default())))?;
-                w.raw_array(level, ename, &v, 10);
-            }
-            ty::FLOAT_XYZ => {
-                let v = numbers(16, &|b| {
-                    (0..4)
-                        .map(|i| xml::float(f32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap_or_default())))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })?;
-                w.item_array(level, ename, &v);
-            }
-            ty::HASH64 => {
-                let v = numbers(8, &|b| hash64_text(u64::from_le_bytes(b.try_into().unwrap_or_default())))?;
-                w.item_array(level, ename, &v);
-            }
-            ty::ULONG | ty::ULONG2 => {
-                let v = numbers(8, &|b| u64::from_le_bytes(b.try_into().unwrap_or_default()).to_string())?;
-                w.raw_array(level, ename, &v, 10);
-            }
-            ty::SINT => {
-                let v = numbers(4, &|b| i32::from_le_bytes(b.try_into().unwrap_or_default()).to_string())?;
-                w.raw_array(level, ename, &v, 10);
-            }
-            ty::SSHORT => {
-                let v = numbers(2, &|b| i16::from_le_bytes(b.try_into().unwrap_or_default()).to_string())?;
-                w.raw_array(level, ename, &v, 10);
-            }
-            ty::FLOAT_XYZW => {
-                let v = numbers(16, &|b| {
-                    b.as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|c| xml::float(f32::from_le_bytes(*c)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })?;
-                w.item_array(level, ename, &v);
-            }
-            ty::HASH | ty::HASH2 => {
-                let v = numbers(4, &|b| names::value(u32::from_le_bytes(b.try_into().unwrap_or_default())))?;
-                w.item_array(level, ename, &v);
-            }
-            other => return Err(format!("unexpected array item type {other:#04x}")),
+        }
+        w.close(level, ename);
+        Ok(())
+    }
+
+    /// An array of plain numbers, hashes or vectors.
+    fn number_array(&self, w: &mut Writer, loc: &ArrayRef, kind: u8, ename: &str) -> Result<(), String> {
+        let Some(items) = array_items(kind) else { return Err(format!("unexpected array item type {kind:#04x}")) };
+        let bytes = self.array(loc.ptr, loc.count, items.size)?;
+        let v: Vec<String> = bytes.chunks_exact(items.size).map(items.text).collect();
+        match items.columns {
+            Some(columns) => w.raw_array(loc.level, ename, &v, columns),
+            None => w.item_array(loc.level, ename, &v),
         }
         Ok(())
     }

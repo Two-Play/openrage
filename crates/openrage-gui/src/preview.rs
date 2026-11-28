@@ -81,87 +81,131 @@ pub(crate) enum PreviewSource {
     },
 }
 
+/// What selecting a row found out, before the window is touched.
+struct Selected {
+    item: Item,
+    vpath: String,
+    source: Option<PreviewSource>,
+    keys: Option<Arc<GtaVKeys>>,
+    generation: u64,
+}
+
+/// What the preview of a selected item needs more than loading its contents.
+enum SpecialPreview {
+    ClipDictionary,
+    AudioContainer,
+    Sound,
+    Video,
+    Model,
+}
+
 pub(crate) fn select_row(ui: &AppWindow, row: usize) {
-    let Some((item, vpath, source, keys, generation)) = with_app(|a| {
-        let listing = a.listing.as_ref()?;
-        let idx = *a.visible.get(row)?;
-        a.selected = Some(idx);
-        let item = listing.items.get(idx)?.clone();
-        let source = match (&listing.location, item.entry) {
-            (Location::History, _) => None,
-            (_, None) if item.mark == Some(Mark::Removed) => {
-                // Removed by the mod: show the original.
-                let vpath = item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name));
-                a.game_dir.clone().map(|game_dir| PreviewSource::Virtual {
-                    game_dir,
-                    vpath,
-                    query: None,
-                    overlay: false,
-                })
-            }
-            (Location::Changes { .. }, _) => {
-                let vpath = item.vpath.clone().unwrap_or_default();
-                a.game_dir.clone().map(|game_dir| PreviewSource::Virtual {
-                    game_dir,
-                    vpath,
-                    query: None,
-                    overlay: true,
-                })
-            }
-            (Location::Search { query, .. }, _) => {
-                let vpath = item.vpath.clone().unwrap_or_default();
-                let query = (item.info == "text").then(|| match rage_index::parse_hash(query) {
-                    Some(h) => format!("0x{h:08X}"),
-                    None => query.clone(),
-                });
-                a.game_dir.clone().map(|game_dir| PreviewSource::Virtual { game_dir, vpath, query, overlay: false })
-            }
-            (Location::Textures { dict, .. }, _) => Some(PreviewSource::Texture(Arc::clone(dict), idx)),
-            (Location::Disk(dir), _) if item.kind == ItemKind::Archive => {
-                Some(PreviewSource::DiskArchive(dir.join(&item.name)))
-            }
-            (Location::Disk(dir), _) if item.kind == ItemKind::File => {
-                Some(PreviewSource::DiskFile(dir.join(&item.name)))
-            }
-            (Location::Archive(rpf, _), Some(id)) if item.kind != ItemKind::Dir => {
-                Some(PreviewSource::Entry(Arc::clone(rpf), id))
-            }
-            (Location::Rpf8(rpf, dir), _) if item.kind != ItemKind::Dir => {
-                rpf.find(&browser::join(dir, &item.name)).map(|i| PreviewSource::Rpf8(Arc::clone(rpf), i))
-            }
-            (Location::Rpf9(rpf, dir), _) if item.kind != ItemKind::Dir => rpf
-                .loaded()
-                .and_then(|entries| rpf.find(&entries, &browser::join(dir, &item.name)))
-                .map(|i| PreviewSource::Rpf9(Arc::clone(rpf), i)),
-            (Location::Gta4(a, dir), _) if item.kind != ItemKind::Dir => {
-                a.find_child(*dir, &item.name).map(|i| PreviewSource::Gta4(Arc::clone(a), i))
-            }
-            _ => None,
-        };
-        let generation = a.preview_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let vpath = item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name));
-        Some((item, vpath, source, a.keys.clone(), generation))
-    }) else {
+    let Some(sel) = with_app(|a| select_state(a, row)) else { return };
+    mark_selected(ui, row, &sel.item);
+    let info = selection_info(&sel.item);
+    set_info(ui, &sel.item.name, &sel.vpath, &info, badges::icon(&sel.item.name, sel.item.kind));
+    reset_preview(ui);
+    if let Some(special) = special_preview(&sel.item) {
+        show_special_preview(ui, special, sel, info);
         return;
-    };
+    }
+    start_preview_load(ui, row, sel, info);
+}
+
+/// Remembers the selection and works out where the preview comes from.
+fn select_state(a: &mut App, row: usize) -> Option<Selected> {
+    let listing = a.listing.as_ref()?;
+    let idx = *a.visible.get(row)?;
+    a.selected = Some(idx);
+    let item = listing.items.get(idx)?.clone();
+    let source = preview_source(listing, &item, idx, &a.game_dir);
+    let generation = a.preview_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let vpath = item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name));
+    Some(Selected { item, vpath, source, keys: a.keys.clone(), generation })
+}
+
+fn virtual_source(
+    game_dir: &Option<PathBuf>,
+    vpath: String,
+    query: Option<String>,
+    overlay: bool,
+) -> Option<PreviewSource> {
+    game_dir.clone().map(|game_dir| PreviewSource::Virtual { game_dir, vpath, query, overlay })
+}
+
+fn preview_source(listing: &Listing, item: &Item, idx: usize, game_dir: &Option<PathBuf>) -> Option<PreviewSource> {
+    match (&listing.location, item.entry) {
+        (Location::History, _) => None,
+        (_, None) if item.mark == Some(Mark::Removed) => {
+            // Removed by the mod: show the original.
+            let vpath = item.vpath.clone().unwrap_or_else(|| browser::join(&listing.vpath, &item.name));
+            virtual_source(game_dir, vpath, None, false)
+        }
+        (Location::Changes { .. }, _) => virtual_source(game_dir, item.vpath.clone().unwrap_or_default(), None, true),
+        (Location::Search { query, .. }, _) => {
+            let vpath = item.vpath.clone().unwrap_or_default();
+            let query = (item.info == "text").then(|| match rage_index::parse_hash(query) {
+                Some(h) => format!("0x{h:08X}"),
+                None => query.clone(),
+            });
+            virtual_source(game_dir, vpath, query, false)
+        }
+        (Location::Textures { dict, .. }, _) => Some(PreviewSource::Texture(Arc::clone(dict), idx)),
+        (Location::Disk(dir), _) => disk_source(dir, item),
+        (location, entry) => archive_source(location, entry, item),
+    }
+}
+
+fn disk_source(dir: &Path, item: &Item) -> Option<PreviewSource> {
+    match item.kind {
+        ItemKind::Archive => Some(PreviewSource::DiskArchive(dir.join(&item.name))),
+        ItemKind::File => Some(PreviewSource::DiskFile(dir.join(&item.name))),
+        _ => None,
+    }
+}
+
+fn archive_source(location: &Location, entry: Option<EntryId>, item: &Item) -> Option<PreviewSource> {
+    if item.kind == ItemKind::Dir {
+        return None;
+    }
+    match (location, entry) {
+        (Location::Archive(rpf, _), Some(id)) => Some(PreviewSource::Entry(Arc::clone(rpf), id)),
+        (Location::Rpf8(rpf, dir), _) => {
+            rpf.find(&browser::join(dir, &item.name)).map(|i| PreviewSource::Rpf8(Arc::clone(rpf), i))
+        }
+        (Location::Rpf9(rpf, dir), _) => rpf
+            .loaded()
+            .and_then(|entries| rpf.find(&entries, &browser::join(dir, &item.name)))
+            .map(|i| PreviewSource::Rpf9(Arc::clone(rpf), i)),
+        (Location::Gta4(a, dir), _) => a.find_child(*dir, &item.name).map(|i| PreviewSource::Gta4(Arc::clone(a), i)),
+        _ => None,
+    }
+}
+
+fn mark_selected(ui: &AppWindow, row: usize, item: &Item) {
     ui.set_file_selected(row as i32);
     with_app(|a| a.pending_viewer = false);
-    ui.set_image_viewable(is_viewable(&item));
+    ui.set_image_viewable(is_viewable(item));
     ui.set_can_extract(true);
     ui.set_texture_selected(item.kind == ItemKind::Texture);
     if with_app(|a| matches!(a.listing.as_ref().map(|l| &l.location), Some(Location::History))) {
         ui.set_history_group(item.info.clone().into());
     }
     ui.set_entry_selected(item.entry.is_some());
+}
 
+fn selection_info(item: &Item) -> Meta {
     let mut info = vec![kv("Type", badges::type_name(&item.name, item.kind)), kv("Size", human_size(item.size))];
     if !item.info.is_empty() && item.kind != ItemKind::Sound {
         // Resources show their version ("v171"); other items a short note.
         let is_version = item.info.strip_prefix('v').is_some_and(|v| v.chars().all(|c| c.is_ascii_digit()));
         info.push(kv(if is_version { "Version" } else { "Details" }, &item.info));
     }
-    set_info(ui, &item.name, &vpath, &info, badges::icon(&item.name, item.kind));
-    // What was loading belongs to the row before.
+    info
+}
+
+/// Clears what was showing: it belongs to the row before.
+fn reset_preview(ui: &AppWindow) {
     ui.set_preview_loading(false);
     ui.set_preview_text(SharedString::new());
     ui.set_has_image(false);
@@ -184,33 +228,80 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
         a.suggest_awc.clear();
         a.suggest_pending = false;
     });
-    if is_clip_dictionary(&item) && item.mark != Some(Mark::Removed) {
-        show_clip_dictionary(ui, vpath.clone(), info);
-        return;
+}
+
+fn special_preview(item: &Item) -> Option<SpecialPreview> {
+    let not_removed_file = item.kind == ItemKind::File && item.mark != Some(Mark::Removed);
+    if is_clip_dictionary(item) && item.mark != Some(Mark::Removed) {
+        Some(SpecialPreview::ClipDictionary)
+    } else if browser::is_audio(&item.name) && not_removed_file {
+        Some(SpecialPreview::AudioContainer)
+    } else if item.kind == ItemKind::Sound {
+        Some(SpecialPreview::Sound)
+    } else if browser::is_video(&item.name) && not_removed_file {
+        Some(SpecialPreview::Video)
+    } else {
+        is_model_item(item).then_some(SpecialPreview::Model)
     }
-    if browser::is_audio(&item.name) && item.kind == ItemKind::File && item.mark != Some(Mark::Removed) {
-        show_audio_container(ui, vpath.clone(), info, generation);
-        return;
-    }
-    if item.kind == ItemKind::Sound {
-        let awc = with_app(|a| match a.listing.as_ref().map(|l| &l.location) {
-            Some(Location::Audio { awc }) => Some(Arc::clone(awc)),
-            _ => None,
-        });
-        if let Some(awc) = awc {
-            let index = with_app(|a| a.selected).unwrap_or(0);
-            start_sound_preview(ui, awc, index, info, generation);
+}
+
+fn show_special_preview(ui: &AppWindow, special: SpecialPreview, sel: Selected, info: Meta) {
+    let Selected { vpath, generation, .. } = sel;
+    match special {
+        SpecialPreview::ClipDictionary => show_clip_dictionary(ui, vpath, info),
+        SpecialPreview::AudioContainer => show_audio_container(ui, vpath, info, generation),
+        SpecialPreview::Sound => {
+            let awc = with_app(|a| match a.listing.as_ref().map(|l| &l.location) {
+                Some(Location::Audio { awc }) => Some(Arc::clone(awc)),
+                _ => None,
+            });
+            if let Some(awc) = awc {
+                let index = with_app(|a| a.selected).unwrap_or(0);
+                start_sound_preview(ui, awc, index, info, generation);
+            }
         }
-        return;
+        SpecialPreview::Video => start_video_preview(ui, vpath, info, generation),
+        SpecialPreview::Model => start_model_preview(ui, vpath, info, generation),
     }
-    if browser::is_video(&item.name) && item.kind == ItemKind::File && item.mark != Some(Mark::Removed) {
-        start_video_preview(ui, vpath.clone(), info, generation);
-        return;
+}
+
+/// Everything the worker thread of a preview needs.
+struct PreviewJob {
+    delivery: Delivery,
+    plugin: Option<(String, bool)>,
+    nameless: bool,
+    game: plugins::GameContext,
+    source: PreviewSource,
+    keys: Option<Arc<GtaVKeys>>,
+    vpath: String,
+    info: Meta,
+}
+
+/// Where a preview's result goes: the window, if the selection is still the current one.
+struct Delivery {
+    weak: slint::Weak<AppWindow>,
+    counter: Arc<AtomicU64>,
+    generation: u64,
+}
+
+impl Delivery {
+    fn is_current(&self) -> bool {
+        self.counter.load(Ordering::SeqCst) == self.generation
     }
-    if is_model_item(&item) {
-        start_model_preview(ui, vpath.clone(), info, generation);
-        return;
+
+    /// Runs `f` on the UI thread unless a newer selection superseded this one.
+    fn post(self, f: impl FnOnce(&AppWindow) + Send + 'static) {
+        let Delivery { weak, counter, generation } = self;
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            if counter.load(Ordering::SeqCst) == generation {
+                f(&ui);
+            }
+        });
     }
+}
+
+fn start_preview_load(ui: &AppWindow, row: usize, sel: Selected, info: Meta) {
+    let Selected { item, vpath, source, keys, generation } = sel;
     let Some(source) = source else {
         ui.set_preview_loading(false);
         return;
@@ -225,60 +316,72 @@ pub(crate) fn select_row(ui: &AppWindow, row: usize) {
         .flatten();
     let nameless = may_be_video(row);
     let game = plugins::GameContext { dir: with_app(|a| a.game_dir.clone()), keys: keys.clone() };
-    std::thread::spawn(move || {
-        if nameless && is_video_source(&source) {
-            let _ = weak.upgrade_in_event_loop(move |ui| {
-                if counter.load(Ordering::SeqCst) == generation {
-                    start_video_preview(&ui, vpath, info, generation);
-                }
-            });
-            return;
-        }
-        let mut from_plugin = plugin.and_then(|(id, specific)| plugin_preview(&id, specific, &game, &vpath));
-        // A plugin's 3D model goes to the model view.
-        if let Some(model) = from_plugin.as_mut().and_then(|p| p.model.take()) {
-            let extra = from_plugin.map(|p| p.info).unwrap_or_default();
-            let preview = model_preview(model);
-            let _ = weak.upgrade_in_event_loop(move |ui| {
-                if counter.load(Ordering::SeqCst) != generation {
-                    return;
-                }
-                ui.set_preview_loading(false);
-                show_model_preview(&ui, preview, info.iter().cloned().chain(extra).collect());
-            });
-            return;
-        }
-        let (extra, body, image) = match from_plugin {
-            Some(p) => (p.info, p.text, p.image),
-            None => load_preview(source, keys),
-        };
-        if counter.load(Ordering::SeqCst) != generation {
-            return; // a newer selection superseded this one
-        }
-        let image =
-            image.map(|(w, h, rgba)| slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h));
-        let _ = weak.upgrade_in_event_loop(move |ui| {
-            if counter.load(Ordering::SeqCst) != generation {
-                return;
-            }
-            with_app(|a| a.play_when_ready = false);
-            if !extra.is_empty() {
-                set_meta(&ui, &info.iter().cloned().chain(extra).collect());
-            }
-            ui.set_preview_text(body.into());
-            match image {
-                Some(buffer) => {
-                    ui.set_preview_image(slint::Image::from_rgba8(buffer));
-                    ui.set_has_image(true);
-                    if with_app(|a| std::mem::take(&mut a.pending_viewer)) {
-                        open_viewer(&ui);
-                    }
-                }
-                None => ui.set_has_image(false),
-            }
+    let job = PreviewJob {
+        delivery: Delivery { weak, counter, generation },
+        plugin,
+        nameless,
+        game,
+        source,
+        keys,
+        vpath,
+        info,
+    };
+    std::thread::spawn(move || run_preview_job(job));
+}
+
+fn run_preview_job(job: PreviewJob) {
+    let PreviewJob { delivery, plugin, nameless, game, source, keys, vpath, info } = job;
+    if nameless && is_video_source(&source) {
+        let generation = delivery.generation;
+        delivery.post(move |ui| start_video_preview(ui, vpath, info, generation));
+        return;
+    }
+    let mut from_plugin = plugin.and_then(|(id, specific)| plugin_preview(&id, specific, &game, &vpath));
+    // A plugin's 3D model goes to the model view.
+    if let Some(model) = from_plugin.as_mut().and_then(|p| p.model.take()) {
+        let extra = from_plugin.map(|p| p.info).unwrap_or_default();
+        let preview = model_preview(model);
+        delivery.post(move |ui| {
             ui.set_preview_loading(false);
+            show_model_preview(ui, preview, info.iter().cloned().chain(extra).collect());
         });
-    });
+        return;
+    }
+    let (extra, body, image) = match from_plugin {
+        Some(p) => (p.info, p.text, p.image),
+        None => load_preview(source, keys),
+    };
+    if !delivery.is_current() {
+        return; // a newer selection superseded this one
+    }
+    let image = image.map(|(w, h, rgba)| slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&rgba, w, h));
+    delivery.post(move |ui| show_loaded_preview(ui, info, extra, body, image));
+}
+
+/// Shows what the worker loaded: metadata, text and the image, if any.
+fn show_loaded_preview(
+    ui: &AppWindow,
+    info: Meta,
+    extra: Meta,
+    body: String,
+    image: Option<slint::SharedPixelBuffer<slint::Rgba8Pixel>>,
+) {
+    with_app(|a| a.play_when_ready = false);
+    if !extra.is_empty() {
+        set_meta(ui, &info.iter().cloned().chain(extra).collect());
+    }
+    ui.set_preview_text(body.into());
+    match image {
+        Some(buffer) => {
+            ui.set_preview_image(slint::Image::from_rgba8(buffer));
+            ui.set_has_image(true);
+            if with_app(|a| std::mem::take(&mut a.pending_viewer)) {
+                open_viewer(ui);
+            }
+        }
+        None => ui.set_has_image(false),
+    }
+    ui.set_preview_loading(false);
 }
 
 /// Whether the row is a file whose name does not tell what it is. RDR2's
@@ -421,187 +524,238 @@ pub(crate) fn load_preview(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -
 pub(crate) fn load_preview_text(source: PreviewSource, keys: Option<Arc<GtaVKeys>>) -> (Meta, String) {
     match source {
         PreviewSource::Virtual { game_dir, vpath, query: Some(query), overlay } => {
-            let matching = vfs::resolve(&game_dir, &vpath, keys.clone())
-                .ok()
-                .and_then(|node| rage_index::snippet(&rage_index::node_text(&node)?, &query));
-            let (mut meta, body) =
-                load_preview_text(PreviewSource::Virtual { game_dir, vpath, query: None, overlay }, keys);
-            if let Some(line) = matching {
-                meta.insert(0, kv("Match", line));
-            }
-            (meta, body)
+            virtual_match_preview(game_dir, vpath, query, overlay, keys)
         }
-        PreviewSource::Virtual { game_dir, vpath, query: None, overlay } => match if overlay {
-            rage_mods::resolve(&game_dir, &vpath, keys.clone()).map(|(n, _)| n)
-        } else {
-            vfs::resolve(&game_dir, &vpath, keys.clone())
-        } {
-            Ok(Node::ArchiveFile(rpf, id)) => load_preview_text(PreviewSource::Entry(rpf, id), keys),
-            Ok(Node::ArchiveDir(rpf, id)) if id == Rpf7::ROOT => (archive_info(&rpf), String::new()),
-            Ok(Node::ArchiveDir(..)) | Ok(Node::Dir(_)) => (Meta::new(), String::new()),
-            Ok(Node::PlainFile(p)) => load_preview_text(PreviewSource::DiskFile(p), keys),
-            Ok(Node::Rpf8File(rpf, i)) => rpf8_preview(&rpf, i),
-            Ok(Node::Rpf8Dir(..)) => (Meta::new(), String::new()),
-            Ok(Node::Rpf9File(rpf, i)) => rpf9_preview(&rpf, i),
-            Ok(Node::Rpf9Dir(rpf, dir)) if dir.is_empty() => (rpf9_archive_info(&rpf), String::new()),
-            Ok(Node::Gta4File(a, i)) => gta4_preview(&a, i),
-            Ok(Node::Gta4Dir(a, i)) if i == rage_rpf::Gta4Archive::ROOT => (gta4_archive_info(&a), String::new()),
-            Ok(Node::Gta4Dir(..)) => (Meta::new(), String::new()),
-            Ok(_) => (Meta::new(), String::new()),
-            Err(e) => (vec![kv("Error", e)], String::new()),
-        },
+        PreviewSource::Virtual { game_dir, vpath, query: None, overlay } => {
+            virtual_preview(&game_dir, &vpath, overlay, keys)
+        }
         PreviewSource::Rpf8(rpf, i) => rpf8_preview(&rpf, i),
         PreviewSource::Rpf9(rpf, i) => rpf9_preview(&rpf, i),
         PreviewSource::Gta4(a, i) => gta4_preview(&a, i),
         PreviewSource::Texture(..) => (Meta::new(), String::new()),
-        PreviewSource::DiskFile(path)
-            if openrage_app::metadata::is_metadata(&path.file_name().unwrap_or_default().to_string_lossy()) =>
+        PreviewSource::DiskFile(path) => disk_file_preview(&path),
+        PreviewSource::DiskArchive(path) => disk_archive_preview(&path, keys),
+        PreviewSource::Entry(rpf, id) => entry_preview(&rpf, id),
+    }
+}
+
+/// A text search hit: the preview of the file, with the matching line first.
+fn virtual_match_preview(
+    game_dir: PathBuf,
+    vpath: String,
+    query: String,
+    overlay: bool,
+    keys: Option<Arc<GtaVKeys>>,
+) -> (Meta, String) {
+    let matching = vfs::resolve(&game_dir, &vpath, keys.clone())
+        .ok()
+        .and_then(|node| rage_index::snippet(&rage_index::node_text(&node)?, &query));
+    let (mut meta, body) = load_preview_text(PreviewSource::Virtual { game_dir, vpath, query: None, overlay }, keys);
+    if let Some(line) = matching {
+        meta.insert(0, kv("Match", line));
+    }
+    (meta, body)
+}
+
+/// A search hit, resolved on disk (or through the mods overlay).
+fn virtual_preview(game_dir: &Path, vpath: &str, overlay: bool, keys: Option<Arc<GtaVKeys>>) -> (Meta, String) {
+    let resolved = if overlay {
+        rage_mods::resolve(game_dir, vpath, keys.clone()).map(|(n, _)| n)
+    } else {
+        vfs::resolve(game_dir, vpath, keys.clone())
+    };
+    match resolved {
+        Ok(node) => node_preview(node, keys),
+        Err(e) => (vec![kv("Error", e)], String::new()),
+    }
+}
+
+fn node_preview(node: Node, keys: Option<Arc<GtaVKeys>>) -> (Meta, String) {
+    match node {
+        Node::ArchiveFile(rpf, id) => load_preview_text(PreviewSource::Entry(rpf, id), keys),
+        Node::ArchiveDir(rpf, id) if id == Rpf7::ROOT => (archive_info(&rpf), String::new()),
+        Node::ArchiveDir(..) | Node::Dir(_) => (Meta::new(), String::new()),
+        Node::PlainFile(p) => load_preview_text(PreviewSource::DiskFile(p), keys),
+        other => other_node_preview(other),
+    }
+}
+
+fn other_node_preview(node: Node) -> (Meta, String) {
+    match node {
+        Node::Rpf8File(rpf, i) => rpf8_preview(&rpf, i),
+        Node::Rpf9File(rpf, i) => rpf9_preview(&rpf, i),
+        Node::Rpf9Dir(rpf, dir) if dir.is_empty() => (rpf9_archive_info(&rpf), String::new()),
+        Node::Gta4File(a, i) => gta4_preview(&a, i),
+        Node::Gta4Dir(a, i) if i == rage_rpf::Gta4Archive::ROOT => (gta4_archive_info(&a), String::new()),
+        _ => (Meta::new(), String::new()),
+    }
+}
+
+fn disk_file_preview(path: &Path) -> (Meta, String) {
+    if openrage_app::metadata::is_metadata(&path.file_name().unwrap_or_default().to_string_lossy()) {
+        return match std::fs::read(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|d| openrage_app::metadata::from_bytes(&d))
         {
-            match std::fs::read(&path).map_err(anyhow::Error::from).and_then(|d| openrage_app::metadata::from_bytes(&d))
-            {
-                Ok(xml) => metadata_lines(xml),
-                Err(e) => (vec![kv("Error", e)], String::new()),
-            }
-        }
-        PreviewSource::DiskFile(path) if openrage_app::texttable::Kind::of(&path.to_string_lossy()).is_some() => {
-            let kind = openrage_app::texttable::Kind::of(&path.to_string_lossy()).expect("checked");
-            match std::fs::read(&path) {
-                Ok(data) => text_table_preview(kind, &data),
-                Err(e) => (vec![kv("Error", e)], String::new()),
-            }
-        }
-        PreviewSource::DiskFile(path) if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("wpl")) => {
-            let game = openrage_app::gta4::game_folder(&path);
-            match std::fs::read(&path)
-                .map_err(anyhow::Error::from)
-                .and_then(|d| openrage_app::gta4::wpl_to_text(game.as_deref(), &d))
-            {
-                Ok(converted) => wpl_preview(table_text_preview("GTA IV placement file", Ok(converted))),
-                Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new()),
-            }
-        }
-        PreviewSource::DiskFile(path) => {
-            let mut data = Vec::new();
-            match File::open(&path).and_then(|f| f.take(1 << 20).read_to_end(&mut data)) {
-                Ok(_) => (Meta::new(), preview::render(&data)),
-                Err(e) => (vec![kv("Error", e)], String::new()),
-            }
-        }
-        PreviewSource::DiskArchive(path) if rage_rpf::Gta4Archive::file_is_gta4(&path) => {
-            match rage_rpf::Gta4Archive::open_default(&path) {
-                Ok(a) => (gta4_archive_info(&a), String::new()),
-                Err(e) => (vec![kv("Error", e)], String::new()),
-            }
-        }
-        // GTA VI: a texture pool.
-        PreviewSource::DiskArchive(path) if browser::is_texture_pool(&path.to_string_lossy()) => {
-            match rage_formats::ttpf::Pool::open(&path) {
-                Ok(pool) => {
-                    let plain = (0..pool.len()).filter(|i| pool.descriptor(*i).is_some_and(|d| d.is_2d())).count();
-                    let meta = vec![
-                        kv("Format", "Texture pool (GTA VI)"),
-                        kv("Textures", grouped(pool.len())),
-                        kv("Arrays, cube maps, volumes", grouped(pool.len() - plain)),
-                        note(
-                            "Opens as folders of 64 textures. Textures have no names here, only numbers. \
-                             Arrays, cube maps and volumes are not read yet; textures packed with BCPack \
-                             are shown from their largest level that is not.",
-                        ),
-                    ];
-                    (meta, String::new())
-                }
-                Err(e) => (vec![kv("Error", e)], String::new()),
-            }
-        }
-        // GTA VI: RPF9. Described from its header and a stored index: no scan here.
-        PreviewSource::DiskArchive(path) if rage_rpf::Rpf9::file_is_rpf9(&path) => match rage_rpf::Rpf9::open(&path) {
+            Ok(xml) => metadata_lines(xml),
+            Err(e) => (vec![kv("Error", e)], String::new()),
+        };
+    }
+    if let Some(kind) = openrage_app::texttable::Kind::of(&path.to_string_lossy()) {
+        return match std::fs::read(path) {
+            Ok(data) => text_table_preview(kind, &data),
+            Err(e) => (vec![kv("Error", e)], String::new()),
+        };
+    }
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("wpl")) {
+        let game = openrage_app::gta4::game_folder(path);
+        return match std::fs::read(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|d| openrage_app::gta4::wpl_to_text(game.as_deref(), &d))
+        {
+            Ok(converted) => wpl_preview(table_text_preview("GTA IV placement file", Ok(converted))),
+            Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new()),
+        };
+    }
+    let mut data = Vec::new();
+    match File::open(path).and_then(|f| f.take(1 << 20).read_to_end(&mut data)) {
+        Ok(_) => (Meta::new(), preview::render(&data)),
+        Err(e) => (vec![kv("Error", e)], String::new()),
+    }
+}
+
+fn disk_archive_preview(path: &Path, keys: Option<Arc<GtaVKeys>>) -> (Meta, String) {
+    if rage_rpf::Gta4Archive::file_is_gta4(path) {
+        return match rage_rpf::Gta4Archive::open_default(path) {
+            Ok(a) => (gta4_archive_info(&a), String::new()),
+            Err(e) => (vec![kv("Error", e)], String::new()),
+        };
+    }
+    // GTA VI: a texture pool.
+    if browser::is_texture_pool(&path.to_string_lossy()) {
+        return texture_pool_preview(path);
+    }
+    // GTA VI: RPF9. Described from its header and a stored index: no scan here.
+    if rage_rpf::Rpf9::file_is_rpf9(path) {
+        return match rage_rpf::Rpf9::open(path) {
             Ok(rpf) => (rpf9_archive_info(&rpf), String::new()),
             Err(e) => (vec![kv("Error", e)], String::new()),
-        },
-        // RDR2: RPF8, not RPF7.
-        PreviewSource::DiskArchive(path) if rage_rpf::Rpf8::file_is_rpf8(&path) => {
-            match rage_rpf::Rpf8::open_default(&path) {
-                Ok(rpf) => (rpf8_archive_info(&rpf), String::new()),
+        };
+    }
+    // RDR2: RPF8, not RPF7.
+    if rage_rpf::Rpf8::file_is_rpf8(path) {
+        return match rage_rpf::Rpf8::open_default(path) {
+            Ok(rpf) => (rpf8_archive_info(&rpf), String::new()),
+            Err(e) => (vec![kv("Error", e)], String::new()),
+        };
+    }
+    match Rpf7::open(path, keys) {
+        Ok(rpf) => (archive_info(&rpf), String::new()),
+        Err(e) => (vec![kv("Error", e)], String::new()),
+    }
+}
+
+fn texture_pool_preview(path: &Path) -> (Meta, String) {
+    match rage_formats::ttpf::Pool::open(path) {
+        Ok(pool) => {
+            let plain = (0..pool.len()).filter(|i| pool.descriptor(*i).is_some_and(|d| d.is_2d())).count();
+            let meta = vec![
+                kv("Format", "Texture pool (GTA VI)"),
+                kv("Textures", grouped(pool.len())),
+                kv("Arrays, cube maps, volumes", grouped(pool.len() - plain)),
+                note(
+                    "Opens as folders of 64 textures. Textures have no names here, only numbers. \
+                     Arrays, cube maps and volumes are not read yet; textures packed with BCPack \
+                     are shown from their largest level that is not.",
+                ),
+            ];
+            (meta, String::new())
+        }
+        Err(e) => (vec![kv("Error", e)], String::new()),
+    }
+}
+
+fn entry_preview(rpf: &Rpf7, id: EntryId) -> (Meta, String) {
+    let entry = rpf.entry(id).clone();
+    if entry.is_archive() {
+        return match rpf.open_child(id) {
+            Ok(child) => (archive_info(&child), String::new()),
+            Err(e) => (vec![kv("Error", e)], String::new()),
+        };
+    }
+    if let Some(preview) = entry_special_preview(rpf, id, &entry.name) {
+        return preview;
+    }
+    match entry.kind {
+        EntryKind::Resource { size, .. } => {
+            let (sys, gfx) = entry.resource_page_sizes().unwrap_or_default();
+            let mut meta = vec![
+                kv("Resource version", entry.resource_version().unwrap_or_default()),
+                kv("Stored", human_size(size as u64)),
+                kv("System pages", human_size(sys)),
+                kv("Graphics pages", human_size(gfx)),
+            ];
+            match rpf.read_resource_pages(id) {
+                Ok(pages) => (meta, preview::hex_dump(&pages)),
+                Err(e) => {
+                    meta.push(kv("Error", e));
+                    (meta, String::new())
+                }
+            }
+        }
+        EntryKind::Binary { stored_size, size, encrypted, .. } => {
+            let mut meta = Meta::new();
+            if stored_size > 0 {
+                meta.push(kv(
+                    "Compressed",
+                    format!("{} → {}", human_size(stored_size as u64), human_size(size as u64)),
+                ));
+            }
+            if encrypted {
+                meta.push(kv("Encrypted", "yes"));
+            }
+            match rpf.read(id) {
+                Ok(data) => (meta, preview::render(&data)),
                 Err(e) => (vec![kv("Error", e)], String::new()),
             }
         }
-        PreviewSource::DiskArchive(path) => match Rpf7::open(&path, keys) {
-            Ok(rpf) => (archive_info(&rpf), String::new()),
-            Err(e) => (vec![kv("Error", e)], String::new()),
-        },
-        PreviewSource::Entry(rpf, id) => {
-            let entry = rpf.entry(id).clone();
-            if entry.is_archive() {
-                return match rpf.open_child(id) {
-                    Ok(child) => (archive_info(&child), String::new()),
-                    Err(e) => (vec![kv("Error", e)], String::new()),
-                };
-            }
-            if openrage_app::metadata::is_metadata(&entry.name)
-                && let Some(preview) = metadata_preview(&rpf, id)
-            {
-                return preview;
-            }
-            if openrage_app::media::is_media(&entry.name)
-                && let Ok(data) = rpf.read(id)
-            {
-                return match openrage_app::media::rows(&data) {
-                    Ok(rows) => {
-                        let mut meta: Meta = rows.into_iter().filter(|(_, v)| !v.is_empty()).collect();
-                        meta.push(note(
-                            "Right-click → Export as SWF… opens it in Flash tools such as JPEXS or Ruffle.",
-                        ));
-                        (meta, String::new())
-                    }
-                    Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new()),
-                };
-            }
-            if entry.name.to_ascii_lowercase().ends_with(".ysc")
-                && let Some(preview) = script_preview(&rpf, id)
-            {
-                return preview;
-            }
-            if let Some(kind) = openrage_app::texttable::Kind::of(&entry.name)
-                && let Ok(data) = rpf.read(id)
-            {
-                return text_table_preview(kind, &data);
-            }
-            match entry.kind {
-                EntryKind::Resource { size, .. } => {
-                    let (sys, gfx) = entry.resource_page_sizes().unwrap_or_default();
-                    let mut meta = vec![
-                        kv("Resource version", entry.resource_version().unwrap_or_default()),
-                        kv("Stored", human_size(size as u64)),
-                        kv("System pages", human_size(sys)),
-                        kv("Graphics pages", human_size(gfx)),
-                    ];
-                    match rpf.read_resource_pages(id) {
-                        Ok(pages) => (meta, preview::hex_dump(&pages)),
-                        Err(e) => {
-                            meta.push(kv("Error", e));
-                            (meta, String::new())
-                        }
-                    }
-                }
-                EntryKind::Binary { stored_size, size, encrypted, .. } => {
-                    let mut meta = Meta::new();
-                    if stored_size > 0 {
-                        meta.push(kv(
-                            "Compressed",
-                            format!("{} → {}", human_size(stored_size as u64), human_size(size as u64)),
-                        ));
-                    }
-                    if encrypted {
-                        meta.push(kv("Encrypted", "yes"));
-                    }
-                    match rpf.read(id) {
-                        Ok(data) => (meta, preview::render(&data)),
-                        Err(e) => (vec![kv("Error", e)], String::new()),
-                    }
-                }
-                EntryKind::Directory { .. } => (Meta::new(), String::new()),
-            }
+        EntryKind::Directory { .. } => (Meta::new(), String::new()),
+    }
+}
+
+/// The previews of entries with a dedicated format: metadata, media, scripts and text tables.
+fn entry_special_preview(rpf: &Rpf7, id: EntryId, name: &str) -> Option<(Meta, String)> {
+    if openrage_app::metadata::is_metadata(name)
+        && let Some(preview) = metadata_preview(rpf, id)
+    {
+        return Some(preview);
+    }
+    if openrage_app::media::is_media(name)
+        && let Ok(data) = rpf.read(id)
+    {
+        return Some(media_preview(&data));
+    }
+    if name.to_ascii_lowercase().ends_with(".ysc")
+        && let Some(preview) = script_preview(rpf, id)
+    {
+        return Some(preview);
+    }
+    if let Some(kind) = openrage_app::texttable::Kind::of(name)
+        && let Ok(data) = rpf.read(id)
+    {
+        return Some(text_table_preview(kind, &data));
+    }
+    None
+}
+
+fn media_preview(data: &[u8]) -> (Meta, String) {
+    match openrage_app::media::rows(data) {
+        Ok(rows) => {
+            let mut meta: Meta = rows.into_iter().filter(|(_, v)| !v.is_empty()).collect();
+            meta.push(note("Right-click → Export as SWF… opens it in Flash tools such as JPEXS or Ruffle."));
+            (meta, String::new())
         }
+        Err(e) => (vec![kv("Error", format!("{e:#}"))], String::new()),
     }
 }
 

@@ -124,46 +124,87 @@ fn vec3(res: &Resource, at: u64) -> Result<[f32; 3], ResourceError> {
     Ok([0, 4, 8].map(|o| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])))
 }
 
-/// Path nodes and their links (`.ynd`).
-pub fn parse_ynd(res: &Resource) -> Result<(Drawable, Stats), ResourceError> {
-    let root = Resource::ROOT;
-    let nodes_at = res.u64(root + 0x10)?;
-    let count = res.u32(root + 0x18)? as u64;
-    let vehicle = res.u32(root + 0x1C)? as u64;
-    let links_at = res.u64(root + 0x28)?;
-    let link_count = res.u32(root + 0x30)? as u64;
-    if count > 1 << 16 || link_count > 1 << 18 {
-        return Err(ResourceError::Format(format!("implausible path data: {count} nodes, {link_count} links")));
-    }
+/// A path node: position, area, first link, link count.
+type YndNode = ([f32; 3], u16, u64, u64);
+
+fn ynd_node(res: &Resource, n: u64) -> Result<YndNode, ResourceError> {
     let i16_at = |at: u64| -> Result<f32, ResourceError> { Ok(res.u16(at)? as i16 as f32) };
-    let mut nodes = Vec::with_capacity(count as usize);
-    for i in 0..count {
-        let n = nodes_at + i * 40;
-        let pos = [i16_at(n + 0x1C)? / 4.0, i16_at(n + 0x1E)? / 4.0, i16_at(n + 0x22)? / 32.0];
-        let area = res.u16(n + 0x10)?;
-        let first = res.u16(n + 0x1A)? as u64;
-        let links = (res.u8(n + 0x25)? >> 3) as u64;
-        nodes.push((pos, area, first, links));
+    let pos = [i16_at(n + 0x1C)? / 4.0, i16_at(n + 0x1E)? / 4.0, i16_at(n + 0x22)? / 32.0];
+    let area = res.u16(n + 0x10)?;
+    let first = res.u16(n + 0x1A)? as u64;
+    let links = (res.u8(n + 0x25)? >> 3) as u64;
+    Ok((pos, area, first, links))
+}
+
+/// The header of a `.ynd`: where the nodes and links are, and how many.
+struct YndHeader {
+    nodes_at: u64,
+    count: u64,
+    vehicle: u64,
+    links_at: u64,
+    link_count: u64,
+}
+
+impl YndHeader {
+    fn read(res: &Resource) -> Result<Self, ResourceError> {
+        let root = Resource::ROOT;
+        let nodes_at = res.u64(root + 0x10)?;
+        let count = res.u32(root + 0x18)? as u64;
+        let vehicle = res.u32(root + 0x1C)? as u64;
+        let links_at = res.u64(root + 0x28)?;
+        let link_count = res.u32(root + 0x30)? as u64;
+        if count > 1 << 16 || link_count > 1 << 18 {
+            return Err(ResourceError::Format(format!("implausible path data: {count} nodes, {link_count} links")));
+        }
+        Ok(Self { nodes_at, count, vehicle, links_at, link_count })
     }
-    let mut b = Builder::default();
-    let mut stats = Stats { nodes: nodes.len(), vehicle_nodes: vehicle as usize, ..Default::default() };
-    let size = line_size(nodes.iter().map(|n| n.0));
-    for (i, &(pos, area, first, links)) in nodes.iter().enumerate() {
-        let is_vehicle = (i as u64) < vehicle;
-        b.marker(if is_vehicle { part::VEHICLE_NODES } else { part::PED_NODES }, pos, size * 1.5);
-        for l in first..(first + links).min(link_count) {
-            let at = links_at + l * 8;
-            let (to_area, to_node) = (res.u16(at)?, res.u16(at + 2)? as usize);
+}
+
+/// What drawing the links of a `.ynd` needs: the file, its nodes and the link table.
+struct YndLinks<'a> {
+    res: &'a Resource,
+    nodes: &'a [YndNode],
+    header: &'a YndHeader,
+    size: f32,
+}
+
+impl YndLinks<'_> {
+    /// Draws the links of node `i`.
+    fn draw(&self, i: usize, b: &mut Builder, stats: &mut Stats) -> Result<(), ResourceError> {
+        let (pos, area, first, links) = self.nodes[i];
+        let is_vehicle = (i as u64) < self.header.vehicle;
+        for l in first..(first + links).min(self.header.link_count) {
+            let at = self.header.links_at + l * 8;
+            let (to_area, to_node) = (self.res.u16(at)?, self.res.u16(at + 2)? as usize);
             stats.links += 1;
             // Links into other areas need that area's file; each link within
             // the area is drawn once.
             if to_area == area
                 && to_node > i
-                && let Some(&(to, ..)) = nodes.get(to_node)
+                && let Some(&(to, ..)) = self.nodes.get(to_node)
             {
-                b.bar(if is_vehicle { part::VEHICLE_LINKS } else { part::PED_LINKS }, pos, to, size * 0.6);
+                b.bar(if is_vehicle { part::VEHICLE_LINKS } else { part::PED_LINKS }, pos, to, self.size * 0.6);
             }
         }
+        Ok(())
+    }
+}
+
+/// Path nodes and their links (`.ynd`).
+pub fn parse_ynd(res: &Resource) -> Result<(Drawable, Stats), ResourceError> {
+    let header = YndHeader::read(res)?;
+    let mut nodes = Vec::with_capacity(header.count as usize);
+    for i in 0..header.count {
+        nodes.push(ynd_node(res, header.nodes_at + i * 40)?);
+    }
+    let mut b = Builder::default();
+    let mut stats = Stats { nodes: nodes.len(), vehicle_nodes: header.vehicle as usize, ..Default::default() };
+    let size = line_size(nodes.iter().map(|n| n.0));
+    let links = YndLinks { res, nodes: &nodes, header: &header, size };
+    for (i, &(pos, ..)) in nodes.iter().enumerate() {
+        let is_vehicle = (i as u64) < header.vehicle;
+        b.marker(if is_vehicle { part::VEHICLE_NODES } else { part::PED_NODES }, pos, size * 1.5);
+        links.draw(i, &mut b, &mut stats)?;
     }
     Ok((finish(b, "path nodes"), stats))
 }
@@ -239,13 +280,34 @@ fn nav_list(res: &Resource, list: u64, size: usize) -> Result<Vec<u8>, ResourceE
     Ok(out)
 }
 
-/// A nav mesh (`.ynv`): the surfaces peds can walk on, by kind.
-pub fn parse_ynv(res: &Resource) -> Result<(Drawable, Stats), ResourceError> {
+/// The surface kind of a GTA V nav mesh polygon (`p` is its 48 bytes).
+fn ynv_kind(p: &[u8; 48]) -> u8 {
+    let flags0 = u16::from_le_bytes([p[0], p[1]]);
+    let flags1 = u32::from_le_bytes([p[0x24], p[0x25], p[0x26], p[0x27]]);
+    if flags0 & 0x80 != 0 || flags1 & 0x2000 != 0 {
+        part::WATER
+    } else if flags1 & 0x1000 != 0 {
+        part::TRAIN_TRACK
+    } else if flags1 & 0x400 != 0 {
+        part::ROAD
+    } else if flags0 & 0x4 != 0 {
+        part::PAVEMENT
+    } else if flags1 & 0x40 != 0 {
+        part::INTERIOR
+    } else if flags0 & 0x40 != 0 {
+        part::STEEP
+    } else {
+        part::GROUND
+    }
+}
+
+/// The vertices of a GTA V nav mesh, placed in its bounding box.
+fn ynv_vertices(res: &Resource) -> Result<Vec<[f32; 3]>, ResourceError> {
     let root = Resource::ROOT;
     let size = vec3(res, root + 0x60)?;
     let tree = res.u64(root + 0x120)?;
     let min = if tree != 0 { vec3(res, tree)? } else { [0.0; 3] };
-    let verts: Vec<[f32; 3]> = nav_list(res, res.u64(root + 0x70)?, 6)?
+    Ok(nav_list(res, res.u64(root + 0x70)?, 6)?
         .as_chunks::<6>()
         .0
         .iter()
@@ -253,38 +315,33 @@ pub fn parse_ynv(res: &Resource) -> Result<(Drawable, Stats), ResourceError> {
             let q = [0, 2, 4].map(|o| u16::from_le_bytes([c[o], c[o + 1]]) as f32 / 65535.0);
             [min[0] + q[0] * size[0], min[1] + q[1] * size[1], min[2] + q[2] * size[2]]
         })
-        .collect();
+        .collect())
+}
+
+/// The corners of a GTA V nav mesh polygon that name an existing vertex.
+fn ynv_corners(p: &[u8; 48], indices: &[u16], verts: &[[f32; 3]]) -> Vec<[f32; 3]> {
+    let count = (u16::from_le_bytes([p[2], p[3]]) >> 5) as usize;
+    let first = u16::from_le_bytes([p[4], p[5]]) as usize;
+    indices
+        .get(first..first + count)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|&i| verts.get(i as usize).copied())
+        .collect()
+}
+
+/// A nav mesh (`.ynv`): the surfaces peds can walk on, by kind.
+pub fn parse_ynv(res: &Resource) -> Result<(Drawable, Stats), ResourceError> {
+    let root = Resource::ROOT;
+    let verts = ynv_vertices(res)?;
     let indices: Vec<u16> =
         nav_list(res, res.u64(root + 0x80)?, 2)?.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
     let polys = nav_list(res, res.u64(root + 0x118)?, 48)?;
     let mut b = Builder::default();
     let mut stats = Stats::default();
     for p in polys.as_chunks::<48>().0 {
-        let flags0 = u16::from_le_bytes([p[0], p[1]]);
-        let count = (u16::from_le_bytes([p[2], p[3]]) >> 5) as usize;
-        let first = u16::from_le_bytes([p[4], p[5]]) as usize;
-        let flags1 = u32::from_le_bytes([p[0x24], p[0x25], p[0x26], p[0x27]]);
-        let kind = if flags0 & 0x80 != 0 || flags1 & 0x2000 != 0 {
-            part::WATER
-        } else if flags1 & 0x1000 != 0 {
-            part::TRAIN_TRACK
-        } else if flags1 & 0x400 != 0 {
-            part::ROAD
-        } else if flags0 & 0x4 != 0 {
-            part::PAVEMENT
-        } else if flags1 & 0x40 != 0 {
-            part::INTERIOR
-        } else if flags0 & 0x40 != 0 {
-            part::STEEP
-        } else {
-            part::GROUND
-        };
-        let corners: Vec<[f32; 3]> = indices
-            .get(first..first + count)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|&i| verts.get(i as usize).copied())
-            .collect();
+        let kind = ynv_kind(p);
+        let corners = ynv_corners(p, &indices, &verts);
         if corners.len() < 3 {
             continue;
         }

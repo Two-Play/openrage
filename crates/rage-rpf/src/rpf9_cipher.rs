@@ -224,35 +224,64 @@ impl Cipher {
     }
 }
 
-/// Converts an original-file PE address to a bounded source range. No
-/// executable code is loaded or run by the parser.
-fn pe_bytes(exe: &[u8], address: u64, len: usize) -> Option<&[u8]> {
+/// `N` bytes at `at`.
+fn bytes_at<const N: usize>(b: &[u8], at: usize) -> Option<[u8; N]> {
+    b.get(at..at + N)?.try_into().ok()
+}
+
+/// The offset of the PE header of a Windows executable.
+fn pe_header(exe: &[u8]) -> Option<usize> {
     if exe.get(..2)? != b"MZ" {
         return None;
     }
-    let pe = u32::from_le_bytes(exe.get(0x3c..0x40)?.try_into().ok()?) as usize;
+    let pe = u32::from_le_bytes(bytes_at(exe, 0x3c)?) as usize;
     if exe.get(pe..pe.checked_add(4)?)? != b"PE\0\0" {
         return None;
     }
-    let count = u16::from_le_bytes(exe.get(pe + 6..pe + 8)?.try_into().ok()?) as usize;
-    let opt_len = u16::from_le_bytes(exe.get(pe + 20..pe + 22)?.try_into().ok()?) as usize;
+    Some(pe)
+}
+
+/// The section count and the optional header's length, if it is a PE32+ header.
+fn pe_optional_header(exe: &[u8], pe: usize) -> Option<(usize, usize)> {
+    let count = u16::from_le_bytes(bytes_at(exe, pe + 6)?) as usize;
+    let opt_len = u16::from_le_bytes(bytes_at(exe, pe + 20)?) as usize;
     if count > 96 || opt_len < 32 || exe.get(pe + 24..pe + 26)? != [0x0b, 0x02] {
         return None;
     }
-    let base = u64::from_le_bytes(exe.get(pe + 48..pe + 56)?.try_into().ok()?);
-    let rva = address.checked_sub(base)?;
+    Some((count, opt_len))
+}
+
+/// The start of the section table of a 64-bit PE image, its section count and the image base.
+fn pe_sections_at(exe: &[u8]) -> Option<(usize, usize, u64)> {
+    let pe = pe_header(exe)?;
+    let (count, opt_len) = pe_optional_header(exe, pe)?;
+    let base = u64::from_le_bytes(bytes_at(exe, pe + 48)?);
     let start = pe.checked_add(24)?.checked_add(opt_len)?;
+    Some((start, count, base))
+}
+
+/// Where `rva` lies in the file, if `len` bytes of it are stored in this section.
+fn section_offset(section: &[u8; 40], rva: u64, len: usize) -> Option<Option<usize>> {
+    let virtual_start = u32::from_le_bytes(section[12..16].try_into().ok()?) as u64;
+    let stored_len = u32::from_le_bytes(section[16..20].try_into().ok()?) as u64;
+    let stored_start = u32::from_le_bytes(section[20..24].try_into().ok()?) as u64;
+    let Some(relative) = rva.checked_sub(virtual_start) else { return Some(None) };
+    if relative.checked_add(len as u64)? > stored_len {
+        return Some(None);
+    }
+    Some(Some(usize::try_from(stored_start.checked_add(relative)?).ok()?))
+}
+
+/// Converts an original-file PE address to a bounded source range. No
+/// executable code is loaded or run by the parser.
+fn pe_bytes(exe: &[u8], address: u64, len: usize) -> Option<&[u8]> {
+    let (start, count, base) = pe_sections_at(exe)?;
+    let rva = address.checked_sub(base)?;
     let sections = exe.get(start..start.checked_add(count.checked_mul(40)?)?)?;
     for section in sections.as_chunks::<40>().0 {
-        let virtual_start = u32::from_le_bytes(section[12..16].try_into().ok()?) as u64;
-        let stored_len = u32::from_le_bytes(section[16..20].try_into().ok()?) as u64;
-        let stored_start = u32::from_le_bytes(section[20..24].try_into().ok()?) as u64;
-        let Some(relative) = rva.checked_sub(virtual_start) else { continue };
-        if relative.checked_add(len as u64)? > stored_len {
-            continue;
+        if let Some(offset) = section_offset(section, rva, len)? {
+            return exe.get(offset..offset.checked_add(len)?);
         }
-        let offset = usize::try_from(stored_start.checked_add(relative)?).ok()?;
-        return exe.get(offset..offset.checked_add(len)?);
     }
     None
 }

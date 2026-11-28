@@ -298,147 +298,287 @@ pub struct SceneItem<'a> {
     pub skin: Option<&'a [math::Mat4]>,
 }
 
+/// A picture and its decoded pixels.
+type Sampler<'a> = (&'a Image, &'a [u8]);
+
+/// The image being drawn into.
+struct Target {
+    color: Vec<u8>,
+    depth: Vec<f32>,
+    w: usize,
+    h: usize,
+}
+
+/// The pinhole camera of a render.
+struct Projector {
+    eye: V3,
+    forward: V3,
+    right: V3,
+    up: V3,
+    focal: f32,
+    w: usize,
+    h: usize,
+}
+
+impl Projector {
+    /// Camera space → (screen x, screen y, view depth).
+    #[inline]
+    fn project(&self, p: V3) -> (f32, f32, f32) {
+        let r = sub(p, self.eye);
+        let z = dot(r, self.forward);
+        (
+            self.w as f32 / 2.0 + dot(r, self.right) * self.focal / z,
+            self.h as f32 / 2.0 - dot(r, self.up) * self.focal / z,
+            z,
+        )
+    }
+}
+
+/// How the vertices of one mesh get from the part's space into the scene.
+struct Deform<'a> {
+    part: &'a crate::models::Part,
+    mesh: &'a rage_formats::drawable::Mesh,
+    placement: &'a math::Mat4,
+    skin: Option<&'a [math::Mat4]>,
+}
+
+impl Deform<'_> {
+    /// Skinning acts in model space: after the part's placement. Parts
+    /// attached to a bone follow that bone; others use the mesh weights.
+    fn weights(&self, i: usize) -> Option<([u16; 4], [f32; 4])> {
+        match self.part.bone {
+            Some(b) => Some(([b as u16, 0, 0, 0], [1.0, 0.0, 0.0, 0.0])),
+            None => Some((*self.mesh.bone_indices.get(i)?, *self.mesh.bone_weights.get(i)?)),
+        }
+    }
+
+    fn vertex(&self, i: usize, v: [f32; 3], direction: bool) -> [f32; 3] {
+        let placed = if direction {
+            math::transform_dir(&self.part.transform, v)
+        } else {
+            math::transform_point(&self.part.transform, v)
+        };
+        let posed = match (self.skin, self.weights(i)) {
+            (Some(s), Some((idx, w))) => crate::anim::skin_point(s, idx, w, placed, direction),
+            _ => placed,
+        };
+        if direction {
+            math::transform_dir(self.placement, posed)
+        } else {
+            math::transform_point(self.placement, posed)
+        }
+    }
+}
+
+/// One mesh ready to be rasterised: its vertices in the scene and how to colour it.
+struct MeshShade<'a> {
+    mesh: &'a rage_formats::drawable::Mesh,
+    tint: [f32; 4],
+    img: Option<Sampler<'a>>,
+    overlay: Option<Sampler<'a>>,
+    has_uv: bool,
+    has_n: bool,
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    pts: Vec<(f32, f32, f32)>,
+}
+
+/// A triangle that passed culling: its corners, screen box and face normal.
+struct Tri {
+    idx: [usize; 3],
+    pts: [(f32, f32, f32); 3],
+    /// Reciprocal view depths of the corners.
+    inv_z: [f32; 3],
+    area: f32,
+    face_n: V3,
+    /// Pixel box: x0, x1, y0, y1 (inclusive).
+    bounds: [usize; 4],
+}
+
+/// Interpolates a per-vertex 2D attribute with the perspective-correct weights.
+#[inline]
+fn lerp_uv(uvs: &[[f32; 2]], idx: [usize; 3], q: [f32; 3]) -> (f32, f32) {
+    let [a, b, c] = idx;
+    (q[0] * uvs[a][0] + q[1] * uvs[b][0] + q[2] * uvs[c][0], q[0] * uvs[a][1] + q[1] * uvs[b][1] + q[2] * uvs[c][1])
+}
+
+impl MeshShade<'_> {
+    /// The texture colour times the tint, `None` for an alpha cut-out pixel.
+    #[inline]
+    fn base_color(&self, idx: [usize; 3], q: [f32; 3]) -> Option<[f32; 4]> {
+        let mut base = [1.0f32; 4];
+        if let (Some(img), true) = (self.img, self.has_uv) {
+            let (u, v) = lerp_uv(&self.mesh.uvs, idx, q);
+            let t = img.0.sample(img.1, u, v);
+            if t[3] < 77 {
+                return None; // alpha cut-out
+            }
+            base = [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0];
+        }
+        for (b, t) in base.iter_mut().zip(self.tint).take(3) {
+            *b *= t;
+        }
+        Some(base)
+    }
+
+    #[inline]
+    fn blend_overlay(&self, img: Sampler, idx: [usize; 3], q: [f32; 3], base: &mut [f32; 4]) {
+        let (u, v) = lerp_uv(&self.mesh.uvs1, idx, q);
+        let t = img.0.sample(img.1, u, v);
+        let alpha = t[3] as f32 / 255.0;
+        for k in 0..3 {
+            base[k] += (t[k] as f32 / 255.0 - base[k]) * alpha;
+        }
+    }
+
+    #[inline]
+    fn normal_at(&self, tri: &Tri, q: [f32; 3]) -> V3 {
+        if !self.has_n {
+            return tri.face_n;
+        }
+        let [a, b, c] = tri.idx;
+        let (na, nb, nc) = (self.normals[a], self.normals[b], self.normals[c]);
+        norm([
+            q[0] * na[0] + q[1] * nb[0] + q[2] * nc[0],
+            q[0] * na[1] + q[1] * nb[1] + q[2] * nc[1],
+            q[0] * na[2] + q[1] * nb[2] + q[2] * nc[2],
+        ])
+    }
+
+    /// The pixel colour at perspective-correct weights `q`; `None` when it is cut out.
+    #[inline]
+    fn shade(&self, tri: &Tri, q: [f32; 3], forward: V3) -> Option<[u8; 3]> {
+        let mut base = self.base_color(tri.idx, q)?;
+        if let Some(img) = self.overlay {
+            self.blend_overlay(img, tri.idx, q, &mut base);
+        }
+        let n = self.normal_at(tri, q);
+        // Headlight plus a little sky light; double-sided.
+        let light = 0.25 + 0.65 * dot(n, forward).abs() + 0.1 * n[2].max(0.0);
+        Some([0, 1, 2].map(|k| (base[k] * light * 255.0).clamp(0.0, 255.0) as u8))
+    }
+
+    /// Culls and sets up triangle `tri` of the mesh; `None` when nothing of it is visible.
+    #[inline]
+    fn setup(&self, tri: &[u32], near: f32, size: (usize, usize)) -> Option<Tri> {
+        let idx = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+        let [a, b, c] = idx;
+        let (pa, pb, pc) = (self.pts[a], self.pts[b], self.pts[c]);
+        if pa.2 < near || pb.2 < near || pc.2 < near {
+            return None;
+        }
+        let area = (pb.0 - pa.0) * (pc.1 - pa.1) - (pb.1 - pa.1) * (pc.0 - pa.0);
+        if area.abs() < 1e-9 {
+            return None;
+        }
+        // Face normal for shading when vertex normals are missing.
+        let face_n = norm(cross(sub(self.positions[b], self.positions[a]), sub(self.positions[c], self.positions[a])));
+        let minx = pa.0.min(pb.0).min(pc.0).floor().max(0.0) as usize;
+        let maxx = pa.0.max(pb.0).max(pc.0).ceil().min(size.0 as f32 - 1.0);
+        let miny = pa.1.min(pb.1).min(pc.1).floor().max(0.0) as usize;
+        let maxy = pa.1.max(pb.1).max(pc.1).ceil().min(size.1 as f32 - 1.0);
+        if maxx < 0.0 || maxy < 0.0 {
+            return None;
+        }
+        Some(Tri {
+            idx,
+            pts: [pa, pb, pc],
+            inv_z: [1.0 / pa.2, 1.0 / pb.2, 1.0 / pc.2],
+            area,
+            face_n,
+            bounds: [minx, maxx as usize, miny, maxy as usize],
+        })
+    }
+
+    /// Rasterises one triangle into `target`.
+    #[inline]
+    fn draw_triangle(&self, tri: &Tri, target: &mut Target, forward: V3) {
+        let [minx, maxx, miny, maxy] = tri.bounds;
+        for y in miny..=maxy {
+            for x in minx..=maxx {
+                self.draw_pixel(tri, target, (x, y), forward);
+            }
+        }
+    }
+
+    #[inline]
+    fn draw_pixel(&self, tri: &Tri, target: &mut Target, (x, y): (usize, usize), forward: V3) {
+        let [pa, pb, pc] = tri.pts;
+        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+        let w0 = ((pb.0 - px) * (pc.1 - py) - (pb.1 - py) * (pc.0 - px)) / tri.area;
+        let w1 = ((pc.0 - px) * (pa.1 - py) - (pc.1 - py) * (pa.0 - px)) / tri.area;
+        let w2 = 1.0 - w0 - w1;
+        if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+            return;
+        }
+        let [iza, izb, izc] = tri.inv_z;
+        let iz = w0 * iza + w1 * izb + w2 * izc;
+        let z = 1.0 / iz;
+        let di = y * target.w + x;
+        if z >= target.depth[di] {
+            return;
+        }
+        // Perspective-correct weights.
+        let q = [w0 * iza * z, w1 * izb * z, w2 * izc * z];
+        let Some(rgb) = self.shade(tri, q, forward) else { return };
+        target.depth[di] = z;
+        target.color[di * 4..di * 4 + 3].copy_from_slice(&rgb);
+        target.color[di * 4 + 3] = 255;
+    }
+}
+
+/// The mesh of `part` as it stands in the scene, `None` when it is hidden.
+fn mesh_shade<'a>(
+    item: &SceneItem<'a>,
+    part: &crate::models::Part,
+    mesh: &'a rage_formats::drawable::Mesh,
+    cam: &Projector,
+) -> Option<MeshShade<'a>> {
+    let SceneItem { model, look, materials, transform: placement, skin } = *item;
+    let tint = model.tint(look, part.drawable, mesh.shader)?;
+    let overlay =
+        materials.overlay_image(part.drawable, mesh.shader).filter(|_| mesh.uvs1.len() == mesh.positions.len());
+    let deform = Deform { part, mesh, placement: &placement, skin };
+    let positions: Vec<[f32; 3]> =
+        mesh.positions.iter().enumerate().map(|(i, p)| deform.vertex(i, *p, false)).collect();
+    let normals: Vec<[f32; 3]> = mesh.normals.iter().enumerate().map(|(i, n)| deform.vertex(i, *n, true)).collect();
+    let pts = positions.iter().map(|p| cam.project(*p)).collect();
+    Some(MeshShade {
+        mesh,
+        tint,
+        img: materials.image(part.drawable, mesh.shader),
+        overlay,
+        has_uv: mesh.uvs.len() == mesh.positions.len(),
+        has_n: mesh.normals.len() == mesh.positions.len(),
+        positions,
+        normals,
+        pts,
+    })
+}
+
 /// Renders several models into one RGBA image (software; for previews and
 /// when there is no GPU).
 pub fn render_scene(items: &[SceneItem], camera: &Camera, width: usize, height: usize) -> Vec<u8> {
     let (w, h) = (width.max(1), height.max(1));
     // Transparent background: the UI (or the PNG viewer) shows through.
-    let mut color = vec![0u8; w * h * 4];
-    let mut depth = vec![f32::INFINITY; w * h];
+    let mut target = Target { color: vec![0u8; w * h * 4], depth: vec![f32::INFINITY; w * h], w, h };
     let Camera { eye, forward, right, up, distance, fov, .. } = *camera;
     // Fit the field of view to the shorter side so tall previews do not crop.
     let focal = (w.min(h) as f32 / 2.0) / (fov / 2.0).tan();
     let near = distance * 0.01;
+    let cam = Projector { eye, forward, right, up, focal, w, h };
 
-    // Camera space → (screen x, screen y, view depth).
-    let project = |p: V3| -> (f32, f32, f32) {
-        let r = sub(p, eye);
-        let z = dot(r, forward);
-        (w as f32 / 2.0 + dot(r, right) * focal / z, h as f32 / 2.0 - dot(r, up) * focal / z, z)
-    };
-
-    for &SceneItem { model, look, materials, transform: placement, skin } in items {
-        for (part, d) in model.shown(&look.parts) {
+    for item in items {
+        for (part, d) in item.model.shown(&item.look.parts) {
             for mesh in &d.meshes {
-                let Some(tint) = model.tint(look, part.drawable, mesh.shader) else { continue };
-                let img = materials.image(part.drawable, mesh.shader);
-                let has_uv = mesh.uvs.len() == mesh.positions.len();
-                let overlay = materials
-                    .overlay_image(part.drawable, mesh.shader)
-                    .filter(|_| mesh.uvs1.len() == mesh.positions.len());
-                let has_n = mesh.normals.len() == mesh.positions.len();
-                // Skinning acts in model space: after the part's placement. Parts
-                // attached to a bone follow that bone; others use the mesh weights.
-                let weights = |i: usize| -> Option<([u16; 4], [f32; 4])> {
-                    match part.bone {
-                        Some(b) => Some(([b as u16, 0, 0, 0], [1.0, 0.0, 0.0, 0.0])),
-                        None => Some((*mesh.bone_indices.get(i)?, *mesh.bone_weights.get(i)?)),
-                    }
-                };
-                let deform = |i: usize, v: [f32; 3], direction: bool| -> [f32; 3] {
-                    let placed = if direction {
-                        math::transform_dir(&part.transform, v)
-                    } else {
-                        math::transform_point(&part.transform, v)
-                    };
-                    let posed = match (skin, weights(i)) {
-                        (Some(s), Some((idx, w))) => crate::anim::skin_point(s, idx, w, placed, direction),
-                        _ => placed,
-                    };
-                    if direction {
-                        math::transform_dir(&placement, posed)
-                    } else {
-                        math::transform_point(&placement, posed)
-                    }
-                };
-                let positions: Vec<[f32; 3]> =
-                    mesh.positions.iter().enumerate().map(|(i, p)| deform(i, *p, false)).collect();
-                let normals: Vec<[f32; 3]> =
-                    mesh.normals.iter().enumerate().map(|(i, n)| deform(i, *n, true)).collect();
-                let pts: Vec<(f32, f32, f32)> = positions.iter().map(|p| project(*p)).collect();
+                let Some(shade) = mesh_shade(item, part, mesh, &cam) else { continue };
                 for tri in mesh.indices.as_chunks::<3>().0 {
-                    let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
-                    let (pa, pb, pc) = (pts[a], pts[b], pts[c]);
-                    if pa.2 < near || pb.2 < near || pc.2 < near {
-                        continue;
-                    }
-                    let area = (pb.0 - pa.0) * (pc.1 - pa.1) - (pb.1 - pa.1) * (pc.0 - pa.0);
-                    if area.abs() < 1e-9 {
-                        continue;
-                    }
-                    // Face normal for shading when vertex normals are missing.
-                    let face_n = norm(cross(sub(positions[b], positions[a]), sub(positions[c], positions[a])));
-                    let minx = pa.0.min(pb.0).min(pc.0).floor().max(0.0) as usize;
-                    let maxx = pa.0.max(pb.0).max(pc.0).ceil().min(w as f32 - 1.0);
-                    let miny = pa.1.min(pb.1).min(pc.1).floor().max(0.0) as usize;
-                    let maxy = pa.1.max(pb.1).max(pc.1).ceil().min(h as f32 - 1.0);
-                    if maxx < 0.0 || maxy < 0.0 {
-                        continue;
-                    }
-                    let (iza, izb, izc) = (1.0 / pa.2, 1.0 / pb.2, 1.0 / pc.2);
-                    for y in miny..=maxy as usize {
-                        for x in minx..=maxx as usize {
-                            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-                            let w0 = ((pb.0 - px) * (pc.1 - py) - (pb.1 - py) * (pc.0 - px)) / area;
-                            let w1 = ((pc.0 - px) * (pa.1 - py) - (pc.1 - py) * (pa.0 - px)) / area;
-                            let w2 = 1.0 - w0 - w1;
-                            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                                continue;
-                            }
-                            let iz = w0 * iza + w1 * izb + w2 * izc;
-                            let z = 1.0 / iz;
-                            let di = y * w + x;
-                            if z >= depth[di] {
-                                continue;
-                            }
-                            // Perspective-correct weights.
-                            let (q0, q1, q2) = (w0 * iza * z, w1 * izb * z, w2 * izc * z);
-                            let mut base = [1.0f32; 4];
-                            if let (Some(img), true) = (img, has_uv) {
-                                let u = q0 * mesh.uvs[a][0] + q1 * mesh.uvs[b][0] + q2 * mesh.uvs[c][0];
-                                let v = q0 * mesh.uvs[a][1] + q1 * mesh.uvs[b][1] + q2 * mesh.uvs[c][1];
-                                let t = img.0.sample(img.1, u, v);
-                                if t[3] < 77 {
-                                    continue; // alpha cut-out
-                                }
-                                base = [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0];
-                            }
-                            for k in 0..3 {
-                                base[k] *= tint[k];
-                            }
-                            if let Some(img) = overlay {
-                                let uv = &mesh.uvs1;
-                                let u = q0 * uv[a][0] + q1 * uv[b][0] + q2 * uv[c][0];
-                                let v = q0 * uv[a][1] + q1 * uv[b][1] + q2 * uv[c][1];
-                                let t = img.0.sample(img.1, u, v);
-                                let alpha = t[3] as f32 / 255.0;
-                                for k in 0..3 {
-                                    base[k] += (t[k] as f32 / 255.0 - base[k]) * alpha;
-                                }
-                            }
-                            let n = if has_n {
-                                let (na, nb, nc) = (normals[a], normals[b], normals[c]);
-                                norm([
-                                    q0 * na[0] + q1 * nb[0] + q2 * nc[0],
-                                    q0 * na[1] + q1 * nb[1] + q2 * nc[1],
-                                    q0 * na[2] + q1 * nb[2] + q2 * nc[2],
-                                ])
-                            } else {
-                                face_n
-                            };
-                            // Headlight plus a little sky light; double-sided.
-                            let light = 0.25 + 0.65 * dot(n, forward).abs() + 0.1 * n[2].max(0.0);
-                            depth[di] = z;
-                            let o = &mut color[di * 4..di * 4 + 4];
-                            for k in 0..3 {
-                                o[k] = (base[k] * light * 255.0).clamp(0.0, 255.0) as u8;
-                            }
-                            o[3] = 255;
-                        }
+                    if let Some(tri) = shade.setup(tri, near, (target.w, target.h)) {
+                        shade.draw_triangle(&tri, &mut target, forward);
                     }
                 }
             }
         }
     }
-    color
+    target.color
 }

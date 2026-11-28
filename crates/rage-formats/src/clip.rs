@@ -275,63 +275,77 @@ impl Channel {
 
 /// Reads a channel's parameters (and, for table-based channels, its table).
 fn read_channel(kind: u16, c: &mut Cursor, frames: usize) -> Result<Channel, ResourceError> {
-    Ok(match kind {
-        0 => {
-            let v = [c.f32()?, c.f32()?, c.f32()?];
-            let w = (1.0 - (v[0] * v[0] + v[1] * v[1] + v[2] * v[2])).max(0.0).sqrt();
-            Channel::StaticQuaternion([v[0], v[1], v[2], w])
-        }
-        1 => Channel::StaticVector3([c.f32()?, c.f32()?, c.f32()?]),
-        2 => Channel::StaticFloat(c.f32()?),
-        3 => Channel::RawFloat { bit: 0 },
-        4 => {
-            let bits = c.u32()?;
-            Channel::QuantizeFloat { bit: 0, bits: bits.min(32), quantum: c.f32()?, offset: c.f32()? }
-        }
-        5 => {
-            let frame_bits = c.u32()?.min(32);
-            let value_bits = c.u32()?.clamp(1, 32);
-            let num_ints = c.u32()? as usize;
-            let quantum = c.f32()?;
-            let offset = c.f32()?;
-            let start = c.pos * 8;
-            let count = ((num_ints * 32) / value_bits as usize).min((1usize << frame_bits.min(20)).saturating_sub(1));
-            let table = (0..count)
-                .map(|i| bits(c.data, start + i * value_bits as usize, value_bits) as f32 * quantum + offset)
-                .collect();
-            c.pos += num_ints * 4;
-            Channel::IndirectQuantizeFloat { bit: 0, frame_bits, table }
-        }
-        6 | 9 => {
-            // `num_ints` covers the whole channel, this 16-byte header included.
-            let start = c.pos;
-            let num_ints = c.u32()? as usize;
-            let counts = c.u32()?;
-            let quantum = c.f32()?;
-            let offset = c.f32()?;
-            let values = if kind == 9 {
-                chunk_starts(c.data, c.pos * 8, frames, counts, quantum, offset)
-            } else {
-                linear_float(c.data, c.pos * 8, frames, counts, quantum, offset)
-            };
-            c.pos = start + (num_ints * 4).max(16);
-            Channel::LinearFloat(values)
-        }
-        7 | 8 => Channel::CachedQuaternion { index: 0 },
-        10 => {
-            let start = c.pos;
-            let num_ints = c.u32()? as usize;
-            let counts = c.u32()?;
-            let quantum = c.f32()?;
-            let offset = c.f32()?;
-            let words =
-                c.data.get(c.pos..start + num_ints * 4).ok_or_else(|| bad("packed channel outside the block"))?;
-            let values = packed_float(words, frames, counts)?;
-            c.pos = start + num_ints * 4;
-            Channel::LinearFloat(values.into_iter().map(|v| v as f32 * quantum + offset).collect())
-        }
-        k => return Err(bad(format!("unknown animation channel type {k}"))),
-    })
+    match kind {
+        0 => read_static_quaternion(c),
+        1 => read_static_vector3(c),
+        2 => c.f32().map(Channel::StaticFloat),
+        3 => Ok(Channel::RawFloat { bit: 0 }),
+        4 => read_quantize_float(c),
+        5 => read_indirect_quantize_float(c),
+        6 | 9 => read_linear_float_channel(kind, c, frames),
+        7 | 8 => Ok(Channel::CachedQuaternion { index: 0 }),
+        10 => read_packed_channel(c, frames),
+        k => Err(bad(format!("unknown animation channel type {k}"))),
+    }
+}
+
+fn read_static_vector3(c: &mut Cursor) -> Result<Channel, ResourceError> {
+    Ok(Channel::StaticVector3([c.f32()?, c.f32()?, c.f32()?]))
+}
+
+fn read_static_quaternion(c: &mut Cursor) -> Result<Channel, ResourceError> {
+    let v = [c.f32()?, c.f32()?, c.f32()?];
+    let w = (1.0 - (v[0] * v[0] + v[1] * v[1] + v[2] * v[2])).max(0.0).sqrt();
+    Ok(Channel::StaticQuaternion([v[0], v[1], v[2], w]))
+}
+
+fn read_quantize_float(c: &mut Cursor) -> Result<Channel, ResourceError> {
+    let bits = c.u32()?;
+    Ok(Channel::QuantizeFloat { bit: 0, bits: bits.min(32), quantum: c.f32()?, offset: c.f32()? })
+}
+
+fn read_indirect_quantize_float(c: &mut Cursor) -> Result<Channel, ResourceError> {
+    let frame_bits = c.u32()?.min(32);
+    let value_bits = c.u32()?.clamp(1, 32);
+    let num_ints = c.u32()? as usize;
+    let quantum = c.f32()?;
+    let offset = c.f32()?;
+    let start = c.pos * 8;
+    let count = ((num_ints * 32) / value_bits as usize).min((1usize << frame_bits.min(20)).saturating_sub(1));
+    let table = (0..count)
+        .map(|i| bits(c.data, start + i * value_bits as usize, value_bits) as f32 * quantum + offset)
+        .collect();
+    c.pos += num_ints * 4;
+    Ok(Channel::IndirectQuantizeFloat { bit: 0, frame_bits, table })
+}
+
+/// Kinds 6 (GTA V linear floats) and 9 (RDR2).
+fn read_linear_float_channel(kind: u16, c: &mut Cursor, frames: usize) -> Result<Channel, ResourceError> {
+    // `num_ints` covers the whole channel, this 16-byte header included.
+    let start = c.pos;
+    let num_ints = c.u32()? as usize;
+    let counts = c.u32()?;
+    let quantum = c.f32()?;
+    let offset = c.f32()?;
+    let values = if kind == 9 {
+        chunk_starts(c.data, c.pos * 8, frames, counts, quantum, offset)
+    } else {
+        linear_float(c.data, c.pos * 8, frames, counts, quantum, offset)
+    };
+    c.pos = start + (num_ints * 4).max(16);
+    Ok(Channel::LinearFloat(values))
+}
+
+fn read_packed_channel(c: &mut Cursor, frames: usize) -> Result<Channel, ResourceError> {
+    let start = c.pos;
+    let num_ints = c.u32()? as usize;
+    let counts = c.u32()?;
+    let quantum = c.f32()?;
+    let offset = c.f32()?;
+    let words = c.data.get(c.pos..start + num_ints * 4).ok_or_else(|| bad("packed channel outside the block"))?;
+    let values = packed_float(words, frames, counts)?;
+    c.pos = start + num_ints * 4;
+    Ok(Channel::LinearFloat(values.into_iter().map(|v| v as f32 * quantum + offset).collect()))
 }
 
 /// Delta-coded values in chunks of 64 frames: per chunk a bit offset and a
@@ -528,85 +542,157 @@ pub(crate) enum Layout {
     GtaVi,
 }
 
+/// A channel with its anim sequence and slot.
+type SlotChannel = (usize, usize, Channel);
+
+/// What the channel lists of a sequence block are read from.
+struct BlockCtx<'a> {
+    data: &'a [u8],
+    /// Where the per-kind channel counts start.
+    list: usize,
+    frames: usize,
+    layout: Layout,
+}
+
+/// Where reading channel items stands.
+struct ChannelScan {
+    item: usize,
+    frame_bit: usize,
+    channels: Vec<SlotChannel>,
+}
+
+impl Layout {
+    /// Number of channel kinds.
+    fn kinds(self) -> usize {
+        match self {
+            Layout::GtaV => 9,
+            Layout::Rdr2 => 10,
+            Layout::GtaVi => 11,
+        }
+    }
+}
+
+/// The header of a sequence block.
+struct BlockHeader {
+    data_len: usize,
+    frame_offset: usize,
+    frames: usize,
+    frame_len: usize,
+}
+
+impl BlockHeader {
+    fn read(res: &Resource, ptr: u64) -> Result<Self, ResourceError> {
+        Ok(BlockHeader {
+            data_len: res.u32(ptr + 0x04)? as usize,
+            frame_offset: res.u32(ptr + 0x0C)? as usize,
+            frames: res.u16(ptr + 0x16)? as usize,
+            frame_len: res.u16(ptr + 0x18)? as usize,
+        })
+    }
+}
+
 /// Decodes one sequence block (header at `ptr`).
 pub(crate) fn read_block(res: &Resource, ptr: u64, tracks: usize, layout: Layout) -> Result<Block, ResourceError> {
-    let data_len = res.u32(ptr + 0x04)? as usize;
-    let frame_offset = res.u32(ptr + 0x0C)? as usize;
-    let frames = res.u16(ptr + 0x16)? as usize;
-    let frame_len = res.u16(ptr + 0x18)? as usize;
-    let data = res.bytes(ptr + 0x20, data_len)?;
-    let list = frame_offset + frame_len * frames;
-    let count = |t: usize| -> Result<usize, ResourceError> {
-        data.get(list + t * 2..list + t * 2 + 2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
-            .ok_or_else(|| bad("channel list outside the block"))
-    };
+    let header = BlockHeader::read(res, ptr)?;
+    let data = res.bytes(ptr + 0x20, header.data_len)?;
+    let list = header.frame_offset + header.frame_len * header.frames;
+    let ctx = BlockCtx { data, list, frames: header.frames, layout };
 
-    // (anim sequence, slot, channel)
-    let mut channels: Vec<(usize, usize, Channel)> = Vec::new();
     let mut params = Cursor { data, pos: 0 };
-    let kinds = match layout {
-        Layout::GtaV => 9,
-        Layout::Rdr2 => 10,
-        Layout::GtaVi => 11,
-    };
+    let kinds = layout.kinds();
     if layout == Layout::GtaVi && usize::from(res.u8(ptr + 0x1E)?) != kinds {
         return Err(bad("a block with an unknown number of channel kinds"));
     }
-    let mut item = list + kinds * 2;
-    let mut frame_bit = 0usize;
+    let mut scan = ChannelScan { item: list + kinds * 2, frame_bit: 0, channels: Vec::new() };
     for kind in 0..kinds as u16 {
-        let n = count(kind as usize)?;
-        // Kinds no GTA VI file was seen to have: their coding there is not known.
-        if layout == Layout::GtaVi && n != 0 && matches!(kind, 6 | 9) {
-            return Err(bad(format!("channels of kind {kind}, which are not known in GTA VI")));
-        }
-        for _ in 0..n {
-            let raw = data.get(item..item + 2).ok_or_else(|| bad("channel item outside the block"))?;
-            let raw = u16::from_le_bytes([raw[0], raw[1]]) as usize;
-            item += 2;
-            let mut ch = read_channel(kind, &mut params, frames)?;
-            ch.set_bit(frame_bit);
-            frame_bit += ch.frame_bits() as usize;
-            let (seq, mut slot) = (raw >> 2, raw & 3);
-            if let Channel::CachedQuaternion { index } = &mut ch {
-                // RDR2 always derives w; its low bits mean something else there.
-                *index = if layout == Layout::Rdr2 { 3 } else { slot };
-                slot = if kind == 7 { 3 } else { 4 };
-            }
-            channels.push((seq, slot, ch));
-        }
-        if n % 4 != 0 {
-            item += (4 - n % 4) * 2;
-        }
+        read_kind_channels(&ctx, &mut params, &mut scan, kind)?;
     }
 
-    if layout == Layout::GtaVi {
-        // Everything has to add up: the parameters end where the frames
-        // start, the frames are as long as their fields, and every track has
-        // channels.
-        let covered: std::collections::HashSet<usize> = channels.iter().map(|(seq, ..)| *seq).collect();
-        if params.pos != frame_offset
-            || frame_bit.div_ceil(32) * 4 != frame_len
-            || covered.len() != tracks
-            || covered.iter().any(|t| *t >= tracks)
-        {
-            return Err(bad("a block whose channels do not fit its tracks"));
-        }
+    if layout == Layout::GtaVi && !channels_fit(&scan, params.pos, tracks, &header) {
+        return Err(bad("a block whose channels do not fit its tracks"));
     }
-    let mut values = vec![vec![[0.0f32, 0.0, 0.0, 1.0]; frames]; tracks];
+    let values = evaluate_block(scan.channels, data, tracks, &header);
+    Ok(Block { frames: header.frames, values })
+}
+
+/// The values of every track at every frame of a block.
+fn evaluate_block(channels: Vec<SlotChannel>, data: &[u8], tracks: usize, header: &BlockHeader) -> Vec<Vec<[f32; 4]>> {
+    let mut values = vec![vec![[0.0f32, 0.0, 0.0, 1.0]; header.frames]; tracks];
     for (seq, slots) in group(channels).into_iter().enumerate() {
         let Some(out) = values.get_mut(seq) else { break };
         for (f, v) in out.iter_mut().enumerate() {
-            let frame_start = (frame_offset + frame_len * f) * 8;
+            let frame_start = (header.frame_offset + header.frame_len * f) * 8;
             *v = evaluate(&slots, data, f, frame_start);
         }
     }
-    Ok(Block { frames, values })
+    values
+}
+
+/// GTA VI: everything has to add up: the parameters end where the frames
+/// start, the frames are as long as their fields, and every track has
+/// channels.
+fn channels_fit(scan: &ChannelScan, params_end: usize, tracks: usize, header: &BlockHeader) -> bool {
+    let covered: std::collections::HashSet<usize> = scan.channels.iter().map(|(seq, ..)| *seq).collect();
+    params_end == header.frame_offset
+        && scan.frame_bit.div_ceil(32) * 4 == header.frame_len
+        && covered.len() == tracks
+        && covered.iter().all(|t| *t < tracks)
+}
+
+/// Number of channels of `kind`, from the channel list.
+fn channel_count(ctx: &BlockCtx, kind: usize) -> Result<usize, ResourceError> {
+    ctx.data
+        .get(ctx.list + kind * 2..ctx.list + kind * 2 + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+        .ok_or_else(|| bad("channel list outside the block"))
+}
+
+/// Reads the channels of one kind (and skips the padding of their items).
+fn read_kind_channels(
+    ctx: &BlockCtx,
+    params: &mut Cursor,
+    scan: &mut ChannelScan,
+    kind: u16,
+) -> Result<(), ResourceError> {
+    let n = channel_count(ctx, kind as usize)?;
+    // Kinds no GTA VI file was seen to have: their coding there is not known.
+    if ctx.layout == Layout::GtaVi && n != 0 && matches!(kind, 6 | 9) {
+        return Err(bad(format!("channels of kind {kind}, which are not known in GTA VI")));
+    }
+    for _ in 0..n {
+        read_item_channel(ctx, params, scan, kind)?;
+    }
+    if n % 4 != 0 {
+        scan.item += (4 - n % 4) * 2;
+    }
+    Ok(())
+}
+
+/// Reads the channel of the next channel item.
+fn read_item_channel(
+    ctx: &BlockCtx,
+    params: &mut Cursor,
+    scan: &mut ChannelScan,
+    kind: u16,
+) -> Result<(), ResourceError> {
+    let raw = ctx.data.get(scan.item..scan.item + 2).ok_or_else(|| bad("channel item outside the block"))?;
+    let raw = u16::from_le_bytes([raw[0], raw[1]]) as usize;
+    scan.item += 2;
+    let mut ch = read_channel(kind, params, ctx.frames)?;
+    ch.set_bit(scan.frame_bit);
+    scan.frame_bit += ch.frame_bits() as usize;
+    let (seq, mut slot) = (raw >> 2, raw & 3);
+    if let Channel::CachedQuaternion { index } = &mut ch {
+        // RDR2 always derives w; its low bits mean something else there.
+        *index = if ctx.layout == Layout::Rdr2 { 3 } else { slot };
+        slot = if kind == 7 { 3 } else { 4 };
+    }
+    scan.channels.push((seq, slot, ch));
+    Ok(())
 }
 
 /// Channels per anim sequence, by slot.
-fn group(channels: Vec<(usize, usize, Channel)>) -> Vec<Vec<Option<Channel>>> {
+fn group(channels: Vec<SlotChannel>) -> Vec<Vec<Option<Channel>>> {
     let count = channels.iter().map(|(s, ..)| s + 1).max().unwrap_or(0);
     let mut out: Vec<Vec<Option<Channel>>> = vec![Vec::new(); count];
     for (seq, slot, ch) in channels {
@@ -753,80 +839,101 @@ pub fn parse_ycd(res: &Resource) -> Result<ClipDictionary, ResourceError> {
     if res.version == RDR2_VERSION {
         return parse_ycd_rdr2(res);
     }
-    let root = Resource::ROOT;
-    // Animations, by their address (clips refer to them by pointer).
+    let (animations, anim_ptrs) = read_animations(res)?;
+    let mut clips = read_clips(res, &anim_ptrs)?;
+    clips.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(ClipDictionary { clips, animations })
+}
+
+/// Index of the animation at `ptr` among the read ones.
+fn anim_index(anim_ptrs: &[u64], ptr: u64) -> Option<usize> {
+    anim_ptrs.iter().position(|&p| p == ptr)
+}
+
+/// The animations of the dictionary's map, by their address (clips refer to
+/// them by pointer), and those addresses.
+fn read_animations(res: &Resource) -> Result<(Vec<Animation>, Vec<u64>), ResourceError> {
     let mut animations: Vec<Animation> = Vec::new();
     let mut anim_ptrs: Vec<u64> = Vec::new();
-    let map = res.u64(root + 0x18)?;
+    let map = res.u64(Resource::ROOT + 0x18)?;
     if map != 0 {
         let buckets = res.u64(map + 0x18)?;
         let count = res.u16(map + 0x20)? as u64;
-        for b in 0..count.min(65536) {
-            let mut entry = res.u64(buckets + b * 8)?;
-            let mut guard = 0;
-            while entry != 0 && guard < 100_000 {
-                let anim = res.u64(entry + 0x08)?;
-                if anim != 0 && !anim_ptrs.contains(&anim) {
-                    animations.push(read_animation(res, anim)?);
-                    anim_ptrs.push(anim);
-                }
-                entry = res.u64(entry + 0x10)?;
-                guard += 1;
+        for_each_map_object(res, buckets, count, |anim| {
+            if anim != 0 && !anim_ptrs.contains(&anim) {
+                animations.push(read_animation(res, anim)?);
+                anim_ptrs.push(anim);
             }
-        }
+            Ok(())
+        })?;
     }
-    let index_of = |ptr: u64| anim_ptrs.iter().position(|&p| p == ptr);
+    Ok((animations, anim_ptrs))
+}
 
+fn read_clips(res: &Resource, anim_ptrs: &[u64]) -> Result<Vec<Clip>, ResourceError> {
+    let root = Resource::ROOT;
     let mut clips = Vec::new();
     let buckets = res.u64(root + 0x28)?;
     let count = res.u16(root + 0x30)? as u64;
-    for b in 0..count.min(65536) {
-        let mut entry = res.u64(buckets + b * 8)?;
-        let mut guard = 0;
-        while entry != 0 && guard < 100_000 {
-            let clip = res.u64(entry + 0x08)?;
-            if clip != 0 {
-                let name_ptr = res.u64(clip + 0x18)?;
-                let name = if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() };
-                let name = name.strip_prefix("pack:/").unwrap_or(&name).trim_end_matches(".clip").to_owned();
-                let mut parts = Vec::new();
-                match res.u8(clip + 0x10)? {
-                    1 => {
-                        let anim = res.u64(clip + 0x50)?;
-                        if let Some(animation) = index_of(anim) {
-                            parts.push(ClipPart {
-                                animation,
-                                start: f32::from_bits(res.u32(clip + 0x58)?),
-                                end: f32::from_bits(res.u32(clip + 0x5C)?),
-                                rate: f32::from_bits(res.u32(clip + 0x60)?),
-                            });
-                        }
-                    }
-                    2 => {
-                        let list = res.u64(clip + 0x50)?;
-                        let n = res.u16(clip + 0x58)? as u64;
-                        for i in 0..n.min(256) {
-                            let e = list + i * 0x18;
-                            if let Some(animation) = index_of(res.u64(e + 0x10)?) {
-                                parts.push(ClipPart {
-                                    animation,
-                                    start: f32::from_bits(res.u32(e)?),
-                                    end: f32::from_bits(res.u32(e + 4)?),
-                                    rate: f32::from_bits(res.u32(e + 8)?),
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                clips.push(Clip { name, parts, sequential: false });
-            }
-            entry = res.u64(entry + 0x10)?;
-            guard += 1;
+    for_each_map_object(res, buckets, count, |clip| {
+        if clip != 0 {
+            clips.push(read_clip(res, clip, anim_ptrs)?);
+        }
+        Ok(())
+    })?;
+    Ok(clips)
+}
+
+/// The name of the clip whose name pointer is `name_ptr`, without its
+/// `pack:/` prefix and `.clip` suffix.
+fn clip_name(res: &Resource, name_ptr: u64) -> String {
+    let name = if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() };
+    name.strip_prefix("pack:/").unwrap_or(&name).trim_end_matches(".clip").to_owned()
+}
+
+fn read_clip(res: &Resource, clip: u64, anim_ptrs: &[u64]) -> Result<Clip, ResourceError> {
+    let name_ptr = res.u64(clip + 0x18)?;
+    let name = clip_name(res, name_ptr);
+    let parts = match res.u8(clip + 0x10)? {
+        1 => read_single_part(res, clip, anim_ptrs)?,
+        2 => read_part_list(res, clip, anim_ptrs)?,
+        _ => Vec::new(),
+    };
+    Ok(Clip { name, parts, sequential: false })
+}
+
+/// Clip type 1: one animation, with start, end and rate in the clip.
+fn read_single_part(res: &Resource, clip: u64, anim_ptrs: &[u64]) -> Result<Vec<ClipPart>, ResourceError> {
+    let mut parts = Vec::new();
+    let anim = res.u64(clip + 0x50)?;
+    if let Some(animation) = anim_index(anim_ptrs, anim) {
+        parts.push(ClipPart {
+            animation,
+            start: f32::from_bits(res.u32(clip + 0x58)?),
+            end: f32::from_bits(res.u32(clip + 0x5C)?),
+            rate: f32::from_bits(res.u32(clip + 0x60)?),
+        });
+    }
+    Ok(parts)
+}
+
+/// Clip type 2: a list of entries of 0x18 bytes.
+fn read_part_list(res: &Resource, clip: u64, anim_ptrs: &[u64]) -> Result<Vec<ClipPart>, ResourceError> {
+    let mut parts = Vec::new();
+    let list = res.u64(clip + 0x50)?;
+    let n = res.u16(clip + 0x58)? as u64;
+    for i in 0..n.min(256) {
+        let e = list + i * 0x18;
+        if let Some(animation) = anim_index(anim_ptrs, res.u64(e + 0x10)?) {
+            parts.push(ClipPart {
+                animation,
+                start: f32::from_bits(res.u32(e)?),
+                end: f32::from_bits(res.u32(e + 4)?),
+                rate: f32::from_bits(res.u32(e + 8)?),
+            });
         }
     }
-    clips.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(ClipDictionary { clips, animations })
+    Ok(parts)
 }
 
 /// A Red Dead Redemption 2 animation (`crAnimation` in clip dictionaries
@@ -854,22 +961,36 @@ fn read_animation_rdr2(res: &Resource, ptr: u64) -> Result<Animation, ResourceEr
     Ok(Animation { flags: res.u16(ptr + 0x20)?, frames, frames_per_block, duration, tracks, blocks })
 }
 
-/// Walks a hash map (bucket pointers, entries chained at +0x10) and returns
-/// the object pointer (+0x08) of every entry.
-pub(crate) fn map_objects(res: &Resource, buckets: u64, count: u64) -> Result<Vec<u64>, ResourceError> {
-    let mut out = Vec::new();
+/// Walks a hash map (bucket pointers, entries chained at +0x10) and calls `f`
+/// with the object pointer (+0x08) of every entry (also a null one).
+fn for_each_map_object(
+    res: &Resource,
+    buckets: u64,
+    count: u64,
+    mut f: impl FnMut(u64) -> Result<(), ResourceError>,
+) -> Result<(), ResourceError> {
     for b in 0..count.min(65536) {
         let mut entry = res.u64(buckets + b * 8)?;
         let mut guard = 0;
         while entry != 0 && guard < 100_000 {
-            let object = res.u64(entry + 0x08)?;
-            if object != 0 {
-                out.push(object);
-            }
+            f(res.u64(entry + 0x08)?)?;
             entry = res.u64(entry + 0x10)?;
             guard += 1;
         }
     }
+    Ok(())
+}
+
+/// Walks a hash map (bucket pointers, entries chained at +0x10) and returns
+/// the object pointer (+0x08) of every entry.
+pub(crate) fn map_objects(res: &Resource, buckets: u64, count: u64) -> Result<Vec<u64>, ResourceError> {
+    let mut out = Vec::new();
+    for_each_map_object(res, buckets, count, |object| {
+        if object != 0 {
+            out.push(object);
+        }
+        Ok(())
+    })?;
     Ok(out)
 }
 
@@ -877,6 +998,17 @@ pub(crate) fn map_objects(res: &Resource, buckets: u64, count: u64) -> Result<Ve
 /// with its animation dictionaries embedded. Clips refer to animations by
 /// pointer; each clip has a list of animation parts (pointer, start, end, rate).
 pub fn parse_ycd_rdr2(res: &Resource) -> Result<ClipDictionary, ResourceError> {
+    let (animations, anim_ptrs) = read_animations_rdr2(res)?;
+    let mut clips = Vec::new();
+    for clip in map_objects(res, res.u64(Resource::ROOT + 0x48)?, res.u16(Resource::ROOT + 0x50)? as u64)? {
+        clips.push(read_clip_rdr2(res, clip, &anim_ptrs)?);
+    }
+    clips.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(ClipDictionary { clips, animations })
+}
+
+/// The animations of the embedded animation dictionaries, and their addresses.
+fn read_animations_rdr2(res: &Resource) -> Result<(Vec<Animation>, Vec<u64>), ResourceError> {
     let root = Resource::ROOT;
     let mut animations = Vec::new();
     let mut anim_ptrs = Vec::new();
@@ -887,51 +1019,65 @@ pub fn parse_ycd_rdr2(res: &Resource) -> Result<ClipDictionary, ResourceError> {
         if dict == 0 {
             continue;
         }
-        let (buckets, count) = (res.u64(dict + 0x48)?, res.u16(dict + 0x50)? as u64);
-        for anim in map_objects(res, buckets, count)? {
-            if !anim_ptrs.contains(&anim) {
-                animations.push(read_animation_rdr2(res, anim)?);
-                anim_ptrs.push(anim);
-            }
+        read_dict_animations(res, dict, &mut animations, &mut anim_ptrs)?;
+    }
+    Ok((animations, anim_ptrs))
+}
+
+/// Adds the animations of one embedded animation dictionary not read yet.
+fn read_dict_animations(
+    res: &Resource,
+    dict: u64,
+    animations: &mut Vec<Animation>,
+    anim_ptrs: &mut Vec<u64>,
+) -> Result<(), ResourceError> {
+    let (buckets, count) = (res.u64(dict + 0x48)?, res.u16(dict + 0x50)? as u64);
+    for anim in map_objects(res, buckets, count)? {
+        if !anim_ptrs.contains(&anim) {
+            animations.push(read_animation_rdr2(res, anim)?);
+            anim_ptrs.push(anim);
         }
     }
-    let index_of = |ptr: u64| anim_ptrs.iter().position(|&p| p == ptr);
-    let mut clips = Vec::new();
-    for clip in map_objects(res, res.u64(root + 0x48)?, res.u16(root + 0x50)? as u64)? {
-        let name_ptr = res.u64(clip + 0x28)?;
-        let name = if name_ptr != 0 { res.string(name_ptr).unwrap_or_default() } else { String::new() };
-        let name = name.strip_prefix("pack:/").unwrap_or(&name).trim_end_matches(".clip").to_owned();
-        // A layer: animation pointer, then start, end and rate at 0x28.
-        let layer = |at: u64| -> Result<Option<ClipPart>, ResourceError> {
-            Ok(index_of(res.u64(at)?).map(|animation| ClipPart {
-                animation,
-                start: f32::from_bits(res.u32(at + 0x28).unwrap_or(0)),
-                end: f32::from_bits(res.u32(at + 0x2C).unwrap_or(0)),
-                rate: f32::from_bits(res.u32(at + 0x30).unwrap_or(0)),
-            }))
-        };
-        let mut parts = Vec::new();
-        if res.u32(clip + 0x20)? == RDR2_CLIP_SINGLE {
-            // One animation (props, destruction): the layer is in the clip.
-            parts.extend(layer(clip + 0x68)?);
-        } else {
-            // Parts (played one after another): each a list of animation
-            // layers and a duration. The first layer is the part's animation.
-            let list = res.u64(clip + 0x68)?;
-            let n = res.u16(clip + 0x70)? as u64;
-            for i in 0..n.min(256) {
-                let part = list + i * RDR2_CLIP_PART;
-                let (layers, layer_count) = (res.u64(part)?, res.u16(part + 8)?);
-                if layers != 0 && layer_count != 0 {
-                    parts.extend(layer(layers)?);
-                }
-            }
+    Ok(())
+}
+
+fn read_clip_rdr2(res: &Resource, clip: u64, anim_ptrs: &[u64]) -> Result<Clip, ResourceError> {
+    let name_ptr = res.u64(clip + 0x28)?;
+    let name = clip_name(res, name_ptr);
+    let parts = if res.u32(clip + 0x20)? == RDR2_CLIP_SINGLE {
+        // One animation (props, destruction): the layer is in the clip.
+        rdr2_layer(res, anim_ptrs, clip + 0x68)?.into_iter().collect()
+    } else {
+        rdr2_part_list(res, anim_ptrs, clip)?
+    };
+    let sequential = parts.len() > 1;
+    Ok(Clip { name, parts, sequential })
+}
+
+/// Parts (played one after another): each a list of animation layers and a
+/// duration. The first layer is the part's animation.
+fn rdr2_part_list(res: &Resource, anim_ptrs: &[u64], clip: u64) -> Result<Vec<ClipPart>, ResourceError> {
+    let mut parts = Vec::new();
+    let list = res.u64(clip + 0x68)?;
+    let n = res.u16(clip + 0x70)? as u64;
+    for i in 0..n.min(256) {
+        let part = list + i * RDR2_CLIP_PART;
+        let (layers, layer_count) = (res.u64(part)?, res.u16(part + 8)?);
+        if layers != 0 && layer_count != 0 {
+            parts.extend(rdr2_layer(res, anim_ptrs, layers)?);
         }
-        let sequential = parts.len() > 1;
-        clips.push(Clip { name, parts, sequential });
     }
-    clips.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(ClipDictionary { clips, animations })
+    Ok(parts)
+}
+
+/// A layer: animation pointer, then start, end and rate at 0x28.
+fn rdr2_layer(res: &Resource, anim_ptrs: &[u64], at: u64) -> Result<Option<ClipPart>, ResourceError> {
+    Ok(anim_index(anim_ptrs, res.u64(at)?).map(|animation| ClipPart {
+        animation,
+        start: f32::from_bits(res.u32(at + 0x28).unwrap_or(0)),
+        end: f32::from_bits(res.u32(at + 0x2C).unwrap_or(0)),
+        rate: f32::from_bits(res.u32(at + 0x30).unwrap_or(0)),
+    }))
 }
 
 /// Resource version of Red Dead Redemption 2's clip dictionaries.

@@ -498,50 +498,17 @@ impl Rpf8 {
         keys: Option<Arc<Rdr2Keys>>,
     ) -> Result<Rpf8, RpfError> {
         let mut f = File::open(path)?;
-        f.seek(SeekFrom::Start(base))?;
-        let mut head = [0u8; HEADER_LEN as usize];
-        f.read_exact(&mut head)?;
-        let header = Header::parse(&head).ok_or_else(|| {
-            RpfError::BadMagic(name.clone(), u32::from_le_bytes(head[0..4].try_into().unwrap_or_default()))
-        })?;
+        let header = read_header(&mut f, base, &name)?;
         let table_end = HEADER_LEN + SIGNATURE_LEN + u64::from(header.entry_count) * ENTRY_LEN as u64;
         if table_end > size || u64::from(header.names_length) > size {
             return Err(RpfError::CorruptToc { archive: name, reason: "entry table larger than the file".into() });
         }
-        let table_key = match &keys {
-            Some(k) if header.is_encrypted() => {
-                k.keys.get(&(header.decryption_tag as u8)).filter(|_| header.decryption_tag < 0x100)
-            }
-            _ => None,
-        };
+        let table_key = table_key(keys.as_deref(), &header);
         let entries = if header.is_encrypted() && table_key.is_none() {
             None
         } else {
-            f.seek(SeekFrom::Start(base + HEADER_LEN + SIGNATURE_LEN))?;
-            let mut table = vec![0u8; header.entry_count as usize * ENTRY_LEN];
-            f.read_exact(&mut table)?;
-            if let (Some(key), Some(k)) = (table_key, &keys) {
-                rage_tfit2::Cbc::new(&k.context, key, k.iv).decrypt(&mut table);
-                if !plausible_table(&table, size) {
-                    return Err(RpfError::CorruptToc {
-                        archive: name,
-                        reason: "the table does not decrypt with the loaded keys".into(),
-                    });
-                }
-            }
-            let mut entries: Vec<Entry> = table.as_chunks::<ENTRY_LEN>().0.iter().map(|c| Entry::parse(c)).collect();
-            for e in &entries {
-                if e.offset + e.size_on_disk > size {
-                    return Err(RpfError::OutOfBounds { archive: name, entry: e.display_name(header.platform) });
-                }
-            }
-            if header.names_length > 0 {
-                f.seek(SeekFrom::Start(base + size - u64::from(header.names_length)))?;
-                let mut names = vec![0u8; header.names_length as usize];
-                f.read_exact(&mut names)?;
-                apply_names(&mut entries, &names, header.platform);
-            }
-            Some(entries)
+            let src = TableSource { base, size, name: &name, header: &header };
+            Some(src.read_entries(&mut f, table_key.zip(keys.as_deref()))?)
         };
         Ok(Rpf8 { path: path.to_path_buf(), base, display: name, header, size, entries, keys, names: None, depth: 0 })
     }
@@ -624,19 +591,44 @@ impl Rpf8 {
     /// Resources come without their 16-byte on-disk prefix: virtual pages,
     /// then physical pages.
     pub fn read(&self, entry: &Entry) -> Result<Vec<u8>, RpfError> {
-        let archive = self.display.clone();
         let name = entry.display_name(self.header.platform);
-        let key = if entry.is_encrypted() {
-            let k = self.keys.as_ref().ok_or_else(|| RpfError::KeysRequired(format!("{archive}/{name}")))?;
-            Some((
-                k,
-                k.keys
-                    .get(&entry.key_id)
-                    .ok_or_else(|| RpfError::KeysRequired(format!("{archive}/{name} (key {})", entry.key_id)))?,
-            ))
-        } else {
-            None
-        };
+        let key = self.entry_key(entry, &name)?;
+        let mut data = self.read_decrypted(entry, key)?;
+        match entry.compression {
+            Compression::None => {
+                if !entry.is_resource {
+                    data.truncate(entry.size_or_flags as usize);
+                }
+                Ok(data)
+            }
+            Compression::Deflate => self.inflate(entry, name, &data),
+            Compression::Oodle => self.oodle(entry, name, &data),
+            Compression::Unknown(n) => {
+                Err(self.inflate_error(name, std::io::Error::other(format!("unknown compression {n}"))))
+            }
+        }
+    }
+
+    fn inflate_error(&self, entry: String, source: std::io::Error) -> RpfError {
+        RpfError::Inflate { archive: self.display.clone(), entry, source }
+    }
+
+    /// The keys that decrypt `entry`, `None` for an unencrypted one.
+    fn entry_key(&self, entry: &Entry, name: &str) -> Result<Option<(&Rdr2Keys, &rage_tfit2::Key)>, RpfError> {
+        if !entry.is_encrypted() {
+            return Ok(None);
+        }
+        let archive = &self.display;
+        let k = self.keys.as_ref().ok_or_else(|| RpfError::KeysRequired(format!("{archive}/{name}")))?;
+        let key = k
+            .keys
+            .get(&entry.key_id)
+            .ok_or_else(|| RpfError::KeysRequired(format!("{archive}/{name} (key {})", entry.key_id)))?;
+        Ok(Some((k, key)))
+    }
+
+    /// The entry's bytes as stored, decrypted but not decompressed (resources without their prefix).
+    fn read_decrypted(&self, entry: &Entry, key: Option<(&Rdr2Keys, &rage_tfit2::Key)>) -> Result<Vec<u8>, RpfError> {
         let mut f = File::open(&self.path)?;
         f.seek(SeekFrom::Start(self.base + entry.offset))?;
         let mut data = vec![0u8; entry.size_on_disk as usize];
@@ -654,57 +646,104 @@ impl Rpf8 {
             let prefix = if entry.is_resource { 16 } else { 0 };
             rage_tfit2::decrypt_file(&k.context, key, k.iv, entry.encryption_config, chunk, prefix, &mut data);
         }
-        match entry.compression {
-            Compression::None => {
-                if !entry.is_resource {
-                    data.truncate(entry.size_or_flags as usize);
-                }
-                Ok(data)
-            }
-            Compression::Deflate => {
-                let mut out = Vec::new();
-                flate2::read::DeflateDecoder::new(&data[..])
-                    .take(entry.size().min(crate::MAX_UNPACKED))
-                    .read_to_end(&mut out)
-                    .map_err(|source| RpfError::Inflate { archive, entry: name, source })?;
-                Ok(out)
-            }
-            Compression::Oodle => {
-                let expected = entry.size();
-                if expected > crate::MAX_UNPACKED {
-                    return Err(RpfError::Inflate {
-                        archive,
-                        entry: name,
-                        source: std::io::Error::other(format!("implausible unpacked size {expected}")),
-                    });
-                }
-                let expected = expected as usize;
-                let mut out = vec![0u8; expected];
-                // oozextract panics on some damaged input instead of failing.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    oozextract::Extractor::new().read_from_slice(&data, &mut out).map_err(|e| e.to_string())
-                }))
-                .unwrap_or_else(|_| Err("damaged Oodle data".to_owned()));
-                let n = result.map_err(|e| RpfError::Inflate {
-                    archive: archive.clone(),
-                    entry: name.clone(),
-                    source: std::io::Error::other(e),
-                })?;
-                if n != expected {
-                    return Err(RpfError::Inflate {
-                        archive,
-                        entry: name,
-                        source: std::io::Error::other(format!("Oodle gave {n} bytes, expected {expected}")),
-                    });
-                }
-                Ok(out)
-            }
-            Compression::Unknown(n) => Err(RpfError::Inflate {
-                archive,
-                entry: name,
-                source: std::io::Error::other(format!("unknown compression {n}")),
-            }),
+        Ok(data)
+    }
+
+    fn inflate(&self, entry: &Entry, name: String, data: &[u8]) -> Result<Vec<u8>, RpfError> {
+        let mut out = Vec::new();
+        flate2::read::DeflateDecoder::new(data)
+            .take(entry.size().min(crate::MAX_UNPACKED))
+            .read_to_end(&mut out)
+            .map_err(|source| self.inflate_error(name, source))?;
+        Ok(out)
+    }
+
+    fn oodle(&self, entry: &Entry, name: String, data: &[u8]) -> Result<Vec<u8>, RpfError> {
+        let expected = entry.size();
+        if expected > crate::MAX_UNPACKED {
+            let source = std::io::Error::other(format!("implausible unpacked size {expected}"));
+            return Err(self.inflate_error(name, source));
         }
+        let expected = expected as usize;
+        let mut out = vec![0u8; expected];
+        // oozextract panics on some damaged input instead of failing.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            oozextract::Extractor::new().read_from_slice(data, &mut out).map_err(|e| e.to_string())
+        }))
+        .unwrap_or_else(|_| Err("damaged Oodle data".to_owned()));
+        let n = result.map_err(|e| self.inflate_error(name.clone(), std::io::Error::other(e)))?;
+        if n != expected {
+            let source = std::io::Error::other(format!("Oodle gave {n} bytes, expected {expected}"));
+            return Err(self.inflate_error(name, source));
+        }
+        Ok(out)
+    }
+}
+
+/// Reads the header at `base`; `name` is only for the error.
+fn read_header(f: &mut File, base: u64, name: &str) -> Result<Header, RpfError> {
+    f.seek(SeekFrom::Start(base))?;
+    let mut head = [0u8; HEADER_LEN as usize];
+    f.read_exact(&mut head)?;
+    Header::parse(&head).ok_or_else(|| {
+        RpfError::BadMagic(name.to_owned(), u32::from_le_bytes(head[0..4].try_into().unwrap_or_default()))
+    })
+}
+
+/// The key that decrypts the entry table, if the table is encrypted and the key is loaded.
+fn table_key<'a>(keys: Option<&'a Rdr2Keys>, header: &Header) -> Option<&'a rage_tfit2::Key> {
+    match keys {
+        Some(k) if header.is_encrypted() => {
+            k.keys.get(&(header.decryption_tag as u8)).filter(|_| header.decryption_tag < 0x100)
+        }
+        _ => None,
+    }
+}
+
+/// Where the entry table of an archive is and how to check it.
+struct TableSource<'a> {
+    base: u64,
+    size: u64,
+    name: &'a str,
+    header: &'a Header,
+}
+
+impl TableSource<'_> {
+    /// Reads (and decrypts, given the table key and the keys it belongs to) the entry table and the name table.
+    fn read_entries(
+        &self,
+        f: &mut File,
+        decrypt: Option<(&rage_tfit2::Key, &Rdr2Keys)>,
+    ) -> Result<Vec<Entry>, RpfError> {
+        let header = self.header;
+        f.seek(SeekFrom::Start(self.base + HEADER_LEN + SIGNATURE_LEN))?;
+        let mut table = vec![0u8; header.entry_count as usize * ENTRY_LEN];
+        f.read_exact(&mut table)?;
+        if let Some((key, k)) = decrypt {
+            rage_tfit2::Cbc::new(&k.context, key, k.iv).decrypt(&mut table);
+            if !plausible_table(&table, self.size) {
+                return Err(RpfError::CorruptToc {
+                    archive: self.name.to_owned(),
+                    reason: "the table does not decrypt with the loaded keys".into(),
+                });
+            }
+        }
+        let mut entries: Vec<Entry> = table.as_chunks::<ENTRY_LEN>().0.iter().map(|c| Entry::parse(c)).collect();
+        for e in &entries {
+            if e.offset + e.size_on_disk > self.size {
+                return Err(RpfError::OutOfBounds {
+                    archive: self.name.to_owned(),
+                    entry: e.display_name(header.platform),
+                });
+            }
+        }
+        if header.names_length > 0 {
+            f.seek(SeekFrom::Start(self.base + self.size - u64::from(header.names_length)))?;
+            let mut names = vec![0u8; header.names_length as usize];
+            f.read_exact(&mut names)?;
+            apply_names(&mut entries, &names, header.platform);
+        }
+        Ok(entries)
     }
 }
 

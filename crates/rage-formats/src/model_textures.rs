@@ -57,6 +57,357 @@ enum At {
     Block(usize, u64),
 }
 
+/// Final (name, structure) per dictionary, when its lists change.
+type Lists = Vec<Option<Vec<(String, At)>>>;
+
+/// The model being edited, with the new blocks and pointers collected so far.
+struct Editor<'a> {
+    dicts: &'a [u64],
+    enhanced: bool,
+    layout: Layout,
+    parsed: Vec<ytd::TextureDictionary>,
+    /// Structure addresses, parallel to each dictionary's textures.
+    addresses: Vec<Vec<u64>>,
+    out: Resource,
+    blocks: Vec<NewBlock>,
+    /// (where, what it points to)
+    fixups: Vec<(At, At)>,
+    lists: Lists,
+    replaced: usize,
+    added: usize,
+    removed: usize,
+}
+
+/// Parses the dictionaries; none may be missing or unreadable.
+fn parse_dictionaries(
+    res: &Resource,
+    dicts: &[u64],
+    enhanced: bool,
+) -> Result<Vec<ytd::TextureDictionary>, ResourceError> {
+    if dicts.is_empty() {
+        return Err(bad("the model has no textures of its own"));
+    }
+    let parsed: Vec<ytd::TextureDictionary> =
+        dicts.iter().map(|&d| ytd::parse_at(res, d, enhanced)).collect::<Result<_, _>>()?;
+    if let Some(e) = parsed.iter().flat_map(|d| &d.errors).next() {
+        return Err(bad(format!("the model has unreadable textures ({e}); refusing to change it")));
+    }
+    Ok(parsed)
+}
+
+/// Rejects replacements the model's format cannot take.
+fn check_edits(edits: &[Edit], enhanced: bool) -> Result<(), ResourceError> {
+    for e in edits {
+        if let Edit::Set(t) = e {
+            if t.expected_size().is_none_or(|n| n > t.data.len()) {
+                return Err(bad(format!("{}: pixel data is shorter than its format and size require", t.name)));
+            }
+            if !enhanced && t.format.to_d3d9().is_none() {
+                return Err(bad(format!("{}: {} is not available in GTA V Legacy", t.name, t.format.name())));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn texture_addresses(
+    res: &Resource,
+    dicts: &[u64],
+    parsed: &[ytd::TextureDictionary],
+) -> Result<Vec<Vec<u64>>, ResourceError> {
+    dicts
+        .iter()
+        .zip(parsed)
+        .map(|(&d, p)| {
+            let list = res.u64(d + 0x30)?;
+            (0..p.textures.len() as u64).map(|i| res.u64(list + i * 8)).collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<_, _>>()
+}
+
+/// The address of every block, from the offsets of its page segment's blocks.
+fn block_addresses(count: usize, gfx: (&[usize], &[u64]), sys: (&[usize], &[u64])) -> Vec<u64> {
+    let mut address = vec![0u64; count];
+    for (k, &b) in gfx.0.iter().enumerate() {
+        address[b] = GRAPHICS_BASE + gfx.1[k];
+    }
+    for (k, &b) in sys.0.iter().enumerate() {
+        address[b] = SYSTEM_BASE + sys.1[k];
+    }
+    address
+}
+
+impl Editor<'_> {
+    fn entries(&self, d: usize) -> Vec<(String, At)> {
+        self.parsed[d].textures.iter().zip(&self.addresses[d]).map(|(t, &a)| (t.name.clone(), At::Address(a))).collect()
+    }
+
+    fn apply_edit(&mut self, edit: &Edit) -> Result<(), ResourceError> {
+        match edit {
+            Edit::Set(new) => self.set(new),
+            Edit::Remove(name) => self.remove(name),
+        }
+    }
+
+    fn set(&mut self, new: &Texture) -> Result<(), ResourceError> {
+        let mut found = false;
+        for d in 0..self.dicts.len() {
+            let Some(i) = self.parsed[d].textures.iter().position(|t| t.name.eq_ignore_ascii_case(&new.name)) else {
+                continue;
+            };
+            found = true;
+            self.replace(d, i, new)?;
+        }
+        if found {
+            self.replaced += 1;
+            return Ok(());
+        }
+        self.add(new)
+    }
+
+    /// Replaces texture `i` of dictionary `d`.
+    fn replace(&mut self, d: usize, i: usize, new: &Texture) -> Result<(), ResourceError> {
+        let size = self.layout.texture_size();
+        let old = &self.parsed[d].textures[i];
+        let tex = Texture {
+            name: old.name.clone(),
+            usage: if new.usage == 0 { old.usage } else { new.usage },
+            ..new.clone()
+        };
+        let len = tex.expected_size().expect("checked above");
+        let at = self.addresses[d][i];
+        write_fields(self.layout, self.out.bytes_mut(at, size)?, &tex, false)?;
+        if len <= old.data.len() {
+            self.out.bytes_mut(self.parsed[d].stored[i].data_ptr, len)?.copy_from_slice(&tex.data[..len]);
+        } else {
+            self.blocks.push(NewBlock {
+                graphics: true,
+                data: tex.data[..len].to_vec(),
+                align: DATA_ALIGN,
+                texture: Some((tex.name.clone(), old.data.len())),
+            });
+            self.fixups.push((At::Address(at + data_field(self.layout)), At::Block(self.blocks.len() - 1, 0)));
+        }
+        Ok(())
+    }
+
+    /// Adds a texture to the model's only list.
+    fn add(&mut self, new: &Texture) -> Result<(), ResourceError> {
+        if self.dicts.len() != 1 {
+            return Err(bad(format!(
+                "{}: this model has {} texture lists; new textures can only be added to a model with one",
+                new.name,
+                self.dicts.len()
+            )));
+        }
+        let df = data_field(self.layout);
+        let mut t = self.parsed[0]
+            .stored
+            .first()
+            .map(|s| s.template.clone())
+            .ok_or_else(|| bad("cannot add a texture to an empty texture list (no template texture)"))?;
+        t.resize(self.layout.texture_size(), 0);
+        write_fields(self.layout, &mut t, new, true)?;
+        let len = new.expected_size().expect("checked above");
+        self.blocks.push(NewBlock { graphics: false, data: t, align: 16, texture: None });
+        let tex_block = self.blocks.len() - 1;
+        let mut name = new.name.clone().into_bytes();
+        name.push(0);
+        self.blocks.push(NewBlock { graphics: false, data: name, align: 16, texture: None });
+        self.fixups.push((At::Block(tex_block, NAME_FIELD), At::Block(self.blocks.len() - 1, 0)));
+        self.blocks.push(NewBlock { graphics: true, data: new.data[..len].to_vec(), align: DATA_ALIGN, texture: None });
+        self.fixups.push((At::Block(tex_block, df), At::Block(self.blocks.len() - 1, 0)));
+        if self.enhanced {
+            // The embedded shader resource view.
+            self.fixups.push((At::Block(tex_block, 0x30), At::Block(tex_block, 0x58)));
+        }
+        let entry = (new.name.clone(), At::Block(tex_block, 0));
+        if self.lists[0].is_none() {
+            self.lists[0] = Some(self.entries(0));
+        }
+        if let Some(list) = &mut self.lists[0] {
+            list.push(entry);
+        }
+        self.added += 1;
+        Ok(())
+    }
+
+    fn remove(&mut self, name: &str) -> Result<(), ResourceError> {
+        let mut found = false;
+        for d in 0..self.lists.len() {
+            if self.lists[d].is_none() {
+                self.lists[d] = Some(self.entries(d));
+            }
+            let Some(list) = &mut self.lists[d] else { continue };
+            let before = list.len();
+            list.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+            found |= list.len() != before;
+        }
+        if !found {
+            return Err(bad(format!("{name}: no such texture")));
+        }
+        self.removed += 1;
+        Ok(())
+    }
+
+    /// Name hash and pointer lists of changed dictionaries.
+    fn write_lists(&mut self) -> Result<(), ResourceError> {
+        let lists = std::mem::take(&mut self.lists);
+        for (d, list) in lists.into_iter().enumerate() {
+            let Some(mut list) = list else { continue };
+            list.sort_by_key(|(n, _)| name_hash(n));
+            self.write_list(self.dicts[d], &list)?;
+        }
+        Ok(())
+    }
+
+    fn write_list(&mut self, txd: u64, list: &[(String, At)]) -> Result<(), ResourceError> {
+        let count = list.len() as u16;
+        let capacity = self.out.u16(txd + 0x3A)?.min(self.out.u16(txd + 0x2A)?);
+        let has_new = list.iter().any(|(_, a)| matches!(a, At::Block(..)));
+        let hashes: Vec<u8> = list.iter().flat_map(|(n, _)| name_hash(n).to_le_bytes()).collect();
+        if !has_new && count <= capacity {
+            self.rewrite_in_place(txd, list, &hashes)?;
+        } else {
+            self.append_list(txd, list, hashes)?;
+        }
+        for at in [0x28, 0x38] {
+            self.out.bytes_mut(txd + at, 2)?.copy_from_slice(&count.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// The lists still fit where they are.
+    fn rewrite_in_place(&mut self, txd: u64, list: &[(String, At)], hashes: &[u8]) -> Result<(), ResourceError> {
+        let (h, p) = (self.out.u64(txd + 0x20)?, self.out.u64(txd + 0x30)?);
+        self.out.bytes_mut(h, hashes.len())?.copy_from_slice(hashes);
+        for (k, (_, a)) in list.iter().enumerate() {
+            let At::Address(a) = a else { unreachable!("no new entries") };
+            self.out.bytes_mut(p + k as u64 * 8, 8)?.copy_from_slice(&a.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// The lists move to new blocks, with room for `list.len()` entries.
+    fn append_list(&mut self, txd: u64, list: &[(String, At)], hashes: Vec<u8>) -> Result<(), ResourceError> {
+        let count = list.len() as u16;
+        self.blocks.push(NewBlock { graphics: false, data: hashes, align: 16, texture: None });
+        self.fixups.push((At::Address(txd + 0x20), At::Block(self.blocks.len() - 1, 0)));
+        self.blocks.push(NewBlock { graphics: false, data: vec![0; list.len() * 8], align: 16, texture: None });
+        let ptrs = self.blocks.len() - 1;
+        self.fixups.push((At::Address(txd + 0x30), At::Block(ptrs, 0)));
+        for (k, (_, a)) in list.iter().enumerate() {
+            self.fixups.push((At::Block(ptrs, k as u64 * 8), *a));
+        }
+        for at in [0x2A, 0x3A] {
+            self.out.bytes_mut(txd + at, 2)?.copy_from_slice(&count.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Appended pages for the graphics blocks; says which texture does not fit and what would.
+    fn graphics_pages(
+        &self,
+        graphics_flags: u32,
+        sys_pages: u32,
+        gfx_blocks: &[usize],
+    ) -> Result<pages::Appended, ResourceError> {
+        let blocks = &self.blocks;
+        pages::append(
+            graphics_flags,
+            sys_pages,
+            &gfx_blocks.iter().map(|&b| (blocks[b].data.len() as u64, blocks[b].align)).collect::<Vec<_>>(),
+        )
+        .map_err(|e| {
+            let room = pages::largest_new_page(graphics_flags, sys_pages);
+            let Some(b) = gfx_blocks.iter().map(|&b| &blocks[b]).max_by_key(|b| b.data.len()) else { return e };
+            match &b.texture {
+                Some((name, old)) => bad(format!(
+                    "{name}: its pixel data ({} bytes) does not fit into the model. The old texture's place holds \
+                     {old} bytes and the model has room for at most {room} more; use the same resolution and \
+                     format as the original, or a smaller one",
+                    b.data.len()
+                )),
+                None => bad(format!(
+                    "the new texture's pixel data ({} bytes) does not fit into the model, which has room for at \
+                     most {room} more bytes; use a smaller texture",
+                    b.data.len()
+                )),
+            }
+        })
+    }
+
+    /// The appended system pages. The pages-info block (if any) lists every
+    /// page, so it grows with them: iterate to a fixed point. Returns the
+    /// pages and the final guess of the total page count.
+    fn system_pages(
+        &self,
+        system_flags: u32,
+        gfx_count: u32,
+        sys_pages: u32,
+        sys_blocks: &[usize],
+        pages_info: u64,
+    ) -> Result<(pages::Appended, u32), ResourceError> {
+        let mut guess = sys_pages + gfx_count + 1;
+        loop {
+            let mut sizes: Vec<(u64, u64)> =
+                sys_blocks.iter().map(|&b| (self.blocks[b].data.len() as u64, self.blocks[b].align)).collect();
+            if pages_info != 0 {
+                sizes.push((16 + 8 * guess as u64, 16));
+            }
+            let sys = pages::append(system_flags, gfx_count, &sizes)?;
+            let total = pages::Pages::from_flags(sys.flags).count() + gfx_count;
+            if pages_info == 0 || total == guess {
+                return Ok((sys, guess));
+            }
+            guess = total;
+        }
+    }
+
+    /// Copies the blocks to their addresses and fills in the pointers.
+    fn write_blocks(&mut self, address: &[u64]) -> Result<(), ResourceError> {
+        for (b, block) in self.blocks.iter().enumerate() {
+            self.out.bytes_mut(address[b], block.data.len())?.copy_from_slice(&block.data);
+        }
+        let resolve = |a: At| match a {
+            At::Address(x) => x,
+            At::Block(b, off) => address[b] + off,
+        };
+        for &(at, to) in &self.fixups {
+            let value = resolve(to);
+            self.out.bytes_mut(resolve(at), 8)?.copy_from_slice(&value.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Lays out the new blocks in appended pages and repacks the resource.
+    fn finish(mut self, system_flags: u32, graphics_flags: u32) -> Result<EditResult, ResourceError> {
+        let sys_pages = pages::Pages::from_flags(system_flags).count();
+        let gfx_blocks: Vec<usize> = (0..self.blocks.len()).filter(|&b| self.blocks[b].graphics).collect();
+        let gfx = self.graphics_pages(graphics_flags, sys_pages, &gfx_blocks)?;
+        let gfx_count = pages::Pages::from_flags(gfx.flags).count();
+        let pages_info = self.out.u64(Resource::ROOT + 0x08).unwrap_or(0);
+        let mut sys_blocks: Vec<usize> = (0..self.blocks.len()).filter(|&b| !self.blocks[b].graphics).collect();
+        let (sys, guess) = self.system_pages(system_flags, gfx_count, sys_pages, &sys_blocks, pages_info)?;
+        let sys_count = pages::Pages::from_flags(sys.flags).count();
+        if pages_info != 0 {
+            let mut info = self.out.bytes(pages_info, 16)?.to_vec();
+            info[8] = sys_count as u8;
+            info[9] = gfx_count as u8;
+            info.resize(16 + 8 * guess as usize, 0);
+            self.blocks.push(NewBlock { graphics: false, data: info, align: 16, texture: None });
+            sys_blocks.push(self.blocks.len() - 1);
+            self.fixups.push((At::Address(Resource::ROOT + 0x08), At::Block(self.blocks.len() - 1, 0)));
+        }
+        let address = block_addresses(self.blocks.len(), (&gfx_blocks, &gfx.offsets), (&sys_blocks, &sys.offsets));
+        self.out.system.resize(sys.len as usize, 0);
+        self.out.graphics.resize(gfx.len as usize, 0);
+        self.write_blocks(&address)?;
+        let file = rage_resource::builder::repack(&self.out, sys.flags, gfx.flags)?;
+        Ok(EditResult { file, in_place: false, replaced: self.replaced, added: self.added, removed: self.removed })
+    }
+}
+
 /// Edits the dictionaries at `dicts` (addresses of `pgDictionary<grcTexture>`
 /// inside the model `res`, whose page flags are given). Returns a standalone
 /// RSC7 file; `in_place` means no pages were added.
@@ -69,246 +420,33 @@ pub fn apply(
     edits: &[Edit],
 ) -> Result<EditResult, ResourceError> {
     let layout = if enhanced { Layout::Enhanced } else { Layout::Legacy };
-    if dicts.is_empty() {
-        return Err(bad("the model has no textures of its own"));
-    }
-    let parsed: Vec<ytd::TextureDictionary> =
-        dicts.iter().map(|&d| ytd::parse_at(res, d, enhanced)).collect::<Result<_, _>>()?;
-    if let Some(e) = parsed.iter().flat_map(|d| &d.errors).next() {
-        return Err(bad(format!("the model has unreadable textures ({e}); refusing to change it")));
-    }
-    for e in edits {
-        if let Edit::Set(t) = e {
-            if t.expected_size().is_none_or(|n| n > t.data.len()) {
-                return Err(bad(format!("{}: pixel data is shorter than its format and size require", t.name)));
-            }
-            if !enhanced && t.format.to_d3d9().is_none() {
-                return Err(bad(format!("{}: {} is not available in GTA V Legacy", t.name, t.format.name())));
-            }
-        }
-    }
-    // Structure addresses, parallel to each dictionary's textures.
-    let addresses: Vec<Vec<u64>> = dicts
-        .iter()
-        .zip(&parsed)
-        .map(|(&d, p)| {
-            let list = res.u64(d + 0x30)?;
-            (0..p.textures.len() as u64).map(|i| res.u64(list + i * 8)).collect::<Result<Vec<_>, _>>()
-        })
-        .collect::<Result<_, _>>()?;
-
-    let mut out = res.clone();
-    let mut blocks: Vec<NewBlock> = Vec::new();
-    let mut fixups: Vec<(At, At)> = Vec::new(); // (where, what it points to)
-    // Final (name, structure) per dictionary, when its lists change.
-    let mut lists: Vec<Option<Vec<(String, At)>>> = vec![None; dicts.len()];
-    let entries = |d: usize| -> Vec<(String, At)> {
-        parsed[d].textures.iter().zip(&addresses[d]).map(|(t, &a)| (t.name.clone(), At::Address(a))).collect()
+    let parsed = parse_dictionaries(res, dicts, enhanced)?;
+    check_edits(edits, enhanced)?;
+    let addresses = texture_addresses(res, dicts, &parsed)?;
+    let mut editor = Editor {
+        dicts,
+        enhanced,
+        layout,
+        parsed,
+        addresses,
+        out: res.clone(),
+        blocks: Vec::new(),
+        fixups: Vec::new(),
+        lists: vec![None; dicts.len()],
+        replaced: 0,
+        added: 0,
+        removed: 0,
     };
-    let (mut replaced, mut added, mut removed) = (0, 0, 0);
-    let df = data_field(layout);
-    let size = layout.texture_size();
-
     for edit in edits {
-        match edit {
-            Edit::Set(new) => {
-                let mut found = false;
-                for d in 0..dicts.len() {
-                    let Some(i) = parsed[d].textures.iter().position(|t| t.name.eq_ignore_ascii_case(&new.name)) else {
-                        continue;
-                    };
-                    found = true;
-                    let old = &parsed[d].textures[i];
-                    let tex = Texture {
-                        name: old.name.clone(),
-                        usage: if new.usage == 0 { old.usage } else { new.usage },
-                        ..new.clone()
-                    };
-                    let len = tex.expected_size().expect("checked above");
-                    let at = addresses[d][i];
-                    write_fields(layout, out.bytes_mut(at, size)?, &tex, false)?;
-                    if len <= old.data.len() {
-                        out.bytes_mut(parsed[d].stored[i].data_ptr, len)?.copy_from_slice(&tex.data[..len]);
-                    } else {
-                        blocks.push(NewBlock {
-                            graphics: true,
-                            data: tex.data[..len].to_vec(),
-                            align: DATA_ALIGN,
-                            texture: Some((tex.name.clone(), old.data.len())),
-                        });
-                        fixups.push((At::Address(at + df), At::Block(blocks.len() - 1, 0)));
-                    }
-                }
-                if found {
-                    replaced += 1;
-                    continue;
-                }
-                if dicts.len() != 1 {
-                    return Err(bad(format!(
-                        "{}: this model has {} texture lists; new textures can only be added to a model with one",
-                        new.name,
-                        dicts.len()
-                    )));
-                }
-                let mut t = parsed[0]
-                    .stored
-                    .first()
-                    .map(|s| s.template.clone())
-                    .ok_or_else(|| bad("cannot add a texture to an empty texture list (no template texture)"))?;
-                t.resize(size, 0);
-                write_fields(layout, &mut t, new, true)?;
-                let len = new.expected_size().expect("checked above");
-                blocks.push(NewBlock { graphics: false, data: t, align: 16, texture: None });
-                let tex_block = blocks.len() - 1;
-                let mut name = new.name.clone().into_bytes();
-                name.push(0);
-                blocks.push(NewBlock { graphics: false, data: name, align: 16, texture: None });
-                fixups.push((At::Block(tex_block, NAME_FIELD), At::Block(blocks.len() - 1, 0)));
-                blocks.push(NewBlock {
-                    graphics: true,
-                    data: new.data[..len].to_vec(),
-                    align: DATA_ALIGN,
-                    texture: None,
-                });
-                fixups.push((At::Block(tex_block, df), At::Block(blocks.len() - 1, 0)));
-                if enhanced {
-                    // The embedded shader resource view.
-                    fixups.push((At::Block(tex_block, 0x30), At::Block(tex_block, 0x58)));
-                }
-                lists[0].get_or_insert_with(|| entries(0)).push((new.name.clone(), At::Block(tex_block, 0)));
-                added += 1;
-            }
-            Edit::Remove(name) => {
-                let mut found = false;
-                for (d, list) in lists.iter_mut().enumerate() {
-                    let list = list.get_or_insert_with(|| entries(d));
-                    let before = list.len();
-                    list.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
-                    found |= list.len() != before;
-                }
-                if !found {
-                    return Err(bad(format!("{name}: no such texture")));
-                }
-                removed += 1;
-            }
-        }
+        editor.apply_edit(edit)?;
     }
-
-    // Name hash and pointer lists of changed dictionaries.
-    for (d, list) in lists.iter_mut().enumerate() {
-        let Some(list) = list else { continue };
-        list.sort_by_key(|(n, _)| name_hash(n));
-        let txd = dicts[d];
-        let count = list.len() as u16;
-        let capacity = out.u16(txd + 0x3A)?.min(out.u16(txd + 0x2A)?);
-        let has_new = list.iter().any(|(_, a)| matches!(a, At::Block(..)));
-        let hashes: Vec<u8> = list.iter().flat_map(|(n, _)| name_hash(n).to_le_bytes()).collect();
-        if !has_new && count <= capacity {
-            let (h, p) = (out.u64(txd + 0x20)?, out.u64(txd + 0x30)?);
-            out.bytes_mut(h, hashes.len())?.copy_from_slice(&hashes);
-            for (k, (_, a)) in list.iter().enumerate() {
-                let At::Address(a) = a else { unreachable!("no new entries") };
-                out.bytes_mut(p + k as u64 * 8, 8)?.copy_from_slice(&a.to_le_bytes());
-            }
-        } else {
-            blocks.push(NewBlock { graphics: false, data: hashes, align: 16, texture: None });
-            fixups.push((At::Address(txd + 0x20), At::Block(blocks.len() - 1, 0)));
-            blocks.push(NewBlock { graphics: false, data: vec![0; list.len() * 8], align: 16, texture: None });
-            let ptrs = blocks.len() - 1;
-            fixups.push((At::Address(txd + 0x30), At::Block(ptrs, 0)));
-            for (k, (_, a)) in list.iter().enumerate() {
-                fixups.push((At::Block(ptrs, k as u64 * 8), *a));
-            }
-            for at in [0x2A, 0x3A] {
-                out.bytes_mut(txd + at, 2)?.copy_from_slice(&count.to_le_bytes());
-            }
-        }
-        for at in [0x28, 0x38] {
-            out.bytes_mut(txd + at, 2)?.copy_from_slice(&count.to_le_bytes());
-        }
-    }
-
-    if blocks.is_empty() {
-        let file = rage_resource::builder::repack(&out, system_flags, graphics_flags)?;
+    editor.write_lists()?;
+    if editor.blocks.is_empty() {
+        let file = rage_resource::builder::repack(&editor.out, system_flags, graphics_flags)?;
+        let Editor { replaced, added, removed, .. } = editor;
         return Ok(EditResult { file, in_place: true, replaced, added, removed });
     }
-
-    // Lay out the new blocks in appended pages. The pages-info block (if
-    // any) lists every page, so it grows with them: iterate to a fixed point.
-    let sys_pages = pages::Pages::from_flags(system_flags).count();
-    let gfx_blocks: Vec<usize> = (0..blocks.len()).filter(|&b| blocks[b].graphics).collect();
-    let gfx = pages::append(
-        graphics_flags,
-        sys_pages,
-        &gfx_blocks.iter().map(|&b| (blocks[b].data.len() as u64, blocks[b].align)).collect::<Vec<_>>(),
-    )
-    .map_err(|e| {
-        // Say which texture does not fit and what would.
-        let room = pages::largest_new_page(graphics_flags, sys_pages);
-        let Some(b) = gfx_blocks.iter().map(|&b| &blocks[b]).max_by_key(|b| b.data.len()) else { return e };
-        match &b.texture {
-            Some((name, old)) => bad(format!(
-                "{name}: its pixel data ({} bytes) does not fit into the model. The old texture's place holds \
-                 {old} bytes and the model has room for at most {room} more; use the same resolution and \
-                 format as the original, or a smaller one",
-                b.data.len()
-            )),
-            None => bad(format!(
-                "the new texture's pixel data ({} bytes) does not fit into the model, which has room for at \
-                 most {room} more bytes; use a smaller texture",
-                b.data.len()
-            )),
-        }
-    })?;
-    let gfx_count = pages::Pages::from_flags(gfx.flags).count();
-    let pages_info = out.u64(Resource::ROOT + 0x08).unwrap_or(0);
-    let mut sys_blocks: Vec<usize> = (0..blocks.len()).filter(|&b| !blocks[b].graphics).collect();
-    let mut guess = sys_pages + gfx_count + 1;
-    let sys = loop {
-        let mut sizes: Vec<(u64, u64)> =
-            sys_blocks.iter().map(|&b| (blocks[b].data.len() as u64, blocks[b].align)).collect();
-        if pages_info != 0 {
-            sizes.push((16 + 8 * guess as u64, 16));
-        }
-        let sys = pages::append(system_flags, gfx_count, &sizes)?;
-        let total = pages::Pages::from_flags(sys.flags).count() + gfx_count;
-        if pages_info == 0 || total == guess {
-            break sys;
-        }
-        guess = total;
-    };
-    let sys_count = pages::Pages::from_flags(sys.flags).count();
-    if pages_info != 0 {
-        let mut info = out.bytes(pages_info, 16)?.to_vec();
-        info[8] = sys_count as u8;
-        info[9] = gfx_count as u8;
-        info.resize(16 + 8 * guess as usize, 0);
-        blocks.push(NewBlock { graphics: false, data: info, align: 16, texture: None });
-        sys_blocks.push(blocks.len() - 1);
-        fixups.push((At::Address(Resource::ROOT + 0x08), At::Block(blocks.len() - 1, 0)));
-    }
-    let mut address = vec![0u64; blocks.len()];
-    for (k, &b) in gfx_blocks.iter().enumerate() {
-        address[b] = GRAPHICS_BASE + gfx.offsets[k];
-    }
-    for (k, &b) in sys_blocks.iter().enumerate() {
-        address[b] = SYSTEM_BASE + sys.offsets[k];
-    }
-    out.system.resize(sys.len as usize, 0);
-    out.graphics.resize(gfx.len as usize, 0);
-    for (b, block) in blocks.iter().enumerate() {
-        out.bytes_mut(address[b], block.data.len())?.copy_from_slice(&block.data);
-    }
-    let resolve = |a: At| match a {
-        At::Address(x) => x,
-        At::Block(b, off) => address[b] + off,
-    };
-    for (at, to) in fixups {
-        let value = resolve(to);
-        out.bytes_mut(resolve(at), 8)?.copy_from_slice(&value.to_le_bytes());
-    }
-    let file = rage_resource::builder::repack(&out, sys.flags, gfx.flags)?;
-    Ok(EditResult { file, in_place: false, replaced, added, removed })
+    editor.finish(system_flags, graphics_flags)
 }
 
 #[cfg(test)]

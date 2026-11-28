@@ -250,69 +250,60 @@ fn same_meshes(a: &OfDrawable, b: &OfDrawable) -> bool {
     })
 }
 
-fn import_drawable(
-    template: &Resource,
-    tpl: OfDrawable,
-    d: &OfDrawable,
-    options: ImportOptions,
-    mut notes: Vec<String>,
-) -> Result<Imported> {
-    // Shaders: the files' shader i is the game file's shader of that name,
-    // the same index when the names agree.
+/// The game file's shader `s` (the files' shader `i`): the same index when the names agree.
+fn shader_index(tpl: &OfDrawable, i: usize, s: &of::OfShader) -> Result<usize> {
+    match tpl.shaders.get(i) {
+        Some(t) if t.name.eq_ignore_ascii_case(&s.name) => Ok(i),
+        _ => tpl.shaders.iter().position(|t| t.name.eq_ignore_ascii_case(&s.name)).with_context(|| {
+            format!("shader {i} ({}.sps) is not one of the model's shaders; its shaders cannot be changed", s.name)
+        }),
+    }
+}
+
+fn same_param_value(a: &of::OfValue, b: &of::OfValue) -> bool {
+    match (a, b) {
+        (of::OfValue::Texture(a), of::OfValue::Texture(b)) => a.eq_ignore_ascii_case(b),
+        (of::OfValue::Floats(a), of::OfValue::Floats(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| close(*x, *y))
+        }
+        _ => false,
+    }
+}
+
+fn shader_params_differ(s: &of::OfShader, t: &of::OfShader) -> bool {
+    s.params.len() != t.params.len()
+        || s.params
+            .iter()
+            .any(|(n, v)| !t.params.iter().any(|(tn, tv)| tn.eq_ignore_ascii_case(n) && same_param_value(v, tv)))
+}
+
+/// Shaders: the files' shader i is the game file's shader of that name,
+/// the same index when the names agree.
+fn map_shaders(tpl: &OfDrawable, d: &OfDrawable, notes: &mut Vec<String>) -> Result<Vec<u16>> {
     let mut shader_map = Vec::new();
     for (i, s) in d.shaders.iter().enumerate() {
-        let index = match tpl.shaders.get(i) {
-            Some(t) if t.name.eq_ignore_ascii_case(&s.name) => i,
-            _ => tpl.shaders.iter().position(|t| t.name.eq_ignore_ascii_case(&s.name)).with_context(|| {
-                format!("shader {i} ({}.sps) is not one of the model's shaders; its shaders cannot be changed", s.name)
-            })?,
-        };
-        let t = &tpl.shaders[index];
-        let differs = s.params.len() != t.params.len()
-            || s.params.iter().any(|(n, v)| {
-                !t.params.iter().any(|(tn, tv)| {
-                    tn.eq_ignore_ascii_case(n)
-                        && match (v, tv) {
-                            (of::OfValue::Texture(a), of::OfValue::Texture(b)) => a.eq_ignore_ascii_case(b),
-                            (of::OfValue::Floats(a), of::OfValue::Floats(b)) => {
-                                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| close(*x, *y))
-                            }
-                            _ => false,
-                        }
-                })
-            });
-        if differs {
+        let index = shader_index(tpl, i, s)?;
+        if shader_params_differ(s, &tpl.shaders[index]) {
             notes.push(format!("shader {i} ({}): changed parameters are not imported, the model's stay", s.name));
         }
         shader_map.push(index as u16);
     }
-    let file_skel = d.skeleton.as_ref();
-    let tpl_skel = tpl.skeleton.as_ref();
-    if let (Some(a), Some(b)) = (file_skel, tpl_skel)
-        && (a.bones.len() != b.bones.len()
-            || a.bones.iter().zip(&b.bones).any(|(x, y)| x.tag != y.tag || x.name != y.name))
-    {
-        notes.push(format!("the skeleton is kept from the game file ({} bones)", b.bones.len()));
-    }
-    // A bone of the files' skeleton → the game file's (by tag, else name).
-    let bone_map = |i: usize| -> Option<usize> {
-        let (Some(fs), Some(ts)) = (file_skel, tpl_skel) else { return Some(i) };
-        let b = fs.bones.get(i)?;
-        ts.bones
-            .iter()
-            .position(|t| t.tag == b.tag && t.name.eq_ignore_ascii_case(&b.name))
-            .or_else(|| ts.bones.iter().position(|t| t.tag == b.tag))
-            .or_else(|| ts.bones.iter().position(|t| t.name.eq_ignore_ascii_case(&b.name)))
-    };
+    Ok(shader_map)
+}
 
-    let mut file = None;
-    if options.always_rebuild_meshes || !same_meshes(d, &tpl) {
-        file = Some(write_meshes(template, &tpl, d, &shader_map, &bone_map, &mut notes)?);
-    } else {
-        notes.push("the meshes are the game file's; they stay as they are".into());
-    }
+/// A bone of the files' skeleton → the game file's (by tag, else name).
+fn map_bone(file_skel: Option<&of::OfSkeleton>, tpl_skel: Option<&of::OfSkeleton>, i: usize) -> Option<usize> {
+    let (Some(fs), Some(ts)) = (file_skel, tpl_skel) else { return Some(i) };
+    let b = fs.bones.get(i)?;
+    ts.bones
+        .iter()
+        .position(|t| t.tag == b.tag && t.name.eq_ignore_ascii_case(&b.name))
+        .or_else(|| ts.bones.iter().position(|t| t.tag == b.tag))
+        .or_else(|| ts.bones.iter().position(|t| t.name.eq_ignore_ascii_case(&b.name)))
+}
 
-    // Embedded textures: changed and new ones go in by name.
+/// Embedded textures: the changed and new ones, renamed to the game file's spelling.
+fn changed_textures(tpl: &OfDrawable, d: &OfDrawable, notes: &mut Vec<String>) -> Vec<Texture> {
     let mut changed = Vec::new();
     for t in &d.textures {
         let mut t = t.texture.clone();
@@ -328,21 +319,72 @@ fn import_drawable(
             notes.push(format!("embedded texture {} is kept (shaders use textures by name)", o.texture.name));
         }
     }
+    changed
+}
+
+fn note_skeleton_kept(file_skel: Option<&of::OfSkeleton>, tpl_skel: Option<&of::OfSkeleton>, notes: &mut Vec<String>) {
+    if let (Some(a), Some(b)) = (file_skel, tpl_skel)
+        && (a.bones.len() != b.bones.len()
+            || a.bones.iter().zip(&b.bones).any(|(x, y)| x.tag != y.tag || x.name != y.name))
+    {
+        notes.push(format!("the skeleton is kept from the game file ({} bones)", b.bones.len()));
+    }
+}
+
+/// The embedded textures `changed` put into the rebuilt file (else the template).
+fn replace_textures(
+    template: &Resource,
+    file: Option<&[u8]>,
+    changed: &[Texture],
+    notes: &mut Vec<String>,
+) -> Result<Vec<u8>> {
+    let base = match file {
+        Some(f) => Resource::from_rsc7(f)?,
+        None => template.clone(),
+    };
+    notes.push(format!(
+        "embedded textures replaced: {}",
+        changed.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+    ));
+    Ok(ydr_write::replace_embedded_textures(&base, changed)?)
+}
+
+fn import_drawable(
+    template: &Resource,
+    tpl: OfDrawable,
+    d: &OfDrawable,
+    options: ImportOptions,
+    mut notes: Vec<String>,
+) -> Result<Imported> {
+    let shader_map = map_shaders(&tpl, d, &mut notes)?;
+    let file_skel = d.skeleton.as_ref();
+    let tpl_skel = tpl.skeleton.as_ref();
+    note_skeleton_kept(file_skel, tpl_skel, &mut notes);
+    let bone_map = |i: usize| map_bone(file_skel, tpl_skel, i);
+
+    let mut file = None;
+    if options.always_rebuild_meshes || !same_meshes(d, &tpl) {
+        file = Some(write_meshes(template, &tpl, d, &shader_map, &bone_map, &mut notes)?);
+    } else {
+        notes.push("the meshes are the game file's; they stay as they are".into());
+    }
+
+    let changed = changed_textures(&tpl, d, &mut notes);
     if !changed.is_empty() {
-        let base = match &file {
-            Some(f) => Resource::from_rsc7(f)?,
-            None => template.clone(),
-        };
-        notes.push(format!(
-            "embedded textures replaced: {}",
-            changed.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
-        ));
-        file = Some(ydr_write::replace_embedded_textures(&base, &changed)?);
+        file = Some(replace_textures(template, file.as_deref(), &changed, &mut notes)?);
     }
     if file.is_none() {
         notes.push("nothing differs from the game file".into());
     }
     Ok(Imported { file, notes })
+}
+
+/// What converting the files' geometries into meshes of the template needs.
+struct MeshCtx<'a> {
+    skinned_template: bool,
+    world: &'a [math::Mat4],
+    shader_map: &'a [u16],
+    bone_map: &'a dyn Fn(usize) -> Option<usize>,
 }
 
 /// The files' detail levels written onto the template.
@@ -356,100 +398,13 @@ fn write_meshes(
 ) -> Result<Vec<u8>> {
     let skinned_template = ydr_write::skinned_bones(template)?.is_some();
     let world = tpl.skeleton.as_ref().map(|s| skeleton(s).world_transforms()).unwrap_or_default();
+    let ctx = MeshCtx { skinned_template, world: &world, shader_map, bone_map };
     let mut levels: Vec<Vec<NewMesh>> = Vec::new();
     for (k, lod) in d.lods.iter().enumerate() {
         if lod.models.is_empty() {
             continue;
         }
-        // The bone the game file's model of this level is attached to: the
-        // written model is a copy of it.
-        let target = tpl.lods.get(k).and_then(|l| l.models.first()).or_else(|| tpl.lods[0].models.first());
-        let target_bone = target.map_or(0, |m| m.bone as usize);
-        let mut meshes = Vec::new();
-        for m in &lod.models {
-            let bone = bone_map(m.bone as usize)
-                .with_context(|| format!("model on bone {}, which the game file's skeleton does not have", m.bone))?;
-            // Fixed models: from their bone's space to the target bone's. A
-            // model on bone 0 is in model space (as the game's models are read).
-            let space = |b: usize| if b == 0 { Some(&math::IDENTITY) } else { world.get(b) };
-            let to_target = (!skinned_template && bone != target_bone)
-                .then(|| {
-                    let (a, b) = (space(bone)?, space(target_bone)?);
-                    Some(math::mul(&math::inverse_affine(b), a))
-                })
-                .flatten();
-            for g in &m.geometries {
-                let shader = *shader_map
-                    .get(g.shader as usize)
-                    .with_context(|| format!("a geometry uses shader {}, which the files do not have", g.shader))?;
-                let xyz = |c: usize| -> Vec<[f32; 3]> {
-                    g.attribute(c).map(|v| v.iter().map(|p| [p[0], p[1], p[2]]).collect()).unwrap_or_default()
-                };
-                let mut mesh = NewMesh {
-                    shader,
-                    positions: xyz(component::POSITION),
-                    normals: xyz(component::NORMAL),
-                    uvs: g
-                        .attribute(component::TEXCOORD0)
-                        .map(|v| v.iter().map(|t| [t[0], t[1]]).collect())
-                        .unwrap_or_default(),
-                    colors: g
-                        .attribute(component::COLOUR0)
-                        .map(|v| v.iter().map(|c| c.map(|x| x / 255.0)).collect())
-                        .unwrap_or_default(),
-                    indices: g.indices.clone(),
-                    bones: Vec::new(),
-                    blend: Vec::new(),
-                };
-                if let Some(t) = &to_target {
-                    mesh.positions.iter_mut().for_each(|p| *p = math::transform_point(t, *p));
-                    mesh.normals.iter_mut().for_each(|n| *n = math::transform_dir(t, *n));
-                }
-                if skinned_template {
-                    mesh.bones = match (g.attribute(component::BLEND_INDICES), g.attribute(component::BLEND_WEIGHTS)) {
-                        (Some(idx), Some(w)) => idx
-                            .iter()
-                            .zip(w)
-                            .map(|(i, w)| {
-                                let k = (0..4).max_by(|&a, &b| w[a].total_cmp(&w[b])).unwrap_or(0);
-                                bone_map(i[k] as usize).map(|b| b as u16).with_context(|| {
-                                    format!(
-                                        "a vertex moves with bone {}, which the game file's skeleton does not have",
-                                        i[k]
-                                    )
-                                })
-                            })
-                            .collect::<Result<_>>()?,
-                        _ => vec![bone as u16; mesh.positions.len()],
-                    };
-                    // All four bones with their weights (peds, clothing).
-                    if let (Some(idx), Some(w)) =
-                        (g.attribute(component::BLEND_INDICES), g.attribute(component::BLEND_WEIGHTS))
-                    {
-                        mesh.blend = idx
-                            .iter()
-                            .zip(w)
-                            .map(|(i, w)| {
-                                let mut b = ydr_write::Blend::default();
-                                for k in 0..4 {
-                                    if w[k] > 0.0 {
-                                        b.bones[k] = bone_map(i[k] as usize).unwrap_or(0) as u16;
-                                        b.weights[k] = w[k];
-                                    }
-                                }
-                                let sum: f32 = b.weights.iter().sum();
-                                if sum > 0.0 {
-                                    b.weights.iter_mut().for_each(|x| *x /= sum);
-                                }
-                                b
-                            })
-                            .collect();
-                    }
-                }
-                meshes.extend(crate::obj::split(mesh));
-            }
-        }
-        levels.push(meshes);
+        levels.push(lod_meshes(&ctx, tpl, k, lod)?);
     }
     if levels.is_empty() {
         bail!("the files have no meshes");
@@ -462,4 +417,104 @@ fn write_meshes(
     let vertices: usize = levels.iter().flatten().map(|m| m.positions.len()).sum();
     notes.push(format!("meshes written: {} detail level(s), {vertices} vertices", levels.len()));
     Ok(file)
+}
+
+/// The meshes of one detail level of the files.
+fn lod_meshes(ctx: &MeshCtx, tpl: &OfDrawable, k: usize, lod: &of::OfLod) -> Result<Vec<NewMesh>> {
+    // The bone the game file's model of this level is attached to: the
+    // written model is a copy of it.
+    let target = tpl.lods.get(k).and_then(|l| l.models.first()).or_else(|| tpl.lods[0].models.first());
+    let target_bone = target.map_or(0, |m| m.bone as usize);
+    let mut meshes = Vec::new();
+    for m in &lod.models {
+        let bone = (ctx.bone_map)(m.bone as usize)
+            .with_context(|| format!("model on bone {}, which the game file's skeleton does not have", m.bone))?;
+        let to_target = (!ctx.skinned_template && bone != target_bone)
+            .then(|| bone_to_target(ctx.world, bone, target_bone))
+            .flatten();
+        for g in &m.geometries {
+            let mesh = geometry_mesh(ctx, g, bone, to_target.as_ref())?;
+            meshes.extend(crate::obj::split(mesh));
+        }
+    }
+    Ok(meshes)
+}
+
+/// Fixed models: from their bone's space to the target bone's. A model on
+/// bone 0 is in model space (as the game's models are read).
+fn bone_to_target(world: &[math::Mat4], bone: usize, target_bone: usize) -> Option<math::Mat4> {
+    let space = |b: usize| if b == 0 { Some(&math::IDENTITY) } else { world.get(b) };
+    let (a, b) = (space(bone)?, space(target_bone)?);
+    Some(math::mul(&math::inverse_affine(b), a))
+}
+
+/// A geometry of the files as a mesh of the template, on `bone`.
+fn geometry_mesh(ctx: &MeshCtx, g: &OfGeometry, bone: usize, to_target: Option<&math::Mat4>) -> Result<NewMesh> {
+    let shader = *ctx
+        .shader_map
+        .get(g.shader as usize)
+        .with_context(|| format!("a geometry uses shader {}, which the files do not have", g.shader))?;
+    let xyz = |c: usize| -> Vec<[f32; 3]> {
+        g.attribute(c).map(|v| v.iter().map(|p| [p[0], p[1], p[2]]).collect()).unwrap_or_default()
+    };
+    let mut mesh = NewMesh {
+        shader,
+        positions: xyz(component::POSITION),
+        normals: xyz(component::NORMAL),
+        uvs: g.attribute(component::TEXCOORD0).map(|v| v.iter().map(|t| [t[0], t[1]]).collect()).unwrap_or_default(),
+        colors: g
+            .attribute(component::COLOUR0)
+            .map(|v| v.iter().map(|c| c.map(|x| x / 255.0)).collect())
+            .unwrap_or_default(),
+        indices: g.indices.clone(),
+        bones: Vec::new(),
+        blend: Vec::new(),
+    };
+    if let Some(t) = to_target {
+        mesh.positions.iter_mut().for_each(|p| *p = math::transform_point(t, *p));
+        mesh.normals.iter_mut().for_each(|n| *n = math::transform_dir(t, *n));
+    }
+    if ctx.skinned_template {
+        skin_mesh(ctx.bone_map, g, bone, &mut mesh)?;
+    }
+    Ok(mesh)
+}
+
+/// Gives a mesh for a skinned template its bones and blend weights.
+fn skin_mesh(bone_map: &dyn Fn(usize) -> Option<usize>, g: &OfGeometry, bone: usize, mesh: &mut NewMesh) -> Result<()> {
+    let blend_attributes = (g.attribute(component::BLEND_INDICES), g.attribute(component::BLEND_WEIGHTS));
+    mesh.bones = match blend_attributes {
+        (Some(idx), Some(w)) => idx
+            .iter()
+            .zip(w)
+            .map(|(i, w)| {
+                let k = (0..4).max_by(|&a, &b| w[a].total_cmp(&w[b])).unwrap_or(0);
+                bone_map(i[k] as usize).map(|b| b as u16).with_context(|| {
+                    format!("a vertex moves with bone {}, which the game file's skeleton does not have", i[k])
+                })
+            })
+            .collect::<Result<_>>()?,
+        _ => vec![bone as u16; mesh.positions.len()],
+    };
+    // All four bones with their weights (peds, clothing).
+    if let (Some(idx), Some(w)) = blend_attributes {
+        mesh.blend = idx.iter().zip(w).map(|(i, w)| vertex_blend(bone_map, i, w)).collect();
+    }
+    Ok(())
+}
+
+/// The four bones of a vertex with their weights, normalised.
+fn vertex_blend(bone_map: &dyn Fn(usize) -> Option<usize>, i: &[f32; 4], w: &[f32; 4]) -> ydr_write::Blend {
+    let mut b = ydr_write::Blend::default();
+    for k in 0..4 {
+        if w[k] > 0.0 {
+            b.bones[k] = bone_map(i[k] as usize).unwrap_or(0) as u16;
+            b.weights[k] = w[k];
+        }
+    }
+    let sum: f32 = b.weights.iter().sum();
+    if sum > 0.0 {
+        b.weights.iter_mut().for_each(|x| *x /= sum);
+    }
+    b
 }

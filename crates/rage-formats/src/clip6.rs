@@ -81,41 +81,39 @@ fn float(res: &Resource, at: u64) -> Result<f32, ResourceError> {
     if v.is_finite() { Ok(v) } else { Err(bad("a number that is none")) }
 }
 
-fn read_animation(res: &Resource, ptr: u64) -> Result<Animation, ResourceError> {
+/// Where an animation's blocks and tracks are, and how many of each.
+struct Header {
+    frames: usize,
+    duration: f32,
+    blocks_at: u64,
+    block_count: u64,
+    tracks_at: u64,
+    track_count: u64,
+}
+
+fn read_header(res: &Resource, ptr: u64) -> Result<Header, ResourceError> {
     let frames = usize::from(res.u16(ptr + 0x24)?);
     let duration = float(res, ptr + 0x28)?;
     let (blocks_at, block_count) = (res.u64(ptr + 0x50)?, u64::from(res.u16(ptr + 0x58)?));
     let (tracks_at, track_count) = (res.u64(ptr + 0x60)?, u64::from(res.u16(ptr + 0x68)?));
-    if frames == 0 || !(0.0..1e5).contains(&duration) || block_count == 0 || block_count > 4096 || track_count > 4096 {
-        return Err(bad("implausible animation"));
+    let header = Header { frames, duration, blocks_at, block_count, tracks_at, track_count };
+    if header.is_plausible() { Ok(header) } else { Err(bad("implausible animation")) }
+}
+
+impl Header {
+    fn is_plausible(&self) -> bool {
+        self.frames != 0
+            && (0.0..1e5).contains(&self.duration)
+            && self.block_count != 0
+            && self.block_count <= 4096
+            && self.track_count <= 4096
     }
-    let tracks: Vec<BoneTrack> = (0..track_count)
-        .map(|i| {
-            let at = tracks_at + i * 12;
-            let kind_hash = res.u32(at + 4)?;
-            let format = match res.u32(at + 8)? {
-                0 => 1,
-                2..=4 => 0,
-                f => return Err(bad(format!("a track of unknown format {f}"))),
-            };
-            let track = match kind_hash {
-                BONE_TRANSLATION => TRACK_BONE_TRANSLATION,
-                BONE_ROTATION => TRACK_BONE_ROTATION,
-                BONE_SCALE => TRACK_BONE_SCALE,
-                _ => TRACK_OTHER,
-            };
-            Ok(BoneTrack { bone: 0, format, track, bone_hash: res.u32(at)?, kind_hash })
-        })
-        .collect::<Result<_, ResourceError>>()?;
-    // The frames a block holds are in its header; what they add up to is
-    // checked before any is decoded.
-    let mut stored = 0;
-    for i in 0..block_count {
-        stored += usize::from(res.u16(res.u64(blocks_at + i * 8)? + BLOCK_FRAMES)?);
-    }
-    if stored != frames + block_count as usize - 1 {
-        return Err(bad("an animation whose blocks have another number of frames"));
-    }
+}
+
+fn read_animation(res: &Resource, ptr: u64) -> Result<Animation, ResourceError> {
+    let Header { frames, duration, blocks_at, block_count, tracks_at, track_count } = read_header(res, ptr)?;
+    let tracks = (0..track_count).map(|i| read_track(res, tracks_at + i * 12)).collect::<Result<Vec<_>, _>>()?;
+    check_stored_frames(res, blocks_at, block_count, frames)?;
     let blocks = (0..block_count)
         .map(|i| read_block(res, res.u64(blocks_at + i * 8)?, tracks.len(), Layout::GtaVi))
         .collect::<Result<Vec<_>, _>>()?;
@@ -126,6 +124,35 @@ fn read_animation(res: &Resource, ptr: u64) -> Result<Animation, ResourceError> 
         return Err(bad("an animation whose blocks have another number of frames"));
     }
     Ok(animation)
+}
+
+fn read_track(res: &Resource, at: u64) -> Result<BoneTrack, ResourceError> {
+    let kind_hash = res.u32(at + 4)?;
+    let format = match res.u32(at + 8)? {
+        0 => 1,
+        2..=4 => 0,
+        f => return Err(bad(format!("a track of unknown format {f}"))),
+    };
+    let track = match kind_hash {
+        BONE_TRANSLATION => TRACK_BONE_TRANSLATION,
+        BONE_ROTATION => TRACK_BONE_ROTATION,
+        BONE_SCALE => TRACK_BONE_SCALE,
+        _ => TRACK_OTHER,
+    };
+    Ok(BoneTrack { bone: 0, format, track, bone_hash: res.u32(at)?, kind_hash })
+}
+
+/// The frames a block holds are in its header; what they add up to is
+/// checked before any is decoded.
+fn check_stored_frames(res: &Resource, blocks_at: u64, block_count: u64, frames: usize) -> Result<(), ResourceError> {
+    let mut stored = 0;
+    for i in 0..block_count {
+        stored += usize::from(res.u16(res.u64(blocks_at + i * 8)? + BLOCK_FRAMES)?);
+    }
+    if stored != frames + block_count as usize - 1 {
+        return Err(bad("an animation whose blocks have another number of frames"));
+    }
+    Ok(())
 }
 
 /// A clip's name: a pointer, or text in place. Without path and extension.
@@ -182,82 +209,138 @@ fn join_layers(layers: &[ClipPart], animations: &[Animation], duration: f32) -> 
 /// Parses a clip dictionary.
 pub fn parse(res: &Resource) -> Result<ClipDictionary, ResourceError> {
     let root = Resource::ROOT;
-    if res.u64(root)? != 0 || res.string(res.u64(root + 0x38)?)?.is_empty() {
-        return Err(bad("not a GTA VI clip dictionary"));
-    }
-    let mut stored: Vec<Animation> = Vec::new();
-    let mut by_pointer: HashMap<u64, usize> = HashMap::new();
-    let dicts = res.u64(root + 0x70)?;
-    for d in 0..u64::from(res.u16(root + 0x78)?) {
-        let dict = res.u64(dicts + d * 16)?;
-        for at in map_objects(res, res.u64(dict + 0x48)?, u64::from(res.u16(dict + 0x50)?))? {
-            if let std::collections::hash_map::Entry::Vacant(e) = by_pointer.entry(at) {
-                e.insert(stored.len());
-                stored.push(read_animation(res, at)?);
-            }
-        }
-    }
+    check_dictionary(res)?;
+    let (stored, by_pointer) = read_stored(res)?;
 
-    let mut out = ClipDictionary::default();
-    // Where an animation, or a set of layers, is in `out`.
-    let mut placed: HashMap<Vec<(usize, [u32; 3])>, usize> = HashMap::new();
-    let mut used = vec![false; stored.len()];
+    let mut st = Placing {
+        stored: &stored,
+        by_pointer: &by_pointer,
+        out: ClipDictionary::default(),
+        placed: HashMap::new(),
+        used: vec![false; stored.len()],
+    };
     for clip in map_objects(res, res.u64(root + 0x48)?, u64::from(res.u16(root + 0x50)?))? {
-        let name = clip_name(res, clip + 0x28)?;
-        let kind = res.u32(clip + 0x20)?;
-        if kind != CLIP_PARTS {
-            return Err(bad(format!("{name}: a clip of unknown kind {kind}")));
-        }
-        let list = res.u64(clip + 0x68)?;
-        let mut parts = Vec::new();
-        for p in 0..u64::from(res.u16(clip + 0x70)?) {
-            let part = list + p * PART_SIZE;
-            let (layers_at, count) = (res.u64(part)?, u64::from(res.u16(part + 8)?));
-            let duration = float(res, part + 0x10)?;
-            let mut layers = Vec::new();
-            for l in 0..count {
-                let at = layers_at + l * LAYER_SIZE;
-                let Some(&animation) = by_pointer.get(&res.u64(at)?) else {
-                    return Err(bad(format!("{name}: a layer without its animation")));
-                };
-                used[animation] = true;
-                let (start, end, rate) = (float(res, at + 0x28)?, float(res, at + 0x2C)?, float(res, at + 0x30)?);
-                layers.push(ClipPart { animation, start, end, rate });
-            }
-            match layers.as_slice() {
-                [] => {}
-                [one] => {
-                    let key = vec![(one.animation, [0; 3])];
-                    let animation = *placed.entry(key).or_insert_with(|| {
-                        out.animations.push(stored[one.animation].clone());
-                        out.animations.len() - 1
-                    });
-                    parts.push(ClipPart { animation, ..one.clone() });
-                }
-                _ => {
-                    let key: Vec<_> = layers
-                        .iter()
-                        .map(|l| (l.animation, [l.start.to_bits(), l.end.to_bits(), l.rate.to_bits()]))
-                        .collect();
-                    let animation = match placed.get(&key) {
-                        Some(&i) => i,
-                        None => {
-                            out.animations.push(join_layers(&layers, &stored, duration)?);
-                            placed.insert(key, out.animations.len() - 1);
-                            out.animations.len() - 1
-                        }
-                    };
-                    parts.push(ClipPart { animation, start: 0.0, end: duration, rate: 1.0 });
-                }
-            }
-        }
-        let sequential = parts.len() > 1;
-        out.clips.push(Clip { name, parts, sequential });
+        let clip = read_clip(res, clip, &mut st)?;
+        st.out.clips.push(clip);
     }
+    let Placing { mut out, used, .. } = st;
     out.clips.sort_by(|a, b| a.name.cmp(&b.name));
     // Animations no clip plays.
     out.animations.extend(stored.into_iter().zip(used).filter(|(_, used)| !used).map(|(a, _)| a));
     Ok(out)
+}
+
+fn check_dictionary(res: &Resource) -> Result<(), ResourceError> {
+    let root = Resource::ROOT;
+    if res.u64(root)? != 0 || res.string(res.u64(root + 0x38)?)?.is_empty() {
+        return Err(bad("not a GTA VI clip dictionary"));
+    }
+    Ok(())
+}
+
+/// The animations of the embedded animation dictionaries, and where each
+/// address is among them.
+fn read_stored(res: &Resource) -> Result<(Vec<Animation>, HashMap<u64, usize>), ResourceError> {
+    let root = Resource::ROOT;
+    let mut stored: Vec<Animation> = Vec::new();
+    let mut by_pointer: HashMap<u64, usize> = HashMap::new();
+    let dicts = res.u64(root + 0x70)?;
+    for d in 0..u64::from(res.u16(root + 0x78)?) {
+        read_dict(res, res.u64(dicts + d * 16)?, &mut stored, &mut by_pointer)?;
+    }
+    Ok((stored, by_pointer))
+}
+
+/// Adds the animations of one animation dictionary not read yet.
+fn read_dict(
+    res: &Resource,
+    dict: u64,
+    stored: &mut Vec<Animation>,
+    by_pointer: &mut HashMap<u64, usize>,
+) -> Result<(), ResourceError> {
+    for at in map_objects(res, res.u64(dict + 0x48)?, u64::from(res.u16(dict + 0x50)?))? {
+        if let std::collections::hash_map::Entry::Vacant(e) = by_pointer.entry(at) {
+            e.insert(stored.len());
+            stored.push(read_animation(res, at)?);
+        }
+    }
+    Ok(())
+}
+
+/// What the clips of a dictionary are placed into.
+struct Placing<'a> {
+    stored: &'a [Animation],
+    by_pointer: &'a HashMap<u64, usize>,
+    out: ClipDictionary,
+    /// Where an animation, or a set of layers, is in `out`.
+    placed: HashMap<Vec<(usize, [u32; 3])>, usize>,
+    /// Which of `stored` a clip plays.
+    used: Vec<bool>,
+}
+
+fn read_clip(res: &Resource, clip: u64, st: &mut Placing) -> Result<Clip, ResourceError> {
+    let name = clip_name(res, clip + 0x28)?;
+    let kind = res.u32(clip + 0x20)?;
+    if kind != CLIP_PARTS {
+        return Err(bad(format!("{name}: a clip of unknown kind {kind}")));
+    }
+    let list = res.u64(clip + 0x68)?;
+    let mut parts = Vec::new();
+    for p in 0..u64::from(res.u16(clip + 0x70)?) {
+        parts.extend(read_part(res, list + p * PART_SIZE, &name, st)?);
+    }
+    let sequential = parts.len() > 1;
+    Ok(Clip { name, parts, sequential })
+}
+
+/// Reads a part of a clip and places its animation (`None` for a part
+/// without layers).
+fn read_part(res: &Resource, part: u64, name: &str, st: &mut Placing) -> Result<Option<ClipPart>, ResourceError> {
+    let (layers_at, count) = (res.u64(part)?, u64::from(res.u16(part + 8)?));
+    let duration = float(res, part + 0x10)?;
+    let mut layers = Vec::new();
+    for l in 0..count {
+        layers.push(read_layer(res, layers_at + l * LAYER_SIZE, name, st)?);
+    }
+    match layers.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(place_single(one, st))),
+        _ => place_joined(&layers, duration, st).map(Some),
+    }
+}
+
+fn read_layer(res: &Resource, at: u64, name: &str, st: &mut Placing) -> Result<ClipPart, ResourceError> {
+    let Some(&animation) = st.by_pointer.get(&res.u64(at)?) else {
+        return Err(bad(format!("{name}: a layer without its animation")));
+    };
+    st.used[animation] = true;
+    let (start, end, rate) = (float(res, at + 0x28)?, float(res, at + 0x2C)?, float(res, at + 0x30)?);
+    Ok(ClipPart { animation, start, end, rate })
+}
+
+/// A part of one layer plays that animation of `stored`, as it is.
+fn place_single(one: &ClipPart, st: &mut Placing) -> ClipPart {
+    let key = vec![(one.animation, [0; 3])];
+    let animation = *st.placed.entry(key).or_insert_with(|| {
+        st.out.animations.push(st.stored[one.animation].clone());
+        st.out.animations.len() - 1
+    });
+    ClipPart { animation, ..one.clone() }
+}
+
+/// A part of several layers plays them joined as one animation.
+fn place_joined(layers: &[ClipPart], duration: f32, st: &mut Placing) -> Result<ClipPart, ResourceError> {
+    let key: Vec<_> =
+        layers.iter().map(|l| (l.animation, [l.start.to_bits(), l.end.to_bits(), l.rate.to_bits()])).collect();
+    let animation = match st.placed.get(&key) {
+        Some(&i) => i,
+        None => {
+            st.out.animations.push(join_layers(layers, st.stored, duration)?);
+            st.placed.insert(key, st.out.animations.len() - 1);
+            st.out.animations.len() - 1
+        }
+    };
+    Ok(ClipPart { animation, start: 0.0, end: duration, rate: 1.0 })
 }
 
 #[cfg(test)]

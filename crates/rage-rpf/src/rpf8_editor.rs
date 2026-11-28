@@ -349,8 +349,32 @@ impl Rpf8Editor {
 
         // Where every entry's data goes: unchanged entries stay unless the
         // table now covers them; the rest is appended after the old end.
-        let mut cursor = old_len.next_multiple_of(16).max(data_start);
-        let mut writes: Vec<(u64, Vec<u8>)> = Vec::new();
+        let cursor = old_len.next_multiple_of(16).max(data_start);
+        let (writes, cursor, relocated) = self.place_data(data_start, cursor)?;
+        // The name table ends the archive, which ends on a 16-byte boundary
+        // (nested archives are as long as their entry's 16-byte rounded size).
+        let names = self.name_table();
+        let names_at = (cursor + names.len() as u64).next_multiple_of(16) - names.len() as u64;
+        let new_len = names_at + names.len() as u64;
+
+        let mut f = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let mut region = vec![0u8; data_start.min(old_len) as usize];
+        f.read_exact(&mut region)?;
+        let table = self.build_table(data_start, names.len(), &region);
+
+        let backup = Backup { old_len, new_len, region };
+        before_write(&backup)?;
+
+        let appended: u64 = writes.iter().map(|(_, b)| b.len() as u64).sum();
+        write_archive(&mut f, &writes, &names, names_at, new_len, &table)?;
+        Ok(CommitStats { changed: true, appended, relocated, new_len })
+    }
+
+    /// Assigns offsets to the entries whose data is written (new ones and
+    /// those the table now covers). Returns the writes, the cursor after
+    /// them and the number of relocated entries.
+    fn place_data(&mut self, data_start: u64, mut cursor: u64) -> Result<(Writes, u64, usize), RpfError> {
+        let mut writes = Writes::new();
         let mut relocated = 0;
         let mut stored: Vec<Vec<u8>> = Vec::new();
         for slot in &self.slots {
@@ -364,45 +388,20 @@ impl Rpf8Editor {
         }
         let mut moved = stored.into_iter();
         for slot in &mut self.slots {
-            let bytes = match &mut slot.data {
-                Data::New(d) => Some(std::mem::take(d)),
-                Data::Existing(offset) if *offset < data_start && slot.entry.size_on_disk > 0 => {
-                    Some(moved.next().expect("read above"))
-                }
-                Data::Existing(_) => None,
-            };
-            if let Some(bytes) = bytes {
-                let len = bytes.len() as u64;
-                slot.entry.offset = if len == 0 { 0 } else { cursor };
-                if matches!(slot.data, Data::New(_)) {
-                    slot.entry.size_on_disk = len.next_multiple_of(16);
-                    slot.entry.compression = Compression::None;
-                }
-                if len > 0 {
-                    writes.push((cursor, bytes));
-                    cursor += len.next_multiple_of(16);
-                }
-            }
-            if slot.entry.size_on_disk > 0x0FFF_FFFF << 4 || slot.entry.offset > 0x7FFF_FFFF << 4 {
-                return Err(err(format!("{}: too large for an RPF8 entry", self_name(&slot.entry))));
-            }
+            place_slot(slot, data_start, &mut cursor, &mut moved, &mut writes)?;
         }
-        // The name table ends the archive, which ends on a 16-byte boundary
-        // (nested archives are as long as their entry's 16-byte rounded size).
-        let names = self.name_table();
-        let names_at = (cursor + names.len() as u64).next_multiple_of(16) - names.len() as u64;
-        let new_len = names_at + names.len() as u64;
+        Ok((writes, cursor, relocated))
+    }
 
+    /// The new table: header, signature block, entries, padded to `data_start`.
+    fn build_table(&self, data_start: u64, names_len: usize, region: &[u8]) -> Vec<u8> {
         let header = self.rpf.header();
         let mut table = Vec::with_capacity(data_start as usize);
         table.extend(MAGIC.to_le_bytes());
-        table.extend((count as u32).to_le_bytes());
-        table.extend((names.len() as u32).to_le_bytes());
+        table.extend((self.slots.len() as u32).to_le_bytes());
+        table.extend((names_len as u32).to_le_bytes());
         table.extend(PLAINTEXT.to_le_bytes());
         // Platform letter and the byte after it, as they were.
-        let mut f = OpenOptions::new().read(true).write(true).open(&self.path)?;
-        let mut region = vec![0u8; data_start.min(old_len) as usize];
-        f.read_exact(&mut region)?;
         table.push(header.platform as u8);
         table.push(region.get(15).copied().unwrap_or(0));
         // The signature block stays.
@@ -411,25 +410,81 @@ impl Rpf8Editor {
             table.extend(slot.entry.to_bytes());
         }
         table.resize(data_start as usize, 0);
-
-        let backup = Backup { old_len, new_len, region };
-        before_write(&backup)?;
-
-        let appended: u64 = writes.iter().map(|(_, b)| b.len() as u64).sum();
-        for (at, bytes) in &writes {
-            f.seek(SeekFrom::Start(*at))?;
-            f.write_all(bytes)?;
-        }
-        f.set_len(names_at)?;
-        f.seek(SeekFrom::Start(names_at))?;
-        f.write_all(&names)?;
-        f.set_len(new_len)?;
-        f.sync_data()?;
-        f.seek(SeekFrom::Start(0))?;
-        f.write_all(&table)?;
-        f.sync_all()?;
-        Ok(CommitStats { changed: true, appended, relocated, new_len })
+        table
     }
+}
+
+/// Data to write: (offset, bytes).
+type Writes = Vec<(u64, Vec<u8>)>;
+
+/// Largest `size_on_disk` and offset an entry can hold (28 bits, in 16-byte units).
+const MAX_SIZE_ON_DISK: u64 = 0x0FFF_FFFF << 4;
+const MAX_OFFSET: u64 = 0x7FFF_FFFF << 4;
+
+/// Gives one slot its new data position, if its data is written again.
+fn place_slot(
+    slot: &mut Slot,
+    data_start: u64,
+    cursor: &mut u64,
+    moved: &mut impl Iterator<Item = Vec<u8>>,
+    writes: &mut Writes,
+) -> Result<(), RpfError> {
+    let bytes = match &mut slot.data {
+        Data::New(d) => Some(std::mem::take(d)),
+        Data::Existing(offset) if *offset < data_start && slot.entry.size_on_disk > 0 => {
+            Some(moved.next().expect("read above"))
+        }
+        Data::Existing(_) => None,
+    };
+    if let Some(bytes) = bytes {
+        let len = bytes.len() as u64;
+        slot.entry.offset = if len == 0 { 0 } else { *cursor };
+        if matches!(slot.data, Data::New(_)) {
+            slot.entry.size_on_disk = len.next_multiple_of(16);
+            slot.entry.compression = Compression::None;
+        }
+        if len > 0 {
+            writes.push((*cursor, bytes));
+            *cursor += len.next_multiple_of(16);
+        }
+    }
+    check_entry_size(&slot.entry)
+}
+
+fn check_entry_size(entry: &Entry) -> Result<(), RpfError> {
+    if entry.size_on_disk > MAX_SIZE_ON_DISK || entry.offset > MAX_OFFSET {
+        return Err(err(format!("{}: too large for an RPF8 entry", self_name(entry))));
+    }
+    Ok(())
+}
+
+fn write_archive(
+    f: &mut std::fs::File,
+    writes: &[(u64, Vec<u8>)],
+    names: &[u8],
+    names_at: u64,
+    new_len: u64,
+    table: &[u8],
+) -> Result<(), RpfError> {
+    for (at, bytes) in writes {
+        f.seek(SeekFrom::Start(*at))?;
+        f.write_all(bytes)?;
+    }
+    write_names(f, names, names_at, new_len)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(table)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Writes the name table at the end and cuts the file to its new length.
+fn write_names(f: &mut std::fs::File, names: &[u8], names_at: u64, new_len: u64) -> Result<(), RpfError> {
+    f.set_len(names_at)?;
+    f.seek(SeekFrom::Start(names_at))?;
+    f.write_all(names)?;
+    f.set_len(new_len)?;
+    f.sync_data()?;
+    Ok(())
 }
 
 /// An RPF8 archive without entries (plain table, empty signature, PC), to

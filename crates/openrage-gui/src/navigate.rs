@@ -520,152 +520,24 @@ pub(crate) fn set_meta(ui: &AppWindow, meta: &Meta) {
     ui.set_info_rows(ModelRc::new(VecModel::from(rows)));
 }
 
+/// Title, path, rows and icon of the info panel.
+type FolderInfo = (String, String, Meta, (&'static str, slint::Color));
+
+/// What a location shows: the whole info panel, or just its own rows (the common
+/// title, path, icon and source rows are added around them).
+enum Place {
+    Whole(FolderInfo),
+    Rows(Meta),
+}
+
 pub(crate) fn show_folder_info(ui: &AppWindow) {
     // Read before `with_app` below: it would borrow the app state twice.
     let overlay = overlay_name();
     // A video does not go on without its picture.
     if ui.get_preview_loading() || with_app(|a| a.video.is_some()) {
-        with_app(|a| a.preview_generation.fetch_add(1, Ordering::SeqCst));
-        ui.set_preview_loading(false);
-        stop_sound(ui);
-        ui.set_audio_mode(false);
-        ui.set_video_mode(false);
-        with_app(|a| {
-            a.sound = None;
-            a.video = None;
-        });
+        stop_preview_media(ui);
     }
-    let info = with_app(|a| {
-        let l = a.listing.as_ref()?;
-        let name = location_title(l);
-        let folder_icon = if l.vpath.to_ascii_lowercase().ends_with(".rpf") {
-            badges::icon(&name, ItemKind::Archive)
-        } else {
-            badges::icon(&name, ItemKind::Dir)
-        };
-        let place = match &l.location {
-            Location::Search { query, summary } => {
-                return Some((
-                    format!("Search: {query}"),
-                    String::new(),
-                    vec![note(summary)],
-                    ("search", badges::NEUTRAL),
-                ));
-            }
-            Location::Changes { summary } => {
-                return Some((
-                    "Mod changes".into(),
-                    String::new(),
-                    vec![note(summary)],
-                    badges::icon("", ItemKind::Dir),
-                ));
-            }
-            Location::History => {
-                return Some((
-                    "History".into(),
-                    String::new(),
-                    vec![note(format!(
-                        "Every change OpenRAGE made to the {} folder. Select a package entry to uninstall the whole package.",
-                        overlay
-                    ))],
-                    ("history", badges::NEUTRAL),
-                ));
-            }
-            Location::Textures { dict, .. } => {
-                // `…/x.wdr/textures`: the textures inside a GTA IV model.
-                if let Some(model) = browser::model_of_textures(&l.vpath) {
-                    let model_name = model.rsplit('/').next().unwrap_or(model);
-                    return Some((
-                        format!("{model_name} — textures"),
-                        l.vpath.clone(),
-                        vec![
-                            kv("Type", "Textures inside a model"),
-                            kv("Textures", dict.textures.len()),
-                            note(if openrage_app::textures::is_gta4_model(model) {
-                                "Replace a texture to change the model's look. Textures its shaders use \
-                                 cannot be removed."
-                            } else {
-                                "Replace a texture to change the model's look. The same size (or smaller) \
-                                 always fits; a larger one only if the model has room for it."
-                            }),
-                        ],
-                        badges::icon(&name, ItemKind::Resource),
-                    ));
-                }
-                return Some((
-                    name.clone(),
-                    l.vpath.clone(),
-                    vec![
-                        kv("Type", "Texture dictionary"),
-                        kv("Textures", dict.textures.len()),
-                        note("Extract… exports DDS files like OpenIV; Save PNG… exports images."),
-                    ],
-                    badges::icon(&name, ItemKind::Resource),
-                ));
-            }
-            Location::Audio { awc } => {
-                let mut meta = vec![kv("Type", "Audio container")];
-                match &awc.stream_format {
-                    Some(f) => {
-                        meta.push(kv("Content", format!("one stream with {} channels", f.channels)));
-                        if let Some(s) = awc.sounds.first() {
-                            meta.push(kv("Duration", browser::seconds(s.duration_secs())));
-                        }
-                    }
-                    None => meta.push(kv("Sounds", awc.sounds.len())),
-                }
-                if awc.encrypted {
-                    meta.push(kv("Encrypted", "yes"));
-                }
-                meta.push(note("Double-click a sound to play it; Extract… saves WAV files."));
-                return Some((name.clone(), l.vpath.clone(), meta, ("audio", badges::NEUTRAL)));
-            }
-            Location::Disk(p) => vec![kv("Type", "Folder"), kv("On disk", p.display())],
-            Location::Rpf8(rpf, _) => {
-                let h = rpf.header();
-                vec![
-                    kv("Type", "Inside a Red Dead Redemption 2 archive"),
-                    kv("Archive", rpf.display_name().rsplit('/').next().unwrap_or_default()),
-                    kv("Entries", grouped(h.entry_count as usize)),
-                    note(
-                        "Changes go into lml/replace (Lenny's Mod Loader), never into the game's archives. \
-                         Names come from `openrage rdr2-names`; unnamed files are under hash/.",
-                    ),
-                ]
-            }
-            Location::Rpf9(rpf, _) => {
-                let mut meta = vec![
-                    kv(
-                        "Type",
-                        if rpf.is_native() { "Inside a GTA VI archive" } else { "Recovered from a GTA VI archive" },
-                    ),
-                    kv("Archive", rpf.display_name().rsplit('/').next().unwrap_or_default()),
-                ];
-                meta.extend(crate::preview::rpf9_archive_info(rpf));
-                meta.push(note("Read-only. Extract… saves the files unpacked."));
-                meta
-            }
-            Location::Gta4(a, _) => {
-                let mut meta = vec![kv("Type", "Inside a GTA IV archive")];
-                meta.extend(gta4_archive_info(a));
-                meta.push(note("Read-only. Extract… saves files as stored (resources as RSC5 files, like OpenIV)."));
-                meta
-            }
-            Location::Archive(rpf, _) => vec![
-                kv("Type", "Inside an archive"),
-                kv("Archive", rpf.name()),
-                kv("Encryption", format!("{:?}", rpf.encryption())),
-                kv("Entries", grouped(rpf.entries().len())),
-            ],
-        };
-        let mut meta = place;
-        match l.origin {
-            Origin::Mods => meta.push(kv("Source", format!("{} folder (replaces the game's version)", overlay))),
-            Origin::Merged => meta.push(kv("Source", "game folder merged with its mods counterpart")),
-            Origin::Base => {}
-        }
-        Some((name, l.vpath.clone(), meta, folder_icon))
-    });
+    let info = with_app(|a| folder_info(a.listing.as_ref()?, overlay));
     let (title, path, meta, icon) =
         info.unwrap_or_else(|| (String::new(), String::new(), Meta::new(), ("folder", slint::Color::default())));
     ui.set_location_title(title.clone().into());
@@ -675,4 +547,152 @@ pub(crate) fn show_folder_info(ui: &AppWindow) {
     ui.set_model_mode(false);
     ui.set_model_textures(0);
     ui.set_preview_loading(false);
+}
+
+fn stop_preview_media(ui: &AppWindow) {
+    with_app(|a| a.preview_generation.fetch_add(1, Ordering::SeqCst));
+    ui.set_preview_loading(false);
+    stop_sound(ui);
+    ui.set_audio_mode(false);
+    ui.set_video_mode(false);
+    with_app(|a| {
+        a.sound = None;
+        a.video = None;
+    });
+}
+
+fn folder_info(l: &Listing, overlay: &str) -> Option<FolderInfo> {
+    let name = location_title(l);
+    let folder_icon = if l.vpath.to_ascii_lowercase().ends_with(".rpf") {
+        badges::icon(&name, ItemKind::Archive)
+    } else {
+        badges::icon(&name, ItemKind::Dir)
+    };
+    let mut meta = match place_info(l, &name, overlay) {
+        Place::Whole(info) => return Some(info),
+        Place::Rows(meta) => meta,
+    };
+    match l.origin {
+        Origin::Mods => meta.push(kv("Source", format!("{} folder (replaces the game's version)", overlay))),
+        Origin::Merged => meta.push(kv("Source", "game folder merged with its mods counterpart")),
+        Origin::Base => {}
+    }
+    Some((name, l.vpath.clone(), meta, folder_icon))
+}
+
+fn place_info(l: &Listing, name: &str, overlay: &str) -> Place {
+    match &l.location {
+        Location::Search { query, summary } => {
+            Place::Whole((format!("Search: {query}"), String::new(), vec![note(summary)], ("search", badges::NEUTRAL)))
+        }
+        Location::Changes { summary } => {
+            Place::Whole(("Mod changes".into(), String::new(), vec![note(summary)], badges::icon("", ItemKind::Dir)))
+        }
+        Location::History => Place::Whole((
+            "History".into(),
+            String::new(),
+            vec![note(format!(
+                "Every change OpenRAGE made to the {} folder. Select a package entry to uninstall the whole package.",
+                overlay
+            ))],
+            ("history", badges::NEUTRAL),
+        )),
+        Location::Textures { dict, .. } => Place::Whole(textures_info(l, dict, name)),
+        Location::Audio { awc } => {
+            Place::Whole((name.to_owned(), l.vpath.clone(), audio_rows(awc), ("audio", badges::NEUTRAL)))
+        }
+        other => Place::Rows(archive_rows(other)),
+    }
+}
+
+fn textures_info(l: &Listing, dict: &rage_formats::ytd::TextureDictionary, name: &str) -> FolderInfo {
+    // `…/x.wdr/textures`: the textures inside a GTA IV model.
+    if let Some(model) = browser::model_of_textures(&l.vpath) {
+        let model_name = model.rsplit('/').next().unwrap_or(model);
+        return (
+            format!("{model_name} — textures"),
+            l.vpath.clone(),
+            vec![
+                kv("Type", "Textures inside a model"),
+                kv("Textures", dict.textures.len()),
+                note(if openrage_app::textures::is_gta4_model(model) {
+                    "Replace a texture to change the model's look. Textures its shaders use \
+                     cannot be removed."
+                } else {
+                    "Replace a texture to change the model's look. The same size (or smaller) \
+                     always fits; a larger one only if the model has room for it."
+                }),
+            ],
+            badges::icon(name, ItemKind::Resource),
+        );
+    }
+    (
+        name.to_owned(),
+        l.vpath.clone(),
+        vec![
+            kv("Type", "Texture dictionary"),
+            kv("Textures", dict.textures.len()),
+            note("Extract… exports DDS files like OpenIV; Save PNG… exports images."),
+        ],
+        badges::icon(name, ItemKind::Resource),
+    )
+}
+
+fn audio_rows(awc: &rage_formats::awc::Awc) -> Meta {
+    let mut meta = vec![kv("Type", "Audio container")];
+    match &awc.stream_format {
+        Some(f) => {
+            meta.push(kv("Content", format!("one stream with {} channels", f.channels)));
+            if let Some(s) = awc.sounds.first() {
+                meta.push(kv("Duration", browser::seconds(s.duration_secs())));
+            }
+        }
+        None => meta.push(kv("Sounds", awc.sounds.len())),
+    }
+    if awc.encrypted {
+        meta.push(kv("Encrypted", "yes"));
+    }
+    meta.push(note("Double-click a sound to play it; Extract… saves WAV files."));
+    meta
+}
+
+/// The rows of a folder on disk or inside an archive (the other locations show their own panel).
+fn archive_rows(location: &Location) -> Meta {
+    match location {
+        Location::Disk(p) => vec![kv("Type", "Folder"), kv("On disk", p.display())],
+        Location::Rpf8(rpf, _) => {
+            let h = rpf.header();
+            vec![
+                kv("Type", "Inside a Red Dead Redemption 2 archive"),
+                kv("Archive", rpf.display_name().rsplit('/').next().unwrap_or_default()),
+                kv("Entries", grouped(h.entry_count as usize)),
+                note(
+                    "Changes go into lml/replace (Lenny's Mod Loader), never into the game's archives. \
+                     Names come from `openrage rdr2-names`; unnamed files are under hash/.",
+                ),
+            ]
+        }
+        Location::Rpf9(rpf, _) => {
+            let mut meta = vec![
+                kv("Type", if rpf.is_native() { "Inside a GTA VI archive" } else { "Recovered from a GTA VI archive" }),
+                kv("Archive", rpf.display_name().rsplit('/').next().unwrap_or_default()),
+            ];
+            meta.extend(crate::preview::rpf9_archive_info(rpf));
+            meta.push(note("Read-only. Extract… saves the files unpacked."));
+            meta
+        }
+        Location::Gta4(a, _) => {
+            let mut meta = vec![kv("Type", "Inside a GTA IV archive")];
+            meta.extend(gta4_archive_info(a));
+            meta.push(note("Read-only. Extract… saves files as stored (resources as RSC5 files, like OpenIV)."));
+            meta
+        }
+        Location::Archive(rpf, _) => vec![
+            kv("Type", "Inside an archive"),
+            kv("Archive", rpf.name()),
+            kv("Encryption", format!("{:?}", rpf.encryption())),
+            kv("Entries", grouped(rpf.entries().len())),
+        ],
+        _ => Vec::new(),
+    }
 }

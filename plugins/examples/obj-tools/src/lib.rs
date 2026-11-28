@@ -81,6 +81,9 @@ fn safe(name: &str) -> String {
     name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect()
 }
 
+/// The PNG file names written so far, by lower-case texture name (`None` for a texture that failed).
+type Written = HashMap<String, Option<String>>;
+
 fn export(vpath: &str) -> Result<Vec<OutputFile>, String> {
     let model = load_model(vpath)?;
     let name = file_name(vpath);
@@ -88,74 +91,83 @@ fn export(vpath: &str) -> Result<Vec<OutputFile>, String> {
 
     let mut mtl = String::new();
     let mut files = Vec::new();
-    let mut written: HashMap<String, Option<String>> = HashMap::new();
+    let mut written = Written::new();
     for m in &model.materials {
-        let (r, g, b, _) = m.color;
-        let _ = writeln!(mtl, "newmtl {}\nKd {r:.4} {g:.4} {b:.4}", safe(&m.name));
-        if !m.texture.is_empty() {
-            let png = written.entry(m.texture.to_ascii_lowercase()).or_insert_with(|| {
-                match load_texture(vpath, &m.texture).map_err(|e| e.to_string()).and_then(|img| encode_png(&img)) {
-                    Ok(data) => {
-                        let file = format!("{}.png", safe(&m.texture));
-                        files.push(OutputFile::new(file.clone(), data));
-                        Some(file)
-                    }
-                    Err(e) => {
-                        log(Level::Warn, format!("texture {}: {e}", m.texture));
-                        None
-                    }
-                }
-            });
-            if let Some(file) = png {
-                let _ = writeln!(mtl, "map_Kd {file}");
-            }
-        }
-        mtl.push('\n');
+        write_material(&mut mtl, vpath, m, &mut files, &mut written);
     }
 
     let mut obj = format!("# {name}, exported by OpenRAGE\nmtllib {stem}.mtl\n");
     let mut base = 1usize; // OBJ indices start at 1 and run across the file
     for (i, mesh) in model.meshes.iter().enumerate() {
-        let n = mesh.positions.len() / 3;
         let part = if mesh.part.is_empty() { stem.clone() } else { safe(&mesh.part) };
         let _ = writeln!(obj, "o {part}_{i}\nusemtl {}", safe(&model.materials[mesh.material as usize].name));
-        for p in mesh.positions.as_chunks::<3>().0 {
-            // Z-up → Y-up
-            let _ = writeln!(obj, "v {} {} {}", p[0], p[2], -p[1]);
-        }
-        for t in mesh.uvs.as_chunks::<2>().0 {
-            let _ = writeln!(obj, "vt {} {}", t[0], 1.0 - t[1]);
-        }
-        for v in mesh.normals.as_chunks::<3>().0 {
-            let _ = writeln!(obj, "vn {} {} {}", v[0], v[2], -v[1]);
-        }
-        let (has_uv, has_n) = (!mesh.uvs.is_empty(), !mesh.normals.is_empty());
-        for tri in mesh.indices.as_chunks::<3>().0 {
-            obj.push('f');
-            for &k in tri {
-                let k = base + k as usize;
-                match (has_uv, has_n) {
-                    (true, true) => {
-                        let _ = write!(obj, " {k}/{k}/{k}");
-                    }
-                    (true, false) => {
-                        let _ = write!(obj, " {k}/{k}");
-                    }
-                    (false, true) => {
-                        let _ = write!(obj, " {k}//{k}");
-                    }
-                    (false, false) => {
-                        let _ = write!(obj, " {k}");
-                    }
-                }
-            }
-            obj.push('\n');
-        }
-        base += n;
+        write_mesh(&mut obj, mesh, base);
+        base += mesh.positions.len() / 3;
     }
     files.push(OutputFile::new(format!("{stem}.obj"), obj));
     files.push(OutputFile::new(format!("{stem}.mtl"), mtl));
     Ok(files)
+}
+
+/// A material's entry in the `.mtl`; its texture is exported as PNG the first time it comes up.
+fn write_material(mtl: &mut String, vpath: &str, m: &Material, files: &mut Vec<OutputFile>, written: &mut Written) {
+    let (r, g, b, _) = m.color;
+    let _ = writeln!(mtl, "newmtl {}\nKd {r:.4} {g:.4} {b:.4}", safe(&m.name));
+    if !m.texture.is_empty() {
+        let png =
+            written.entry(m.texture.to_ascii_lowercase()).or_insert_with(|| export_texture(vpath, &m.texture, files));
+        if let Some(file) = png {
+            let _ = writeln!(mtl, "map_Kd {file}");
+        }
+    }
+    mtl.push('\n');
+}
+
+/// Adds a texture as a PNG file and gives its name; a texture that cannot be read is logged and skipped.
+fn export_texture(vpath: &str, texture: &str, files: &mut Vec<OutputFile>) -> Option<String> {
+    match load_texture(vpath, texture).map_err(|e| e.to_string()).and_then(|img| encode_png(&img)) {
+        Ok(data) => {
+            let file = format!("{}.png", safe(texture));
+            files.push(OutputFile::new(file.clone(), data));
+            Some(file)
+        }
+        Err(e) => {
+            log(Level::Warn, format!("texture {texture}: {e}"));
+            None
+        }
+    }
+}
+
+/// The vertices and faces of a mesh; face indices start after the `base` vertices before it.
+fn write_mesh(obj: &mut String, mesh: &Mesh, base: usize) {
+    for p in mesh.positions.as_chunks::<3>().0 {
+        // Z-up → Y-up
+        let _ = writeln!(obj, "v {} {} {}", p[0], p[2], -p[1]);
+    }
+    for t in mesh.uvs.as_chunks::<2>().0 {
+        let _ = writeln!(obj, "vt {} {}", t[0], 1.0 - t[1]);
+    }
+    for v in mesh.normals.as_chunks::<3>().0 {
+        let _ = writeln!(obj, "vn {} {} {}", v[0], v[2], -v[1]);
+    }
+    let (has_uv, has_n) = (!mesh.uvs.is_empty(), !mesh.normals.is_empty());
+    for tri in mesh.indices.as_chunks::<3>().0 {
+        obj.push('f');
+        for &k in tri {
+            write_corner(obj, base + k as usize, has_uv, has_n);
+        }
+        obj.push('\n');
+    }
+}
+
+/// One corner of a face: the vertex, and the same index for the uv and normal that exist.
+fn write_corner(obj: &mut String, k: usize, has_uv: bool, has_n: bool) {
+    let _ = match (has_uv, has_n) {
+        (true, true) => write!(obj, " {k}/{k}/{k}"),
+        (true, false) => write!(obj, " {k}/{k}"),
+        (false, true) => write!(obj, " {k}//{k}"),
+        (false, false) => write!(obj, " {k}"),
+    };
 }
 
 /// Colours and textures from a `.mtl`: a material's `map_Kd` becomes its
@@ -229,128 +241,182 @@ fn encode_png(img: &Image) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+fn obj_number(s: Option<&str>, line: usize) -> Result<f32, String> {
+    s.ok_or_else(|| format!("line {line}: number missing"))?
+        .parse::<f32>()
+        .map_err(|_| format!("line {line}: not a number"))
+}
+
+/// Three numbers, turned from Y-up to Z-up.
+fn obj_vector(it: &mut std::str::SplitWhitespace<'_>, line: usize) -> Result<[f32; 3], String> {
+    let (x, y, z) = (obj_number(it.next(), line)?, obj_number(it.next(), line)?, obj_number(it.next(), line)?);
+    Ok([x, -z, y])
+}
+
+/// Two numbers (the second optional), with v flipped.
+fn obj_uv(it: &mut std::str::SplitWhitespace<'_>, line: usize) -> Result<[f32; 2], String> {
+    let (u, t) = (obj_number(it.next(), line)?, it.next().map_or(Ok(0.0), |s| obj_number(Some(s), line))?);
+    Ok([u, 1.0 - t])
+}
+
+/// A 1-based (or negative, from the end) index into a list of `len` items.
+fn obj_index(i: &str, len: usize, line: usize) -> Result<usize, String> {
+    let k: i64 = i.parse().map_err(|_| format!("line {line}: bad index {i:?}"))?;
+    let k = if k < 0 { len as i64 + k } else { k - 1 };
+    if k < 0 || k as usize >= len {
+        return Err(format!("line {line}: index {i} out of range"));
+    }
+    Ok(k as usize)
+}
+
+/// An optional face index plus one (0 when absent or empty).
+fn optional_index(part: Option<&str>, len: usize, line: usize) -> Result<usize, String> {
+    match part {
+        Some(s) if !s.is_empty() => Ok(obj_index(s, len, line)? + 1),
+        _ => Ok(0),
+    }
+}
+
+const FNV_OFFSET_BASIS: u32 = 2166136261;
+const FNV_PRIME: u32 = 16777619;
+
+/// The vertex data of the file so far.
+#[derive(Default)]
+struct ObjSource {
+    v: Vec<[f32; 3]>,
+    vt: Vec<[f32; 2]>,
+    vn: Vec<[f32; 3]>,
+}
+
+impl ObjSource {
+    /// The vertex of a `p/t/n` corner, added to `mesh` unless `seen` has it.
+    fn corner(
+        &self,
+        seen: &mut HashMap<(usize, usize, usize), u32>,
+        mesh: &mut Mesh,
+        corner: &str,
+        line: usize,
+    ) -> Result<u32, String> {
+        let mut f = corner.split('/');
+        let p = obj_index(f.next().unwrap_or(""), self.v.len(), line)?;
+        let t = optional_index(f.next(), self.vt.len(), line)?;
+        let nn = optional_index(f.next(), self.vn.len(), line)?;
+        let key = (p, t, nn);
+        if let Some(&i) = seen.get(&key) {
+            return Ok(i);
+        }
+        let i = (mesh.positions.len() / 3) as u32;
+        mesh.positions.extend(self.v[p]);
+        mesh.uvs.extend(if t > 0 { self.vt[t - 1] } else { [0.0, 0.0] });
+        mesh.normals.extend(if nn > 0 { self.vn[nn - 1] } else { [0.0, 0.0, 1.0] });
+        seen.insert(key, i);
+        Ok(i)
+    }
+}
+
+#[derive(Default)]
+struct ObjParser {
+    src: ObjSource,
+    materials: Vec<Material>,
+    meshes: Vec<Mesh>,
+    /// Per mesh: (position, uv, normal) index triple → vertex.
+    seen: HashMap<(usize, usize, usize), u32>,
+    part: String,
+    material: u32,
+}
+
+impl ObjParser {
+    fn line(&mut self, line: usize, raw: &str) -> Result<(), String> {
+        let mut it = raw.split_whitespace();
+        match it.next() {
+            Some(kind @ ("v" | "vt" | "vn")) => self.vertex_line(kind, &mut it, line)?,
+            Some("o" | "g") => {
+                self.part = it.collect::<Vec<_>>().join(" ");
+                self.seen.clear();
+            }
+            Some("usemtl") => {
+                self.use_material(it.collect::<Vec<_>>().join(" "));
+                self.seen.clear();
+            }
+            Some("f") => self.face(it, line)?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn vertex_line(&mut self, kind: &str, it: &mut std::str::SplitWhitespace<'_>, line: usize) -> Result<(), String> {
+        match kind {
+            "v" => self.src.v.push(obj_vector(it, line)?),
+            "vt" => self.src.vt.push(obj_uv(it, line)?),
+            _ => self.src.vn.push(obj_vector(it, line)?),
+        }
+        Ok(())
+    }
+
+    fn use_material(&mut self, name: String) {
+        self.material = match self.materials.iter().position(|m| m.name == name) {
+            Some(i) => i as u32,
+            None => {
+                // A stable colour per material name.
+                let h = name.bytes().fold(FNV_OFFSET_BASIS, |h, b| (h ^ u32::from(b)).wrapping_mul(FNV_PRIME));
+                let c = |s: u32| 0.45 + 0.4 * ((h >> s) & 0xff) as f32 / 255.0;
+                self.materials.push(Material {
+                    name,
+                    texture: String::new(),
+                    color: (c(0), c(8), c(16), 1.0),
+                    image: None,
+                });
+                (self.materials.len() - 1) as u32
+            }
+        };
+    }
+
+    fn face(&mut self, corners: std::str::SplitWhitespace<'_>, line: usize) -> Result<(), String> {
+        if self.materials.is_empty() {
+            self.materials.push(Material {
+                name: "default".into(),
+                texture: String::new(),
+                color: (0.7, 0.7, 0.7, 1.0),
+                image: None,
+            });
+        }
+        let (part, material) = (&self.part, self.material);
+        let need_new = self.meshes.last().is_none_or(|m| m.material != material || m.part != *part);
+        if need_new {
+            self.meshes.push(Mesh {
+                part: self.part.clone(),
+                positions: Vec::new(),
+                normals: Vec::new(),
+                uvs: Vec::new(),
+                indices: Vec::new(),
+                material,
+            });
+            self.seen.clear();
+        }
+        let mesh = self.meshes.last_mut().expect("just pushed");
+        let mut indices = Vec::new();
+        for corner in corners {
+            indices.push(self.src.corner(&mut self.seen, mesh, corner, line)?);
+        }
+        for k in 1..indices.len().saturating_sub(1) {
+            mesh.indices.extend([indices[0], indices[k], indices[k + 1]]);
+        }
+        Ok(())
+    }
+}
+
 /// Reads an OBJ file: `v`, `vt`, `vn`, `f` (polygons are fanned into
 /// triangles, negative indices count from the end), `o`/`g` for parts and
 /// `usemtl` for materials.
 fn parse_obj(text: &str) -> Result<Model, String> {
-    let (mut v, mut vt, mut vn) = (Vec::<[f32; 3]>::new(), Vec::<[f32; 2]>::new(), Vec::<[f32; 3]>::new());
-    let mut materials: Vec<Material> = Vec::new();
-    let mut meshes: Vec<Mesh> = Vec::new();
-    // Per mesh: (position, uv, normal) index triple → vertex.
-    let mut seen: HashMap<(usize, usize, usize), u32> = HashMap::new();
-    let (mut part, mut material) = (String::new(), 0u32);
-    let num = |s: Option<&str>, line: usize| -> Result<f32, String> {
-        s.ok_or_else(|| format!("line {line}: number missing"))?
-            .parse::<f32>()
-            .map_err(|_| format!("line {line}: not a number"))
-    };
-    let resolve = |i: &str, len: usize, line: usize| -> Result<usize, String> {
-        let k: i64 = i.parse().map_err(|_| format!("line {line}: bad index {i:?}"))?;
-        let k = if k < 0 { len as i64 + k } else { k - 1 };
-        if k < 0 || k as usize >= len {
-            return Err(format!("line {line}: index {i} out of range"));
-        }
-        Ok(k as usize)
-    };
+    let mut parser = ObjParser::default();
     for (n, raw) in text.lines().enumerate() {
-        let line = n + 1;
-        let mut it = raw.split_whitespace();
-        match it.next() {
-            // Y-up → Z-up
-            Some("v") => {
-                let (x, y, z) = (num(it.next(), line)?, num(it.next(), line)?, num(it.next(), line)?);
-                v.push([x, -z, y]);
-            }
-            Some("vt") => {
-                let (u, t) = (num(it.next(), line)?, it.next().map_or(Ok(0.0), |s| num(Some(s), line))?);
-                vt.push([u, 1.0 - t]);
-            }
-            Some("vn") => {
-                let (x, y, z) = (num(it.next(), line)?, num(it.next(), line)?, num(it.next(), line)?);
-                vn.push([x, -z, y]);
-            }
-            Some("o") | Some("g") => {
-                part = it.collect::<Vec<_>>().join(" ");
-                seen.clear();
-            }
-            Some("usemtl") => {
-                let name = it.collect::<Vec<_>>().join(" ");
-                material = match materials.iter().position(|m| m.name == name) {
-                    Some(i) => i as u32,
-                    None => {
-                        // A stable colour per material name.
-                        let h = name.bytes().fold(2166136261u32, |h, b| (h ^ u32::from(b)).wrapping_mul(16777619));
-                        let c = |s: u32| 0.45 + 0.4 * ((h >> s) & 0xff) as f32 / 255.0;
-                        materials.push(Material {
-                            name,
-                            texture: String::new(),
-                            color: (c(0), c(8), c(16), 1.0),
-                            image: None,
-                        });
-                        (materials.len() - 1) as u32
-                    }
-                };
-                seen.clear();
-            }
-            Some("f") => {
-                if materials.is_empty() {
-                    materials.push(Material {
-                        name: "default".into(),
-                        texture: String::new(),
-                        color: (0.7, 0.7, 0.7, 1.0),
-                        image: None,
-                    });
-                }
-                let need_new = meshes.last().is_none_or(|m| m.material != material || m.part != part);
-                if need_new {
-                    meshes.push(Mesh {
-                        part: part.clone(),
-                        positions: Vec::new(),
-                        normals: Vec::new(),
-                        uvs: Vec::new(),
-                        indices: Vec::new(),
-                        material,
-                    });
-                    seen.clear();
-                }
-                let mesh = meshes.last_mut().expect("just pushed");
-                let mut corners = Vec::new();
-                for corner in it {
-                    let mut f = corner.split('/');
-                    let p = resolve(f.next().unwrap_or(""), v.len(), line)?;
-                    let t = match f.next() {
-                        Some(s) if !s.is_empty() => resolve(s, vt.len(), line)? + 1,
-                        _ => 0,
-                    };
-                    let nn = match f.next() {
-                        Some(s) if !s.is_empty() => resolve(s, vn.len(), line)? + 1,
-                        _ => 0,
-                    };
-                    let key = (p, t, nn);
-                    let index = match seen.get(&key) {
-                        Some(&i) => i,
-                        None => {
-                            let i = (mesh.positions.len() / 3) as u32;
-                            mesh.positions.extend(v[p]);
-                            mesh.uvs.extend(if t > 0 { vt[t - 1] } else { [0.0, 0.0] });
-                            mesh.normals.extend(if nn > 0 { vn[nn - 1] } else { [0.0, 0.0, 1.0] });
-                            seen.insert(key, i);
-                            i
-                        }
-                    };
-                    corners.push(index);
-                }
-                for k in 1..corners.len().saturating_sub(1) {
-                    mesh.indices.extend([corners[0], corners[k], corners[k + 1]]);
-                }
-            }
-            _ => {}
-        }
+        parser.line(n + 1, raw)?;
     }
-    if meshes.is_empty() {
+    if parser.meshes.is_empty() {
         return Err("no faces in this OBJ file".into());
     }
-    Ok(Model { meshes, materials })
+    Ok(Model { meshes: parser.meshes, materials: parser.materials })
 }
 
 #[cfg(test)]
