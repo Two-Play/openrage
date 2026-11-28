@@ -31,7 +31,7 @@ concurrency:
 env:
   ZOLA_VERSION: "0.23.6"
   ZOLA_SHA256: "8f5132b3522412d04e395e0b25f6d68613ad272a873e54a2b3ebf664873024a4"
-  SITE_URL: "https://two-play.github.io/openrage"
+  SITE_URL: "https://two-play.github.io/openRAGE"
 
 jobs:
   build:

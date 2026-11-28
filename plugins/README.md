@@ -1,7 +1,7 @@
 # OpenRAGE plugins
 
 Sandboxed WebAssembly plugins for [OpenRAGE](https://github.com/Two-Play/openrage).
-How to write one: **[Writing plugins](https://two-play.github.io/openrage/plugins/)**.
+How to write one: **[Writing plugins](https://two-play.github.io/openRAGE/plugins/)**.
 
 | Folder | |
 |---|---|

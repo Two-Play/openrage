@@ -195,6 +195,9 @@ openrage verify --media                        # read every Scaleform movie and 
 ```
 
 Set up the keys first: `openrage --game "/path/to/Grand Theft Auto V" keys`, or see [Getting started](@/getting-started.md).
+When the executable does not contain the keys in plain form (GTA V Enhanced, some GTA V Legacy updates), add
+`--magic <magic.dat>`, or `--download-magic` to download CodeWalker's key blob from its repository first (OpenRAGE ships
+no keys).
 
 ## In scripts
 

@@ -22,6 +22,11 @@ serde_json.workspace = true
 openrage-plugins = { path = "../openrage-plugins" }
 png = "0.18"
 zip.workspace = true
+sha2.workspace = true
+# Downloads CodeWalker's key blob when the user asks for it: rustls with the
+# system's certificates, no other TLS stack and no bundled root certificates.
+ureq = { version = "3.5", default-features = false, features = ["rustls-no-provider", "_ring"] }
+rustls-native-certs = "0.8"
 
 [dev-dependencies]
 flate2.workspace = true

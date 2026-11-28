@@ -24,10 +24,16 @@ pub(crate) enum Command {
         /// Game executable to scan (default: GTA5_Enhanced.exe or GTA5.exe in the game directory).
         #[arg(long)]
         exe: Option<PathBuf>,
-        /// CodeWalker key blob (magic.dat); required for GTA V Enhanced, whose
-        /// executable no longer contains the NG keys in plain form.
+        /// CodeWalker key blob (magic.dat); required when the executable does not
+        /// contain the NG keys in plain form: GTA V Enhanced, and some GTA V
+        /// Legacy updates.
         #[arg(long)]
         magic: Option<PathBuf>,
+        /// Download CodeWalker's key blob (magic.dat) from its GitHub repository
+        /// into OpenRAGE's settings folder and use it. OpenRAGE ships no keys:
+        /// this fetches them from CodeWalker, only when you ask for it.
+        #[arg(long, conflicts_with = "magic")]
+        download_magic: bool,
     },
     /// List a directory, an archive, or a directory inside an archive.
     Ls {

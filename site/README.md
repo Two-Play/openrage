@@ -1,6 +1,6 @@
 # OpenRAGE website
 
-Source of <https://two-play.github.io/openrage/>, built with [Zola](https://www.getzola.org) (one binary, no other tools).
+Source of <https://two-play.github.io/openRAGE/>, built with [Zola](https://www.getzola.org) (one binary, no other tools).
 
 | What | Where |
 |---|---|

@@ -89,7 +89,7 @@ fn run() -> Result<()> {
     let mut cfg = Config::load();
     let game_dir = cli.game.clone().or_else(|| cfg.game_dir.clone());
 
-    if let Command::Keys { exe, magic } = &cli.command {
+    if let Command::Keys { exe, magic, download_magic } = &cli.command {
         let game_dir = game_dir.context("no game directory given; pass --game <DIR>")?;
         let game_dir = openrage_app::gta4::normalize_dir(&game_dir);
         if openrage_app::gta4::is_gta4_dir(&game_dir) {
@@ -99,7 +99,14 @@ fn run() -> Result<()> {
             cfg.save()?;
             return Ok(());
         }
-        let magic = magic.clone().or_else(|| cfg.magic_path.clone());
+        let magic = if *download_magic {
+            outln!("{}", openrage_app::setup::CODEWALKER_MAGIC_NOTICE);
+            let path = openrage_app::setup::download_codewalker_magic()?;
+            outln!("Saved {}.", path.display());
+            Some(path)
+        } else {
+            magic.clone().or_else(|| cfg.magic_path.clone())
+        };
         cmd_keys(&game_dir, exe.as_deref(), magic.as_deref())?;
         cfg.game_dir = Some(game_dir);
         cfg.magic_path = magic;

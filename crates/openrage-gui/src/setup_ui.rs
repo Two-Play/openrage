@@ -1,6 +1,7 @@
 //! Games: choosing one, and the first-run setup that finds the keys.
 
 use crate::*;
+use slint::Model as _;
 
 /// The games set up so far that are still installed.
 pub(crate) fn installed_games(cfg: &Config) -> Vec<PathBuf> {
@@ -192,6 +193,13 @@ pub(crate) fn show_folder_hint(ui: &AppWindow) {
         format!("{} does not exist.", dir.display())
     };
     ui.set_setup_log(hint.into());
+    // The "Detected" list shows the folder above, or nothing when it is not one of them.
+    let matching = ui
+        .get_setup_detected()
+        .iter()
+        .find(|d| !text.trim().is_empty() && openrage_app::gta4::normalize_dir(&PathBuf::from(d.as_str())) == dir)
+        .unwrap_or_default();
+    ui.set_setup_detected_value(matching);
 }
 
 pub(crate) fn pick_path(w: Weak<AppWindow>, file: bool, title: &'static str, apply: fn(&AppWindow, PathBuf)) {
@@ -201,6 +209,34 @@ pub(crate) fn pick_path(w: Weak<AppWindow>, file: bool, title: &'static str, app
         if let Some(p) = picked {
             let _ = w.upgrade_in_event_loop(move |ui| apply(&ui, p));
         }
+    });
+}
+
+/// Downloads CodeWalker's key blob (the user confirmed it in the setup
+/// dialog) and puts its path in the key blob field.
+pub(crate) fn download_magic(w: Weak<AppWindow>) {
+    let _ = w.upgrade_in_event_loop(|ui| {
+        ui.set_setup_running(true);
+        ui.set_setup_log("Downloading magic.dat from CodeWalker's repository …".into());
+    });
+    std::thread::spawn(move || {
+        let result = setup::download_codewalker_magic();
+        let _ = w.upgrade_in_event_loop(move |ui| {
+            ui.set_setup_running(false);
+            match result {
+                Ok(path) => {
+                    ui.set_setup_magic_path(path.display().to_string().into());
+                    ui.set_setup_log(format!("Saved {}. Press Open to use it.", path.display()).into());
+                }
+                Err(e) => ui.set_setup_log(
+                    format!(
+                        "Error: {e:#}\nYou can also download it in a browser from\n{}",
+                        setup::CODEWALKER_MAGIC_PAGE
+                    )
+                    .into(),
+                ),
+            }
+        });
     });
 }
 
@@ -318,8 +354,9 @@ pub(crate) fn run_setup(ui: &AppWindow) {
                 let _ = weak.upgrade_in_event_loop(move |ui| finish_setup(&ui, game_dir, magic, keys));
             }
             Err(e) => {
-                if e.downcast_ref::<KeyBlobRequired>().is_some() {
-                    push("This is GTA V Enhanced: its executable no longer contains the NG keys in plain form.");
+                if let Some(required) = e.downcast_ref::<KeyBlobRequired>() {
+                    push(&format!("{} does not contain the NG keys in plain form.", required.exe_name()));
+                    push("This is so for GTA V Enhanced, and for some updates of GTA V Legacy.");
                     push("Select a CodeWalker key blob (magic.dat) and try again.");
                 } else {
                     push(&format!("Error: {e:#}"));

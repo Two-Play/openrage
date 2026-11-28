@@ -15,6 +15,12 @@ pub fn cache_dir() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("openrage"))
 }
 
+/// Where a key blob downloaded from CodeWalker is kept
+/// (`<config dir>/openrage/magic.dat`).
+pub fn downloaded_magic() -> Option<PathBuf> {
+    Some(config_dir()?.join("magic.dat"))
+}
+
 /// The GTA V key cache (`<config dir>/openrage/gtav.keys`).
 pub fn gtav_keys() -> Option<PathBuf> {
     Some(config_dir()?.join("gtav.keys"))
