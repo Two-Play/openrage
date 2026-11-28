@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use roxmltree::{Document, Node};
 
-use super::{ARRAYINFO, Entry, Pso, PsoError, StructInfo, ty};
+use super::{ARRAYINFO, Entry, Pso, PsoError, StructInfo, ty, vector_len};
 use crate::names;
 
 type R<T> = Result<T, String>;
@@ -102,6 +102,80 @@ fn vector(node: Node<'_, '_>, n: usize) -> R<Vec<f32>> {
 /// Largest alignment an item of `size` bytes needs (at most 16).
 fn align_of(size: usize) -> usize {
     if size == 0 { 1 } else { (1 << size.trailing_zeros()).min(16) }
+}
+
+/// How an array's items are stored.
+#[derive(Clone, Copy)]
+struct ArrayShape {
+    external: bool,
+    count: usize,
+    size: usize,
+    block_name: u32,
+}
+
+fn string_array_layout(sub: u8) -> R<(usize, u32)> {
+    match sub {
+        7..=15 => Ok((4, UINTS)),
+        2 => Ok((8, POINTERS)),
+        3 => Ok((16, COUNTED_STRINGS)),
+        s => Err(format!("unexpected string array subtype {s}")),
+    }
+}
+
+/// Item size and block name of an array of vectors or plain numbers.
+fn plain_array_layout(kind: u8) -> R<(usize, u32)> {
+    let size = match kind {
+        ty::FLOAT2 => 8,
+        ty::FLOAT3 | ty::FLOAT3A | ty::FLOAT4 | ty::FLOAT4A | ty::VEC4V => 16,
+        ty::LONG | ty::ULONG => 8,
+        ty::SBYTE | ty::UBYTE | ty::BOOL => 1,
+        ty::USHORT => 2,
+        ty::FLOAT | ty::UINT | ty::SINT => 4,
+        other => return Err(format!("unsupported array item type {other:#04x}")),
+    };
+    Ok((size, kind as u32))
+}
+
+/// The place of an array's first item and the size of an item.
+#[derive(Clone, Copy)]
+struct ItemsAt {
+    block: usize,
+    off: usize,
+    size: usize,
+}
+
+fn parse_bool(s: &str) -> R<u8> {
+    match s {
+        "true" | "True" | "1" => Ok(1),
+        "false" | "False" | "0" => Ok(0),
+        other => Err(format!("\"{other}\" is not true or false")),
+    }
+}
+
+/// The item type entry of an array field, and whether its items are stored elsewhere.
+fn array_item(e: &Entry, info: &StructInfo) -> R<(Entry, bool)> {
+    let mut index = (e.key & 0xFFFF) as usize;
+    if index >= info.entries.len() {
+        index = (e.key & 0xFFF) as usize;
+    }
+    let item = *info.entries.get(index).ok_or("ARRAYINFO not found")?;
+    let external =
+        matches!(e.sub, 0 | 5) || (e.sub == 4 && item.sub == 3) || matches!(item.kind, ty::STRING | ty::ENUM);
+    if !external && !matches!(e.sub, 1 | 2 | 4 | 129) {
+        return Err(format!("unsupported array subtype {}", e.sub));
+    }
+    Ok((item, external))
+}
+
+/// How many items the XML of an array holds.
+fn array_count(kind: u8, node: Node<'_, '_>) -> usize {
+    match kind {
+        ty::STRUCTURE | ty::STRING | ty::ENUM => element_children(node).count(),
+        ty::FLOAT2 => tokens(node).len().div_ceil(2),
+        ty::FLOAT3 | ty::FLOAT3A => tokens(node).len().div_ceil(3),
+        ty::FLOAT4 | ty::FLOAT4A | ty::VEC4V => tokens(node).len().div_ceil(4),
+        _ => tokens(node).len(),
+    }
 }
 
 impl<'a> Builder<'a> {
@@ -208,67 +282,96 @@ impl<'a> Builder<'a> {
     ) -> R<()> {
         let at = base + e.offset;
         match e.kind {
-            ty::ARRAY => self.array(bi, base, e, info, node, depth)?,
-            ty::BOOL => {
-                let v = match value(node)? {
-                    "true" | "True" | "1" => 1u8,
-                    "false" | "False" | "0" => 0,
-                    other => return Err(format!("\"{other}\" is not true or false")),
-                };
-                self.put(bi, at, &[v])?;
-            }
-            ty::SBYTE | ty::UBYTE => self.put(bi, at, &[int(value(node)?)? as u8])?,
-            ty::SSHORT | ty::USHORT | ty::HFLOAT => self.put(bi, at, &(int(value(node)?)? as u16).to_be_bytes())?,
-            ty::SINT | ty::UINT => self.put(bi, at, &(int(value(node)?)? as u32).to_be_bytes())?,
-            ty::LONG | ty::ULONG => self.put(bi, at, &(int(value(node)?)? as u64).to_be_bytes())?,
-            ty::ENUM => {
-                let sub = if self.is_rdr2() { e.sub.saturating_sub(1) } else { e.sub };
-                let v = self.enum_value(e.key, &text(node))?;
-                match sub {
-                    0 => self.put(bi, at, &(v as u32).to_be_bytes())?,
-                    1 => self.put(bi, at, &(v as u16).to_be_bytes())?,
-                    2 => self.put(bi, at, &[v as u8])?,
-                    s => return Err(format!("unexpected enum subtype {s}")),
-                }
-            }
-            ty::FLAGS => self.flags(bi, at, e, info, node)?,
-            ty::FLOAT => self.put(bi, at, &float(value(node)?)?.to_be_bytes())?,
-            ty::FLOAT2 => self.floats(bi, at, &vector(node, 2)?)?,
-            ty::FLOAT3 | ty::FLOAT3A | ty::FLOAT4A => self.floats(bi, at, &vector(node, 3)?)?,
-            ty::FLOAT4 | ty::VEC4V => self.floats(bi, at, &vector(node, 4)?)?,
-            ty::MATRIX44 => {
-                let v: Vec<f32> = tokens(node).iter().map(|t| float(t)).collect::<R<_>>()?;
-                if v.len() != 16 {
-                    return Err(format!("a matrix needs 16 numbers, not {}", v.len()));
-                }
-                self.floats(bi, at, &v)?;
-            }
-            ty::STRING => self.string(bi, at, e, &text(node))?,
-            ty::STRUCTURE => match e.sub {
-                0 => self.structure(bi, at, e.key, node, depth + 1)?,
-                3 | 4 => {
-                    if let Some(t) = node.attribute("type") {
-                        let actual = self.struct_named(t)?;
-                        let len = self.struct_info(actual)?.length;
-                        let (pb, poff) = self.alloc(actual, len, align_of(len));
-                        self.pointer(bi, at, pb, poff);
-                        self.structure(pb, poff, actual, node, depth + 1)?;
-                    }
-                }
-                s => return Err(format!("unexpected structure subtype {s}")),
-            },
-            ty::OPAQUE16 => {
-                let hex = value(node)?;
-                let bytes: Vec<u8> = (0..16)
-                    .map(|i| hex.get(i * 2..i * 2 + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
-                    .collect::<Option<_>>()
-                    .ok_or_else(|| format!("\"{hex}\" is not 16 bytes of hex"))?;
-                self.put(bi, at, &bytes)?;
-            }
-            ty::MAP => self.map(bi, at, e, info, node, depth)?,
-            other => return Err(format!("unexpected data type {other:#04x}")),
+            ty::ARRAY => self.array(bi, base, e, info, node, depth),
+            ty::ENUM => self.enum_field(bi, at, e, node),
+            ty::FLAGS => self.flags(bi, at, e, info, node),
+            ty::MATRIX44 => self.matrix_field(bi, at, node),
+            ty::STRING => self.string(bi, at, e, &text(node)),
+            ty::STRUCTURE => self.structure_field(bi, at, e, node, depth),
+            ty::OPAQUE16 => self.opaque_field(bi, at, node),
+            ty::MAP => self.map(bi, at, e, info, node, depth),
+            _ => self.scalar_field(bi, at, e.kind, node),
         }
-        Ok(())
+    }
+
+    fn matrix_field(&mut self, bi: usize, at: usize, node: Node<'_, '_>) -> R<()> {
+        let v: Vec<f32> = tokens(node).iter().map(|t| float(t)).collect::<R<_>>()?;
+        if v.len() != 16 {
+            return Err(format!("a matrix needs 16 numbers, not {}", v.len()));
+        }
+        self.floats(bi, at, &v)
+    }
+
+    fn opaque_field(&mut self, bi: usize, at: usize, node: Node<'_, '_>) -> R<()> {
+        let hex = value(node)?;
+        let bytes: Vec<u8> = (0..16)
+            .map(|i| hex.get(i * 2..i * 2 + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
+            .collect::<Option<_>>()
+            .ok_or_else(|| format!("\"{hex}\" is not 16 bytes of hex"))?;
+        self.put(bi, at, &bytes)
+    }
+
+    /// A number, boolean or vector field.
+    fn scalar_field(&mut self, bi: usize, at: usize, kind: u8, node: Node<'_, '_>) -> R<()> {
+        if let Some(n) = vector_len(kind) {
+            return self.floats(bi, at, &vector(node, n)?);
+        }
+        match kind {
+            ty::BOOL => self.put(bi, at, &[parse_bool(value(node)?)?]),
+            ty::FLOAT => self.put(bi, at, &float(value(node)?)?.to_be_bytes()),
+            ty::SBYTE
+            | ty::UBYTE
+            | ty::SSHORT
+            | ty::USHORT
+            | ty::HFLOAT
+            | ty::SINT
+            | ty::UINT
+            | ty::LONG
+            | ty::ULONG => self.int_field(bi, at, kind, node),
+            other => Err(format!("unexpected data type {other:#04x}")),
+        }
+    }
+
+    fn int_field(&mut self, bi: usize, at: usize, kind: u8, node: Node<'_, '_>) -> R<()> {
+        let v = int(value(node)?)?;
+        match kind {
+            ty::SBYTE | ty::UBYTE => self.put(bi, at, &[v as u8]),
+            ty::SSHORT | ty::USHORT | ty::HFLOAT => self.put(bi, at, &(v as u16).to_be_bytes()),
+            ty::SINT | ty::UINT => self.put(bi, at, &(v as u32).to_be_bytes()),
+            _ => self.put(bi, at, &(v as u64).to_be_bytes()),
+        }
+    }
+
+    fn enum_field(&mut self, bi: usize, at: usize, e: &Entry, node: Node<'_, '_>) -> R<()> {
+        let sub = if self.is_rdr2() { e.sub.saturating_sub(1) } else { e.sub };
+        let v = self.enum_value(e.key, &text(node))?;
+        match sub {
+            0 => self.put(bi, at, &(v as u32).to_be_bytes()),
+            1 => self.put(bi, at, &(v as u16).to_be_bytes()),
+            2 => self.put(bi, at, &[v as u8]),
+            s => Err(format!("unexpected enum subtype {s}")),
+        }
+    }
+
+    /// A structure inline (subtype 0) or through a pointer (3, 4).
+    fn structure_field(&mut self, bi: usize, at: usize, e: &Entry, node: Node<'_, '_>, depth: usize) -> R<()> {
+        match e.sub {
+            0 => self.structure(bi, at, e.key, node, depth + 1),
+            3 | 4 => match node.attribute("type") {
+                Some(t) => self.pointed_structure(bi, at, t, node, depth),
+                None => Ok(()),
+            },
+            s => Err(format!("unexpected structure subtype {s}")),
+        }
+    }
+
+    /// A structure of the type named `type_name` in a new place, with a pointer to it at `at`.
+    fn pointed_structure(&mut self, bi: usize, at: usize, type_name: &str, node: Node<'_, '_>, depth: usize) -> R<()> {
+        let actual = self.struct_named(type_name)?;
+        let len = self.struct_info(actual)?.length;
+        let (pb, poff) = self.alloc(actual, len, align_of(len));
+        self.pointer(bi, at, pb, poff);
+        self.structure(pb, poff, actual, node, depth + 1)
     }
 
     /// A map, mirroring [`Pso::map_node`]: a header (`0x01000000`, pointer
@@ -332,11 +435,7 @@ impl<'a> Builder<'a> {
                     self.structure(pb, base + item_entry.offset, item_entry.key, child, depth + 1)?;
                 }
                 ty::STRUCTURE => {
-                    let actual = self.struct_named(attr(child, "type")?)?;
-                    let len = self.struct_info(actual)?.length;
-                    let (sb, soff) = self.alloc(actual, len, align_of(len));
-                    self.pointer(pb, base + item_entry.offset, sb, soff);
-                    self.structure(sb, soff, actual, child, depth + 1)?;
+                    self.pointed_structure(pb, base + item_entry.offset, attr(child, "type")?, child, depth)?;
                 }
                 _ => {
                     let v = element_children(child)
@@ -470,35 +569,11 @@ impl<'a> Builder<'a> {
         depth: usize,
     ) -> R<()> {
         let at = base + e.offset;
-        let mut index = (e.key & 0xFFFF) as usize;
-        if index >= info.entries.len() {
-            index = (e.key & 0xFFF) as usize;
-        }
-        let item = *info.entries.get(index).ok_or("ARRAYINFO not found")?;
-        let external =
-            matches!(e.sub, 0 | 5) || (e.sub == 4 && item.sub == 3) || matches!(item.kind, ty::STRING | ty::ENUM);
-        if !external && !matches!(e.sub, 1 | 2 | 4 | 129) {
-            return Err(format!("unsupported array subtype {}", e.sub));
-        }
+        let (item, external) = array_item(e, info)?;
         if item.kind == ty::ARRAY {
-            let n = (e.key >> 16) as usize;
-            let items: Vec<_> = element_children(node).collect();
-            if items.len() > n {
-                return Err(format!("{} arrays where the structure holds {n}", items.len()));
-            }
-            for (i, child) in items.into_iter().enumerate() {
-                let inner = Entry { offset: 0, ..item };
-                self.array(bi, at + i * 16, &inner, info, child, depth + 1)?;
-            }
-            return Ok(());
+            return self.nested_arrays(&ItemsAt { block: bi, off: at, size: 16 }, e, info, &item, node, depth);
         }
-        let count = match item.kind {
-            ty::STRUCTURE | ty::STRING | ty::ENUM => element_children(node).count(),
-            ty::FLOAT2 => tokens(node).len().div_ceil(2),
-            ty::FLOAT3 | ty::FLOAT3A => tokens(node).len().div_ceil(3),
-            ty::FLOAT4 | ty::FLOAT4A | ty::VEC4V => tokens(node).len().div_ceil(4),
-            _ => tokens(node).len(),
-        };
+        let count = array_count(item.kind, node);
         if count == 0 {
             // Empty: no storage, and the item type may not even be in the schema.
             if external {
@@ -506,98 +581,139 @@ impl<'a> Builder<'a> {
             }
             return Ok(());
         }
-        // Item size and the block name of external storage.
-        let (size, block_name) = match (item.kind, item.sub) {
-            (ty::STRUCTURE, 3 | 4) => (8, POINTERS),
-            (ty::STRUCTURE, _) => (self.struct_info(item.key)?.length, item.key),
-            (ty::STRING, 7..=15) => (4, UINTS),
-            (ty::STRING, 2) => (8, POINTERS),
-            (ty::STRING, 3) => (16, COUNTED_STRINGS),
-            (ty::STRING, s) => return Err(format!("unexpected string array subtype {s}")),
-            (ty::FLOAT2, _) => (8, ty::FLOAT2 as u32),
-            (ty::FLOAT3 | ty::FLOAT3A | ty::FLOAT4 | ty::FLOAT4A | ty::VEC4V, _) => (16, item.kind as u32),
-            (ty::LONG | ty::ULONG, _) => (8, item.kind as u32),
-            (ty::SBYTE | ty::UBYTE | ty::BOOL, _) => (1, item.kind as u32),
-            (ty::USHORT, _) => (2, item.kind as u32),
-            (ty::FLOAT | ty::UINT | ty::SINT, _) => (4, item.kind as u32),
-            (ty::ENUM, _) => (4, UINTS),
-            (other, _) => return Err(format!("unsupported array item type {other:#04x}")),
-        };
-        // Where the items go: (block, offset).
-        let (ab, aoff) = if external {
+        let (size, block_name) = self.array_item_layout(&item)?;
+        let (ab, aoff) = self.array_storage(bi, at, e, &ArrayShape { external, count, size, block_name })?;
+        self.fill_array(&ItemsAt { block: ab, off: aoff, size }, &item, node, depth)
+    }
+
+    /// An array of arrays: one 16-byte inner array after the other.
+    fn nested_arrays(
+        &mut self,
+        dst: &ItemsAt,
+        e: &Entry,
+        info: &StructInfo,
+        item: &Entry,
+        node: Node<'_, '_>,
+        depth: usize,
+    ) -> R<()> {
+        let n = (e.key >> 16) as usize;
+        let items: Vec<_> = element_children(node).collect();
+        if items.len() > n {
+            return Err(format!("{} arrays where the structure holds {n}", items.len()));
+        }
+        for (i, child) in items.into_iter().enumerate() {
+            let inner = Entry { offset: 0, ..*item };
+            self.array(dst.block, dst.off + i * dst.size, &inner, info, child, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    /// Item size and the block name of external storage.
+    fn array_item_layout(&self, item: &Entry) -> R<(usize, u32)> {
+        match item.kind {
+            ty::STRUCTURE if matches!(item.sub, 3 | 4) => Ok((8, POINTERS)),
+            ty::STRUCTURE => Ok((self.struct_info(item.key)?.length, item.key)),
+            ty::STRING => string_array_layout(item.sub),
+            ty::ENUM => Ok((4, UINTS)),
+            kind => plain_array_layout(kind),
+        }
+    }
+
+    /// Where the items go: (block, offset). External storage is allocated
+    /// with its pointer and count written; inline storage must be big enough.
+    fn array_storage(&mut self, bi: usize, at: usize, e: &Entry, shape: &ArrayShape) -> R<(usize, usize)> {
+        let ArrayShape { external, count, size, block_name } = *shape;
+        if external {
             let n = u16::try_from(count).map_err(|_| format!("{count} items are more than an array holds"))?;
             self.put(bi, at + 8, &n.to_be_bytes())?;
             self.put(bi, at + 10, &n.to_be_bytes())?;
             let (ab, aoff) = self.alloc(block_name, count * size, align_of(size));
             self.pointer(bi, at, ab, aoff);
-            (ab, aoff)
-        } else {
-            let n = (e.key >> 16) as usize;
-            if count > n {
-                return Err(format!("{count} items where the structure holds {n}"));
-            }
-            (bi, at)
-        };
+            return Ok((ab, aoff));
+        }
+        let n = (e.key >> 16) as usize;
+        if count > n {
+            return Err(format!("{count} items where the structure holds {n}"));
+        }
+        Ok((bi, at))
+    }
+
+    fn fill_array(&mut self, dst: &ItemsAt, item: &Entry, node: Node<'_, '_>, depth: usize) -> R<()> {
         match item.kind {
-            ty::STRUCTURE if matches!(item.sub, 3 | 4) => {
-                for (i, child) in element_children(node).enumerate() {
-                    if let Some(t) = child.attribute("type") {
-                        let actual = self.struct_named(t)?;
-                        let len = self.struct_info(actual)?.length;
-                        let (pb, poff) = self.alloc(actual, len, align_of(len));
-                        self.pointer(ab, aoff + i * 8, pb, poff);
-                        self.structure(pb, poff, actual, child, depth + 1)?;
-                    }
-                }
-            }
-            ty::STRUCTURE => {
-                for (i, child) in element_children(node).enumerate() {
-                    self.structure(ab, aoff + i * size, item.key, child, depth + 1)?;
-                }
-            }
-            ty::STRING => {
-                for (i, child) in element_children(node).enumerate() {
-                    let s = text(child);
-                    let p = aoff + i * size;
-                    if item.sub >= 7 {
-                        self.put(ab, p, &names::parse_value(s.trim()).to_be_bytes())?;
-                    } else if item.sub == 3 {
-                        self.counted_string(ab, p, &s)?;
-                    } else if !s.is_empty() {
-                        let (cb, coff) = self.chars(&s);
-                        self.pointer(ab, p, cb, coff);
-                    }
-                }
-            }
-            ty::ENUM => {
-                for (i, child) in element_children(node).enumerate() {
-                    let v = self.enum_value(item.key, &text(child))?;
-                    self.put(ab, aoff + i * 4, &(v as u32).to_be_bytes())?;
-                }
-            }
+            ty::STRUCTURE if matches!(item.sub, 3 | 4) => self.fill_struct_pointers(dst, node, depth),
+            ty::STRUCTURE => self.fill_structs(dst, item, node, depth),
+            ty::STRING => self.fill_strings(dst, item, node),
+            ty::ENUM => self.fill_enums(dst, item, node),
             ty::FLOAT2 | ty::FLOAT3 | ty::FLOAT3A | ty::FLOAT4 | ty::FLOAT4A | ty::VEC4V | ty::FLOAT => {
-                let per = match item.kind {
-                    ty::FLOAT => 1,
-                    ty::FLOAT2 => 2,
-                    ty::FLOAT3 | ty::FLOAT3A => 3,
-                    _ => 4,
-                };
-                for (i, t) in tokens(node).iter().enumerate() {
-                    let p = aoff + (i / per) * size + (i % per) * 4;
-                    self.put(ab, p, &float(t)?.to_be_bytes())?;
-                }
+                self.fill_floats(dst, item, node)
             }
-            _ => {
-                for (i, t) in tokens(node).iter().enumerate() {
-                    let v = int(t)?;
-                    let p = aoff + i * size;
-                    match size {
-                        1 => self.put(ab, p, &[v as u8])?,
-                        2 => self.put(ab, p, &(v as u16).to_be_bytes())?,
-                        4 => self.put(ab, p, &(v as u32).to_be_bytes())?,
-                        _ => self.put(ab, p, &(v as u64).to_be_bytes())?,
-                    }
-                }
+            _ => self.fill_ints(dst, node),
+        }
+    }
+
+    fn fill_struct_pointers(&mut self, dst: &ItemsAt, node: Node<'_, '_>, depth: usize) -> R<()> {
+        for (i, child) in element_children(node).enumerate() {
+            if let Some(t) = child.attribute("type") {
+                self.pointed_structure(dst.block, dst.off + i * 8, t, child, depth)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_structs(&mut self, dst: &ItemsAt, item: &Entry, node: Node<'_, '_>, depth: usize) -> R<()> {
+        for (i, child) in element_children(node).enumerate() {
+            self.structure(dst.block, dst.off + i * dst.size, item.key, child, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn fill_enums(&mut self, dst: &ItemsAt, item: &Entry, node: Node<'_, '_>) -> R<()> {
+        for (i, child) in element_children(node).enumerate() {
+            let v = self.enum_value(item.key, &text(child))?;
+            self.put(dst.block, dst.off + i * 4, &(v as u32).to_be_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn fill_floats(&mut self, dst: &ItemsAt, item: &Entry, node: Node<'_, '_>) -> R<()> {
+        let per = match item.kind {
+            ty::FLOAT => 1,
+            ty::FLOAT2 => 2,
+            ty::FLOAT3 | ty::FLOAT3A => 3,
+            _ => 4,
+        };
+        for (i, t) in tokens(node).iter().enumerate() {
+            let p = dst.off + (i / per) * dst.size + (i % per) * 4;
+            self.put(dst.block, p, &float(t)?.to_be_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn fill_ints(&mut self, dst: &ItemsAt, node: Node<'_, '_>) -> R<()> {
+        for (i, t) in tokens(node).iter().enumerate() {
+            let v = int(t)?;
+            let p = dst.off + i * dst.size;
+            match dst.size {
+                1 => self.put(dst.block, p, &[v as u8])?,
+                2 => self.put(dst.block, p, &(v as u16).to_be_bytes())?,
+                4 => self.put(dst.block, p, &(v as u32).to_be_bytes())?,
+                _ => self.put(dst.block, p, &(v as u64).to_be_bytes())?,
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_strings(&mut self, dst: &ItemsAt, item: &Entry, node: Node<'_, '_>) -> R<()> {
+        for (i, child) in element_children(node).enumerate() {
+            let s = text(child);
+            let p = dst.off + i * dst.size;
+            if item.sub >= 7 {
+                self.put(dst.block, p, &names::parse_value(s.trim()).to_be_bytes())?;
+            } else if item.sub == 3 {
+                self.counted_string(dst.block, p, &s)?;
+            } else if !s.is_empty() {
+                let (cb, coff) = self.chars(&s);
+                self.pointer(dst.block, p, cb, coff);
             }
         }
         Ok(())

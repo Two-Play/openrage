@@ -562,6 +562,10 @@ fn batch_files(files: &dyn GameFiles, root: &str, action: &Action) -> Result<Vec
     Ok(out)
 }
 
+/// Called before each file of a batch with its number, the total and its
+/// path; returning `false` cancels.
+pub type BatchProgress<'a> = dyn FnMut(usize, usize, &str) -> bool + 'a;
+
 /// Runs an action on files and folders of the game (folders only for batch
 /// actions: then once for every matching file inside, with `progress` called
 /// before each file; returning `false` from it cancels). Without folders,
@@ -575,7 +579,7 @@ pub fn run_action(
     action_id: &str,
     targets: &[String],
     picked: &[Picked],
-    progress: &mut dyn FnMut(usize, usize, &str) -> bool,
+    progress: &mut BatchProgress,
 ) -> Result<RunResult> {
     let action = plugin.manifest.action(action_id).with_context(|| format!("no action {action_id:?}"))?;
     if !action.pick.is_empty() && picked.is_empty() {

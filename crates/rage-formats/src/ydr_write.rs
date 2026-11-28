@@ -1088,191 +1088,283 @@ fn build(template: &Resource, parts: &[Part], donor: Option<&Resource>) -> Resul
     b.build(template.version)
 }
 
-/// Writes the levels of one part and points its drawable at them.
-fn write_part(b: &mut Builder, sys: BlockId, template: &Resource, p: &Prepared) -> Result<(), ResourceError> {
-    let copy = |addr: u64, len: usize| -> Result<Vec<u8>, ResourceError> {
-        if !(SYS..GFX).contains(&addr) {
-            return Err(bad("template structure outside system memory"));
-        }
-        Ok(template.bytes(addr, len)?.to_vec())
-    };
-    let lods = p.part.lods;
-    let root_addr = p.root;
-
-    // The template's detail levels: model list, distance, render mask.
-    let mut levels = Vec::new();
-    for k in 0..4u64 {
-        let list = template.u64(root_addr + 0x50 + k * 8)?;
-        let model = if list != 0 && template.u16(list + 8)? > 0 { template.u64(template.u64(list)?)? } else { 0 };
-        let distance = f32::from_le_bytes(template.bytes(root_addr + 0x70 + k * 4, 4)?.try_into().unwrap());
-        levels.push((model, distance, template.u32(root_addr + 0x80 + k * 4)?));
+/// A copy of a template structure; it must lie in system memory.
+fn copy_struct(template: &Resource, addr: u64, len: usize) -> Result<Vec<u8>, ResourceError> {
+    if !(SYS..GFX).contains(&addr) {
+        return Err(bad("template structure outside system memory"));
     }
-    let template_levels = levels.iter().take_while(|l| l.0 != 0).count();
-    let far = levels.iter().map(|l| l.1).fold(0.0f32, f32::max);
-    let far = if far > 0.0 { far } else { 9998.0 };
+    Ok(template.bytes(addr, len)?.to_vec())
+}
 
-    let mut lists = Vec::new();
-    for (level, meshes) in lods.iter().enumerate() {
-        let mut geometry_blocks: Vec<BlockId> = Vec::new();
-        let mut boxes = Vec::new();
-        for m in meshes.iter() {
-            let t = p.template_of(m);
-            let (blend, table) = match &t.bones {
-                Some(table) => blend_of(m, table)?,
-                None => (Vec::new(), None),
+/// The first model of a model list (0 for no list or an empty one).
+fn first_model(template: &Resource, models: u64) -> Result<u64, ResourceError> {
+    if models != 0 && template.u16(models + 8)? > 0 { template.u64(template.u64(models)?) } else { Ok(0) }
+}
+
+/// The template's detail levels: model list, distance, render mask.
+struct Levels {
+    /// (model, distance, render mask) per level.
+    list: Vec<(u64, f32, u32)>,
+    template_levels: usize,
+    far: f32,
+}
+
+impl Levels {
+    fn read(template: &Resource, root_addr: u64) -> Result<Levels, ResourceError> {
+        let mut list = Vec::new();
+        for k in 0..4u64 {
+            let model = first_model(template, template.u64(root_addr + 0x50 + k * 8)?)?;
+            let distance = f32::from_le_bytes(template.bytes(root_addr + 0x70 + k * 4, 4)?.try_into().unwrap());
+            list.push((model, distance, template.u32(root_addr + 0x80 + k * 4)?));
+        }
+        let template_levels = list.iter().take_while(|l| l.0 != 0).count();
+        let far = list.iter().map(|l| l.1).fold(0.0f32, f32::max);
+        let far = if far > 0.0 { far } else { 9998.0 };
+        Ok(Levels { list, template_levels, far })
+    }
+
+    fn mask_of(&self, level: usize) -> u32 {
+        match self.list.get(level) {
+            Some(&(model, _, mask)) if model != 0 => mask,
+            _ => self.list[0].2,
+        }
+    }
+
+    /// Distances: the template's where it has a level that is not its last;
+    /// 50 m doubling per level otherwise; the last level as far as the
+    /// template's furthest.
+    fn distances(&self, level_count: usize) -> [f32; 4] {
+        let mut distances = [self.far; 4];
+        for (level, d) in distances.iter_mut().enumerate().take(level_count - 1) {
+            let fallback = 50.0 * (1 << level) as f32;
+            *d = if level + 1 < self.template_levels && self.list[level].1 > 0.0 {
+                self.list[level].1
+            } else {
+                fallback.min(self.far)
             };
-            let data = vertex_data(m, &t.layout, t.stride, &blend)?;
-            let vdata = b.add(Segment::System, data);
-            let mut idx = Vec::with_capacity(m.indices.len() * 2);
-            for &k in &m.indices {
-                idx.extend_from_slice(&(k as u16).to_le_bytes());
-            }
-            let idata = b.add(Segment::System, idx);
-
-            let mut vb = copy(t.vertex_buffer, BUFFER_SIZE)?;
-            put_u32(&mut vb, 0x08, m.positions.len() as u32);
-            put_u32(&mut vb, 0x0C, t.stride as u32);
-            let vb_obj = b.add(Segment::System, copy(template.u64(t.vertex_buffer + 0x30)?, BUFFER_OBJECT_SIZE)?);
-            let vb = b.add(Segment::System, vb);
-            b.pointer(vb, 0x18, vdata, 0);
-            b.pointer(vb, 0x30, vb_obj, 0);
-
-            let mut ib = copy(t.index_buffer, BUFFER_SIZE)?;
-            put_u32(&mut ib, 0x08, m.indices.len() as u32);
-            put_u32(&mut ib, 0x0C, 2);
-            let ib_obj = b.add(Segment::System, copy(template.u64(t.index_buffer + 0x30)?, BUFFER_OBJECT_SIZE)?);
-            let ib = b.add(Segment::System, ib);
-            b.pointer(ib, 0x18, idata, 0);
-            b.pointer(ib, 0x30, ib_obj, 0);
-
-            let mut g = copy(t.geometry, GEOMETRY_SIZE)?;
-            put_u32(&mut g, 0x58, m.indices.len() as u32);
-            put_u32(&mut g, 0x5C, (m.indices.len() / 3) as u32);
-            put_u16(&mut g, 0x60, m.positions.len() as u16);
-            put_u16(&mut g, 0x70, t.stride as u16);
-            if let Some(table) = &table {
-                put_u16(&mut g, 0x72, table.len() as u16);
-            }
-            let g = b.add(Segment::System, g);
-            b.pointer(g, 0x18, vb, 0);
-            b.pointer(g, 0x38, ib, 0);
-            b.pointer(g, 0x78, vdata, 0);
-            if let Some(table) = table {
-                let mut bytes: Vec<u8> = table.iter().flat_map(|k| k.to_le_bytes()).collect();
-                bytes.resize(bytes.len().div_ceil(16) * 16, 0);
-                let table = b.add(Segment::System, bytes);
-                b.pointer(g, 0x68, table, 0);
-            }
-            geometry_blocks.push(g);
-            boxes.push(bounds(m.positions.iter()));
         }
-        let n = meshes.len();
-        let all = bounds(meshes.iter().flat_map(|m| &m.positions));
-
-        // The model: the template's at this level (its flags), else the one
-        // the first mesh's template geometry belongs to.
-        let first = p.template_of(&meshes[0]);
-        let source_model = match levels.get(level) {
-            Some(&(model, _, _)) if model != 0 => model,
-            _ => first.model,
-        };
-        let mut model = copy(source_model, MODEL_SIZE)?;
-        // A model whose skinning differs from the geometries' (a skinned
-        // level model with fixed geometries): the geometries' own model.
-        if (template.u32(source_model + 0x28)? >> 8 & 0xFF != 0) != first.bones.is_some() {
-            model = copy(first.model, MODEL_SIZE)?;
-        }
-        put_u16(&mut model, 0x10, n as u16);
-        put_u16(&mut model, 0x12, n as u16);
-        let pointers = b.add(Segment::System, vec![0u8; 8 * n]);
-        for (i, g) in geometry_blocks.iter().enumerate() {
-            b.pointer(pointers, i * 8, *g, 0);
-        }
-        let box_count = if n > 1 { n + 1 } else { 1 };
-        let mut aabbs = vec![0u8; 32 * box_count];
-        if n > 1 {
-            put_box(&mut aabbs, 0, all);
-        }
-        for (i, bx) in boxes.iter().enumerate() {
-            put_box(&mut aabbs, 32 * (i + usize::from(n > 1)), *bx);
-        }
-        let aabbs = b.add(Segment::System, aabbs);
-        let mut shader_indices = vec![0u8; (2 * n).div_ceil(16) * 16];
-        for (i, m) in meshes.iter().enumerate() {
-            put_u16(&mut shader_indices, i * 2, p.output_shader(m));
-        }
-        let shader_indices = b.add(Segment::System, shader_indices);
-        let model = b.add(Segment::System, model);
-        b.pointer(model, 0x08, pointers, 0);
-        b.pointer(model, 0x18, aabbs, 0);
-        b.pointer(model, 0x20, shader_indices, 0);
-
-        let models = b.add(Segment::System, vec![0u8; 16]);
-        b.pointer(models, 0, model, 0);
-        let mut list = vec![0u8; 16];
-        put_u16(&mut list, 8, 1);
-        put_u16(&mut list, 10, 1);
-        let list = b.add(Segment::System, list);
-        b.pointer(list, 0, models, 0);
-        lists.push(list);
+        distances
     }
+}
 
-    // Distances: the template's where it has a level that is not its last;
-    // 50 m doubling per level otherwise; the last level as far as the
-    // template's furthest.
-    let mut distances = [far; 4];
-    for (level, d) in distances.iter_mut().enumerate().take(lods.len() - 1) {
-        let fallback = 50.0 * (1 << level) as f32;
-        *d = if level + 1 < template_levels && levels[level].1 > 0.0 { levels[level].1 } else { fallback.min(far) };
-    }
-    let mask_of = |level: usize| match levels.get(level) {
-        Some(&(model, _, mask)) if model != 0 => mask,
-        _ => levels[0].2,
+/// A block of a written geometry and the bounds of its mesh.
+type WrittenGeometry = (BlockId, ([f32; 3], [f32; 3]));
+
+/// The vertex buffer of a mesh, copied from its template geometry.
+fn write_vertex_buffer(
+    b: &mut Builder,
+    template: &Resource,
+    t: &TemplateGeometry,
+    m: &NewMesh,
+    vdata: BlockId,
+) -> Result<BlockId, ResourceError> {
+    let mut vb = copy_struct(template, t.vertex_buffer, BUFFER_SIZE)?;
+    put_u32(&mut vb, 0x08, m.positions.len() as u32);
+    put_u32(&mut vb, 0x0C, t.stride as u32);
+    let vb_obj =
+        b.add(Segment::System, copy_struct(template, template.u64(t.vertex_buffer + 0x30)?, BUFFER_OBJECT_SIZE)?);
+    let vb = b.add(Segment::System, vb);
+    b.pointer(vb, 0x18, vdata, 0);
+    b.pointer(vb, 0x30, vb_obj, 0);
+    Ok(vb)
+}
+
+/// The index buffer of a mesh, copied from its template geometry.
+fn write_index_buffer(
+    b: &mut Builder,
+    template: &Resource,
+    t: &TemplateGeometry,
+    m: &NewMesh,
+    idata: BlockId,
+) -> Result<BlockId, ResourceError> {
+    let mut ib = copy_struct(template, t.index_buffer, BUFFER_SIZE)?;
+    put_u32(&mut ib, 0x08, m.indices.len() as u32);
+    put_u32(&mut ib, 0x0C, 2);
+    let ib_obj =
+        b.add(Segment::System, copy_struct(template, template.u64(t.index_buffer + 0x30)?, BUFFER_OBJECT_SIZE)?);
+    let ib = b.add(Segment::System, ib);
+    b.pointer(ib, 0x18, idata, 0);
+    b.pointer(ib, 0x30, ib_obj, 0);
+    Ok(ib)
+}
+
+/// Writes one mesh as a geometry of its template geometry.
+fn write_mesh(
+    b: &mut Builder,
+    template: &Resource,
+    p: &Prepared,
+    m: &NewMesh,
+) -> Result<WrittenGeometry, ResourceError> {
+    let t = p.template_of(m);
+    let (blend, table) = match &t.bones {
+        Some(table) => blend_of(m, table)?,
+        None => (Vec::new(), None),
     };
+    let data = vertex_data(m, &t.layout, t.stride, &blend)?;
+    let vdata = b.add(Segment::System, data);
+    let mut idx = Vec::with_capacity(m.indices.len() * 2);
+    for &k in &m.indices {
+        idx.extend_from_slice(&(k as u16).to_le_bytes());
+    }
+    let idata = b.add(Segment::System, idx);
 
-    let all = bounds(lods[0].iter().flat_map(|m| &m.positions));
+    let vb = write_vertex_buffer(b, template, t, m, vdata)?;
+    let ib = write_index_buffer(b, template, t, m, idata)?;
+
+    let mut g = copy_struct(template, t.geometry, GEOMETRY_SIZE)?;
+    put_u32(&mut g, 0x58, m.indices.len() as u32);
+    put_u32(&mut g, 0x5C, (m.indices.len() / 3) as u32);
+    put_u16(&mut g, 0x60, m.positions.len() as u16);
+    put_u16(&mut g, 0x70, t.stride as u16);
+    if let Some(table) = &table {
+        put_u16(&mut g, 0x72, table.len() as u16);
+    }
+    let g = b.add(Segment::System, g);
+    b.pointer(g, 0x18, vb, 0);
+    b.pointer(g, 0x38, ib, 0);
+    b.pointer(g, 0x78, vdata, 0);
+    if let Some(table) = table {
+        let mut bytes: Vec<u8> = table.iter().flat_map(|k| k.to_le_bytes()).collect();
+        bytes.resize(bytes.len().div_ceil(16) * 16, 0);
+        let table = b.add(Segment::System, bytes);
+        b.pointer(g, 0x68, table, 0);
+    }
+    Ok((g, bounds(m.positions.iter())))
+}
+
+/// The bounding boxes of a model: the total (if more than one mesh), then each mesh's.
+fn write_aabbs(b: &mut Builder, meshes: &[NewMesh], written: &[WrittenGeometry]) -> BlockId {
+    let n = meshes.len();
+    let all = bounds(meshes.iter().flat_map(|m| &m.positions));
+    let box_count = if n > 1 { n + 1 } else { 1 };
+    let mut aabbs = vec![0u8; 32 * box_count];
+    if n > 1 {
+        put_box(&mut aabbs, 0, all);
+    }
+    for (i, (_, bx)) in written.iter().enumerate() {
+        put_box(&mut aabbs, 32 * (i + usize::from(n > 1)), *bx);
+    }
+    b.add(Segment::System, aabbs)
+}
+
+/// The model of one level, and the list that holds it.
+fn write_model(
+    b: &mut Builder,
+    template: &Resource,
+    p: &Prepared,
+    levels: &Levels,
+    (level, meshes, written): (usize, &[NewMesh], &[WrittenGeometry]),
+) -> Result<BlockId, ResourceError> {
+    let n = meshes.len();
+    // The model: the template's at this level (its flags), else the one
+    // the first mesh's template geometry belongs to.
+    let first = p.template_of(&meshes[0]);
+    let source_model = match levels.list.get(level) {
+        Some(&(model, _, _)) if model != 0 => model,
+        _ => first.model,
+    };
+    let mut model = copy_struct(template, source_model, MODEL_SIZE)?;
+    // A model whose skinning differs from the geometries' (a skinned
+    // level model with fixed geometries): the geometries' own model.
+    if (template.u32(source_model + 0x28)? >> 8 & 0xFF != 0) != first.bones.is_some() {
+        model = copy_struct(template, first.model, MODEL_SIZE)?;
+    }
+    put_u16(&mut model, 0x10, n as u16);
+    put_u16(&mut model, 0x12, n as u16);
+    let pointers = b.add(Segment::System, vec![0u8; 8 * n]);
+    for (i, (g, _)) in written.iter().enumerate() {
+        b.pointer(pointers, i * 8, *g, 0);
+    }
+    let aabbs = write_aabbs(b, meshes, written);
+    let mut shader_indices = vec![0u8; (2 * n).div_ceil(16) * 16];
+    for (i, m) in meshes.iter().enumerate() {
+        put_u16(&mut shader_indices, i * 2, p.output_shader(m));
+    }
+    let shader_indices = b.add(Segment::System, shader_indices);
+    let model = b.add(Segment::System, model);
+    b.pointer(model, 0x08, pointers, 0);
+    b.pointer(model, 0x18, aabbs, 0);
+    b.pointer(model, 0x20, shader_indices, 0);
+
+    let models = b.add(Segment::System, vec![0u8; 16]);
+    b.pointer(models, 0, model, 0);
+    let mut list = vec![0u8; 16];
+    put_u16(&mut list, 8, 1);
+    put_u16(&mut list, 10, 1);
+    let list = b.add(Segment::System, list);
+    b.pointer(list, 0, models, 0);
+    Ok(list)
+}
+
+/// Writes the bounding sphere and box of the part's first level into its drawable.
+fn write_root_bounds(b: &mut Builder, sys: BlockId, root: usize, first_level: &[NewMesh]) {
+    let all = bounds(first_level.iter().flat_map(|m| &m.positions));
     let centre = [(all.0[0] + all.1[0]) / 2.0, (all.0[1] + all.1[1]) / 2.0, (all.0[2] + all.1[2]) / 2.0];
-    let radius = lods[0]
+    let radius = first_level
         .iter()
         .flat_map(|m| &m.positions)
         .map(|p| dot(sub(*p, centre), sub(*p, centre)).sqrt())
         .fold(0.0f32, f32::max);
+    let d = b.data_mut(sys);
+    for (k, c) in centre.iter().enumerate() {
+        put_f32(d, root + 0x20 + k * 4, *c);
+        put_f32(d, root + 0x30 + k * 4, all.0[k]);
+        put_f32(d, root + 0x40 + k * 4, all.1[k]);
+    }
+    put_f32(d, root + 0x2C, radius);
+    d[root + 0x50..root + 0x70].fill(0);
+}
+
+/// Writes the levels of one part and points its drawable at them.
+fn write_part(b: &mut Builder, sys: BlockId, template: &Resource, p: &Prepared) -> Result<(), ResourceError> {
+    let lods = p.part.lods;
+    let root_addr = p.root;
+    let levels = Levels::read(template, root_addr)?;
+
+    let mut lists = Vec::new();
+    for (level, meshes) in lods.iter().enumerate() {
+        let mut written = Vec::with_capacity(meshes.len());
+        for m in meshes.iter() {
+            written.push(write_mesh(b, template, p, m)?);
+        }
+        lists.push(write_model(b, template, p, &levels, (level, *meshes, &written))?);
+    }
+
     let root = (root_addr - SYS) as usize;
-    {
-        let d = b.data_mut(sys);
-        for (k, c) in centre.iter().enumerate() {
-            put_f32(d, root + 0x20 + k * 4, *c);
-            put_f32(d, root + 0x30 + k * 4, all.0[k]);
-            put_f32(d, root + 0x40 + k * 4, all.1[k]);
-        }
-        put_f32(d, root + 0x2C, radius);
-        d[root + 0x50..root + 0x70].fill(0);
-    }
-    // A fragment keeps its levels: vehicles choose them by distance
-    // themselves (vehicles.meta), so every level the template has gets the
-    // furthest one given, and the distances and masks stay.
+    write_root_bounds(b, sys, root, lods[0]);
     if p.fragment {
-        let count = lists.len().max(template_levels);
-        for k in 0..count {
-            let list = lists[k.min(lists.len() - 1)];
-            b.pointer(sys, root + 0x50 + k * 8, list, 0);
-            if k >= template_levels {
-                put_u32(b.data_mut(sys), root + 0x80 + k * 4, mask_of(0));
-            }
-        }
-        return Ok(());
-    }
-    {
-        let d = b.data_mut(sys);
-        for (k, distance) in distances.iter().enumerate() {
-            put_f32(d, root + 0x70 + k * 4, *distance);
-            put_u32(d, root + 0x80 + k * 4, if k < lods.len() { mask_of(k) } else { 0 });
-        }
-    }
-    for (k, list) in lists.into_iter().enumerate() {
-        b.pointer(sys, root + 0x50 + k * 8, list, 0);
+        keep_levels(b, sys, root, &levels, &lists);
+    } else {
+        write_levels(b, sys, root, &levels, &lists, lods.len());
     }
     Ok(())
+}
+
+/// A fragment keeps its levels: vehicles choose them by distance
+/// themselves (vehicles.meta), so every level the template has gets the
+/// furthest one given, and the distances and masks stay.
+fn keep_levels(b: &mut Builder, sys: BlockId, root: usize, levels: &Levels, lists: &[BlockId]) {
+    let count = lists.len().max(levels.template_levels);
+    for k in 0..count {
+        let list = lists[k.min(lists.len() - 1)];
+        b.pointer(sys, root + 0x50 + k * 8, list, 0);
+        if k >= levels.template_levels {
+            put_u32(b.data_mut(sys), root + 0x80 + k * 4, levels.mask_of(0));
+        }
+    }
+}
+
+/// Writes the levels' distances, masks and lists.
+fn write_levels(b: &mut Builder, sys: BlockId, root: usize, levels: &Levels, lists: &[BlockId], level_count: usize) {
+    let distances = levels.distances(level_count);
+    let d = b.data_mut(sys);
+    for (k, distance) in distances.iter().enumerate() {
+        put_f32(d, root + 0x70 + k * 4, *distance);
+        put_u32(d, root + 0x80 + k * 4, if k < level_count { levels.mask_of(k) } else { 0 });
+    }
+    for (k, list) in lists.iter().enumerate() {
+        b.pointer(sys, root + 0x50 + k * 8, *list, 0);
+    }
 }
 
 /// Per vertex of a mesh at a skinned template geometry, its blend weights and

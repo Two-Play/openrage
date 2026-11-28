@@ -108,6 +108,258 @@ pub fn rebuild(res: &Resource, kind: u32, flags: u32, dict: &TextureDictionary) 
     Ok(apply_inner(res, kind, flags, dict, &[], &Target::STANDALONE, true)?.file)
 }
 
+/// Rejects replacements GTA IV cannot take.
+fn check_edits(edits: &[Edit]) -> Result<(), ResourceError> {
+    for e in edits {
+        if let Edit::Set(t) = e {
+            if t.expected_size().is_none_or(|n| n > t.data.len()) {
+                return Err(bad(format!("{}: pixel data is shorter than its format and size require", t.name)));
+            }
+            if t.depth > 1 || t.format.to_d3d9().is_none() {
+                return Err(bad(format!("{}: {} textures cannot go into GTA IV", t.name, t.format.name())));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn find_texture(dict: &TextureDictionary, name: &str) -> Option<usize> {
+    dict.textures.iter().position(|t| t.name.eq_ignore_ascii_case(name))
+}
+
+/// Overwrites pixel data where only same-shape replacements are asked for.
+fn write_in_place(
+    res: &Resource,
+    kind: u32,
+    flags: u32,
+    dict: &TextureDictionary,
+    edits: &[Edit],
+) -> Result<Option<EditResult>, ResourceError> {
+    let in_place = edits.iter().all(|e| match e {
+        Edit::Set(t) => find_texture(dict, &t.name).is_some_and(|i| same_shape(&dict.textures[i], t)),
+        Edit::Remove(_) => false,
+    });
+    if !in_place {
+        return Ok(None);
+    }
+    let mut out = res.clone();
+    for e in edits {
+        let Edit::Set(t) = e else { unreachable!() };
+        let i = find_texture(dict, &t.name).expect("checked");
+        out.bytes_mut(dict.stored[i].data_ptr, t.data.len())?.copy_from_slice(&t.data);
+    }
+    let file = rage_resource::write_rsc5(kind, flags, &out.system, &out.graphics)?;
+    Ok(Some(EditResult { file, in_place: true, replaced: edits.len(), added: 0, removed: 0 }))
+}
+
+/// The structures as laid out in system memory, in dictionary order.
+fn texture_addresses(res: &Resource, root: u64, dict: &TextureDictionary) -> Result<Vec<u32>, ResourceError> {
+    let list = res.u32(root + 0x18)? as u64;
+    (0..dict.textures.len() as u64).map(|i| res.u32(list + i * 4)).collect()
+}
+
+/// One texture of the final list.
+struct Entry {
+    texture: Texture,
+    /// Index in the dictionary, or `None` when added.
+    original: Option<usize>,
+    /// The pixel data changed.
+    changed: bool,
+}
+
+/// The final list of textures and what was done to get there.
+struct Merged {
+    entries: Vec<Entry>,
+    replaced: usize,
+    added: usize,
+    removed: usize,
+}
+
+impl Merged {
+    fn remove(
+        &mut self,
+        dict: &TextureDictionary,
+        target: &Target,
+        addresses: &[u32],
+        name: &str,
+    ) -> Result<(), ResourceError> {
+        if let Some(i) = find_texture(dict, name)
+            && let Some((_, shader)) = target.in_use.iter().find(|(a, _)| *a == addresses[i] as u64)
+        {
+            return Err(bad(format!("{name} is used by the shader {shader}; replace it instead")));
+        }
+        let before = self.entries.len();
+        self.entries.retain(|e| !e.texture.name.eq_ignore_ascii_case(name));
+        if self.entries.len() == before {
+            return Err(bad(format!("{name}: no such texture")));
+        }
+        self.removed += 1;
+        Ok(())
+    }
+
+    fn set(&mut self, dict: &TextureDictionary, new: &Texture) -> Result<(), ResourceError> {
+        match self.entries.iter_mut().find(|e| e.texture.name.eq_ignore_ascii_case(&new.name)) {
+            Some(slot) => {
+                slot.texture = Texture { name: slot.texture.name.clone(), ..new.clone() };
+                slot.changed = true;
+                self.replaced += 1;
+            }
+            None => {
+                if dict.stored.is_empty() {
+                    return Err(bad("cannot add a texture to an empty dictionary (no template texture)"));
+                }
+                self.entries.push(Entry { texture: new.clone(), original: None, changed: true });
+                self.added += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn merge_edits(
+    dict: &TextureDictionary,
+    edits: &[Edit],
+    target: &Target,
+    addresses: &[u32],
+) -> Result<Merged, ResourceError> {
+    let entries = dict
+        .textures
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(i, texture)| Entry { texture, original: Some(i), changed: false })
+        .collect();
+    let mut merged = Merged { entries, replaced: 0, added: 0, removed: 0 };
+    for e in edits {
+        match e {
+            Edit::Remove(name) => merged.remove(dict, target, addresses, name)?,
+            Edit::Set(new) => merged.set(dict, new)?,
+        }
+    }
+    // The game looks textures up by binary search over the sorted hash list.
+    merged.entries.sort_by_key(|e| name_hash(&e.texture.name));
+    Ok(merged)
+}
+
+/// Appends `bytes` to system memory (16-aligned) and returns their address.
+fn append_system(sys: &mut Vec<u8>, bytes: &[u8]) -> u32 {
+    let at = sys.len().next_multiple_of(16);
+    sys.resize(at, 0);
+    sys.extend_from_slice(bytes);
+    SYSTEM_BASE + at as u32
+}
+
+/// The memory being written.
+struct Memory<'a> {
+    dict: &'a TextureDictionary,
+    target: &'a Target<'a>,
+    addresses: &'a [u32],
+    sys: Vec<u8>,
+    gfx: Vec<u8>,
+    tex_addrs: Vec<u32>,
+}
+
+impl Memory<'_> {
+    /// Where the pixel data of an entry goes.
+    fn place_data(&mut self, e: &Entry, size: usize) -> u32 {
+        match e.original {
+            // Unchanged pixel data stays where it is when the graphics memory is kept.
+            Some(i) if self.target.keep_graphics && !e.changed => self.dict.stored[i].data_ptr as u32,
+            _ => {
+                let data_at = self.gfx.len().next_multiple_of(DATA_ALIGN);
+                self.gfx.resize(data_at, 0);
+                self.gfx.extend_from_slice(&e.texture.data[..size]);
+                GRAPHICS_BASE + data_at as u32
+            }
+        }
+    }
+
+    /// The structure of an added texture: a copy of the template with its own name.
+    fn add_structure(&mut self, tex: &Texture, template: &[u8], data_field: usize) -> u32 {
+        let mut name = format!("pack:/{}.dds", tex.name).into_bytes();
+        name.push(0);
+        let name_ptr = append_system(&mut self.sys, &name);
+        let mut t = template.to_vec();
+        t.resize(Layout::Gta4.texture_size(), 0);
+        put_u32(&mut t, 0x14, name_ptr);
+        put_u32(&mut t, 0x18, 0);
+        if data_field == 0x48 {
+            put_u32(&mut t, 0x40, 0);
+            put_u32(&mut t, 0x44, 0);
+        }
+        append_system(&mut self.sys, &t)
+    }
+
+    fn write_entry(&mut self, e: &Entry) -> Result<(), ResourceError> {
+        let tex = &e.texture;
+        let size = tex.expected_size().ok_or_else(|| bad(format!("{}: unsupported format", tex.name)))?;
+        let data_ptr = self.place_data(e, size);
+
+        let template = &self.dict.stored[e.original.unwrap_or(0)];
+        // The data pointer sits at 0x48, or 0x44 in a few older dictionaries.
+        let data_field = if get_u32(&template.template, 0x48)? as u64 == template.data_ptr { 0x48 } else { 0x44 };
+        let addr = match e.original {
+            Some(i) => self.addresses[i],
+            None => self.add_structure(tex, &template.template, data_field),
+        };
+        let code = tex.format.to_d3d9().expect("checked above");
+        let stride = (tex.level_size(0).unwrap_or(0) / tex.height.max(1) as usize) as u16;
+        let at = (addr - SYSTEM_BASE) as usize;
+        let t = self.sys.get_mut(at..at + Layout::Gta4.texture_size()).ok_or_else(|| bad("texture outside memory"))?;
+        put_u16(t, 0x1C, tex.width as u16);
+        put_u16(t, 0x1E, tex.height as u16);
+        put_u32(t, 0x20, code);
+        put_u16(t, 0x24, stride);
+        t[0x27] = tex.levels as u8;
+        put_u32(t, data_field, data_ptr);
+        self.tex_addrs.push(addr);
+        Ok(())
+    }
+
+    /// Hash and pointer lists: rewritten where they are when they still fit.
+    fn write_lists(&mut self, entries: &[Entry], root: u64) -> Result<(), ResourceError> {
+        let count = entries.len() as u16;
+        let hashes: Vec<u8> = entries.iter().flat_map(|e| name_hash(&e.texture.name).to_le_bytes()).collect();
+        let pointers: Vec<u8> = self.tex_addrs.iter().flat_map(|a| a.to_le_bytes()).collect();
+        let root_at = (root as u32).checked_sub(SYSTEM_BASE).ok_or_else(|| bad("dictionary outside memory"))? as usize;
+        for (at, bytes) in [(root_at + 0x10, hashes), (root_at + 0x18, pointers)] {
+            self.write_list(at, count, &bytes)?;
+        }
+        Ok(())
+    }
+
+    /// The RSC5 file; its flags are recomputed when the memory changed size.
+    fn into_file(self, res: &Resource, kind: u32, flags: u32) -> Result<Vec<u8>, ResourceError> {
+        let Memory { mut sys, mut gfx, .. } = self;
+        let (new_flags, sys_len, gfx_len) = if sys.len() == res.system.len() && gfx.len() == res.graphics.len() {
+            (flags, sys.len(), gfx.len())
+        } else {
+            rage_resource::rsc5_flags_for(sys.len(), gfx.len(), flags)
+        };
+        sys.resize(sys_len, 0);
+        gfx.resize(gfx_len, 0);
+        rage_resource::write_rsc5(kind, new_flags, &sys, &gfx)
+    }
+
+    fn write_list(&mut self, at: usize, count: u16, bytes: &[u8]) -> Result<(), ResourceError> {
+        let sys = &mut self.sys;
+        let capacity = sys.u16_at(at + 6).ok_or_else(|| bad("list outside memory"))?;
+        let old = get_u32(sys, at)?;
+        let ptr = if count <= capacity && old >= SYSTEM_BASE {
+            let ptr = old;
+            let off = (ptr - SYSTEM_BASE) as usize;
+            sys.get_mut(off..off + bytes.len()).ok_or_else(|| bad("list outside memory"))?.copy_from_slice(bytes);
+            ptr
+        } else {
+            put_u16(sys, at + 6, count);
+            append_system(sys, bytes)
+        };
+        put_u32(sys, at, ptr);
+        put_u16(sys, at + 4, count);
+        Ok(())
+    }
+}
+
 fn apply_inner(
     res: &Resource,
     kind: u32,
@@ -123,164 +375,43 @@ fn apply_inner(
     if !dict.errors.is_empty() {
         return Err(bad(format!("dictionary has unreadable textures ({}); refusing to rewrite it", dict.errors[0])));
     }
-    let find = |name: &str| dict.textures.iter().position(|t| t.name.eq_ignore_ascii_case(name));
-    for e in edits {
-        if let Edit::Set(t) = e {
-            if t.expected_size().is_none_or(|n| n > t.data.len()) {
-                return Err(bad(format!("{}: pixel data is shorter than its format and size require", t.name)));
-            }
-            if t.depth > 1 || t.format.to_d3d9().is_none() {
-                return Err(bad(format!("{}: {} textures cannot go into GTA IV", t.name, t.format.name())));
-            }
-        }
-    }
+    check_edits(edits)?;
 
     // In place: only same-shape replacements.
-    let in_place = !force_rebuild
-        && edits.iter().all(|e| match e {
-            Edit::Set(t) => find(&t.name).is_some_and(|i| same_shape(&dict.textures[i], t)),
-            Edit::Remove(_) => false,
-        });
-    if in_place {
-        let mut out = res.clone();
-        for e in edits {
-            let Edit::Set(t) = e else { unreachable!() };
-            let i = find(&t.name).expect("checked");
-            out.bytes_mut(dict.stored[i].data_ptr, t.data.len())?.copy_from_slice(&t.data);
-        }
-        let file = rage_resource::write_rsc5(kind, flags, &out.system, &out.graphics)?;
-        return Ok(EditResult { file, in_place: true, replaced: edits.len(), added: 0, removed: 0 });
+    if !force_rebuild && let Some(done) = write_in_place(res, kind, flags, dict, edits)? {
+        return Ok(done);
     }
+    rewrite(res, (kind, flags), dict, edits, target)
+}
 
-    // The structures as laid out in system memory, in dictionary order.
+/// Lays the dictionary out anew with `edits` applied.
+fn rewrite(
+    res: &Resource,
+    (kind, flags): (u32, u32),
+    dict: &TextureDictionary,
+    edits: &[Edit],
+    target: &Target,
+) -> Result<EditResult, ResourceError> {
     let root = target.root;
-    let list = res.u32(root + 0x18)? as u64;
-    let addresses: Vec<u32> =
-        (0..dict.textures.len() as u64).map(|i| res.u32(list + i * 4)).collect::<Result<_, _>>()?;
+    let addresses = texture_addresses(res, root, dict)?;
 
-    // Final list: (texture, original index or None when added, pixel data changed).
-    let mut entries: Vec<(Texture, Option<usize>, bool)> =
-        dict.textures.iter().cloned().enumerate().map(|(i, t)| (t, Some(i), false)).collect();
-    let (mut replaced, mut added, mut removed) = (0, 0, 0);
-    for e in edits {
-        match e {
-            Edit::Remove(name) => {
-                if let Some(i) = find(name)
-                    && let Some((_, shader)) = target.in_use.iter().find(|(a, _)| *a == addresses[i] as u64)
-                {
-                    return Err(bad(format!("{name} is used by the shader {shader}; replace it instead")));
-                }
-                let before = entries.len();
-                entries.retain(|(t, _, _)| !t.name.eq_ignore_ascii_case(name));
-                if entries.len() == before {
-                    return Err(bad(format!("{name}: no such texture")));
-                }
-                removed += 1;
-            }
-            Edit::Set(new) => match entries.iter_mut().find(|(t, _, _)| t.name.eq_ignore_ascii_case(&new.name)) {
-                Some(slot) => {
-                    slot.0 = Texture { name: slot.0.name.clone(), ..new.clone() };
-                    slot.2 = true;
-                    replaced += 1;
-                }
-                None => {
-                    if dict.stored.is_empty() {
-                        return Err(bad("cannot add a texture to an empty dictionary (no template texture)"));
-                    }
-                    entries.push((new.clone(), None, true));
-                    added += 1;
-                }
-            },
-        }
-    }
-    // The game looks textures up by binary search over the sorted hash list.
-    entries.sort_by_key(|(t, _, _)| name_hash(&t.name));
-
-    let mut sys = res.system.clone();
-    let append = |sys: &mut Vec<u8>, bytes: &[u8]| -> u32 {
-        let at = sys.len().next_multiple_of(16);
-        sys.resize(at, 0);
-        sys.extend_from_slice(bytes);
-        SYSTEM_BASE + at as u32
+    let merged = merge_edits(dict, edits, target, &addresses)?;
+    let gfx: Vec<u8> = if target.keep_graphics { res.graphics.clone() } else { Vec::new() };
+    let mut mem = Memory {
+        dict,
+        target,
+        addresses: &addresses,
+        sys: res.system.clone(),
+        gfx,
+        tex_addrs: Vec::with_capacity(merged.entries.len()),
     };
-    let mut gfx: Vec<u8> = if target.keep_graphics { res.graphics.clone() } else { Vec::new() };
-    let mut tex_addrs = Vec::with_capacity(entries.len());
-    for (tex, original, changed) in &entries {
-        let size = tex.expected_size().ok_or_else(|| bad(format!("{}: unsupported format", tex.name)))?;
-        let data_ptr = match original {
-            // Unchanged pixel data stays where it is when the graphics memory is kept.
-            Some(i) if target.keep_graphics && !changed => dict.stored[*i].data_ptr as u32,
-            _ => {
-                let data_at = gfx.len().next_multiple_of(DATA_ALIGN);
-                gfx.resize(data_at, 0);
-                gfx.extend_from_slice(&tex.data[..size]);
-                GRAPHICS_BASE + data_at as u32
-            }
-        };
-
-        let template = &dict.stored[original.unwrap_or(0)];
-        // The data pointer sits at 0x48, or 0x44 in a few older dictionaries.
-        let data_field = if get_u32(&template.template, 0x48)? as u64 == template.data_ptr { 0x48 } else { 0x44 };
-        let addr = match original {
-            Some(i) => addresses[*i],
-            None => {
-                let mut name = format!("pack:/{}.dds", tex.name).into_bytes();
-                name.push(0);
-                let name_ptr = append(&mut sys, &name);
-                let mut t = template.template.clone();
-                t.resize(Layout::Gta4.texture_size(), 0);
-                put_u32(&mut t, 0x14, name_ptr);
-                put_u32(&mut t, 0x18, 0);
-                if data_field == 0x48 {
-                    put_u32(&mut t, 0x40, 0);
-                    put_u32(&mut t, 0x44, 0);
-                }
-                append(&mut sys, &t)
-            }
-        };
-        let code = tex.format.to_d3d9().expect("checked above");
-        let stride = (tex.level_size(0).unwrap_or(0) / tex.height.max(1) as usize) as u16;
-        let at = (addr - SYSTEM_BASE) as usize;
-        let t = sys.get_mut(at..at + Layout::Gta4.texture_size()).ok_or_else(|| bad("texture outside memory"))?;
-        put_u16(t, 0x1C, tex.width as u16);
-        put_u16(t, 0x1E, tex.height as u16);
-        put_u32(t, 0x20, code);
-        put_u16(t, 0x24, stride);
-        t[0x27] = tex.levels as u8;
-        put_u32(t, data_field, data_ptr);
-        tex_addrs.push(addr);
+    for e in &merged.entries {
+        mem.write_entry(e)?;
     }
+    mem.write_lists(&merged.entries, root)?;
 
-    // Hash and pointer lists: rewritten where they are when they still fit.
-    let count = entries.len() as u16;
-    let hashes: Vec<u8> = entries.iter().flat_map(|(t, _, _)| name_hash(&t.name).to_le_bytes()).collect();
-    let pointers: Vec<u8> = tex_addrs.iter().flat_map(|a| a.to_le_bytes()).collect();
-    let root_at = (root as u32).checked_sub(SYSTEM_BASE).ok_or_else(|| bad("dictionary outside memory"))? as usize;
-    for (at, bytes) in [(root_at + 0x10, hashes), (root_at + 0x18, pointers)] {
-        let capacity = sys.u16_at(at + 6).ok_or_else(|| bad("list outside memory"))?;
-        let old = get_u32(&sys, at)?;
-        let ptr = if count <= capacity && old >= SYSTEM_BASE {
-            let ptr = old;
-            let off = (ptr - SYSTEM_BASE) as usize;
-            sys.get_mut(off..off + bytes.len()).ok_or_else(|| bad("list outside memory"))?.copy_from_slice(&bytes);
-            ptr
-        } else {
-            put_u16(&mut sys, at + 6, count);
-            append(&mut sys, &bytes)
-        };
-        put_u32(&mut sys, at, ptr);
-        put_u16(&mut sys, at + 4, count);
-    }
-
-    let (new_flags, sys_len, gfx_len) = if sys.len() == res.system.len() && gfx.len() == res.graphics.len() {
-        (flags, sys.len(), gfx.len())
-    } else {
-        rage_resource::rsc5_flags_for(sys.len(), gfx.len(), flags)
-    };
-    sys.resize(sys_len, 0);
-    gfx.resize(gfx_len, 0);
-    let file = rage_resource::write_rsc5(kind, new_flags, &sys, &gfx)?;
-    Ok(EditResult { file, in_place: false, replaced, added, removed })
+    let file = mem.into_file(res, kind, flags)?;
+    Ok(EditResult { file, in_place: false, replaced: merged.replaced, added: merged.added, removed: merged.removed })
 }
 
 #[cfg(test)]

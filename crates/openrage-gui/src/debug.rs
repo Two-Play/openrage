@@ -134,44 +134,67 @@ pub(crate) fn debug_viewer(ui: &AppWindow) {
     }
 }
 
+/// Writes `snap` as a PNG to `path` (if it was taken) and quits.
+#[cfg(debug_assertions)]
+fn save_snapshot_and_quit<E>(snap: Option<Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>, E>>, path: &str) {
+    if let Some(Ok(img)) = snap {
+        let _ = rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(path, png));
+    }
+    let _ = slint::quit_event_loop();
+}
+
 /// The part of [`debug_snapshot`] after selecting a file.
 #[cfg(debug_assertions)]
 pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
-    // `OPENRAGE_TOOL=<n>`: the n-th plugin tool's window (`OPENRAGE_TOOL_SET=<i>=<value>`
-    // types into its i-th field first).
-    if let Ok(n) = std::env::var("OPENRAGE_TOOL") {
-        open_tool(ui, n.parse().unwrap_or(0));
-        if let Some(win) = newest_tool_window()
-            && let Ok(set) = std::env::var("OPENRAGE_TOOL_SET")
-            && let Some((i, value)) = set.split_once('=')
-        {
-            win.invoke_changed(i.parse().unwrap_or(0), value.into());
-        }
-        slint::Timer::single_shot(Duration::from_millis(2500), move || {
-            if let Some(Ok(img)) = newest_tool_window().map(|w| w.window().take_snapshot()) {
-                let _ =
-                    rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(&path, png));
-            }
-            let _ = slint::quit_event_loop();
-        });
-        return;
-    }
-    // `OPENRAGE_ASI`: the ASI mods window instead of the explorer.
-    if std::env::var("OPENRAGE_ASI").is_ok() {
-        open_asi_window(ui);
-        slint::Timer::single_shot(Duration::from_millis(800), move || {
-            if let Some(Ok(img)) = asi_window().map(|w| w.window().take_snapshot()) {
-                let _ =
-                    rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(&path, png));
-            }
-            let _ = slint::quit_event_loop();
-        });
+    if debug_tool(ui, &path) || debug_asi(ui, &path) {
         return;
     }
     // A file selected by `OPENRAGE_SELECT` opens in the viewer only now.
     if viewer::newest().is_none() && std::env::var("OPENRAGE_SELECT").is_ok() {
         debug_viewer(ui);
     }
+    debug_open_windows(ui);
+    if debug_cast(&path) || debug_map(ui, &path) || debug_scene(ui, &path) {
+        return;
+    }
+    debug_final_snapshot(ui, path);
+}
+
+/// `OPENRAGE_TOOL=<n>`: the n-th plugin tool's window (`OPENRAGE_TOOL_SET=<i>=<value>`
+/// types into its i-th field first).
+#[cfg(debug_assertions)]
+fn debug_tool(ui: &AppWindow, path: &str) -> bool {
+    let Ok(n) = std::env::var("OPENRAGE_TOOL") else { return false };
+    open_tool(ui, n.parse().unwrap_or(0));
+    if let Some(win) = newest_tool_window()
+        && let Ok(set) = std::env::var("OPENRAGE_TOOL_SET")
+        && let Some((i, value)) = set.split_once('=')
+    {
+        win.invoke_changed(i.parse().unwrap_or(0), value.into());
+    }
+    let path = path.to_owned();
+    slint::Timer::single_shot(Duration::from_millis(2500), move || {
+        save_snapshot_and_quit(newest_tool_window().map(|w| w.window().take_snapshot()), &path);
+    });
+    true
+}
+
+/// `OPENRAGE_ASI`: the ASI mods window instead of the explorer.
+#[cfg(debug_assertions)]
+fn debug_asi(ui: &AppWindow, path: &str) -> bool {
+    if std::env::var("OPENRAGE_ASI").is_err() {
+        return false;
+    }
+    open_asi_window(ui);
+    let path = path.to_owned();
+    slint::Timer::single_shot(Duration::from_millis(800), move || {
+        save_snapshot_and_quit(asi_window().map(|w| w.window().take_snapshot()), &path);
+    });
+    true
+}
+
+#[cfg(debug_assertions)]
+fn debug_open_windows(ui: &AppWindow) {
     if let Ok(i) = std::env::var("OPENRAGE_SUGGEST") {
         ui.invoke_suggestion_open(i.parse().unwrap_or(0));
     }
@@ -190,155 +213,131 @@ pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
     if std::env::var("OPENRAGE_UNLOCK").is_ok() {
         ui.set_unlock_visible(true);
     }
-    // `OPENRAGE_CAST=<row>` with `OPENRAGE_XML=<cut>`: press that actor's Play animation.
-    if let Ok(row) = std::env::var("OPENRAGE_CAST") {
+}
+
+/// `OPENRAGE_CAST=<row>` with `OPENRAGE_XML=<cut>`: press that actor's Play animation.
+#[cfg(debug_assertions)]
+fn debug_cast(path: &str) -> bool {
+    let Ok(row) = std::env::var("OPENRAGE_CAST") else { return false };
+    if let Some(x) = xmlview::newest() {
+        x.invoke_play_actor(row.parse().unwrap_or(0));
+    }
+    let path = path.to_owned();
+    slint::Timer::single_shot(Duration::from_secs(20), move || {
+        save_snapshot_and_quit(viewer::newest().map(|v| v.window().take_snapshot()), &path);
+    });
+    true
+}
+
+/// `OPENRAGE_MAP=<ymap>` (GTA IV: `.wpl` or a map `.img`): the map file's 3D scene, once its models have loaded.
+#[cfg(debug_assertions)]
+fn debug_map(ui: &AppWindow, path: &str) -> bool {
+    let Ok(map) = std::env::var("OPENRAGE_MAP") else { return false };
+    let lower = map.to_ascii_lowercase();
+    if lower.ends_with(".wpl") || lower.ends_with(".img") {
+        scene::open_map(ui, map);
+    } else if lower == "world" {
+        scene::open_map(ui, String::new()); // GTA VI's whole map
+    } else {
+        open_xml_view(ui, map);
         if let Some(x) = xmlview::newest() {
-            x.invoke_play_actor(row.parse().unwrap_or(0));
+            x.invoke_show_map();
         }
-        let path = path.clone();
-        slint::Timer::single_shot(Duration::from_secs(20), move || {
-            if let Some(Ok(img)) = viewer::newest().map(|v| v.window().take_snapshot()) {
-                let _ =
-                    rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(&path, png));
-            }
+    }
+    let path = path.to_owned();
+    let waiting = std::rc::Rc::new(slint::Timer::default());
+    let (started, timer) = (Instant::now(), std::rc::Rc::clone(&waiting));
+    waiting.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
+        if !scene::ready() && started.elapsed() < Duration::from_secs(600) {
+            return;
+        }
+        timer.stop();
+        debug_map_snapshot(path.clone());
+    });
+    true
+}
+
+#[cfg(debug_assertions)]
+fn debug_map_snapshot(path: String) {
+    // `OPENRAGE_FLY_TO=x,y,z,yaw,pitch`, and `OPENRAGE_FLY_WAIT=<s>` for the details to load.
+    let to: Vec<f32> = std::env::var("OPENRAGE_FLY_TO")
+        .map(|t| t.split(',').filter_map(|v| v.parse().ok()).collect())
+        .unwrap_or_default();
+    let mut wait = 800;
+    if let Ok(to) = <[f32; 5]>::try_from(to) {
+        scene::fly_to(to);
+        wait += std::env::var("OPENRAGE_FLY_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(20) * 1000;
+    }
+    slint::Timer::single_shot(Duration::from_millis(wait), move || {
+        // `OPENRAGE_BENCH=<pictures>`: how long they take.
+        if let Some(n) = std::env::var("OPENRAGE_BENCH").ok().and_then(|n| n.parse().ok()) {
+            scene::bench(n);
+        }
+        save_snapshot_and_quit(scene::newest().map(|w| w.window().take_snapshot()), &path);
+    });
+}
+
+/// Takes the picture of the scene window after `delay`, then quits.
+#[cfg(debug_assertions)]
+fn scene_snapshot_after(delay: Duration, path: String) {
+    slint::Timer::single_shot(delay, move || {
+        save_snapshot_and_quit(scene::newest().map(|w| w.window().take_snapshot()), &path);
+    });
+}
+
+/// `OPENRAGE_SCENE=<cut>` (+ `OPENRAGE_SCENE_TIME`, `OPENRAGE_FREE`): the whole cutscene.
+/// `OPENRAGE_SCENE_SNAP_AT=<ms>` takes the picture that soon (while loading);
+/// `OPENRAGE_SCENE_PLAY=<s>` plays that long and quits without a picture.
+#[cfg(debug_assertions)]
+fn debug_scene(ui: &AppWindow, path: &str) -> bool {
+    let Ok(cut) = std::env::var("OPENRAGE_SCENE") else { return false };
+    if with_app(|a| a.game_dir.as_deref().is_some_and(openrage_app::gta4::is_gta4_dir)) {
+        scene::open_gta4(ui, cut);
+    } else {
+        open_xml_view(ui, cut);
+        if let Some(x) = xmlview::newest() {
+            x.invoke_play_scene();
+        }
+    }
+    if let Ok(at) = std::env::var("OPENRAGE_SCENE_SNAP_AT") {
+        scene_snapshot_after(Duration::from_millis(at.parse().unwrap_or(1000)), path.to_owned());
+        return true;
+    }
+    let path = path.to_owned();
+    let waiting = std::rc::Rc::new(slint::Timer::default());
+    let (started, timer) = (Instant::now(), std::rc::Rc::clone(&waiting));
+    waiting.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
+        if !scene::ready() && started.elapsed() < Duration::from_secs(180) {
+            return;
+        }
+        timer.stop();
+        debug_scene_ready(&path);
+    });
+    true
+}
+
+#[cfg(debug_assertions)]
+fn debug_scene_ready(path: &str) {
+    if let Ok(secs) = std::env::var("OPENRAGE_SCENE_PLAY") {
+        slint::Timer::single_shot(Duration::from_secs(secs.parse().unwrap_or(10)), || {
             let _ = slint::quit_event_loop();
         });
         return;
     }
-    // `OPENRAGE_SCENE=<cut>` (+ `OPENRAGE_SCENE_TIME`, `OPENRAGE_FREE`): the whole cutscene.
-    // `OPENRAGE_SCENE_SNAP_AT=<ms>` takes the picture that soon (while loading);
-    // `OPENRAGE_SCENE_PLAY=<s>` plays that long and quits without a picture.
-    // `OPENRAGE_MAP=<ymap>` (GTA IV: `.wpl` or a map `.img`): the map file's 3D scene, once its models have loaded.
-    if let Ok(map) = std::env::var("OPENRAGE_MAP") {
-        let lower = map.to_ascii_lowercase();
-        if lower.ends_with(".wpl") || lower.ends_with(".img") {
-            scene::open_map(ui, map);
-        } else if lower == "world" {
-            scene::open_map(ui, String::new()); // GTA VI's whole map
-        } else {
-            open_xml_view(ui, map);
-            if let Some(x) = xmlview::newest() {
-                x.invoke_show_map();
-            }
-        }
-        let waiting = std::rc::Rc::new(slint::Timer::default());
-        let (started, timer) = (Instant::now(), std::rc::Rc::clone(&waiting));
-        waiting.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
-            if !scene::ready() && started.elapsed() < Duration::from_secs(600) {
-                return;
-            }
-            timer.stop();
-            let path = path.clone();
-            // `OPENRAGE_FLY_TO=x,y,z,yaw,pitch`, and `OPENRAGE_FLY_WAIT=<s>` for the details to load.
-            let to: Vec<f32> = std::env::var("OPENRAGE_FLY_TO")
-                .map(|t| t.split(',').filter_map(|v| v.parse().ok()).collect())
-                .unwrap_or_default();
-            let mut wait = 800;
-            if let Ok(to) = <[f32; 5]>::try_from(to) {
-                scene::fly_to(to);
-                wait += std::env::var("OPENRAGE_FLY_WAIT").ok().and_then(|s| s.parse().ok()).unwrap_or(20) * 1000;
-            }
-            slint::Timer::single_shot(Duration::from_millis(wait), move || {
-                // `OPENRAGE_BENCH=<pictures>`: how long they take.
-                if let Some(n) = std::env::var("OPENRAGE_BENCH").ok().and_then(|n| n.parse().ok()) {
-                    scene::bench(n);
-                }
-                if let Some(Ok(img)) = scene::newest().map(|w| w.window().take_snapshot()) {
-                    let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
-                        .map(|png| std::fs::write(&path, png));
-                }
-                let _ = slint::quit_event_loop();
-            });
-        });
-        return;
-    }
-    if let Ok(cut) = std::env::var("OPENRAGE_SCENE") {
-        if with_app(|a| a.game_dir.as_deref().is_some_and(openrage_app::gta4::is_gta4_dir)) {
-            scene::open_gta4(ui, cut);
-        } else {
-            open_xml_view(ui, cut);
-            if let Some(x) = xmlview::newest() {
-                x.invoke_play_scene();
-            }
-        }
-        if let Ok(at) = std::env::var("OPENRAGE_SCENE_SNAP_AT") {
-            let path = path.clone();
-            slint::Timer::single_shot(Duration::from_millis(at.parse().unwrap_or(1000)), move || {
-                if let Some(Ok(img)) = scene::newest().map(|w| w.window().take_snapshot()) {
-                    let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
-                        .map(|png| std::fs::write(&path, png));
-                }
-                let _ = slint::quit_event_loop();
-            });
-            return;
-        }
-        let waiting = std::rc::Rc::new(slint::Timer::default());
-        let (started, timer) = (Instant::now(), std::rc::Rc::clone(&waiting));
-        waiting.start(slint::TimerMode::Repeated, Duration::from_millis(500), move || {
-            if !scene::ready() && started.elapsed() < Duration::from_secs(180) {
-                return;
-            }
-            timer.stop();
-            if let Ok(secs) = std::env::var("OPENRAGE_SCENE_PLAY") {
-                slint::Timer::single_shot(Duration::from_secs(secs.parse().unwrap_or(10)), || {
-                    let _ = slint::quit_event_loop();
-                });
-                return;
-            }
-            let time = std::env::var("OPENRAGE_SCENE_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0);
-            scene::debug_pose(time, std::env::var("OPENRAGE_FREE").is_ok());
-            let path = path.clone();
-            slint::Timer::single_shot(Duration::from_millis(800), move || {
-                if let Some(Ok(img)) = scene::newest().map(|w| w.window().take_snapshot()) {
-                    let _ = rage_formats::png(img.width(), img.height(), img.as_bytes())
-                        .map(|png| std::fs::write(&path, png));
-                }
-                let _ = slint::quit_event_loop();
-            });
-        });
-        return;
-    }
+    let time = std::env::var("OPENRAGE_SCENE_TIME").ok().and_then(|t| t.parse().ok()).unwrap_or(0.0);
+    scene::debug_pose(time, std::env::var("OPENRAGE_FREE").is_ok());
+    scene_snapshot_after(Duration::from_millis(800), path.to_owned());
+}
+
+/// The snapshot of whichever window is in front, after a short wait.
+#[cfg(debug_assertions)]
+fn debug_final_snapshot(ui: &AppWindow, path: String) {
     let weak = ui.as_weak();
     // An outfit loading in the background needs a few more seconds.
     let wait = if std::env::var("OPENRAGE_OUTFIT").is_ok() { 30 } else { 2 };
     slint::Timer::single_shot(Duration::from_secs(wait), move || {
         let Some(ui) = weak.upgrade() else { return };
-        let snap = match (viewer::newest(), editor::newest(), history::window()) {
-            _ if let Some(p) = player::newest() => p.window().take_snapshot(),
-            _ if let Some(x) = xmlview::newest() => {
-                if let Ok(tab) = std::env::var("OPENRAGE_TAB") {
-                    x.set_tab(tab.parse().unwrap_or(0));
-                }
-                if let Ok(filter) = std::env::var("OPENRAGE_FILTER") {
-                    x.set_filter(filter.clone().into());
-                    x.invoke_filter_edited(filter.into());
-                }
-                // `OPENRAGE_NODE_ACTION=row,action` runs a tree row's menu action.
-                if let Ok(spec) = std::env::var("OPENRAGE_NODE_ACTION")
-                    && let Some((row, action)) = spec.split_once(',')
-                {
-                    if action == "select" {
-                        x.invoke_select(row.parse().unwrap_or(0));
-                    } else {
-                        x.invoke_node_action(row.parse().unwrap_or(0), action.into());
-                    }
-                }
-                // `OPENRAGE_WINDOW_CLICK=x,y[,right]` clicks into this window first.
-                debug_click(x.window(), "OPENRAGE_WINDOW_CLICK");
-                x.window().take_snapshot()
-            }
-            (Some(v), ..) => {
-                debug_click(v.window(), "OPENRAGE_WINDOW_CLICK");
-                v.window().take_snapshot()
-            }
-            (None, Some(e), _) => {
-                debug_click(e.window(), "OPENRAGE_WINDOW_CLICK");
-                e.window().take_snapshot()
-            }
-            (None, None, Some(h)) => h.window().take_snapshot(),
-            (None, None, None) => ui.window().take_snapshot(),
-        };
-        match snap {
+        match front_window_snapshot(&ui) {
             Ok(img) => {
                 let _ =
                     rage_formats::png(img.width(), img.height(), img.as_bytes()).map(|png| std::fs::write(&path, png));
@@ -347,6 +346,48 @@ pub(crate) fn debug_snapshot_rest(ui: &AppWindow, path: String) {
         }
         let _ = slint::quit_event_loop();
     });
+}
+
+#[cfg(debug_assertions)]
+fn front_window_snapshot(ui: &AppWindow) -> Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>, slint::PlatformError> {
+    match (viewer::newest(), editor::newest(), history::window()) {
+        _ if let Some(p) = player::newest() => p.window().take_snapshot(),
+        _ if let Some(x) = xmlview::newest() => debug_xml_snapshot(&x),
+        (Some(v), ..) => {
+            debug_click(v.window(), "OPENRAGE_WINDOW_CLICK");
+            v.window().take_snapshot()
+        }
+        (None, Some(e), _) => {
+            debug_click(e.window(), "OPENRAGE_WINDOW_CLICK");
+            e.window().take_snapshot()
+        }
+        (None, None, Some(h)) => h.window().take_snapshot(),
+        (None, None, None) => ui.window().take_snapshot(),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn debug_xml_snapshot(x: &XmlWindow) -> Result<slint::SharedPixelBuffer<slint::Rgba8Pixel>, slint::PlatformError> {
+    if let Ok(tab) = std::env::var("OPENRAGE_TAB") {
+        x.set_tab(tab.parse().unwrap_or(0));
+    }
+    if let Ok(filter) = std::env::var("OPENRAGE_FILTER") {
+        x.set_filter(filter.clone().into());
+        x.invoke_filter_edited(filter.into());
+    }
+    // `OPENRAGE_NODE_ACTION=row,action` runs a tree row's menu action.
+    if let Ok(spec) = std::env::var("OPENRAGE_NODE_ACTION")
+        && let Some((row, action)) = spec.split_once(',')
+    {
+        if action == "select" {
+            x.invoke_select(row.parse().unwrap_or(0));
+        } else {
+            x.invoke_node_action(row.parse().unwrap_or(0), action.into());
+        }
+    }
+    // `OPENRAGE_WINDOW_CLICK=x,y[,right]` clicks into this window first.
+    debug_click(x.window(), "OPENRAGE_WINDOW_CLICK");
+    x.window().take_snapshot()
 }
 
 /// Clicks into a window at `x,y[,right]` read from the environment variable `var`.

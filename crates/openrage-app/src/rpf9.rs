@@ -366,59 +366,51 @@ pub fn extract(
         let entry = entries.get(i).context("no such entry")?;
         let name = rpf.entry_name(entry);
         let base = name.rsplit('/').next().unwrap_or(&name).to_owned();
-        extract_entry(rpf, entry, &base, out, expand, cancel, progress, &mut summary)?;
+        let mut run = ExtractRun { expand, cancel, progress, summary: &mut summary };
+        extract_entry(rpf, entry, &base, out, &mut run)?;
         summary.target = out.join(base);
     } else {
-        extract_dir(rpf, dir, out, expand, cancel, progress, &mut summary)?;
+        let mut run = ExtractRun { expand, cancel, progress, summary: &mut summary };
+        extract_dir(rpf, dir, out, &mut run)?;
     }
     Ok(summary)
 }
 
-/// Everything below `dir`, with its path from there on.
-fn extract_dir(
-    rpf: &Rpf9,
-    dir: &str,
-    out: &Path,
+/// What an extraction shares between all its files.
+struct ExtractRun<'a> {
     expand: bool,
-    cancel: &AtomicBool,
-    progress: &mut dyn FnMut(&ExtractSummary, &str),
-    summary: &mut ExtractSummary,
-) -> Result<()> {
+    cancel: &'a AtomicBool,
+    progress: &'a mut dyn FnMut(&ExtractSummary, &str),
+    summary: &'a mut ExtractSummary,
+}
+
+/// Everything below `dir`, with its path from there on.
+fn extract_dir(rpf: &Rpf9, dir: &str, out: &Path, run: &mut ExtractRun) -> Result<()> {
     let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
     for e in rpf.entries()?.iter() {
         let name = rpf.entry_name(e);
         if !name.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(&prefix)) {
             continue;
         }
-        if cancel.load(Ordering::Relaxed) {
-            summary.cancelled = true;
+        if run.cancel.load(Ordering::Relaxed) {
+            run.summary.cancelled = true;
             break;
         }
-        extract_entry(rpf, e, &name[prefix.len()..], out, expand, cancel, progress, summary)?;
+        extract_entry(rpf, e, &name[prefix.len()..], out, run)?;
     }
     Ok(())
 }
 
-#[expect(clippy::too_many_arguments)]
-fn extract_entry(
-    rpf: &Rpf9,
-    entry: &Entry,
-    rel: &str,
-    out: &Path,
-    expand: bool,
-    cancel: &AtomicBool,
-    progress: &mut dyn FnMut(&ExtractSummary, &str),
-    summary: &mut ExtractSummary,
-) -> Result<()> {
+fn extract_entry(rpf: &Rpf9, entry: &Entry, rel: &str, out: &Path, run: &mut ExtractRun) -> Result<()> {
     let Some(path) = vfs::safe_relative_path(rel) else {
-        summary.failures.push(format!("unsafe path {rel}"));
+        run.summary.failures.push(format!("unsafe path {rel}"));
         return Ok(());
     };
     let target = out.join(path);
-    if expand && rpf.is_archive(entry) {
+    if run.expand && rpf.is_archive(entry) {
         match rpf.open_child(entry) {
-            Ok(child) => return extract_dir(&child, "", &target, expand, cancel, progress, summary),
-            Err(e) => summary.failures.push(e.to_string()),
+            Ok(child) => return extract_dir(&child, "", &target, run),
+            Err(e) => run.summary.failures.push(e.to_string()),
         }
         return Ok(());
     }
@@ -428,22 +420,22 @@ fn extract_entry(
         // A full disk stops everything, another bad file only itself.
         Err(e) if e.kind() == std::io::ErrorKind::StorageFull => return Err(e.into()),
         Err(e) => {
-            summary.failures.push(format!("{}: {e}", target.display()));
+            run.summary.failures.push(format!("{}: {e}", target.display()));
             return Ok(());
         }
     };
     match rpf.copy_to(entry, &mut writer).and_then(|n| Ok(writer.flush().map(|()| n)?)) {
         Ok(bytes) => {
-            summary.files += 1;
-            summary.bytes += bytes;
+            run.summary.files += 1;
+            run.summary.bytes += bytes;
         }
         Err(e) => {
             drop(writer);
             let _ = fs::remove_file(&target);
-            summary.failures.push(e.to_string());
+            run.summary.failures.push(e.to_string());
         }
     }
-    progress(summary, rel);
+    (run.progress)(run.summary, rel);
     Ok(())
 }
 

@@ -290,6 +290,33 @@ fn last_segment(vpath: &str) -> String {
     vpath.rsplit('/').next().unwrap_or_default().to_owned()
 }
 
+/// What a listing lookup needs besides the path: the game folder, the keys and the overlay switch.
+struct ListCtx<'a> {
+    game_dir: &'a Path,
+    keys: Option<Arc<GtaVKeys>>,
+    overlay: bool,
+}
+
+impl ListCtx<'_> {
+    fn resolve(&self, p: &str) -> Result<(Node, Origin), RpfError> {
+        if self.overlay {
+            rage_mods::resolve(self.game_dir, p, self.keys.clone())
+        } else {
+            Ok((vfs::resolve(self.game_dir, p, self.keys.clone())?, Origin::Base))
+        }
+    }
+
+    fn list(&self, vpath: &str) -> Result<(Listing, Option<String>), RpfError> {
+        list(self.game_dir, vpath, self.keys.clone(), self.overlay)
+    }
+
+    /// Lists the folder of `vpath` with the item `vpath` names selected.
+    fn list_parent_selecting(&self, vpath: &str) -> Result<(Listing, Option<String>), RpfError> {
+        let (listing, _) = self.list(&parent(vpath).unwrap_or_default())?;
+        Ok((listing, Some(last_segment(vpath))))
+    }
+}
+
 /// Lists a virtual path. If the path names a file, its folder is listed and
 /// the file name is returned so the caller can select it.
 ///
@@ -302,120 +329,207 @@ pub fn list(
     overlay: bool,
 ) -> Result<(Listing, Option<String>), RpfError> {
     let vpath = normalize(vpath);
-    let resolve = |p: &str| -> Result<(Node, Origin), RpfError> {
-        if overlay {
-            rage_mods::resolve(game_dir, p, keys.clone())
-        } else {
-            Ok((vfs::resolve(game_dir, p, keys.clone())?, Origin::Base))
+    let ctx = ListCtx { game_dir, keys, overlay };
+    match ctx.resolve(&vpath) {
+        Ok((node, origin)) => list_node(&ctx, vpath, node, origin),
+        Err(e) => list_unresolved(&ctx, vpath, e),
+    }
+}
+
+/// A path that does not resolve: it may still name something inside a container, a pool page or a model.
+fn list_unresolved(ctx: &ListCtx, vpath: String, err: RpfError) -> Result<(Listing, Option<String>), RpfError> {
+    let not_found = matches!(err, RpfError::NotFound(_));
+    // `…/name.ytd/texture` or `…/name.awc/sound`: open the container and select the item.
+    if not_found && is_container_item(&vpath) {
+        return ctx.list_parent_selecting(&vpath);
+    }
+    // `…/pool.ttpf/000000-000063`: a page of a GTA VI texture pool.
+    if pool_page(&vpath).is_some() {
+        return list_pool_page_path(ctx, vpath);
+    }
+    // `…/pool.ttpf/000000-000063/000012`: that page, with the texture selected.
+    if parent(&vpath).is_some_and(|p| pool_page(&p).is_some()) {
+        return ctx.list_parent_selecting(&vpath);
+    }
+    // `…/model/textures`: the textures inside a model (GTA IV .wdr, GTA V .ydr/.yft/.ydd).
+    if not_found && model_of_textures(&vpath).is_some() {
+        return list_model_textures(ctx, vpath);
+    }
+    Err(err)
+}
+
+/// Whether `vpath` names an item inside a texture dictionary or audio container.
+fn is_container_item(vpath: &str) -> bool {
+    parent(vpath).is_some_and(|p| is_texture_dict(&p) || is_audio(&p))
+}
+
+fn list_pool_page_path(ctx: &ListCtx, vpath: String) -> Result<(Listing, Option<String>), RpfError> {
+    let (pool, from) = pool_page(&vpath).unwrap_or_default();
+    let (Node::PlainFile(file), origin) = ctx.resolve(pool)? else { return Err(RpfError::NotFound(vpath)) };
+    Ok((list_pool_page(vpath.clone(), &file, from, origin)?, None))
+}
+
+fn list_model_textures(ctx: &ListCtx, vpath: String) -> Result<(Listing, Option<String>), RpfError> {
+    let model = model_of_textures(&vpath).unwrap_or_default();
+    let no_textures = || RpfError::NotFound(format!("{model} has no textures of its own"));
+    let (dict, origin) = match ctx.resolve(model)? {
+        (Node::Gta4File(a, i), origin) => {
+            (openrage_app::textures::gta4_model_textures(&a.read_resource(i)?).ok_or_else(no_textures)?, origin)
         }
+        (Node::ArchiveFile(rpf, i), origin) => (
+            openrage_app::textures::gta5_model_textures(&rpf.read_resource(i)?, model).ok_or_else(no_textures)?,
+            origin,
+        ),
+        _ => return Err(RpfError::NotFound(vpath.clone())),
     };
-    let (node, origin) = match resolve(&vpath) {
-        Ok(found) => found,
-        // `…/name.ytd/texture` or `…/name.awc/sound`: open the container and select the item.
-        Err(RpfError::NotFound(_)) if parent(&vpath).is_some_and(|p| is_texture_dict(&p) || is_audio(&p)) => {
-            let dict_path = parent(&vpath).unwrap_or_default();
-            let (listing, _) = list(game_dir, &dict_path, keys, overlay)?;
-            return Ok((listing, Some(last_segment(&vpath))));
-        }
-        // `…/pool.ttpf/000000-000063`: a page of a GTA VI texture pool.
-        Err(_) if pool_page(&vpath).is_some() => {
-            let (pool, from) = pool_page(&vpath).unwrap_or_default();
-            let (Node::PlainFile(file), origin) = resolve(pool)? else { return Err(RpfError::NotFound(vpath)) };
-            return Ok((list_pool_page(vpath.clone(), &file, from, origin)?, None));
-        }
-        // `…/pool.ttpf/000000-000063/000012`: that page, with the texture selected.
-        Err(_) if parent(&vpath).is_some_and(|p| pool_page(&p).is_some()) => {
-            let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys, overlay)?;
-            return Ok((listing, Some(last_segment(&vpath))));
-        }
-        // `…/model/textures`: the textures inside a model (GTA IV .wdr, GTA V .ydr/.yft/.ydd).
-        Err(RpfError::NotFound(_)) if model_of_textures(&vpath).is_some() => {
-            let model = model_of_textures(&vpath).unwrap_or_default();
-            let no_textures = || RpfError::NotFound(format!("{model} has no textures of its own"));
-            let (dict, origin) = match resolve(model)? {
-                (Node::Gta4File(a, i), origin) => {
-                    (openrage_app::textures::gta4_model_textures(&a.read_resource(i)?).ok_or_else(no_textures)?, origin)
-                }
-                (Node::ArchiveFile(rpf, i), origin) => (
-                    openrage_app::textures::gta5_model_textures(&rpf.read_resource(i)?, model)
-                        .ok_or_else(no_textures)?,
-                    origin,
-                ),
-                _ => return Err(RpfError::NotFound(vpath.clone())),
-            };
-            return Ok((texture_listing(vpath, dict, origin, false), None));
-        }
-        Err(e) => return Err(e),
-    };
+    Ok((texture_listing(vpath, dict, origin, false), None))
+}
+
+fn list_node(ctx: &ListCtx, vpath: String, node: Node, origin: Origin) -> Result<(Listing, Option<String>), RpfError> {
     match node {
-        Node::ArchiveFile(rpf, id)
-            if is_texture_dict(&rpf.entry(id).name) && rpf.entry(id).resource_version().is_some() =>
-        {
-            Ok((list_textures(vpath, rpf, id, origin)?, None))
-        }
-        Node::ArchiveFile(rpf, id) if is_audio(&rpf.entry(id).name) => {
-            Ok((list_audio(vpath, rpf, id, origin, keys.as_deref())?, None))
-        }
         Node::Dir(dir) => {
             let mut listing = list_disk(vpath, dir, origin)?;
-            if overlay {
-                merge_mods(game_dir, &mut listing);
+            if ctx.overlay {
+                merge_mods(ctx.game_dir, &mut listing);
             }
             Ok((listing, None))
         }
         Node::ArchiveDir(rpf, dir) => Ok((list_archive(vpath, rpf, dir, origin), None)),
         Node::Rpf8Dir(rpf, dir) => {
             let mut listing = list_rpf8(vpath, rpf, dir, origin);
-            if overlay {
-                merge_lml(game_dir, &mut listing);
+            if ctx.overlay {
+                merge_lml(ctx.game_dir, &mut listing);
             }
             Ok((listing, None))
         }
-        Node::Rpf8File(rpf, i) if is_texture_dict(&rpf.entry_name(i)) => {
-            Ok((list_rpf8_textures(vpath, rpf, i, origin)?, None))
-        }
-        Node::Rpf8File(rpf, i) if is_audio(&rpf.entry_name(i)) => {
-            let entry = rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| RpfError::NotFound(vpath.clone()))?;
-            let data = rpf.read(entry)?;
-            let awc = rage_formats::awc::Awc::parse_rdr2(data)
-                .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
-            Ok((audio_listing(vpath, awc, origin), None))
-        }
-        Node::PlainFile(file) if is_texture_pool(&vpath) => Ok((list_pool(vpath, &file, origin)?, None)),
         Node::Rpf9Dir(rpf, dir) => Ok((list_rpf9(vpath, rpf, dir, origin)?, None)),
-        Node::Rpf9File(rpf, i) if is_texture_dict(&vpath) => {
-            let dict = openrage_app::textures::gta6_dictionary(&rpf, i)
-                .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
-            Ok((texture_listing(vpath, dict, origin, true), None))
-        }
-        Node::Rpf9File(rpf, i) if is_audio(&vpath) => {
-            let awc = rage_formats::awc::Awc::parse(rpf.read_at(i)?, None)
-                .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
-            Ok((audio_listing(vpath, awc, origin), None))
-        }
         Node::Gta4Dir(a, dir) => Ok((list_gta4(vpath, a, dir, origin), None)),
-        // An RDR2 dictionary replaced in lml/replace: a loose RSC8 file.
-        Node::PlainFile(p) if is_texture_dict(&vpath) && rage_mods::overlay::is_rdr2(game_dir) => {
-            let res = std::fs::read(&p)
-                .ok()
-                .and_then(|b| rage_rpf::rpf8::parse_resource_file(&b))
-                .ok_or_else(|| RpfError::BadResource { path: vpath.clone(), reason: "not an RSC8 resource".into() })?;
-            let dict = rage_formats::ytd::parse_rdr2(&res)
-                .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
-            let read_only = is_particles(&vpath);
-            Ok((texture_listing(vpath, dict, origin, read_only), None))
-        }
-        Node::Gta4File(a, i) if is_texture_dict(&a.entry(i).name) && a.entry(i).resource_type().is_some() => {
-            let dict = rage_formats::ytd::parse_gta4(&a.read_resource(i)?)
-                .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
-            // GTA IV dictionaries can be changed (RDR2's: same-shape replacements).
-            Ok((texture_listing(vpath, dict, origin, false), None))
-        }
+        file => list_file_node(ctx, vpath, file, origin),
+    }
+}
+
+fn list_file_node(
+    ctx: &ListCtx,
+    vpath: String,
+    node: Node,
+    origin: Origin,
+) -> Result<(Listing, Option<String>), RpfError> {
+    match node {
+        Node::ArchiveFile(rpf, id) => list_archive_file(ctx, vpath, rpf, id, origin),
+        Node::Rpf8File(rpf, i) => list_rpf8_file(ctx, vpath, rpf, i, origin),
+        Node::Rpf9File(rpf, i) => list_rpf9_file(ctx, vpath, rpf, i, origin),
+        Node::PlainFile(file) => list_plain_file(ctx, vpath, file, origin),
+        Node::Gta4File(a, i) => list_gta4_file(ctx, vpath, a, i, origin),
         // Files (and node kinds added later) list their folder, with the file selected.
-        _ => {
-            let name = last_segment(&vpath);
-            let (listing, _) = list(game_dir, &parent(&vpath).unwrap_or_default(), keys, overlay)?;
-            Ok((listing, Some(name)))
+        _ => ctx.list_parent_selecting(&vpath),
+    }
+}
+
+fn list_archive_file(
+    ctx: &ListCtx,
+    vpath: String,
+    rpf: Arc<Rpf7>,
+    id: EntryId,
+    origin: Origin,
+) -> Result<(Listing, Option<String>), RpfError> {
+    if is_texture_dict(&rpf.entry(id).name) && rpf.entry(id).resource_version().is_some() {
+        Ok((list_textures(vpath, rpf, id, origin)?, None))
+    } else if is_audio(&rpf.entry(id).name) {
+        Ok((list_audio(vpath, rpf, id, origin, ctx.keys.as_deref())?, None))
+    } else {
+        ctx.list_parent_selecting(&vpath)
+    }
+}
+
+fn list_rpf8_file(
+    ctx: &ListCtx,
+    vpath: String,
+    rpf: Arc<rage_rpf::Rpf8>,
+    i: usize,
+    origin: Origin,
+) -> Result<(Listing, Option<String>), RpfError> {
+    if is_texture_dict(&rpf.entry_name(i)) {
+        return Ok((list_rpf8_textures(vpath, rpf, i, origin)?, None));
+    }
+    if !is_audio(&rpf.entry_name(i)) {
+        return ctx.list_parent_selecting(&vpath);
+    }
+    let entry = rpf.entries().and_then(|e| e.get(i)).ok_or_else(|| RpfError::NotFound(vpath.clone()))?;
+    let data = rpf.read(entry)?;
+    let awc = rage_formats::awc::Awc::parse_rdr2(data)
+        .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
+    Ok((audio_listing(vpath, awc, origin), None))
+}
+
+fn list_rpf9_file(
+    ctx: &ListCtx,
+    vpath: String,
+    rpf: Arc<rage_rpf::Rpf9>,
+    i: usize,
+    origin: Origin,
+) -> Result<(Listing, Option<String>), RpfError> {
+    if is_texture_dict(&vpath) {
+        let dict = openrage_app::textures::gta6_dictionary(&rpf, i)
+            .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
+        Ok((texture_listing(vpath, dict, origin, true), None))
+    } else if is_audio(&vpath) {
+        let awc = rage_formats::awc::Awc::parse(rpf.read_at(i)?, None)
+            .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: format!("{e:#}") })?;
+        Ok((audio_listing(vpath, awc, origin), None))
+    } else {
+        ctx.list_parent_selecting(&vpath)
+    }
+}
+
+fn list_plain_file(
+    ctx: &ListCtx,
+    vpath: String,
+    file: PathBuf,
+    origin: Origin,
+) -> Result<(Listing, Option<String>), RpfError> {
+    if is_texture_pool(&vpath) {
+        return Ok((list_pool(vpath, &file, origin)?, None));
+    }
+    // An RDR2 dictionary replaced in lml/replace: a loose RSC8 file.
+    if !(is_texture_dict(&vpath) && rage_mods::overlay::is_rdr2(ctx.game_dir)) {
+        return ctx.list_parent_selecting(&vpath);
+    }
+    let res = std::fs::read(&file)
+        .ok()
+        .and_then(|b| rage_rpf::rpf8::parse_resource_file(&b))
+        .ok_or_else(|| RpfError::BadResource { path: vpath.clone(), reason: "not an RSC8 resource".into() })?;
+    let dict = rage_formats::ytd::parse_rdr2(&res)
+        .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
+    let read_only = is_particles(&vpath);
+    Ok((texture_listing(vpath, dict, origin, read_only), None))
+}
+
+fn list_gta4_file(
+    ctx: &ListCtx,
+    vpath: String,
+    a: Arc<rage_rpf::Gta4Archive>,
+    i: rage_rpf::Gta4EntryId,
+    origin: Origin,
+) -> Result<(Listing, Option<String>), RpfError> {
+    if !(is_texture_dict(&a.entry(i).name) && a.entry(i).resource_type().is_some()) {
+        return ctx.list_parent_selecting(&vpath);
+    }
+    let dict = rage_formats::ytd::parse_gta4(&a.read_resource(i)?)
+        .map_err(|e| RpfError::BadResource { path: vpath.clone(), reason: e.to_string() })?;
+    // GTA IV dictionaries can be changed (RDR2's: same-shape replacements).
+    Ok((texture_listing(vpath, dict, origin, false), None))
+}
+
+/// Marks the items of `listing` that `mod_items` replace or contain, and lists the ones they add.
+fn apply_mod_items(listing: &mut Listing, mod_items: Vec<Item>) {
+    for m in mod_items {
+        match listing.items.iter_mut().find(|i| i.name.eq_ignore_ascii_case(&m.name)) {
+            Some(existing) if m.kind == ItemKind::Dir => existing.mark = Some(Mark::ContainsMods),
+            Some(existing) => {
+                existing.size = m.size;
+                existing.mark = Some(Mark::Replaced);
+            }
+            None => listing.items.push(Item { mark: Some(Mark::New), ..m }),
         }
     }
 }
@@ -428,16 +542,7 @@ fn merge_lml(game_dir: &Path, listing: &mut Listing) {
     }
     let Some(dir) = rage_mods::overlay_path(game_dir, &listing.vpath).filter(|p| p.is_dir()) else { return };
     let Ok(Listing { items: mod_items, .. }) = list_disk(listing.vpath.clone(), dir, Origin::Mods) else { return };
-    for m in mod_items {
-        match listing.items.iter_mut().find(|i| i.name.eq_ignore_ascii_case(&m.name)) {
-            Some(existing) if m.kind == ItemKind::Dir => existing.mark = Some(Mark::ContainsMods),
-            Some(existing) => {
-                existing.size = m.size;
-                existing.mark = Some(Mark::Replaced);
-            }
-            None => listing.items.push(Item { mark: Some(Mark::New), ..m }),
-        }
-    }
+    apply_mod_items(listing, mod_items);
 }
 
 /// Adds the `mods` counterpart of a disk folder to its listing and marks items.
@@ -464,16 +569,7 @@ fn merge_mods_inner(game_dir: &Path, listing: &mut Listing) {
     }
     let Some(mod_dir) = vfs::find_case_insensitive(&mods, &listing.vpath).filter(|p| p.is_dir()) else { return };
     let Ok(Listing { items: mod_items, .. }) = list_disk(listing.vpath.clone(), mod_dir, Origin::Mods) else { return };
-    for m in mod_items {
-        match listing.items.iter_mut().find(|i| i.name.eq_ignore_ascii_case(&m.name)) {
-            Some(existing) if m.kind == ItemKind::Dir => existing.mark = Some(Mark::ContainsMods),
-            Some(existing) => {
-                existing.size = m.size;
-                existing.mark = Some(Mark::Replaced);
-            }
-            None => listing.items.push(Item { mark: Some(Mark::New), ..m }),
-        }
-    }
+    apply_mod_items(listing, mod_items);
 }
 
 fn list_textures(vpath: String, rpf: Arc<Rpf7>, id: EntryId, origin: Origin) -> Result<Listing, RpfError> {

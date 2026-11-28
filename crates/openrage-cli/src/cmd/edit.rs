@@ -213,8 +213,6 @@ pub(crate) fn cmd_replace_model(
     o: ReplaceOptions,
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
-    use openrage_app::obj;
-    use rage_formats::ydr_write;
     let Node::ArchiveFile(rpf, id) = rage_mods::resolve(game_dir, vpath, keys.clone())?.0 else {
         bail!("{vpath} is not a file inside an archive")
     };
@@ -224,115 +222,194 @@ pub(crate) fn cmd_replace_model(
         let file = with_collision(game_dir, vpath, &template, false, obj, keys.clone())?;
         return save_model(game_dir, vpath, obj, file, &o, keys);
     }
+    check_replace_options(&lower, vpath, &o)?;
+    let template = rpf.read_resource(id)?;
+    replace_drawable(game_dir, vpath, obj, &o, &template, keys)
+}
+
+/// Replaces the meshes of a drawable, fragment or drawable dictionary.
+fn replace_drawable(
+    game_dir: &Path,
+    vpath: &str,
+    obj: &Path,
+    o: &ReplaceOptions,
+    template: &rage_resource::Resource,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
+    use openrage_app::obj;
+    let (levels, textures) = read_levels(obj, o)?;
+    // Vehicles: parts named like bones (`door_dside_f`, `bonnet`) move with them,
+    // parts named after the wheel (`wheel_lf`) replace its model.
+    // Drawable dictionaries: parts named after a drawable go to it.
+    let options = obj::ImportOptions { shader: o.shader, drawable: o.drawable };
+    let imported = obj::import(template, vpath, levels, &textures, options, || {
+        obj::find_texture_donor(game_dir, vpath, keys.clone())
+    })?;
+    let back = report_import(&imported)?;
+    let file = imported.file;
+    let file = match o.collision {
+        Some(col) => with_collision(game_dir, vpath, &back, true, col, keys.clone())?,
+        None => file,
+    };
+    save_model(game_dir, vpath, obj, file, o, keys)
+}
+
+/// Most further detail levels (`--lod`) a model takes.
+const MAX_FURTHER_LODS: usize = 3;
+
+/// Side of the texture made for a material that only has a colour.
+const COLOUR_TEXTURE_SIDE: u32 = 4;
+
+fn check_replace_options(lower: &str, vpath: &str, o: &ReplaceOptions) -> Result<()> {
     if o.collision.is_some() && !lower.ends_with(".ydr") {
         bail!("--collision is for drawables (.ydr); vehicles and other fragments keep theirs");
     }
     if !lower.ends_with(".ydr") && !lower.ends_with(".yft") && !lower.ends_with(".ydd") {
         bail!("{vpath} is not a drawable (.ydr), fragment (.yft) or drawable dictionary (.ydd)");
     }
-    if o.lods.len() > 3 {
+    if o.lods.len() > MAX_FURTHER_LODS {
         bail!("at most three further detail levels (--lod)");
     }
-    let template = rpf.read_resource(id)?;
-    // Every level's OBJ, and the textures their materials name.
+    Ok(())
+}
+
+type Textures = std::collections::HashMap<String, rage_formats::texture::Texture>;
+
+/// Every level's OBJ, and the textures their materials name.
+fn read_levels(obj: &Path, o: &ReplaceOptions) -> Result<(Vec<Vec<openrage_app::obj::ObjMesh>>, Textures)> {
     let mut files = vec![obj.to_path_buf()];
     files.extend(o.lods.iter().cloned());
     let mut levels = Vec::new();
-    let mut textures = std::collections::HashMap::new();
+    let mut textures = Textures::new();
     for f in &files {
         let text = fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
         if o.textures {
-            let dir = f.parent().unwrap_or(Path::new("."));
-            for (material, mtl) in obj::materials(&text, dir) {
-                if textures.contains_key(&material) {
-                    continue;
-                }
-                let texture = match (mtl.texture, mtl.colour) {
-                    (Some(png), _) => {
-                        let name = obj::texture_name(&png.file_stem().unwrap_or_default().to_string_lossy());
-                        let (w, h, rgba) =
-                            obj::read_png(&png).with_context(|| format!("texture of material {material}"))?;
-                        ydr_write::texture_from_rgba(&name, w, h, &rgba)?
-                    }
-                    // Only a colour: a small texture of that colour.
-                    (None, Some(c)) => {
-                        let px = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
-                        let rgba: Vec<u8> = (0..16).flat_map(|_| [px[0], px[1], px[2], 255]).collect();
-                        ydr_write::texture_from_rgba(&format!("{}_colour", obj::texture_name(&material)), 4, 4, &rgba)?
-                    }
-                    (None, None) => continue,
-                };
-                textures.insert(material, texture);
-            }
+            read_material_textures(&text, f, &mut textures)?;
         }
-        levels.push(obj::read(&text).with_context(|| format!("reading {}", f.display()))?);
+        levels.push(openrage_app::obj::read(&text).with_context(|| format!("reading {}", f.display()))?);
     }
-    // Vehicles: parts named like bones (`door_dside_f`, `bonnet`) move with them,
-    // parts named after the wheel (`wheel_lf`) replace its model.
-    // Drawable dictionaries: parts named after a drawable go to it.
-    let options = obj::ImportOptions { shader: o.shader, drawable: o.drawable };
-    let imported = obj::import(&template, vpath, levels, &textures, options, || {
-        obj::find_texture_donor(game_dir, vpath, keys.clone())
-    })?;
-    let several = imported.targets.len() > 1;
-    for t in &imported.targets {
-        if t.materials.is_empty() {
+    Ok((levels, textures))
+}
+
+fn read_material_textures(text: &str, obj_file: &Path, textures: &mut Textures) -> Result<()> {
+    let dir = obj_file.parent().unwrap_or(Path::new("."));
+    for (material, mtl) in openrage_app::obj::materials(text, dir) {
+        if textures.contains_key(&material) {
             continue;
         }
-        let place = match t.place {
-            _ if !several => String::new(),
-            ydr_write::Place::Main => "body: ".to_owned(),
-            ydr_write::Place::Child(_) => format!("{} (own model): ", t.names.join(", ")),
-            ydr_write::Place::Entry(_) => format!("{}: ", t.names.join(", ")),
-        };
-        for (material, m) in &t.materials {
-            let texture = m
-                .texture
-                .as_ref()
-                .map(|t| format!(", texture {} ({}×{})", t.name, t.width, t.height))
-                .unwrap_or_default();
-            outln!("{place}material {material:<24} → shader {}{texture}", m.shader);
+        if let Some(texture) = material_texture(&material, mtl)? {
+            textures.insert(material, texture);
         }
-        if !t.textures_kept.is_empty() {
-            outln!("{place}kept the shader's own texture (it takes no other): {}", t.textures_kept.join(", "));
+    }
+    Ok(())
+}
+
+/// The texture of an OBJ material: its picture, or a small one of its colour.
+fn material_texture(
+    material: &str,
+    mtl: openrage_app::obj::MtlMaterial,
+) -> Result<Option<rage_formats::texture::Texture>> {
+    use openrage_app::obj;
+    use rage_formats::ydr_write;
+    let texture = match (mtl.texture, mtl.colour) {
+        (Some(png), _) => {
+            let name = obj::texture_name(&png.file_stem().unwrap_or_default().to_string_lossy());
+            let (w, h, rgba) = obj::read_png(&png).with_context(|| format!("texture of material {material}"))?;
+            ydr_write::texture_from_rgba(&name, w, h, &rgba)?
         }
-        if let Some(bones) = t.bones() {
-            for (part, bone) in &bones.matched {
-                outln!("part {part:<28} → bone {bone}");
-            }
-            if !bones.unmatched.is_empty() {
-                outln!("parts on the body ({}): {}", bones.body_name(), bones.unmatched.join(", "));
-            }
-            if !bones.left_out.is_empty() {
-                outln!("left out (the game draws the wheel's own model there): {}", bones.left_out.join(", "));
-            }
+        // Only a colour: a small texture of that colour.
+        (None, Some(c)) => {
+            let px = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+            let pixels = (COLOUR_TEXTURE_SIDE * COLOUR_TEXTURE_SIDE) as usize;
+            let rgba: Vec<u8> = (0..pixels).flat_map(|_| [px[0], px[1], px[2], 255]).collect();
+            let name = format!("{}_colour", obj::texture_name(material));
+            ydr_write::texture_from_rgba(&name, COLOUR_TEXTURE_SIDE, COLOUR_TEXTURE_SIDE, &rgba)?
         }
-        if matches!(t.place, ydr_write::Place::Child(_)) {
-            outln!("parts {} → the model of {}", t.parts.join(", "), t.names.join(", "));
-        }
-        if t.has_weights() {
-            outln!("{place}bone weights from the nearest vertex of the original mesh");
-        }
+        (None, None) => return Ok(None),
+    };
+    Ok(Some(texture))
+}
+
+/// Reports what the import did; returns the written model read back.
+fn report_import(imported: &openrage_app::obj::Imported) -> Result<rage_resource::Resource> {
+    let several = imported.targets.len() > 1;
+    print_imported(imported, several);
+    let back = rage_resource::Resource::from_rsc7(&imported.file)?;
+    print_closest_levels(&back, &imported.targets, several)?;
+    outln!("{} detail level(s), {}", imported.levels, human(imported.file.len() as u64));
+    Ok(back)
+}
+
+fn print_imported(imported: &openrage_app::obj::Imported, several: bool) {
+    for t in &imported.targets {
+        print_target(t, several);
     }
     if !imported.unplaced.is_empty() {
         outln!("left out (named after no drawable; --drawable picks one for them): {}", imported.unplaced.join(", "));
     }
-    let file = imported.file;
-    let back = rage_resource::Resource::from_rsc7(&file)?;
-    for t in imported.targets.iter().filter(|t| !t.materials.is_empty()) {
-        let check = ydr_write::read_at(&back, t.place)?;
+}
+
+fn print_target(t: &openrage_app::obj::Target, several: bool) {
+    use rage_formats::ydr_write;
+    if t.materials.is_empty() {
+        return;
+    }
+    let place = match t.place {
+        _ if !several => String::new(),
+        ydr_write::Place::Main => "body: ".to_owned(),
+        ydr_write::Place::Child(_) => format!("{} (own model): ", t.names.join(", ")),
+        ydr_write::Place::Entry(_) => format!("{}: ", t.names.join(", ")),
+    };
+    print_materials(t, &place);
+    if !t.textures_kept.is_empty() {
+        outln!("{place}kept the shader's own texture (it takes no other): {}", t.textures_kept.join(", "));
+    }
+    if let Some(bones) = t.bones() {
+        print_bones(bones);
+    }
+    if matches!(t.place, ydr_write::Place::Child(_)) {
+        outln!("parts {} → the model of {}", t.parts.join(", "), t.names.join(", "));
+    }
+    if t.has_weights() {
+        outln!("{place}bone weights from the nearest vertex of the original mesh");
+    }
+}
+
+fn print_materials(t: &openrage_app::obj::Target, place: &str) {
+    for (material, m) in &t.materials {
+        let texture =
+            m.texture.as_ref().map(|t| format!(", texture {} ({}×{})", t.name, t.width, t.height)).unwrap_or_default();
+        outln!("{place}material {material:<24} → shader {}{texture}", m.shader);
+    }
+}
+
+fn print_bones(bones: &openrage_app::obj::Bones) {
+    for (part, bone) in &bones.matched {
+        outln!("part {part:<28} → bone {bone}");
+    }
+    if !bones.unmatched.is_empty() {
+        outln!("parts on the body ({}): {}", bones.body_name(), bones.unmatched.join(", "));
+    }
+    if !bones.left_out.is_empty() {
+        outln!("left out (the game draws the wheel's own model there): {}", bones.left_out.join(", "));
+    }
+}
+
+/// Reads the written model back and reports the closest level of each target.
+fn print_closest_levels(
+    back: &rage_resource::Resource,
+    targets: &[openrage_app::obj::Target],
+    several: bool,
+) -> Result<()> {
+    for t in targets.iter().filter(|t| !t.materials.is_empty()) {
+        let check = rage_formats::ydr_write::read_at(back, t.place)?;
         let vertices: usize = check.meshes.iter().map(|m| m.positions.len()).sum();
         let triangles: usize = check.meshes.iter().map(|m| m.indices.len() / 3).sum();
         let what =
             if several { format!("{}: ", t.names.first().map_or("body", String::as_str)) } else { String::new() };
         outln!("{what}closest level: {} meshes, {vertices} vertices, {triangles} triangles", check.meshes.len());
     }
-    outln!("{} detail level(s), {}", imported.levels, human(file.len() as u64));
-    let file = match o.collision {
-        Some(col) => with_collision(game_dir, vpath, &back, true, col, keys.clone())?,
-        None => file,
-    };
-    save_model(game_dir, vpath, obj, file, &o, keys)
+    Ok(())
 }
 
 /// `file` (the model built from `obj`) to `--out` and/or the mods folder.

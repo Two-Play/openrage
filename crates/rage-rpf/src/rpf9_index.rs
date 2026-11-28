@@ -13,6 +13,24 @@ pub const HASH32: u64 = 0xb707_6b62_45d3_5fb5;
 pub const HASH64: u64 = 0x73bc_b72d_ce74_f11f;
 pub const CHUNKS: u64 = 0xe0c1_2d7a_5d48_84c5;
 pub const ENCRYPTION: u64 = 0x2860_30a3_58a7_89fb;
+/// "RPF9", the first field of a decoded header.
+const MAGIC: u32 = 0x5250_4639;
+/// The fixed part of the header, before the directory.
+const HEADER_SIZE: usize = 64;
+/// A header larger than this is taken as damaged.
+const MAX_HEADER_BYTES: usize = 64 << 20;
+/// More entries than this are taken as damaged.
+const MAX_ENTRIES: usize = 1_000_000;
+/// One table descriptor: type hash, record count, offset, stride.
+const DESCRIPTOR_SIZE: usize = 24;
+/// One directory record.
+const DIRECTORY_RECORD_SIZE: usize = 8;
+/// The bytes this parser reads of each record kind.
+const RESOURCE_RECORD_MIN: usize = 18;
+const CHUNKED_RECORD_MIN: usize = 24;
+const RAW_RECORD_MIN: usize = 16;
+const HASH32_RECORD_MIN: usize = 4;
+const HASH64_RECORD_MIN: usize = 8;
 const MASK40: u64 = (1 << 40) - 1;
 const MASK44: u64 = (1 << 44) - 1;
 const MASK48: u64 = (1 << 48) - 1;
@@ -90,155 +108,315 @@ fn product(a: usize, b: usize) -> Result<usize, String> {
     a.checked_mul(b).ok_or_else(|| "native table overflow".into())
 }
 
+/// The header's table dimensions, validated against the header's own size.
+struct Dims {
+    extent: usize,
+    split: usize,
+    directories: usize,
+    blob_size: usize,
+    table_count: usize,
+    secondary: usize,
+    primary: usize,
+    count: usize,
+    width: usize,
+    wide_align: bool,
+}
+
+/// Where the header's arrays start.
+struct Areas {
+    descriptors: usize,
+    indices: usize,
+    secondary_indices: usize,
+    data: usize,
+    secondary_data: usize,
+}
+
+/// What a payload record says about a member's data.
+struct Payload {
+    offset: u64,
+    stored: u64,
+    size: u64,
+    type_id: u8,
+    layout: u8,
+    storage: Storage,
+}
+
+fn check_dims(width: usize, secondary: usize, table_count: usize, count: usize) -> Result<(), String> {
+    if !matches!(width, 1 | 2 | 4) || secondary > table_count || count > MAX_ENTRIES {
+        return Err("unsupported native table dimensions".into());
+    }
+    if table_count == 0 && count != 0 {
+        return Err("native entries have no tables".into());
+    }
+    Ok(())
+}
+
+fn read_dims(header: &[u8], archive_size: u64) -> Result<Dims, String> {
+    if header.len() < HEADER_SIZE || u32_at(header, 0) != MAGIC {
+        return Err("not a native RPF9 header".into());
+    }
+    let extent = u32_at(header, 4) as usize;
+    let split = u32_at(header, 8) as usize;
+    if extent != header.len() || extent as u64 > archive_size || header.len() > MAX_HEADER_BYTES {
+        return Err("native header extent is invalid or too large".into());
+    }
+    let directories = usize::from(u16_at(header, 0x1a));
+    let blob_size = u32_at(header, 0x1c) as usize;
+    let table_count = usize::from(u16_at(header, 0x20));
+    let secondary = usize::from(u16_at(header, 0x22));
+    let count = u32_at(header, 0x24) as usize;
+    let width = usize::from(header[0x2c]);
+    let wide_align = header[0x2d] & 1 != 0;
+    check_dims(width, secondary, table_count, count)?;
+    let primary = table_count - secondary;
+    Ok(Dims { extent, split, directories, blob_size, table_count, secondary, primary, count, width, wide_align })
+}
+
+/// The end of `bytes` bytes placed after `prev`, rounded up.
+fn area_after(prev: usize, bytes: usize, alignment: usize) -> Result<usize, String> {
+    aligned(sum(prev, bytes)?, alignment)
+}
+
+fn matrix_bytes(rows: usize, count: usize, width: usize) -> Result<usize, String> {
+    product(product(rows, count)?, width)
+}
+
+/// Directory, blob, descriptors and the primary index matrix; returns the
+/// descriptors' and the matrix' starts.
+fn leading_areas(d: &Dims) -> Result<(usize, usize), String> {
+    let (directory_align, wide) = if d.wide_align { (16, 16) } else { (4, 8) };
+    let directory = aligned(HEADER_SIZE, directory_align)?;
+    let blob = area_after(directory, product(d.directories, DIRECTORY_RECORD_SIZE)?, wide)?;
+    let descriptors = area_after(blob, d.blob_size, wide)?;
+    let indices = area_after(descriptors, product(d.table_count, DESCRIPTOR_SIZE)?, d.width)?;
+    Ok((descriptors, indices))
+}
+
+fn read_areas(d: &Dims) -> Result<Areas, String> {
+    let (descriptors, indices) = leading_areas(d)?;
+    let data = area_after(indices, matrix_bytes(d.primary, d.count, d.width)?, 8)?;
+    let secondary_indices = aligned(d.split, d.width)?;
+    let secondary_data = area_after(secondary_indices, matrix_bytes(d.secondary, d.count, d.width)?, 8)?;
+    if data > d.split || secondary_data > d.extent {
+        return Err("native table arrays lie outside the header".into());
+    }
+    Ok(Areas { descriptors, indices, secondary_indices, data, secondary_data })
+}
+
+/// The table described at `at`, whose data starts `base` plus its offset and
+/// must end within `limit`.
+fn read_table(header: &[u8], at: usize, column: usize, base: usize, limit: usize) -> Result<Table, String> {
+    let type_hash = u64_at(header, at);
+    let records = u32_at(header, at + 8) as usize;
+    let offset = u32_at(header, at + 12) as usize;
+    let stride = usize::from(u16_at(header, at + 16));
+    let start = sum(base, offset)?;
+    if start > limit || sum(start, product(records, stride)?)? > limit || records > 0 && stride == 0 {
+        return Err(format!("native table {column} lies outside its header section"));
+    }
+    Ok(Table { type_hash, count: records, stride, start })
+}
+
+fn read_tables(header: &[u8], d: &Dims, a: &Areas) -> Result<Vec<Table>, String> {
+    let mut tables = Vec::with_capacity(d.table_count);
+    let mut types = HashSet::new();
+    for column in 0..d.table_count {
+        let (base, limit) = if column < d.primary { (a.data, d.split) } else { (a.secondary_data, d.extent) };
+        let table = read_table(header, a.descriptors + column * DESCRIPTOR_SIZE, column, base, limit)?;
+        if !types.insert(table.type_hash) {
+            return Err("duplicate native table type".into());
+        }
+        tables.push(table);
+    }
+    Ok(tables)
+}
+
+/// An index cell of the given width, and the value that stands for "none".
+fn index_cell(header: &[u8], at: usize, width: usize) -> (u32, u32) {
+    match width {
+        1 => (u32::from(header[at]), 0xff),
+        2 => (u32::from(u16_at(header, at)), 0xffff),
+        _ => (u32_at(header, at), u32::MAX),
+    }
+}
+
+/// The offset of each table's record for one slot.
+fn select_records(
+    header: &[u8],
+    tables: &[Table],
+    d: &Dims,
+    a: &Areas,
+    slot: usize,
+) -> Result<Vec<Option<usize>>, String> {
+    let mut selected = Vec::with_capacity(d.table_count);
+    for (column, table) in tables.iter().enumerate() {
+        let (matrix, columns, local) = if column < d.primary {
+            (a.indices, d.primary, column)
+        } else {
+            (a.secondary_indices, d.secondary, column - d.primary)
+        };
+        let at = matrix + (slot * columns + local) * d.width;
+        let (index, missing) = index_cell(header, at, d.width);
+        if index == missing {
+            selected.push(None);
+        } else if (index as usize) < table.count {
+            selected.push(Some(table.start + index as usize * table.stride));
+        } else {
+            return Err(format!("slot {slot} has an invalid native table index"));
+        }
+    }
+    Ok(selected)
+}
+
+/// A slot's record of the table of type `kind`, if it has one.
+fn slot_record<'h>(
+    header: &'h [u8],
+    tables: &[Table],
+    selected: &[Option<usize>],
+    kind: u64,
+    min: usize,
+) -> Result<Option<&'h [u8]>, String> {
+    let Some(column) = tables.iter().position(|t| t.type_hash == kind) else { return Ok(None) };
+    let Some(at) = selected[column] else { return Ok(None) };
+    let stride = tables[column].stride;
+    if stride < min {
+        return Err(format!("native record {kind:016x} is too short"));
+    }
+    Ok(Some(&header[at..at + stride]))
+}
+
+fn resource_payload(r: &[u8]) -> Payload {
+    let system_flags = u32_at(r, 0);
+    let graphics_flags = u32_at(r, 4);
+    Payload {
+        offset: u64::from(u32_at(r, 12)) << 4,
+        stored: u64::from(u32_at(r, 8)) << 4,
+        size: u64::from(system_flags & 0x7fff_fff0) + u64::from(graphics_flags & 0xffff_fff0),
+        type_id: r[16],
+        layout: r[17],
+        storage: Storage::Resource { system_flags, graphics_flags },
+    }
+}
+
+fn chunked_payload(r: &[u8]) -> Payload {
+    Payload {
+        offset: (u64_at(r, 0) & MASK40) << 4,
+        stored: (u64_at(r, 8) & MASK40) << 4,
+        size: u64_at(r, 16) & MASK44,
+        type_id: r[5],
+        layout: r[6],
+        storage: Storage::Chunked,
+    }
+}
+
+fn raw_payload(r: &[u8]) -> Payload {
+    Payload {
+        offset: u64::from(u32_at(r, 4)) << 4,
+        stored: u64::from(u32_at(r, 0)) << 4,
+        size: u64_at(r, 8) & MASK48,
+        type_id: r[14],
+        layout: r[15],
+        storage: Storage::Raw,
+    }
+}
+
+/// The payload of the one record a slot has among the three kinds.
+fn slot_payload(
+    slot: usize,
+    resource: Option<&[u8]>,
+    chunked: Option<&[u8]>,
+    raw: Option<&[u8]>,
+) -> Result<Payload, String> {
+    match (resource, chunked, raw) {
+        (Some(r), None, None) => Ok(resource_payload(r)),
+        (None, Some(r), None) => Ok(chunked_payload(r)),
+        (None, None, Some(r)) => Ok(raw_payload(r)),
+        _ => Err(format!("slot {slot} has missing or conflicting payload records")),
+    }
+}
+
+fn check_payload(
+    slot: usize,
+    (offset, stored, size): (u64, u64, u64),
+    extent: usize,
+    archive_size: u64,
+) -> Result<(), String> {
+    if offset.checked_add(stored).is_none_or(|end| end > archive_size)
+        || stored > 0 && offset < extent as u64
+        || stored == 0 && size != 0
+    {
+        return Err(format!("slot {slot} payload lies outside the archive"));
+    }
+    Ok(())
+}
+
+fn parse_entry(
+    header: &[u8],
+    tables: &[Table],
+    d: &Dims,
+    a: &Areas,
+    archive_size: u64,
+    slot: usize,
+) -> Result<NativeEntry, String> {
+    let selected = select_records(header, tables, d, a, slot)?;
+    let record = |kind: u64, min: usize| slot_record(header, tables, &selected, kind, min);
+    let resource = record(RESOURCE, RESOURCE_RECORD_MIN)?;
+    let chunked = record(CHUNKED, CHUNKED_RECORD_MIN)?;
+    let raw = record(RAW, RAW_RECORD_MIN)?;
+    let Payload { offset, stored, size, type_id, layout, storage } = slot_payload(slot, resource, chunked, raw)?;
+    check_payload(slot, (offset, stored, size), d.extent, archive_size)?;
+    let name_hash32 = record(HASH32, HASH32_RECORD_MIN)?.map(|r| u32_at(r, 0));
+    let name_hash64 = record(HASH64, HASH64_RECORD_MIN)?.map(|r| u64_at(r, 0));
+    Ok(NativeEntry {
+        slot,
+        offset,
+        stored,
+        size,
+        type_id,
+        layout,
+        name_hash32,
+        name_hash64,
+        storage,
+        records: selected,
+    })
+}
+
+/// One list item of a chunk record in the given format; `next` is where the
+/// previous chunk's padded end left off, for the formats without offsets.
+fn decode_chunk(format: u8, value: u64, next: u64) -> Result<Chunk, String> {
+    let (low, high) = (value as u32, (value >> 32) as u32);
+    let wrapped = |v: u32| 0x10000 - u64::from(v & 0xffff);
+    let (offset, stored, size, codec) = match format {
+        2 => {
+            let padded = u64::from(high & 0x03ff_ffff) << 4;
+            (next, padded.checked_sub(u64::from(high >> 26 & 15)), u64::from(low) << 4, high >> 30)
+        }
+        3 => (u64::from(high & 0x0fff_ffff) << 4, Some(wrapped(low >> 16)), wrapped(low), high >> 28),
+        4 => {
+            let padded = value >> 24 & 0xff_ffff;
+            (next, padded.checked_sub(u64::from(high >> 20 & 15)), value & 0xff_ffff, high >> 24)
+        }
+        format => return Err(format!("chunk format {format} is not supported")),
+    };
+    let stored = stored.ok_or("a chunk is shorter than its padding")?;
+    if !matches!(codec, 0 | 3) {
+        return Err(format!("chunk codec {codec} is not supported"));
+    }
+    Ok(Chunk { offset, stored, size, zlib: codec == 3 })
+}
+
 impl Catalog {
     /// Parses already-decoded header bytes and checks all tables, entry
     /// indices and payload ranges before exposing any native entries.
     pub fn parse(header: Vec<u8>, archive_size: u64) -> Result<Self, String> {
-        if header.len() < 64 || u32_at(&header, 0) != 0x5250_4639 {
-            return Err("not a native RPF9 header".into());
+        let dims = read_dims(&header, archive_size)?;
+        let areas = read_areas(&dims)?;
+        let tables = read_tables(&header, &dims, &areas)?;
+        let mut entries = Vec::with_capacity(dims.count);
+        for slot in 0..dims.count {
+            entries.push(parse_entry(&header, &tables, &dims, &areas, archive_size, slot)?);
         }
-        let extent = u32_at(&header, 4) as usize;
-        let split = u32_at(&header, 8) as usize;
-        if extent != header.len() || extent as u64 > archive_size || header.len() > 64 << 20 {
-            return Err("native header extent is invalid or too large".into());
-        }
-        let directories = usize::from(u16_at(&header, 0x1a));
-        let blob_size = u32_at(&header, 0x1c) as usize;
-        let table_count = usize::from(u16_at(&header, 0x20));
-        let secondary = usize::from(u16_at(&header, 0x22));
-        let count = u32_at(&header, 0x24) as usize;
-        let width = usize::from(header[0x2c]);
-        let wide_align = header[0x2d] & 1 != 0;
-        if !matches!(width, 1 | 2 | 4) || secondary > table_count || count > 1_000_000 {
-            return Err("unsupported native table dimensions".into());
-        }
-        if table_count == 0 && count != 0 {
-            return Err("native entries have no tables".into());
-        }
-        let primary = table_count - secondary;
-        let directory = aligned(64, if wide_align { 16 } else { 4 })?;
-        let blob = aligned(sum(directory, product(directories, 8)?)?, if wide_align { 16 } else { 8 })?;
-        let descriptors = aligned(sum(blob, blob_size)?, if wide_align { 16 } else { 8 })?;
-        let indices = aligned(sum(descriptors, product(table_count, 24)?)?, width)?;
-        let data = aligned(sum(indices, product(product(primary, count)?, width)?)?, 8)?;
-        let secondary_indices = aligned(split, width)?;
-        let secondary_data = aligned(sum(secondary_indices, product(product(secondary, count)?, width)?)?, 8)?;
-        if data > split || secondary_data > extent {
-            return Err("native table arrays lie outside the header".into());
-        }
-        let mut tables = Vec::with_capacity(table_count);
-        let mut types = HashSet::new();
-        for column in 0..table_count {
-            let at = descriptors + column * 24;
-            let type_hash = u64_at(&header, at);
-            let records = u32_at(&header, at + 8) as usize;
-            let offset = u32_at(&header, at + 12) as usize;
-            let stride = usize::from(u16_at(&header, at + 16));
-            let (base, limit) = if column < primary { (data, split) } else { (secondary_data, extent) };
-            let start = sum(base, offset)?;
-            if start > limit || sum(start, product(records, stride)?)? > limit || records > 0 && stride == 0 {
-                return Err(format!("native table {column} lies outside its header section"));
-            }
-            if !types.insert(type_hash) {
-                return Err("duplicate native table type".into());
-            }
-            tables.push(Table { type_hash, count: records, stride, start });
-        }
-        let mut entries = Vec::with_capacity(count);
-        for slot in 0..count {
-            let mut selected = Vec::with_capacity(table_count);
-            for (column, table) in tables.iter().enumerate() {
-                let (matrix, columns, local) = if column < primary {
-                    (indices, primary, column)
-                } else {
-                    (secondary_indices, secondary, column - primary)
-                };
-                let at = matrix + (slot * columns + local) * width;
-                let index = match width {
-                    1 => u32::from(header[at]),
-                    2 => u32::from(u16_at(&header, at)),
-                    _ => u32_at(&header, at),
-                };
-                let missing = match width {
-                    1 => 0xff,
-                    2 => 0xffff,
-                    _ => u32::MAX,
-                };
-                if index == missing {
-                    selected.push(None);
-                } else if (index as usize) < table.count {
-                    selected.push(Some(table.start + index as usize * table.stride));
-                } else {
-                    return Err(format!("slot {slot} has an invalid native table index"));
-                }
-            }
-            let record = |kind: u64, min: usize| -> Result<Option<&[u8]>, String> {
-                let Some(column) = tables.iter().position(|t| t.type_hash == kind) else { return Ok(None) };
-                let Some(at) = selected[column] else { return Ok(None) };
-                let stride = tables[column].stride;
-                if stride < min {
-                    return Err(format!("native record {kind:016x} is too short"));
-                }
-                Ok(Some(&header[at..at + stride]))
-            };
-            let resource = record(RESOURCE, 18)?;
-            let chunked = record(CHUNKED, 24)?;
-            let raw = record(RAW, 16)?;
-            if [resource.is_some(), chunked.is_some(), raw.is_some()].into_iter().filter(|v| *v).count() != 1 {
-                return Err(format!("slot {slot} has missing or conflicting payload records"));
-            }
-            let (offset, stored, size, type_id, layout, storage) = if let Some(r) = resource {
-                let system_flags = u32_at(r, 0);
-                let graphics_flags = u32_at(r, 4);
-                (
-                    u64::from(u32_at(r, 12)) << 4,
-                    u64::from(u32_at(r, 8)) << 4,
-                    u64::from(system_flags & 0x7fff_fff0) + u64::from(graphics_flags & 0xffff_fff0),
-                    r[16],
-                    r[17],
-                    Storage::Resource { system_flags, graphics_flags },
-                )
-            } else if let Some(r) = chunked {
-                (
-                    (u64_at(r, 0) & MASK40) << 4,
-                    (u64_at(r, 8) & MASK40) << 4,
-                    u64_at(r, 16) & MASK44,
-                    r[5],
-                    r[6],
-                    Storage::Chunked,
-                )
-            } else {
-                let r = raw.expect("one checked payload record");
-                (
-                    u64::from(u32_at(r, 4)) << 4,
-                    u64::from(u32_at(r, 0)) << 4,
-                    u64_at(r, 8) & MASK48,
-                    r[14],
-                    r[15],
-                    Storage::Raw,
-                )
-            };
-            if offset.checked_add(stored).is_none_or(|end| end > archive_size)
-                || stored > 0 && offset < extent as u64
-                || stored == 0 && size != 0
-            {
-                return Err(format!("slot {slot} payload lies outside the archive"));
-            }
-            let name_hash32 = record(HASH32, 4)?.map(|r| u32_at(r, 0));
-            let name_hash64 = record(HASH64, 8)?.map(|r| u64_at(r, 0));
-            entries.push(NativeEntry {
-                slot,
-                offset,
-                stored,
-                size,
-                type_id,
-                layout,
-                name_hash32,
-                name_hash64,
-                storage,
-                records: selected,
-            });
-        }
+        let split = dims.split;
         Ok(Self { entries, tables, header, split })
     }
 
@@ -259,27 +437,9 @@ impl Catalog {
         // Formats 2 and 4 have no offsets: chunks follow each other, padded.
         let mut next = 0u64;
         for item in items.as_chunks::<8>().0 {
-            let value = u64::from_le_bytes(*item);
-            let (low, high) = (value as u32, (value >> 32) as u32);
-            let wrapped = |v: u32| 0x10000 - u64::from(v & 0xffff);
-            let (offset, stored, size, codec) = match self.header[at + 7] {
-                2 => {
-                    let padded = u64::from(high & 0x03ff_ffff) << 4;
-                    (next, padded.checked_sub(u64::from(high >> 26 & 15)), u64::from(low) << 4, high >> 30)
-                }
-                3 => (u64::from(high & 0x0fff_ffff) << 4, Some(wrapped(low >> 16)), wrapped(low), high >> 28),
-                4 => {
-                    let padded = value >> 24 & 0xff_ffff;
-                    (next, padded.checked_sub(u64::from(high >> 20 & 15)), value & 0xff_ffff, high >> 24)
-                }
-                format => return Err(format!("chunk format {format} is not supported")),
-            };
-            let stored = stored.ok_or("a chunk is shorter than its padding")?;
-            if !matches!(codec, 0 | 3) {
-                return Err(format!("chunk codec {codec} is not supported"));
-            }
-            next = (offset + stored).next_multiple_of(16);
-            chunks.push(Chunk { offset, stored, size, zlib: codec == 3 });
+            let chunk = decode_chunk(self.header[at + 7], u64::from_le_bytes(*item), next)?;
+            next = (chunk.offset + chunk.stored).next_multiple_of(16);
+            chunks.push(chunk);
         }
         Ok(Some(chunks))
     }

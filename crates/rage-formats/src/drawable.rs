@@ -466,89 +466,116 @@ fn gen9_layout(res: &Resource, decl: u64, stride: usize) -> Result<VertexLayout,
     Ok(layout)
 }
 
-fn read_geometry(res: &Resource, g: u64, layout_gen: Gen) -> Result<Mesh, ResourceError> {
-    let (vb, ib) = if layout_gen == Gen::Rdr2 {
-        (res.u64(g + 0x08)?, res.u64(g + 0x10)?)
-    } else {
-        (res.u64(g + 0x18)?, res.u64(g + 0x38)?)
-    };
-    let (count, stride, data, mut layout) = if layout_gen.sga() {
+/// Vertex count, stride, data pointer and layout of a geometry's vertex buffer at `vb`.
+fn read_vertex_buffer(
+    res: &Resource,
+    vb: u64,
+    layout_gen: Gen,
+) -> Result<(usize, usize, u64, VertexLayout), ResourceError> {
+    if layout_gen.sga() {
         let count = res.u32(vb + 0x08)? as usize;
         let stride = res.u16(vb + 0x0C)? as usize;
         let data = res.u64(vb + 0x18)?;
-        (count, stride, data, gen9_layout(res, res.u64(vb + 0x38)?, stride)?)
+        Ok((count, stride, data, gen9_layout(res, res.u64(vb + 0x38)?, stride)?))
     } else {
         let stride = res.u16(vb + 0x08)? as usize;
         let data = res.u64(vb + 0x10)?;
         let count = res.u32(vb + 0x18)? as usize;
-        (count, stride, data, legacy_layout(res, res.u64(vb + 0x30)?, stride)?)
-    };
-    if stride == 0 || count > 1 << 22 {
-        return Err(bad("implausible vertex buffer"));
+        Ok((count, stride, data, legacy_layout(res, res.u64(vb + 0x30)?, stride)?))
     }
-    layout.streamed = layout_gen == Gen::Rdr2;
-    if layout_gen == Gen::Rdr2
-        && let Some((o, Encoding::R10G10B10A2)) = layout.normal
-    {
-        layout.normal = Some((o, Encoding::R10G10B10A2Unorm));
-    }
-    let bytes = res.bytes(data, count * stride)?;
-    let (pos_off, pos_enc) = layout.position.ok_or_else(|| bad("vertices without positions"))?;
-    // Where attribute (offset, encoding) of vertex i starts, if inside the buffer.
-    let at = |(o, e): (usize, Encoding), i: usize| -> Option<usize> {
-        if layout.streamed {
+}
+
+/// The vertex bytes of a geometry and where its attributes lie in them.
+struct VertexReader<'a> {
+    layout: &'a VertexLayout,
+    bytes: &'a [u8],
+    count: usize,
+}
+
+impl VertexReader<'_> {
+    /// Where attribute (offset, encoding) of vertex i starts, if inside the buffer.
+    fn at(&self, (o, e): (usize, Encoding), i: usize) -> Option<usize> {
+        if self.layout.streamed {
             let start = o + i * e.size();
-            (o + count * e.size() <= bytes.len()).then_some(start)
+            (o + self.count * e.size() <= self.bytes.len()).then_some(start)
         } else {
-            (o + e.size() <= layout.stride).then_some(i * layout.stride + o)
+            (o + e.size() <= self.layout.stride).then_some(i * self.layout.stride + o)
         }
-    };
-    let attr = |slot: Option<(usize, Encoding)>, i: usize| slot.and_then(|s| Some(s.1.decode(&bytes[at(s, i)?..])));
-    let mut mesh = Mesh::default();
-    for i in 0..count {
-        let Some(p_at) = at((pos_off, pos_enc), i) else { return Err(bad("position outside vertex")) };
-        let p = pos_enc.decode(&bytes[p_at..]);
-        mesh.positions.push([p[0], p[1], p[2]]);
-        if let Some(n) = attr(layout.normal, i) {
+    }
+
+    fn attr(&self, slot: Option<(usize, Encoding)>, i: usize) -> Option<[f32; 4]> {
+        slot.and_then(|s| Some(s.1.decode(&self.bytes[self.at(s, i)?..])))
+    }
+
+    fn read_into(&self, mesh: &mut Mesh, pos_slot: (usize, Encoding)) -> Result<(), ResourceError> {
+        for i in 0..self.count {
+            let Some(p_at) = self.at(pos_slot, i) else { return Err(bad("position outside vertex")) };
+            let p = pos_slot.1.decode(&self.bytes[p_at..]);
+            mesh.positions.push([p[0], p[1], p[2]]);
+            self.push_attributes(mesh, i);
+        }
+        Ok(())
+    }
+
+    fn push_attributes(&self, mesh: &mut Mesh, i: usize) {
+        let layout = self.layout;
+        if let Some(n) = self.attr(layout.normal, i) {
             mesh.normals.push([n[0], n[1], n[2]]);
         }
-        if let Some(t) = attr(layout.uv, i) {
+        if let Some(t) = self.attr(layout.uv, i) {
             mesh.uvs.push([t[0], t[1]]);
         }
-        if let Some(t) = attr(layout.uv1, i) {
+        if let Some(t) = self.attr(layout.uv1, i) {
             mesh.uvs1.push([t[0], t[1]]);
         }
-        if let Some(c) = attr(layout.color, i) {
+        if let Some(c) = self.attr(layout.color, i) {
             mesh.colors.push(c);
         }
-        if let (Some(w), Some(b)) = (attr(layout.weights, i), attr(layout.indices, i)) {
+        if let (Some(w), Some(b)) = (self.attr(layout.weights, i), self.attr(layout.indices, i)) {
             mesh.bone_weights.push(w);
             mesh.bone_indices.push(b.map(|v| v as u16));
         }
     }
-    // Blend indices point into the geometry's bone table (skeleton indices).
-    // RDR2 keeps the table at 0x18 without a count: look up just the entries used.
-    if !mesh.bone_indices.is_empty() && layout_gen == Gen::Rdr2 {
-        let table = res.u64(g + 0x18)?;
-        if (0x5000_0000..0x7000_0000).contains(&table) {
-            let used = mesh.bone_indices.iter().flatten().copied().max().unwrap_or(0) as u64 + 1;
-            if let Ok(ids) = (0..used).map(|i| res.u16(table + i * 2)).collect::<Result<Vec<u16>, _>>() {
-                for b in &mut mesh.bone_indices {
-                    *b = b.map(|i| ids.get(i as usize).copied().unwrap_or(0));
-                }
-            }
-        }
-    } else if !mesh.bone_indices.is_empty() {
-        let table = res.u64(g + 0x68)?;
-        let count = res.u16(g + 0x72)? as u64;
-        if table != 0 && count > 0 && count <= 1024 {
-            let ids: Vec<u16> = (0..count).map(|i| res.u16(table + i * 2)).collect::<Result<_, _>>()?;
+}
+
+/// Blend indices point into the geometry's bone table (skeleton indices).
+/// RDR2 keeps the table at 0x18 without a count: look up just the entries used.
+fn remap_bones_rdr2(res: &Resource, g: u64, mesh: &mut Mesh) -> Result<(), ResourceError> {
+    let table = res.u64(g + 0x18)?;
+    if (0x5000_0000..0x7000_0000).contains(&table) {
+        let used = mesh.bone_indices.iter().flatten().copied().max().unwrap_or(0) as u64 + 1;
+        if let Ok(ids) = (0..used).map(|i| res.u16(table + i * 2)).collect::<Result<Vec<u16>, _>>() {
             for b in &mut mesh.bone_indices {
                 *b = b.map(|i| ids.get(i as usize).copied().unwrap_or(0));
             }
         }
     }
+    Ok(())
+}
 
+fn remap_bones(res: &Resource, g: u64, mesh: &mut Mesh) -> Result<(), ResourceError> {
+    let table = res.u64(g + 0x68)?;
+    let count = res.u16(g + 0x72)? as u64;
+    if table != 0 && count > 0 && count <= 1024 {
+        let ids: Vec<u16> = (0..count).map(|i| res.u16(table + i * 2)).collect::<Result<_, _>>()?;
+        for b in &mut mesh.bone_indices {
+            *b = b.map(|i| ids.get(i as usize).copied().unwrap_or(0));
+        }
+    }
+    Ok(())
+}
+
+fn remap_blend_indices(res: &Resource, g: u64, layout_gen: Gen, mesh: &mut Mesh) -> Result<(), ResourceError> {
+    if mesh.bone_indices.is_empty() {
+        Ok(())
+    } else if layout_gen == Gen::Rdr2 {
+        remap_bones_rdr2(res, g, mesh)
+    } else {
+        remap_bones(res, g, mesh)
+    }
+}
+
+fn read_indices(res: &Resource, ib: u64, layout_gen: Gen) -> Result<Vec<u32>, ResourceError> {
     let index_count = res.u32(ib + 0x08)? as usize;
     let (index_ptr, index_size) = if layout_gen.sga() {
         (res.u64(ib + 0x18)?, res.u16(ib + 0x0C)?.max(2) as usize)
@@ -556,11 +583,47 @@ fn read_geometry(res: &Resource, g: u64, layout_gen: Gen) -> Result<Mesh, Resour
         (res.u64(ib + 0x10)?, 2)
     };
     let ib_bytes = res.bytes(index_ptr, index_count * index_size)?;
-    mesh.indices = if index_size == 4 {
+    Ok(if index_size == 4 {
         ib_bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect()
     } else {
         ib_bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c) as u32).collect()
+    })
+}
+
+/// The RDR2 vertex buffer keeps normals as unsigned 10:10:10:2.
+fn fix_rdr2_normal(layout: &mut VertexLayout) {
+    if let Some((o, Encoding::R10G10B10A2)) = layout.normal {
+        layout.normal = Some((o, Encoding::R10G10B10A2Unorm));
+    }
+}
+
+/// The vertices of a geometry's vertex buffer at `vb`, and their count.
+fn read_vertices(res: &Resource, vb: u64, layout_gen: Gen) -> Result<(Mesh, usize), ResourceError> {
+    let (count, stride, data, mut layout) = read_vertex_buffer(res, vb, layout_gen)?;
+    if stride == 0 || count > 1 << 22 {
+        return Err(bad("implausible vertex buffer"));
+    }
+    layout.streamed = layout_gen == Gen::Rdr2;
+    if layout_gen == Gen::Rdr2 {
+        fix_rdr2_normal(&mut layout);
+    }
+    let bytes = res.bytes(data, count * stride)?;
+    let pos_slot = layout.position.ok_or_else(|| bad("vertices without positions"))?;
+    let mut mesh = Mesh::default();
+    VertexReader { layout: &layout, bytes, count }.read_into(&mut mesh, pos_slot)?;
+    Ok((mesh, count))
+}
+
+fn read_geometry(res: &Resource, g: u64, layout_gen: Gen) -> Result<Mesh, ResourceError> {
+    let (vb, ib) = if layout_gen == Gen::Rdr2 {
+        (res.u64(g + 0x08)?, res.u64(g + 0x10)?)
+    } else {
+        (res.u64(g + 0x18)?, res.u64(g + 0x38)?)
     };
+    let (mut mesh, count) = read_vertices(res, vb, layout_gen)?;
+    remap_blend_indices(res, g, layout_gen, &mut mesh)?;
+
+    mesh.indices = read_indices(res, ib, layout_gen)?;
     if mesh.indices.iter().any(|&i| i as usize >= count) {
         return Err(bad("index outside the vertex buffer"));
     }
