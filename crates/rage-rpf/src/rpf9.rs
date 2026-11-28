@@ -951,6 +951,13 @@ fn copy_plain(
 /// number of chunks); a 64-bit word per chunk (type, size, offset). The
 /// container ends where its last chunk does.
 fn awc_len(start: &[u8]) -> Option<u64> {
+    let (flags, count, header) = awc_header(start)?;
+    let table = awc_chunk_table(start, (flags, count), header)?;
+    Some(table.as_chunks::<8>().0.iter().map(|c| awc_chunk_end(u64::from_le_bytes(*c))).fold(header, u64::max))
+}
+
+/// The flags, the stream count and the header length of an audio container.
+fn awc_header(start: &[u8]) -> Option<(u16, usize, u64)> {
     if start.len() < 16 || &start[..4] != b"ADAT" || start[4..6] != [1, 0] {
         return None;
     }
@@ -960,6 +967,11 @@ fn awc_len(start: &[u8]) -> Option<u64> {
     if !(1..=1 << 16).contains(&count) {
         return None;
     }
+    Some((flags, count, header))
+}
+
+/// The table of chunks, after the stream words; it must lie inside the header.
+fn awc_chunk_table(start: &[u8], (flags, count): (u16, usize), header: u64) -> Option<&[u8]> {
     let mut at = 16;
     for (flag, len) in [(0x01, count * 2), (0x20, (count + 1) * 4), (0x40, 4)] {
         if flags & flag != 0 {
@@ -973,12 +985,12 @@ fn awc_len(start: &[u8]) -> Option<u64> {
     if (at + chunks * 8) as u64 > header {
         return None;
     }
-    let mut end = header;
-    for c in table.as_chunks::<8>().0 {
-        let v = u64::from_le_bytes(*c);
-        end = end.max((v & 0x0FFF_FFFF) + ((v >> 28) & 0x0FFF_FFFF));
-    }
-    Some(end)
+    Some(table)
+}
+
+/// Where a chunk ends, from its word of type, size and offset.
+fn awc_chunk_end(v: u64) -> u64 {
+    (v & 0x0FFF_FFFF) + ((v >> 28) & 0x0FFF_FFFF)
 }
 
 const INDEX_RECORD: usize = 46;

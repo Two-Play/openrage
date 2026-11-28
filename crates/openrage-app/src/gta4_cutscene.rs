@@ -263,23 +263,7 @@ impl Gta4Cutscene {
     /// line with a time changes a part partway through: seconds into its
     /// section, or into the cutscene when that is longer than the section.
     pub fn outfit_changes(&self, actor: &str) -> Vec<(f32, Outfit)> {
-        let total = self.duration();
-        // (when, part) of every change, in any order first.
-        let mut events: Vec<(f32, (&'static str, u32, u32))> = Vec::new();
-        let (mut start, mut first) = (0.0, true);
-        for s in &self.sections {
-            if let Some(m) = s.models.iter().find(|m| m.actor() == actor) {
-                for v in s.variations.iter().filter(|v| v.model == m.index && (!first || v.time > 0.0)) {
-                    let Some(component) = v.component_name() else { continue };
-                    let at = if v.time <= s.duration { start + v.time.max(0.0) } else { v.time };
-                    if at < total {
-                        events.push((at, (component, v.drawable, v.texture)));
-                    }
-                }
-                first = false;
-            }
-            start += s.duration;
-        }
+        let mut events = self.outfit_events(actor);
         events.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut current = self.outfit(actor);
         let mut out: Vec<(f32, Outfit)> = Vec::new();
@@ -295,6 +279,21 @@ impl Gta4Cutscene {
             }
         }
         out
+    }
+
+    /// (when, part) of every outfit change of an actor after the start, in any order.
+    fn outfit_events(&self, actor: &str) -> Vec<(f32, (&'static str, u32, u32))> {
+        let total = self.duration();
+        let mut events = Vec::new();
+        let (mut start, mut first) = (0.0, true);
+        for s in &self.sections {
+            if let Some(m) = s.models.iter().find(|m| m.actor() == actor) {
+                section_outfit_events(s, m, (start, total), first, &mut events);
+                first = false;
+            }
+            start += s.duration;
+        }
+        events
     }
 
     /// A vehicle's colours (numbers in `carcols.dat`), from the first section
@@ -673,37 +672,15 @@ pub struct ModelLocation {
 pub fn find_model(game: &Path, cut_vpath: &str, model: &str) -> Option<ModelLocation> {
     let ep = episode(cut_vpath);
     if model.eq_ignore_ascii_case("player") {
-        let rel = format!("{ep}pc/models/cdimages/playerped.rpf");
-        let path = rage_rpf::vfs::find_case_insensitive(game, &rel)?;
-        let rel = path.strip_prefix(game).ok()?.to_string_lossy().replace('\\', "/");
-        return Some(ModelLocation { source: ModelSource::File(format!("{rel}/player.wft")), kind: Kind::Ped });
+        return player_model(game, ep);
     }
     let index = crate::gta4::texture_index(game);
-    let in_episode = |p: &Path| {
-        let rel = p.strip_prefix(game).unwrap_or(p).to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-        let ep = ep.to_ascii_lowercase();
-        if ep.is_empty() { !rel.starts_with("tlad/") && !rel.starts_with("tbogt/") } else { rel.starts_with(&ep) }
-    };
-    let archive_rank = |p: &Path| {
-        let name = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-        ["cutsprops.img", "componentpeds.img", "vehicles.img"].iter().position(|n| name == *n).unwrap_or(3)
-    };
-    let ext_rank =
-        |e: &str| ["wdd", "wft", "wdr"].iter().position(|x| e.to_ascii_lowercase().ends_with(x)).unwrap_or(3);
-    let best =
-        index.model_files(model).iter().min_by_key(|(p, e)| (!in_episode(p), archive_rank(p), ext_rank(e))).and_then(
-            |(p, e)| {
-                let rel = p.strip_prefix(game).ok()?.to_string_lossy().replace('\\', "/");
-                let kind = if e.to_ascii_lowercase().ends_with(".wdd") {
-                    Kind::Ped
-                } else if archive_rank(p) == 2 {
-                    Kind::Vehicle
-                } else {
-                    Kind::Prop
-                };
-                Some(ModelLocation { source: ModelSource::File(format!("{rel}/{e}")), kind })
-            },
-        );
+    let ep_lower = ep.to_ascii_lowercase();
+    let best = index
+        .model_files(model)
+        .iter()
+        .min_by_key(|(p, e)| (!in_episode(game, &ep_lower, p), archive_rank(p), ext_rank(e)))
+        .and_then(|(p, e)| model_file_location(game, p, e));
     if best.is_some() {
         return best;
     }
@@ -711,6 +688,62 @@ pub fn find_model(game: &Path, cut_vpath: &str, model: &str) -> Option<ModelLoca
     let near = game.join(ep.trim_end_matches('/'));
     let source = index.model_source(model, &near, game)?;
     Some(ModelLocation { source, kind: Kind::Prop })
+}
+
+fn player_model(game: &Path, ep: &str) -> Option<ModelLocation> {
+    let rel = format!("{ep}pc/models/cdimages/playerped.rpf");
+    let path = rage_rpf::vfs::find_case_insensitive(game, &rel)?;
+    let rel = path.strip_prefix(game).ok()?.to_string_lossy().replace('\\', "/");
+    Some(ModelLocation { source: ModelSource::File(format!("{rel}/player.wft")), kind: Kind::Ped })
+}
+
+/// The model file `e` inside the archive `p`; its kind follows from the file type and the archive.
+fn model_file_location(game: &Path, p: &Path, e: &str) -> Option<ModelLocation> {
+    let rel = p.strip_prefix(game).ok()?.to_string_lossy().replace('\\', "/");
+    let kind = if e.to_ascii_lowercase().ends_with(".wdd") {
+        Kind::Ped
+    } else if archive_rank(p) == 2 {
+        Kind::Vehicle
+    } else {
+        Kind::Prop
+    };
+    Some(ModelLocation { source: ModelSource::File(format!("{rel}/{e}")), kind })
+}
+
+/// Outfit changes of the model `m` in section `s` (`span` is its start and the cutscene's length);
+/// in the first section of the actor only the changes after the start count (`first`).
+fn section_outfit_events(
+    s: &Section,
+    m: &CutModel,
+    span: (f32, f32),
+    first: bool,
+    events: &mut Vec<(f32, (&'static str, u32, u32))>,
+) {
+    let (start, total) = span;
+    for v in s.variations.iter().filter(|v| v.model == m.index && (!first || v.time > 0.0)) {
+        let Some(component) = v.component_name() else { continue };
+        let at = if v.time <= s.duration { start + v.time.max(0.0) } else { v.time };
+        if at < total {
+            events.push((at, (component, v.drawable, v.texture)));
+        }
+    }
+}
+
+/// Whether an archive is in the episode `ep` (lower case, `""` for the base game).
+fn in_episode(game: &Path, ep: &str, p: &Path) -> bool {
+    let rel = p.strip_prefix(game).unwrap_or(p).to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+    if ep.is_empty() { !rel.starts_with("tlad/") && !rel.starts_with("tbogt/") } else { rel.starts_with(ep) }
+}
+
+/// Preference among the archives of a model: cutscene props, peds, vehicles, the rest.
+fn archive_rank(p: &Path) -> usize {
+    let name = p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    ["cutsprops.img", "componentpeds.img", "vehicles.img"].iter().position(|n| name == *n).unwrap_or(3)
+}
+
+/// Preference among the file types of a model: dictionary, fragment, drawable, the rest.
+fn ext_rank(e: &str) -> usize {
+    ["wdd", "wft", "wdr"].iter().position(|x| e.to_ascii_lowercase().ends_with(x)).unwrap_or(3)
 }
 
 /// Loads an actor's model, dressed in `outfit` (see [`Gta4Cutscene::outfit`]).
@@ -911,47 +944,68 @@ impl Assembly {
 /// origin to the first section's). Props move their root bone; that motion
 /// becomes the mover (where the model stands), as people's already is.
 fn actor_animation(body: &Animation, face: Option<&Animation>, shift: [f32; 3]) -> Animation {
-    use rage_formats::clip::{TRACK_BONE_ROTATION, TRACK_BONE_TRANSLATION};
-    const MOVER_TRANSLATION: u8 = 5;
-    const MOVER_ROTATION: u8 = 6;
     let mut tracks = body.tracks.clone();
     let has_mover = tracks.iter().any(|t| t.bone == 0 && matches!(t.track, MOVER_TRANSLATION | MOVER_ROTATION));
     if !has_mover {
-        for t in tracks.iter_mut().filter(|t| t.bone == 0) {
-            match t.track {
-                TRACK_BONE_TRANSLATION => t.track = MOVER_TRANSLATION,
-                TRACK_BONE_ROTATION => t.track = MOVER_ROTATION,
-                _ => {}
-            }
-        }
+        root_motion_to_mover(&mut tracks);
     }
     let frames = body.frames.max(1);
     let mut values: Vec<Vec<[f32; 4]>> = (0..tracks.len())
         .map(|t| (0..frames).map(|f| body.value(t, f as f32).unwrap_or([0.0, 0.0, 0.0, 1.0])).collect())
         .collect();
     if let Some(face) = face {
-        let time = |f: usize| if frames > 1 { f as f32 / (frames - 1) as f32 * body.duration } else { 0.0 };
-        for (t, track) in face.tracks.iter().enumerate() {
-            if tracks.iter().any(|b| b.bone == track.bone && b.track == track.track) {
-                continue;
-            }
-            tracks.push(*track);
-            values.push(
-                (0..frames).map(|f| face.value(t, face.frame_at(time(f))).unwrap_or([0.0, 0.0, 0.0, 1.0])).collect(),
-            );
-        }
+        add_face_tracks(body, face, &mut tracks, &mut values);
     }
-    const CAMERA_TRANSLATION: u8 = 7;
     if shift != [0.0; 3] {
-        for (t, v) in tracks.iter().zip(&mut values) {
-            if t.bone == 0 && matches!(t.track, MOVER_TRANSLATION | CAMERA_TRANSLATION) {
-                for p in v.iter_mut() {
-                    (0..3).for_each(|k| p[k] += shift[k]);
-                }
-            }
-        }
+        shift_translations(&tracks, &mut values, shift);
     }
     Animation::from_frames(frames, body.duration, tracks, values)
+}
+
+const MOVER_TRANSLATION: u8 = 5;
+const MOVER_ROTATION: u8 = 6;
+const CAMERA_TRANSLATION: u8 = 7;
+
+/// The root bone's motion becomes the mover's.
+fn root_motion_to_mover(tracks: &mut [rage_formats::clip::BoneTrack]) {
+    use rage_formats::clip::{TRACK_BONE_ROTATION, TRACK_BONE_TRANSLATION};
+    for t in tracks.iter_mut().filter(|t| t.bone == 0) {
+        match t.track {
+            TRACK_BONE_TRANSLATION => t.track = MOVER_TRANSLATION,
+            TRACK_BONE_ROTATION => t.track = MOVER_ROTATION,
+            _ => {}
+        }
+    }
+}
+
+/// Adds the facial clip's tracks the body does not have, sampled at the body's frame times.
+fn add_face_tracks(
+    body: &Animation,
+    face: &Animation,
+    tracks: &mut Vec<rage_formats::clip::BoneTrack>,
+    values: &mut Vec<Vec<[f32; 4]>>,
+) {
+    let frames = body.frames.max(1);
+    let time = |f: usize| if frames > 1 { f as f32 / (frames - 1) as f32 * body.duration } else { 0.0 };
+    for (t, track) in face.tracks.iter().enumerate() {
+        if tracks.iter().any(|b| b.bone == track.bone && b.track == track.track) {
+            continue;
+        }
+        tracks.push(*track);
+        values
+            .push((0..frames).map(|f| face.value(t, face.frame_at(time(f))).unwrap_or([0.0, 0.0, 0.0, 1.0])).collect());
+    }
+}
+
+/// Moves the mover and camera translations by `shift`.
+fn shift_translations(tracks: &[rage_formats::clip::BoneTrack], values: &mut [Vec<[f32; 4]>], shift: [f32; 3]) {
+    for (t, v) in tracks.iter().zip(values) {
+        if t.bone == 0 && matches!(t.track, MOVER_TRANSLATION | CAMERA_TRANSLATION) {
+            for p in v.iter_mut() {
+                (0..3).for_each(|k| p[k] += shift[k]);
+            }
+        }
+    }
 }
 
 /// Loads a person's accessories from its prop dictionary (`<model>_p.wdd`
@@ -966,37 +1020,7 @@ pub fn load_props(
     if props.is_empty() {
         return Vec::new();
     }
-    let index = crate::gta4::texture_index(game);
-    let ep = episode(cut_vpath).to_ascii_lowercase();
-    let in_episode = |p: &Path| {
-        let rel = p.strip_prefix(game).unwrap_or(p).to_string_lossy().replace('\\', "/").to_ascii_lowercase();
-        if ep.is_empty() { !rel.starts_with("tlad/") && !rel.starts_with("tbogt/") } else { rel.starts_with(&ep) }
-    };
-    // `CS_Mallorie_D` (one of her outfits) has the props of `cs_mallorie_p`,
-    // `cs_Bernie_CraneC` those of `cs_bernie_crane_p`.
-    let mut shorter = vec![model.to_ascii_lowercase()];
-    while let Some((s, _)) = shorter.last().and_then(|s| s.rsplit_once('_')) {
-        shorter.push(s.to_owned());
-    }
-    let mut stems: Vec<String> =
-        shorter.iter().flat_map(|s| [s.clone(), s[..s.len().saturating_sub(1)].to_owned()]).collect();
-    // A cutscene character's dictionary may lack what the in-game one has
-    // (`cs_mori_k_p` has no glasses, `ig_mori_k_p` does).
-    let in_game: Vec<String> = stems.iter().filter_map(|s| Some(format!("ig_{}", s.strip_prefix("cs_")?))).collect();
-    stems.extend(in_game);
-    let dictionaries: Vec<String> = stems
-        .iter()
-        .filter_map(|stem| {
-            index
-                .model_files(&format!("{stem}_p"))
-                .iter()
-                .filter(|(_, e)| e.to_ascii_lowercase().ends_with(".wdd"))
-                .min_by_key(|(p, _)| !in_episode(p))
-                .and_then(|(p, e)| {
-                    Some(format!("{}/{e}", p.strip_prefix(game).ok()?.to_string_lossy().replace('\\', "/")))
-                })
-        })
-        .collect();
+    let dictionaries = prop_dictionaries(game, &episode(cut_vpath).to_ascii_lowercase(), model);
     let mut wanted: Vec<(String, u32, &'static str)> = props
         .iter()
         .filter_map(|p| {
@@ -1018,6 +1042,36 @@ pub fn load_props(
         }
     }
     out
+}
+
+/// The virtual paths of the prop dictionaries to try for a model, best first.
+fn prop_dictionaries(game: &Path, ep: &str, model: &str) -> Vec<String> {
+    let index = crate::gta4::texture_index(game);
+    // `CS_Mallorie_D` (one of her outfits) has the props of `cs_mallorie_p`,
+    // `cs_Bernie_CraneC` those of `cs_bernie_crane_p`.
+    let mut shorter = vec![model.to_ascii_lowercase()];
+    while let Some((s, _)) = shorter.last().and_then(|s| s.rsplit_once('_')) {
+        shorter.push(s.to_owned());
+    }
+    let mut stems: Vec<String> =
+        shorter.iter().flat_map(|s| [s.clone(), s[..s.len().saturating_sub(1)].to_owned()]).collect();
+    // A cutscene character's dictionary may lack what the in-game one has
+    // (`cs_mori_k_p` has no glasses, `ig_mori_k_p` does).
+    let in_game: Vec<String> = stems.iter().filter_map(|s| Some(format!("ig_{}", s.strip_prefix("cs_")?))).collect();
+    stems.extend(in_game);
+    stems
+        .iter()
+        .filter_map(|stem| {
+            index
+                .model_files(&format!("{stem}_p"))
+                .iter()
+                .filter(|(_, e)| e.to_ascii_lowercase().ends_with(".wdd"))
+                .min_by_key(|(p, _)| !in_episode(game, ep, p))
+                .and_then(|(p, e)| {
+                    Some(format!("{}/{e}", p.strip_prefix(game).ok()?.to_string_lossy().replace('\\', "/")))
+                })
+        })
+        .collect()
 }
 
 /// Paints a GTA IV vehicle: its `gta_vehicle_paint1` to `…paint3`
@@ -1226,30 +1280,10 @@ fn slice(pcm: &rage_formats::awc::Pcm, start: f32, length: f32) -> rage_formats:
 /// A cutscene's own sound (see [`audio`]), without looking for the whole
 /// cutscene it may be part of.
 fn own_audio(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> (Option<rage_formats::awc::Pcm>, Vec<String>) {
-    // (start in the cutscene, sound name)
-    let mut segments: Vec<(f32, String)> = Vec::new();
-    let mut at = 0.0;
-    for s in &cut.sections {
-        if let Some(name) = s.audio.as_deref().filter(|n| !n.is_empty()) {
-            segments.push((at, name.to_ascii_lowercase()));
-        }
-        at += s.duration;
-    }
+    let segments = audio_segments(cut);
     let total = cut.duration();
     let mut missing: Vec<String> = Vec::new();
-    let mut sounds: std::collections::HashMap<String, Option<rage_formats::awc::Pcm>> = Default::default();
-    for (_, name) in &segments {
-        sounds.entry(name.clone()).or_insert_with(|| {
-            let pcm = audio_paths(vpath, name).into_iter().find_map(|p| {
-                let (Node::Gta4File(a, id), _) = rage_mods::resolve(game, &p, None).ok()? else { return None };
-                rage_formats::ivaud::decode(&a.read(id).ok()?).ok()
-            });
-            if pcm.is_none() {
-                missing.push(name.clone());
-            }
-            pcm.map(|p| to_stereo(&p))
-        });
-    }
+    let sounds = decode_sounds(game, vpath, &segments, &mut missing);
     // A sound the game lacks lets the one before run on; so does the same
     // sound named again.
     let mut found: Vec<(f32, &rage_formats::awc::Pcm)> = Vec::new();
@@ -1269,28 +1303,69 @@ fn own_audio(game: &Path, vpath: &str, cut: &Gta4Cutscene) -> (Option<rage_forma
             channels: 2,
             samples: Vec::new(),
         });
-        let rate = track.sample_rate as f32;
-        let frame = |t: f32| (t * rate) as usize * 2;
-        // Silence up to the segment's start, then the sound until the next one starts.
-        track.samples.resize(track.samples.len().max(frame(*start)), 0);
-        track.samples.truncate(frame(*start));
-        let step = pcm.sample_rate as f32 / rate;
-        let frames = ((end.min(total.max(*start)) - start).max(0.0) * rate) as usize;
-        let have = pcm.samples.len() / 2;
-        let take = if end == f32::MAX { have.max(frames) } else { frames };
-        for f in 0..take {
-            let k = (f as f32 * step) as usize;
-            if k >= have {
-                break;
-            }
-            track.samples.extend_from_slice(&pcm.samples[2 * k..2 * k + 2]);
-        }
+        append_sound(track, pcm, (*start, end), total);
     }
     // Nothing plays past the cutscene's end.
     if let Some(track) = out.as_mut() {
         track.samples.truncate((total * track.sample_rate as f32) as usize * 2);
     }
     (out, missing)
+}
+
+/// (start in the cutscene, sound name) of every section that names a sound.
+fn audio_segments(cut: &Gta4Cutscene) -> Vec<(f32, String)> {
+    let mut segments = Vec::new();
+    let mut at = 0.0;
+    for s in &cut.sections {
+        if let Some(name) = s.audio.as_deref().filter(|n| !n.is_empty()) {
+            segments.push((at, name.to_ascii_lowercase()));
+        }
+        at += s.duration;
+    }
+    segments
+}
+
+/// Decodes each named sound once (stereo); the names the game lacks go to `missing`.
+fn decode_sounds(
+    game: &Path,
+    vpath: &str,
+    segments: &[(f32, String)],
+    missing: &mut Vec<String>,
+) -> std::collections::HashMap<String, Option<rage_formats::awc::Pcm>> {
+    let mut sounds: std::collections::HashMap<String, Option<rage_formats::awc::Pcm>> = Default::default();
+    for (_, name) in segments {
+        sounds.entry(name.clone()).or_insert_with(|| {
+            let pcm = audio_paths(vpath, name).into_iter().find_map(|p| {
+                let (Node::Gta4File(a, id), _) = rage_mods::resolve(game, &p, None).ok()? else { return None };
+                rage_formats::ivaud::decode(&a.read(id).ok()?).ok()
+            });
+            if pcm.is_none() {
+                missing.push(name.clone());
+            }
+            pcm.map(|p| to_stereo(&p))
+        });
+    }
+    sounds
+}
+
+/// Appends silence up to the segment's start (`span.0`), then the sound until the next one starts (`span.1`).
+fn append_sound(track: &mut rage_formats::awc::Pcm, pcm: &rage_formats::awc::Pcm, span: (f32, f32), total: f32) {
+    let (start, end) = span;
+    let rate = track.sample_rate as f32;
+    let frame = |t: f32| (t * rate) as usize * 2;
+    track.samples.resize(track.samples.len().max(frame(start)), 0);
+    track.samples.truncate(frame(start));
+    let step = pcm.sample_rate as f32 / rate;
+    let frames = ((end.min(total.max(start)) - start).max(0.0) * rate) as usize;
+    let have = pcm.samples.len() / 2;
+    let take = if end == f32::MAX { have.max(frames) } else { frames };
+    for f in 0..take {
+        let k = (f as f32 * step) as usize;
+        if k >= have {
+            break;
+        }
+        track.samples.extend_from_slice(&pcm.samples[2 * k..2 * k + 2]);
+    }
 }
 
 /// A GTA IV cutscene ready to play: what [`crate::cutscene`] describes for
@@ -1322,16 +1397,14 @@ pub struct Scene {
     pub effect_problems: Vec<String>,
 }
 
-/// Reads the cutscene at `vpath` and finds its animation, models and subtitles.
-pub fn load(game: &Path, vpath: &str) -> Result<Scene> {
-    let (node, _) = rage_mods::resolve(game, vpath, None)?;
-    let Node::Gta4File(archive, id) = node else { bail!("{vpath} is not inside a GTA IV archive") };
-    let cut = parse(&archive.read(id)?)?;
-    let animated = animation(game, vpath, &cut)?;
-    let actors = cut.actors();
-    let models: Vec<Option<ModelLocation>> = actors.iter().map(|(_, m)| find_model(game, vpath, m)).collect();
+/// What [`crate::cutscene`] describes of a cutscene: its length, offset and cast.
+fn cutscene_of(
+    cut: &Gta4Cutscene,
+    actors: &[(String, String)],
+    models: &[Option<ModelLocation>],
+) -> cutscene::Cutscene {
     let first = cut.sections.first().cloned().unwrap_or_default();
-    let cutscene = cutscene::Cutscene {
+    cutscene::Cutscene {
         lights: Vec::new(),
         duration: cut.duration(),
         // The animations are only moved by the offset; `[ORIENT]` turns
@@ -1340,7 +1413,7 @@ pub fn load(game: &Path, vpath: &str) -> Result<Scene> {
         rotation: 0.0,
         actors: actors
             .iter()
-            .zip(&models)
+            .zip(models)
             .map(|((_, model), location)| cutscene::Actor {
                 kind: location.as_ref().map_or(Kind::Prop, |l| l.kind),
                 name: model.clone(),
@@ -1348,20 +1421,36 @@ pub fn load(game: &Path, vpath: &str) -> Result<Scene> {
                 type_file: None,
             })
             .collect(),
-    };
-    let subtitles = subtitles(game, vpath, &cut);
-    let outfits = actors.iter().map(|(key, _)| cut.outfit(key)).collect();
-    let outfit_changes = actors.iter().map(|(key, _)| cut.outfit_changes(key)).collect();
-    let props = actors.iter().map(|(key, _)| cut.props(key)).collect();
+    }
+}
+
+/// Per actor: its vehicle paint, when the cutscene sets colours the game knows.
+fn car_paints(game: &Path, vpath: &str, cut: &Gta4Cutscene, actors: &[(String, String)]) -> Vec<Option<[[f32; 3]; 3]>> {
     let colours = crate::gta4::car_colours(game, episode(vpath));
-    let paints = actors
+    actors
         .iter()
         .map(|(key, _)| {
             let c = cut.vehicle_colours(key)?;
             let rgb = |i: usize| colours.get(c[i] as usize).copied();
             Some([rgb(0)?, rgb(1)?, rgb(2)?])
         })
-        .collect();
+        .collect()
+}
+
+/// Reads the cutscene at `vpath` and finds its animation, models and subtitles.
+pub fn load(game: &Path, vpath: &str) -> Result<Scene> {
+    let (node, _) = rage_mods::resolve(game, vpath, None)?;
+    let Node::Gta4File(archive, id) = node else { bail!("{vpath} is not inside a GTA IV archive") };
+    let cut = parse(&archive.read(id)?)?;
+    let animated = animation(game, vpath, &cut)?;
+    let actors = cut.actors();
+    let models: Vec<Option<ModelLocation>> = actors.iter().map(|(_, m)| find_model(game, vpath, m)).collect();
+    let cutscene = cutscene_of(&cut, &actors, &models);
+    let subtitles = subtitles(game, vpath, &cut);
+    let outfits = actors.iter().map(|(key, _)| cut.outfit(key)).collect();
+    let outfit_changes = actors.iter().map(|(key, _)| cut.outfit_changes(key)).collect();
+    let props = actors.iter().map(|(key, _)| cut.props(key)).collect();
+    let paints = car_paints(game, vpath, &cut, &actors);
     let (audio, missing_audio) = audio(game, vpath, &cut);
     let effects = cut.effects();
     let (effect_library, effect_problems) =

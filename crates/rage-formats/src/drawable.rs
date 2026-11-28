@@ -491,17 +491,21 @@ fn read_vertex_buffer(
     vb: u64,
     layout_gen: Gen,
 ) -> Result<(usize, usize, u64, VertexLayout), ResourceError> {
-    if layout_gen.sga() {
-        let count = res.u32(vb + 0x08)? as usize;
-        let stride = res.u16(vb + 0x0C)? as usize;
-        let data = res.u64(vb + 0x18)?;
-        Ok((count, stride, data, gen9_layout(res, res.u64(vb + 0x38)?, stride)?))
-    } else {
-        let stride = res.u16(vb + 0x08)? as usize;
-        let data = res.u64(vb + 0x10)?;
-        let count = res.u32(vb + 0x18)? as usize;
-        Ok((count, stride, data, legacy_layout(res, res.u64(vb + 0x30)?, stride)?))
-    }
+    if layout_gen.sga() { read_vertex_buffer_gen9(res, vb) } else { read_vertex_buffer_legacy(res, vb) }
+}
+
+fn read_vertex_buffer_gen9(res: &Resource, vb: u64) -> Result<(usize, usize, u64, VertexLayout), ResourceError> {
+    let count = res.u32(vb + 0x08)? as usize;
+    let stride = res.u16(vb + 0x0C)? as usize;
+    let data = res.u64(vb + 0x18)?;
+    Ok((count, stride, data, gen9_layout(res, res.u64(vb + 0x38)?, stride)?))
+}
+
+fn read_vertex_buffer_legacy(res: &Resource, vb: u64) -> Result<(usize, usize, u64, VertexLayout), ResourceError> {
+    let stride = res.u16(vb + 0x08)? as usize;
+    let data = res.u64(vb + 0x10)?;
+    let count = res.u32(vb + 0x18)? as usize;
+    Ok((count, stride, data, legacy_layout(res, res.u64(vb + 0x30)?, stride)?))
 }
 
 /// The vertex bytes of a geometry and where its attributes lie in them.

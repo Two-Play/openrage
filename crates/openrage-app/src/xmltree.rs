@@ -240,53 +240,58 @@ pub fn highlight(line: &str) -> Vec<(SpanKind, &str)> {
     let b = line.as_bytes();
     let mut i = 0;
     let mut text_start = 0;
-    fn push<'a>(out: &mut Vec<(SpanKind, &'a str)>, kind: SpanKind, s: &'a str) {
-        if !s.is_empty() {
-            out.push((kind, s));
-        }
-    }
     while i < b.len() {
         if b[i] == b'<' {
-            push(&mut out, SpanKind::Text, &line[text_start..i]);
+            push_span(&mut out, SpanKind::Text, &line[text_start..i]);
             let end = line[i..].find('>').map_or(b.len(), |e| i + e + 1);
-            let tag = &line[i..end];
-            // `<`, optional `/` or `?`, name, attributes, `/>` or `>`.
-            let mut j = 1;
-            while j < tag.len() && matches!(tag.as_bytes()[j], b'/' | b'?' | b'!') {
-                j += 1;
-            }
-            push(&mut out, SpanKind::Punctuation, &tag[..j]);
-            let name_end =
-                tag[j..].find(|c: char| c.is_whitespace() || c == '>' || c == '/').map_or(tag.len(), |e| j + e);
-            push(&mut out, SpanKind::Tag, &tag[j..name_end]);
-            let mut k = name_end;
-            let tb = tag.as_bytes();
-            while k < tag.len() {
-                if tb[k] == b'"' {
-                    let close = tag[k + 1..].find('"').map_or(tag.len(), |e| k + 1 + e + 1);
-                    push(&mut out, SpanKind::Value, &tag[k..close]);
-                    k = close;
-                } else if tb[k].is_ascii_alphabetic() || tb[k] == b'_' {
-                    let e =
-                        tag[k..].find(|c: char| c == '=' || c.is_whitespace() || c == '>').map_or(tag.len(), |e| k + e);
-                    push(&mut out, SpanKind::Attribute, &tag[k..e]);
-                    k = e;
-                } else {
-                    let e = tag[k..]
-                        .find(|c: char| c == '"' || c.is_ascii_alphabetic() || c == '_')
-                        .map_or(tag.len(), |e| k + e);
-                    push(&mut out, SpanKind::Punctuation, &tag[k..e]);
-                    k = e;
-                }
-            }
+            highlight_tag(&mut out, &line[i..end]);
             i = end;
             text_start = end;
         } else {
             i += 1;
         }
     }
-    push(&mut out, SpanKind::Text, &line[text_start..]);
+    push_span(&mut out, SpanKind::Text, &line[text_start..]);
     out
+}
+
+fn push_span<'a>(out: &mut Vec<(SpanKind, &'a str)>, kind: SpanKind, s: &'a str) {
+    if !s.is_empty() {
+        out.push((kind, s));
+    }
+}
+
+/// Spans of one `<...>` tag: `<`, optional `/` or `?`, name, attributes, `/>` or `>`.
+fn highlight_tag<'a>(out: &mut Vec<(SpanKind, &'a str)>, tag: &'a str) {
+    let mut j = 1;
+    while j < tag.len() && matches!(tag.as_bytes()[j], b'/' | b'?' | b'!') {
+        j += 1;
+    }
+    push_span(out, SpanKind::Punctuation, &tag[..j]);
+    let name_end = tag[j..].find(|c: char| c.is_whitespace() || c == '>' || c == '/').map_or(tag.len(), |e| j + e);
+    push_span(out, SpanKind::Tag, &tag[j..name_end]);
+    let mut k = name_end;
+    while k < tag.len() {
+        k = highlight_tag_part(out, tag, k);
+    }
+}
+
+/// Emits the attribute, quoted value or punctuation starting at `k` and returns where it ends.
+fn highlight_tag_part<'a>(out: &mut Vec<(SpanKind, &'a str)>, tag: &'a str, k: usize) -> usize {
+    let c = tag.as_bytes()[k];
+    if c == b'"' {
+        let close = tag[k + 1..].find('"').map_or(tag.len(), |e| k + 1 + e + 1);
+        push_span(out, SpanKind::Value, &tag[k..close]);
+        close
+    } else if c.is_ascii_alphabetic() || c == b'_' {
+        let e = tag[k..].find(|c: char| c == '=' || c.is_whitespace() || c == '>').map_or(tag.len(), |e| k + e);
+        push_span(out, SpanKind::Attribute, &tag[k..e]);
+        e
+    } else {
+        let e = tag[k..].find(|c: char| c == '"' || c.is_ascii_alphabetic() || c == '_').map_or(tag.len(), |e| k + e);
+        push_span(out, SpanKind::Punctuation, &tag[k..e]);
+        e
+    }
 }
 
 #[cfg(test)]

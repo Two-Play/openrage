@@ -81,6 +81,9 @@ fn safe(name: &str) -> String {
     name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect()
 }
 
+/// The PNG file names written so far, by lower-case texture name (`None` for a texture that failed).
+type Written = HashMap<String, Option<String>>;
+
 fn export(vpath: &str) -> Result<Vec<OutputFile>, String> {
     let model = load_model(vpath)?;
     let name = file_name(vpath);
@@ -88,74 +91,83 @@ fn export(vpath: &str) -> Result<Vec<OutputFile>, String> {
 
     let mut mtl = String::new();
     let mut files = Vec::new();
-    let mut written: HashMap<String, Option<String>> = HashMap::new();
+    let mut written = Written::new();
     for m in &model.materials {
-        let (r, g, b, _) = m.color;
-        let _ = writeln!(mtl, "newmtl {}\nKd {r:.4} {g:.4} {b:.4}", safe(&m.name));
-        if !m.texture.is_empty() {
-            let png = written.entry(m.texture.to_ascii_lowercase()).or_insert_with(|| {
-                match load_texture(vpath, &m.texture).map_err(|e| e.to_string()).and_then(|img| encode_png(&img)) {
-                    Ok(data) => {
-                        let file = format!("{}.png", safe(&m.texture));
-                        files.push(OutputFile::new(file.clone(), data));
-                        Some(file)
-                    }
-                    Err(e) => {
-                        log(Level::Warn, format!("texture {}: {e}", m.texture));
-                        None
-                    }
-                }
-            });
-            if let Some(file) = png {
-                let _ = writeln!(mtl, "map_Kd {file}");
-            }
-        }
-        mtl.push('\n');
+        write_material(&mut mtl, vpath, m, &mut files, &mut written);
     }
 
     let mut obj = format!("# {name}, exported by OpenRAGE\nmtllib {stem}.mtl\n");
     let mut base = 1usize; // OBJ indices start at 1 and run across the file
     for (i, mesh) in model.meshes.iter().enumerate() {
-        let n = mesh.positions.len() / 3;
         let part = if mesh.part.is_empty() { stem.clone() } else { safe(&mesh.part) };
         let _ = writeln!(obj, "o {part}_{i}\nusemtl {}", safe(&model.materials[mesh.material as usize].name));
-        for p in mesh.positions.as_chunks::<3>().0 {
-            // Z-up → Y-up
-            let _ = writeln!(obj, "v {} {} {}", p[0], p[2], -p[1]);
-        }
-        for t in mesh.uvs.as_chunks::<2>().0 {
-            let _ = writeln!(obj, "vt {} {}", t[0], 1.0 - t[1]);
-        }
-        for v in mesh.normals.as_chunks::<3>().0 {
-            let _ = writeln!(obj, "vn {} {} {}", v[0], v[2], -v[1]);
-        }
-        let (has_uv, has_n) = (!mesh.uvs.is_empty(), !mesh.normals.is_empty());
-        for tri in mesh.indices.as_chunks::<3>().0 {
-            obj.push('f');
-            for &k in tri {
-                let k = base + k as usize;
-                match (has_uv, has_n) {
-                    (true, true) => {
-                        let _ = write!(obj, " {k}/{k}/{k}");
-                    }
-                    (true, false) => {
-                        let _ = write!(obj, " {k}/{k}");
-                    }
-                    (false, true) => {
-                        let _ = write!(obj, " {k}//{k}");
-                    }
-                    (false, false) => {
-                        let _ = write!(obj, " {k}");
-                    }
-                }
-            }
-            obj.push('\n');
-        }
-        base += n;
+        write_mesh(&mut obj, mesh, base);
+        base += mesh.positions.len() / 3;
     }
     files.push(OutputFile::new(format!("{stem}.obj"), obj));
     files.push(OutputFile::new(format!("{stem}.mtl"), mtl));
     Ok(files)
+}
+
+/// A material's entry in the `.mtl`; its texture is exported as PNG the first time it comes up.
+fn write_material(mtl: &mut String, vpath: &str, m: &Material, files: &mut Vec<OutputFile>, written: &mut Written) {
+    let (r, g, b, _) = m.color;
+    let _ = writeln!(mtl, "newmtl {}\nKd {r:.4} {g:.4} {b:.4}", safe(&m.name));
+    if !m.texture.is_empty() {
+        let png =
+            written.entry(m.texture.to_ascii_lowercase()).or_insert_with(|| export_texture(vpath, &m.texture, files));
+        if let Some(file) = png {
+            let _ = writeln!(mtl, "map_Kd {file}");
+        }
+    }
+    mtl.push('\n');
+}
+
+/// Adds a texture as a PNG file and gives its name; a texture that cannot be read is logged and skipped.
+fn export_texture(vpath: &str, texture: &str, files: &mut Vec<OutputFile>) -> Option<String> {
+    match load_texture(vpath, texture).map_err(|e| e.to_string()).and_then(|img| encode_png(&img)) {
+        Ok(data) => {
+            let file = format!("{}.png", safe(texture));
+            files.push(OutputFile::new(file.clone(), data));
+            Some(file)
+        }
+        Err(e) => {
+            log(Level::Warn, format!("texture {texture}: {e}"));
+            None
+        }
+    }
+}
+
+/// The vertices and faces of a mesh; face indices start after the `base` vertices before it.
+fn write_mesh(obj: &mut String, mesh: &Mesh, base: usize) {
+    for p in mesh.positions.as_chunks::<3>().0 {
+        // Z-up → Y-up
+        let _ = writeln!(obj, "v {} {} {}", p[0], p[2], -p[1]);
+    }
+    for t in mesh.uvs.as_chunks::<2>().0 {
+        let _ = writeln!(obj, "vt {} {}", t[0], 1.0 - t[1]);
+    }
+    for v in mesh.normals.as_chunks::<3>().0 {
+        let _ = writeln!(obj, "vn {} {} {}", v[0], v[2], -v[1]);
+    }
+    let (has_uv, has_n) = (!mesh.uvs.is_empty(), !mesh.normals.is_empty());
+    for tri in mesh.indices.as_chunks::<3>().0 {
+        obj.push('f');
+        for &k in tri {
+            write_corner(obj, base + k as usize, has_uv, has_n);
+        }
+        obj.push('\n');
+    }
+}
+
+/// One corner of a face: the vertex, and the same index for the uv and normal that exist.
+fn write_corner(obj: &mut String, k: usize, has_uv: bool, has_n: bool) {
+    let _ = match (has_uv, has_n) {
+        (true, true) => write!(obj, " {k}/{k}/{k}"),
+        (true, false) => write!(obj, " {k}/{k}"),
+        (false, true) => write!(obj, " {k}//{k}"),
+        (false, false) => write!(obj, " {k}"),
+    };
 }
 
 /// Colours and textures from a `.mtl`: a material's `map_Kd` becomes its

@@ -205,11 +205,32 @@ impl Decoder {
         if bits.overread() {
             return bad("frame header ends early");
         }
+        let has_alpha = self.fill_flat_alpha(flags);
+
+        let threads = self.coded.0 * self.coded.1 > 256 * 256;
+        let slices = self.make_slices(data, &bits, (&ends, &offsets), FrameHeader { flags, key, has_alpha })?;
+        let left = run_slices(slices, threads)?;
+        self.filter_planes(&edges, flags, has_alpha, threads);
+        Ok(left)
+    }
+
+    /// Whether the frame has an alpha plane of its own; a flat one is filled at once.
+    fn fill_flat_alpha(&mut self, flags: u32) -> bool {
         let has_alpha = self.has_alpha() && flags & FLAT_ALPHA == 0;
         if self.has_alpha() && !has_alpha {
             self.planes[3].data.fill((flags >> 24) as u8);
         }
+        has_alpha
+    }
 
+    /// Cuts the planes, block infos and motion vectors into the parts of the slices.
+    fn make_slices<'a>(
+        &'a mut self,
+        data: &'a [u8],
+        bits: &Bits<'a>,
+        (ends, offsets): (&[usize], &[usize]),
+        FrameHeader { flags, key, has_alpha }: FrameHeader,
+    ) -> Result<Vec<Slice<'a>>> {
         let mut slices = Vec::with_capacity(ends.len());
         let mut planes = self.planes.each_mut().map(|p| p.data.as_mut_slice());
         let mut infos = self.blocks.each_mut().map(|b| b.info.as_mut_slice());
@@ -217,7 +238,7 @@ impl Decoder {
         let stride = self.last.each_ref().map(|p| p.stride);
         let info_stride: [usize; 4] = std::array::from_fn(|c| self.coded.0 >> 3 >> shift(c));
         let (mut start, mut from) = (0, None);
-        for (&end, &to) in ends.iter().zip(&offsets) {
+        for (&end, &to) in ends.iter().zip(offsets) {
             if to > data.len() || from.is_some_and(|f| f > to) {
                 return bad("slice offsets are not in order");
             }
@@ -233,15 +254,9 @@ impl Decoder {
                 has_alpha,
                 reference: (self.coded.0, self.height.next_multiple_of(16)),
                 last: &self.last,
-                dst: std::array::from_fn(|c| {
-                    let n = if planes[c].is_empty() { 0 } else { stride[c] * (rows >> shift(c)) };
-                    planes[c].split_off_mut(..n).unwrap_or_default()
-                }),
+                dst: std::array::from_fn(|c| take_rows(&mut planes[c], stride[c], rows >> shift(c))),
                 stride,
-                info: std::array::from_fn(|c| {
-                    let n = if infos[c].is_empty() { 0 } else { info_stride[c] * (rows >> 3 >> shift(c)) };
-                    infos[c].split_off_mut(..n).unwrap_or_default()
-                }),
+                info: std::array::from_fn(|c| take_rows(&mut infos[c], info_stride[c], rows >> 3 >> shift(c))),
                 info_stride,
                 mvs: mvs.split_off_mut(..(self.coded.0 >> 4) * (rows >> 4)).unwrap_or_default(),
                 start,
@@ -249,18 +264,12 @@ impl Decoder {
             });
             (start, from) = (end, Some(to));
         }
-        let threads = self.coded.0 * self.coded.1 > 256 * 256;
-        let left: Vec<Result<usize>> = if threads {
-            std::thread::scope(|scope| {
-                let running: Vec<_> = slices.into_iter().map(|s| scope.spawn(|| s.decode())).collect();
-                running.into_iter().map(|t| t.join().unwrap_or_else(|_| bad("slice"))).collect()
-            })
-        } else {
-            slices.into_iter().map(Slice::decode).collect()
-        };
-        let left = left.into_iter().collect::<Result<Vec<usize>>>()?;
+        Ok(slices)
+    }
 
-        let filter = Filter { flags, edges: &edges, mvs: &self.mvs, mv_stride: self.coded.0 >> 4 };
+    /// Runs the loop filter over the planes of the frame.
+    fn filter_planes(&mut self, edges: &[Vec<bool>; 2], flags: u32, has_alpha: bool, threads: bool) {
+        let filter = Filter { flags, edges, mvs: &self.mvs, mv_stride: self.coded.0 >> 4 };
         let planes = self.planes.iter_mut().zip(&self.blocks).enumerate().take(3 + usize::from(has_alpha));
         std::thread::scope(|scope| {
             for (comp, (plane, blocks)) in planes {
@@ -272,7 +281,6 @@ impl Decoder {
                 }
             }
         });
-        Ok(left)
     }
 
     /// Rows and columns of block edges the loop filter leaves alone.
@@ -307,42 +315,90 @@ impl Decoder {
     }
 }
 
+/// What the slices of a frame have in common.
+#[derive(Clone, Copy)]
+struct FrameHeader {
+    flags: u32,
+    key: bool,
+    has_alpha: bool,
+}
+
+/// Splits the first `rows` rows of `per_row` elements off `rest` (nothing for an absent plane).
+fn take_rows<'a, T>(rest: &mut &'a mut [T], per_row: usize, rows: usize) -> &'a mut [T] {
+    let n = if rest.is_empty() { 0 } else { per_row * rows };
+    rest.split_off_mut(..n).unwrap_or_default()
+}
+
+/// Decodes the slices, on threads for a big picture. Gives the bytes left in each.
+fn run_slices(slices: Vec<Slice<'_>>, threads: bool) -> Result<Vec<usize>> {
+    let left: Vec<Result<usize>> = if threads {
+        std::thread::scope(|scope| {
+            let running: Vec<_> = slices.into_iter().map(|s| scope.spawn(|| s.decode())).collect();
+            running.into_iter().map(|t| t.join().unwrap_or_else(|_| bad("slice"))).collect()
+        })
+    } else {
+        slices.into_iter().map(Slice::decode).collect()
+    };
+    left.into_iter().collect()
+}
+
 /// A list of flags, plain or as runs.
 fn flag_list(bits: &mut Bits, size: usize) -> Vec<bool> {
     if !bits.bit() {
         return (0..size).map(|_| bits.bit()).collect();
     }
     let mut out: Vec<bool> = Vec::with_capacity(size);
-    let (mut toggle, mut flag) = (false, false);
+    let mut runs = FlagRuns { toggle: false, flag: false };
     while out.len() < size {
         let left = size - out.len();
-        let runs = bits.bit();
-        if !runs {
-            flag = if toggle { !flag } else { bits.bit() };
-            toggle = false;
-            out.push(flag);
-            for _ in 1..left.min(5) {
-                out.push(bits.bit());
-            }
+        if bits.bit() {
+            runs.run(bits, &mut out, left);
         } else {
-            let n = match left {
-                ..4 => 2,
-                4..16 => 4,
-                _ => 5,
-            };
-            let mut run = n as usize + if toggle { 1 } else { 2 };
-            flag = if toggle { !flag } else { bits.bit() };
-            toggle = false;
-            run = run.min(left);
-            if run < left {
-                let extra = bits.read(n);
-                toggle = extra != (1 << n) - 1;
-                run = (run + extra as usize).min(left);
-            }
-            out.resize(out.len() + run, flag);
+            runs.literal(bits, &mut out, left);
         }
     }
     out
+}
+
+/// The state while reading runs of flags.
+struct FlagRuns {
+    toggle: bool,
+    flag: bool,
+}
+
+impl FlagRuns {
+    /// The flag of the next group: read, or the opposite of the last after a long run.
+    fn next_flag(&mut self, bits: &mut Bits) -> bool {
+        self.flag = if self.toggle { !self.flag } else { bits.bit() };
+        self.toggle = false;
+        self.flag
+    }
+
+    /// Up to 5 flags, the first one as `next_flag`.
+    fn literal(&mut self, bits: &mut Bits, out: &mut Vec<bool>, left: usize) {
+        out.push(self.next_flag(bits));
+        for _ in 1..left.min(5) {
+            out.push(bits.bit());
+        }
+    }
+
+    /// A run of one flag; a long one may go on in the next group.
+    fn run(&mut self, bits: &mut Bits, out: &mut Vec<bool>, left: usize) {
+        let n = match left {
+            ..4 => 2,
+            4..16 => 4,
+            _ => 5,
+        };
+        let mut run = n as usize + if self.toggle { 1 } else { 2 };
+        let flag = self.next_flag(bits);
+        run = run.min(left);
+        if run < left {
+            let extra = bits.read(n);
+            self.toggle = extra != (1 << n) - 1;
+            run = (run + extra as usize).min(left);
+        }
+        out.resize(out.len() + run, flag);
+    }
 }
 
 /// Predicts a DC from the blocks to the left, above, and above left.
@@ -366,29 +422,45 @@ fn predict_dcs(
     top: Option<&[i32; 16]>,
     corner: Option<&[i32; 16]>,
 ) -> [i32; 16] {
-    // A grid with the neighbours in row and column 0.
+    let mut g = neighbour_grid(n, left, top, corner);
+    let mut out = [0; 16];
+    for (i, d) in diff[..n * n].iter().enumerate() {
+        let pos = if n == 4 { LUMA_POS[i] as usize } else { i };
+        let (r, c) = (pos / n + 1, pos % n + 1);
+        let predicted = predict_dc(&g, (r, c), (top.is_some(), left.is_some()));
+        g[r][c] = (predicted + d).clamp(min, max);
+        out[pos] = g[r][c];
+    }
+    out
+}
+
+/// A grid with the neighbours in row and column 0.
+fn neighbour_grid(
+    n: usize,
+    left: Option<&[i32; 16]>,
+    top: Option<&[i32; 16]>,
+    corner: Option<&[i32; 16]>,
+) -> [[i32; 5]; 5] {
     let mut g = [[0i32; 5]; 5];
     for i in 0..n {
         g[0][i + 1] = top.map_or(0, |t| t[(n - 1) * n + i]);
         g[i + 1][0] = left.map_or(0, |l| l[i * n + n - 1]);
     }
     g[0][0] = corner.map_or(0, |c| c[n * n - 1]);
-    let mut out = [0; 16];
-    for (i, d) in diff[..n * n].iter().enumerate() {
-        let pos = if n == 4 { LUMA_POS[i] as usize } else { i };
-        let (r, c) = (pos / n + 1, pos % n + 1);
-        let predicted = match (r > 1 || top.is_some(), c > 1 || left.is_some()) {
-            (true, true) => gradient(g[r - 1][c - 1], g[r][c - 1], g[r - 1][c]),
-            // Along the top only even columns have the block below left yet.
-            (false, true) if c % 2 == 1 => extend(g[r][c - 1], g[r + 1][c - 1]),
-            (false, true) => g[r][c - 1],
-            (true, false) => extend(g[r - 1][c], g[r - 1][c + 1]),
-            (false, false) => 0,
-        };
-        g[r][c] = (predicted + d).clamp(min, max);
-        out[pos] = g[r][c];
+    g
+}
+
+/// The prediction for the DC at row `r`, column `c` of the grid.
+#[inline]
+fn predict_dc(g: &[[i32; 5]; 5], (r, c): (usize, usize), (has_top, has_left): (bool, bool)) -> i32 {
+    match (r > 1 || has_top, c > 1 || has_left) {
+        (true, true) => gradient(g[r - 1][c - 1], g[r][c - 1], g[r - 1][c]),
+        // Along the top only even columns have the block below left yet.
+        (false, true) if c % 2 == 1 => extend(g[r][c - 1], g[r + 1][c - 1]),
+        (false, true) => g[r][c - 1],
+        (true, false) => extend(g[r - 1][c], g[r - 1][c + 1]),
+        (false, false) => 0,
     }
-    out
 }
 
 /// Predicts the one motion vector of a macroblock.

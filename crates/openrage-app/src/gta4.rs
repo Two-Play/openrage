@@ -155,6 +155,30 @@ fn add_audio_names(data: &[u8], names: &mut rage_rpf::gta4::AudioNames) {
     }
 }
 
+/// Writes one archive entry (`(id, relative path)`) below `out` and reports progress.
+fn write_entry(
+    archive: &Gta4Archive,
+    out: &Path,
+    (id, rel): (Gta4EntryId, &str),
+    s: &mut ExtractSummary,
+    progress: &mut dyn FnMut(&ExtractSummary, &str),
+) -> Result<()> {
+    let target = out.join(vfs::safe_relative_path(rel).with_context(|| format!("unsafe path {rel}"))?);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match archive.read(id) {
+        Ok(data) => {
+            fs::write(&target, &data)?;
+            s.files += 1;
+            s.bytes += data.len() as u64;
+        }
+        Err(e) => s.failures.push(e.to_string()),
+    }
+    progress(s, rel);
+    Ok(())
+}
+
 /// Extracts an entry of a GTA IV archive (a file, a folder or the whole
 /// archive) below `out`. Files keep their stored form: resources stay RSC5
 /// files, the form OpenIV exports.
@@ -166,25 +190,9 @@ pub fn extract(
     progress: &mut dyn FnMut(&ExtractSummary, &str),
 ) -> Result<ExtractSummary> {
     let mut summary = ExtractSummary { target: out.to_path_buf(), ..Default::default() };
-    let mut write = |i: Gta4EntryId, rel: &str, s: &mut ExtractSummary| -> Result<()> {
-        let target = out.join(vfs::safe_relative_path(rel).with_context(|| format!("unsafe path {rel}"))?);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match archive.read(i) {
-            Ok(data) => {
-                fs::write(&target, &data)?;
-                s.files += 1;
-                s.bytes += data.len() as u64;
-            }
-            Err(e) => s.failures.push(e.to_string()),
-        }
-        progress(s, rel);
-        Ok(())
-    };
     let entry = archive.entry(id);
     if !entry.is_dir() {
-        write(id, &entry.name, &mut summary)?;
+        write_entry(archive, out, (id, &entry.name), &mut summary, progress)?;
         summary.target = out.join(&entry.name);
         return Ok(summary);
     }
@@ -202,7 +210,7 @@ pub fn extract(
             summary.cancelled = true;
             break;
         }
-        write(i, &rel, &mut summary)?;
+        write_entry(archive, out, (i, &rel), &mut summary, progress)?;
     }
     Ok(summary)
 }

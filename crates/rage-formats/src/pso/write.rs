@@ -801,6 +801,23 @@ impl<'a> Builder<'a> {
 
     /// Puts the blocks in order, resolves pointers and assembles the file.
     fn finish(mut self, root: usize) -> R<Vec<u8>> {
+        let (order, id) = self.block_order();
+        for f in std::mem::take(&mut self.fixes) {
+            let p = self.encode_pointer(id[f.target], f.offset)?;
+            self.put(f.block, f.at, &p)?;
+        }
+        if order.len() > 0x7FFF {
+            return Err(format!("{} blocks are more than a block map holds", order.len()));
+        }
+        let (mut psin, map) = self.block_data(&order);
+        let len = u32::try_from(psin.len()).map_err(|_| "the data is over 4 GB".to_owned())?;
+        psin[4..8].copy_from_slice(&len.to_be_bytes());
+        let pmap = self.block_map(&map, id[root], order.len());
+        Ok(self.splice_sections(&psin, &pmap))
+    }
+
+    /// The blocks in file order, and the 1-based id each block gets.
+    fn block_order(&self) -> (Vec<usize>, Vec<usize>) {
         let pso = self.pso;
         // Blocks keep the original's order; new types follow.
         let rank = |name: u32| pso.blocks.iter().position(|b| b.name == name).unwrap_or(usize::MAX);
@@ -810,16 +827,14 @@ impl<'a> Builder<'a> {
         for (n, &i) in order.iter().enumerate() {
             id[i] = n + 1;
         }
-        for f in std::mem::take(&mut self.fixes) {
-            let p = self.encode_pointer(id[f.target], f.offset)?;
-            self.put(f.block, f.at, &p)?;
-        }
-        if order.len() > 0x7FFF {
-            return Err(format!("{} blocks are more than a block map holds", order.len()));
-        }
+        (order, id)
+    }
+
+    /// The PSIN section (its length still unset) and the entries of the block map.
+    fn block_data(&self, order: &[usize]) -> (Vec<u8>, Vec<u8>) {
         let mut psin = b"PSIN\0\0\0\0pppppppp".to_vec();
         let mut map = Vec::with_capacity(16 * order.len());
-        for &i in &order {
+        for &i in order {
             let b = &self.blocks[i];
             psin.resize(psin.len().next_multiple_of(16), b'p');
             map.extend_from_slice(&b.name.to_be_bytes());
@@ -828,13 +843,16 @@ impl<'a> Builder<'a> {
             map.extend_from_slice(&(b.data.len() as u32).to_be_bytes());
             psin.extend_from_slice(&b.data);
         }
-        let len = u32::try_from(psin.len()).map_err(|_| "the data is over 4 GB".to_owned())?;
-        psin[4..8].copy_from_slice(&len.to_be_bytes());
+        (psin, map)
+    }
+
+    /// The PMAP section: the header, then the entries in `map`.
+    fn block_map(&self, map: &[u8], root_id: usize, blocks: usize) -> Vec<u8> {
         let mut pmap = b"PMAP".to_vec();
         let header = if self.is_rdr2() { 24 } else { 16 };
         pmap.extend_from_slice(&((header + map.len()) as u32).to_be_bytes());
-        pmap.extend_from_slice(&(id[root] as u32).to_be_bytes());
-        let count = (order.len() as u16).to_be_bytes();
+        pmap.extend_from_slice(&(root_id as u32).to_be_bytes());
+        let count = (blocks as u16).to_be_bytes();
         if self.is_rdr2() {
             // RDR2: no count at 12, the count at 16 and the blocks from 24.
             pmap.extend_from_slice(&[0; 4]);
@@ -844,23 +862,28 @@ impl<'a> Builder<'a> {
             pmap.extend_from_slice(&count);
             pmap.extend_from_slice(b"pp");
         }
-        pmap.extend_from_slice(&map);
+        pmap.extend_from_slice(map);
+        pmap
+    }
 
-        let same = pso.sections.iter().all(|(ident, s)| match ident {
+    /// The sections of the original with PSIN and PMAP replaced; CHKS goes when either changed.
+    fn splice_sections(&self, psin: &[u8], pmap: &[u8]) -> Vec<u8> {
+        let sections = &self.pso.sections;
+        let same = sections.iter().all(|(ident, s)| match ident {
             b"PSIN" => *s == psin,
             b"PMAP" => *s == pmap,
             _ => true,
         });
         let mut out = Vec::with_capacity(psin.len() + pmap.len() + 4096);
-        for (ident, s) in &pso.sections {
+        for (ident, s) in sections {
             match ident {
-                b"PSIN" => out.extend_from_slice(&psin),
-                b"PMAP" => out.extend_from_slice(&pmap),
+                b"PSIN" => out.extend_from_slice(psin),
+                b"PMAP" => out.extend_from_slice(pmap),
                 b"CHKS" if !same => {}
                 _ => out.extend_from_slice(s),
             }
         }
-        Ok(out)
+        out
     }
 }
 

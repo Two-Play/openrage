@@ -367,40 +367,52 @@ impl Places {
                 continue;
             }
             match group {
-                Group::First | Group::Four => {
-                    if group == Group::First {
-                        self.list[at] = (place + 4, Group::Rest);
-                    } else {
-                        self.list[at] = (0, Group::Done);
+                Group::First | Group::Four | Group::One => {
+                    let slot = at;
+                    if group != Group::First {
                         at += 1;
                     }
-                    for place in place..place + 4 {
-                        if bits.bit() {
-                            self.start -= 1;
-                            self.list[self.start] = (place, Group::One);
-                        } else if !value(bits, place as usize) {
-                            return false;
-                        }
-                    }
-                }
-                Group::Rest => {
-                    self.list[at] = (place, Group::Four);
-                    for i in 1..4 {
-                        self.list[self.end] = (place + 4 * i, Group::Four);
-                        self.end += 1;
-                    }
-                }
-                Group::One => {
-                    self.list[at] = (0, Group::Done);
-                    at += 1;
-                    if !value(bits, place as usize) {
+                    if !self.expand(slot, (place, group), bits, &mut value) {
                         return false;
                     }
                 }
+                Group::Rest => self.split_rest(at, place),
                 Group::Done => {}
             }
         }
         true
+    }
+
+    /// Takes the group at `slot` off the list and reads its places: the ones set go in front of the list, the
+    /// others are given to `value`.
+    fn expand(
+        &mut self,
+        slot: usize,
+        (place, group): (u8, Group),
+        bits: &mut Bits,
+        value: &mut impl FnMut(&mut Bits, usize) -> bool,
+    ) -> bool {
+        self.list[slot] = if group == Group::First { (place + 4, Group::Rest) } else { (0, Group::Done) };
+        if group == Group::One {
+            return value(bits, place as usize);
+        }
+        for place in place..place + 4 {
+            if bits.bit() {
+                self.start -= 1;
+                self.list[self.start] = (place, Group::One);
+            } else if !value(bits, place as usize) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn split_rest(&mut self, at: usize, place: u8) {
+        self.list[at] = (place, Group::Four);
+        for i in 1..4 {
+            self.list[self.end] = (place + 4 * i, Group::Four);
+            self.end += 1;
+        }
     }
 }
 
@@ -611,28 +623,29 @@ impl Decoder {
     /// Decodes a frame. A damaged one leaves the picture before.
     pub fn decode(&mut self, data: &[u8]) -> Result<()> {
         let mut bits = Bits::new(data);
-        let sized = self.revision >= b'i';
-        if self.has_alpha {
-            if sized {
-                bits.read(32);
-            }
-            self.plane(&mut bits, 3)?;
-        }
-        if sized {
-            bits.read(32);
-        }
-        for plane in if self.revision >= b'h' { [0, 2, 1] } else { [0, 1, 2] } {
-            self.plane(&mut bits, plane)?;
-            if bits.left() == 0 {
-                break;
-            }
-        }
+        self.read_planes(&mut bits)?;
         for (last, plane) in self.last.iter_mut().zip(&mut self.planes) {
             std::mem::swap(last, plane);
         }
         // Planes the frame does not have stay.
         for (last, plane) in self.planes.iter_mut().zip(&self.last) {
             last.data.copy_from_slice(&plane.data);
+        }
+        Ok(())
+    }
+
+    fn read_planes(&mut self, bits: &mut Bits) -> Result<()> {
+        let sized = self.revision >= b'i';
+        if self.has_alpha {
+            skip_size(bits, sized);
+            self.plane(bits, 3)?;
+        }
+        skip_size(bits, sized);
+        for plane in if self.revision >= b'h' { [0, 2, 1] } else { [0, 1, 2] } {
+            self.plane(bits, plane)?;
+            if bits.left() == 0 {
+                break;
+            }
         }
         Ok(())
     }
@@ -704,6 +717,13 @@ impl Decoder {
             cr: crop(2),
             a: self.has_alpha.then(|| crop(3)),
         }
+    }
+}
+
+/// Skips the frame size field of the revisions that have one.
+fn skip_size(bits: &mut Bits, sized: bool) {
+    if sized {
+        bits.read(32);
     }
 }
 
