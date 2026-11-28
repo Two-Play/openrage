@@ -251,4 +251,88 @@ mod tests {
         assert_eq!(float(1.0), "1");
         assert_eq!(float(0.25), "0.25");
     }
+
+    #[test]
+    fn escaping_covers_markup_and_drops_control_characters() {
+        assert_eq!(escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e'f");
+        assert_eq!(escape("tab\tnl\ncr\r\u{1}\u{1f}end"), "tab\tnl\ncr\rend");
+        assert_eq!(escape("\u{e9}\u{1F600}"), "\u{e9}\u{1F600}");
+        assert_eq!(escape(""), "");
+    }
+
+    #[test]
+    fn new_writers_start_with_the_header() {
+        let w = Writer::new();
+        assert_eq!(w.out, format!("{HEADER}\n"));
+        assert!(!w.full());
+        assert_eq!(Writer::with_limit(10).out, w.out);
+    }
+
+    #[test]
+    fn elements_are_indented_one_space_per_level() {
+        let mut w = Writer::default();
+        w.open(0, "a x=\"1\"");
+        w.empty(1, "b y=\"2\"");
+        w.text(1, "c z=\"3\"", "1 < 2");
+        w.value(2, "d", "v");
+        w.string(1, "e", "text");
+        w.error(1, "bad <thing>".into());
+        w.close(0, "a");
+        assert_eq!(
+            w.out,
+            "<a x=\"1\">\n <b y=\"2\" />\n <c z=\"3\">1 &lt; 2</c>\n  <d value=\"v\" />\n <e>text</e>\n <error>bad &lt;thing&gt;</error>\n</a>\n"
+        );
+        assert_eq!(w.errors, ["bad <thing>"]);
+    }
+
+    #[test]
+    fn raw_arrays_fit_one_line_or_break_into_rows() {
+        let items: Vec<String> = (1..=5).map(|i| i.to_string()).collect();
+        let mut w = Writer::default();
+        w.raw_array(1, "a", &items[..3], 3);
+        w.raw_array(1, "b", &items, 3);
+        w.raw_array(0, "c", &[], 3);
+        w.raw_array(0, "d", &items[..2], 0);
+        assert_eq!(w.out, " <a>1 2 3</a>\n <b>\n  1 2 3\n  4 5\n </b>\n<c />\n<d>\n 1\n 2\n</d>\n");
+    }
+
+    #[test]
+    fn raw_array_lines_and_item_arrays() {
+        let items = vec!["x".to_owned(), "y&z".to_owned()];
+        let mut w = Writer::default();
+        w.raw_array_lines(2, &items);
+        w.item_array(0, "list", &items);
+        w.item_array(0, "none", &[]);
+        assert_eq!(w.out, "  x\n  y&z\n<list>\n <Item>x</Item>\n <Item>y&amp;z</Item>\n</list>\n<none />\n");
+    }
+
+    #[test]
+    fn a_writer_with_a_small_limit_stops_and_says_so_once() {
+        let mut w = Writer::with_limit(60);
+        for i in 0..10 {
+            w.value(0, "value", &i.to_string());
+        }
+        assert!(w.full());
+        w.open(0, "ignored");
+        w.close(0, "ignored");
+        w.empty(0, "ignored");
+        w.text(0, "ignored", "x");
+        w.error(0, "ignored".into());
+        w.raw_array(0, "ignored", &["1".to_owned()], 1);
+        w.raw_array_lines(0, &["ignored".to_owned()]);
+        w.item_array(0, "ignored", &["1".to_owned()]);
+        let (out, errors) = w.finish();
+        assert!(!out.contains("ignored"));
+        assert_eq!(errors, ["output truncated at 0 MB: the data nests too much to show in full"]);
+        assert_eq!(out.matches("<error>").count(), 1);
+        assert!(out.starts_with(HEADER) && out.ends_with("</error>\n"));
+        assert_eq!(out.matches("<value value=").count(), 2);
+    }
+
+    #[test]
+    fn floats_read_back_to_the_same_value() {
+        for v in [0.1f32, -3.5, 1e-7, 123456.79, f32::MAX] {
+            assert_eq!(float(v).parse::<f32>().unwrap(), v);
+        }
+    }
 }

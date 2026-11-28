@@ -689,6 +689,9 @@ fn half(v: u16) -> f32 {
 }
 
 #[cfg(test)]
+mod read_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

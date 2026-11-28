@@ -361,6 +361,9 @@ fn write(w: &mut Writer, level: usize, e: &Element) {
 }
 
 #[cfg(test)]
+mod format_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

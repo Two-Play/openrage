@@ -196,4 +196,139 @@ mod tests {
         assert_eq!(b.meshes[1].1.indices.len(), 72);
         assert_eq!(b.primitives, 0);
     }
+
+    #[test]
+    fn vector_helpers() {
+        assert_eq!(add([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]), [5.0, 7.0, 9.0]);
+        assert_eq!(sub([4.0, 5.0, 6.0], [1.0, 2.0, 3.0]), [3.0, 3.0, 3.0]);
+        assert_eq!(scale([1.0, -2.0, 3.0], 2.0), [2.0, -4.0, 6.0]);
+        assert_eq!(dot([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]), 32.0);
+        assert_eq!(cross([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]), [0.0, 0.0, 1.0]);
+        assert_eq!(normalize([0.0, 3.0, 4.0]), [0.0, 0.6, 0.8]);
+        assert!(normalize([0.0; 3]).iter().all(|c| c.is_nan()));
+    }
+
+    #[test]
+    fn meshes_are_kept_per_material() {
+        let mut b = Builder::default();
+        b.mesh(4).positions.push([1.0; 3]);
+        b.mesh(2).positions.push([2.0; 3]);
+        b.mesh(4).positions.push([3.0; 3]);
+        assert_eq!(b.meshes.iter().map(|(m, _)| *m).collect::<Vec<_>>(), [4, 2]);
+        assert_eq!(b.meshes[0].1.positions, [[1.0; 3], [3.0; 3]]);
+    }
+
+    #[test]
+    fn a_triangle_is_transformed_and_gets_a_flat_normal() {
+        let mut b = Builder::default();
+        let m = math::from_trs([10.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0], [1.0; 3]);
+        b.triangle(0, &m, [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
+        let mesh = &b.meshes[0].1;
+        assert_eq!(mesh.positions, [[10.0, 0.0, 0.0], [11.0, 0.0, 0.0], [10.0, 1.0, 0.0]]);
+        assert_eq!(mesh.normals, [[0.0, 0.0, 1.0]; 3]);
+        assert_eq!(mesh.indices, [0, 1, 2]);
+        b.triangle(0, &m, [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
+        assert_eq!(b.meshes[0].1.indices, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(b.primitives, 0);
+    }
+
+    #[test]
+    fn a_degenerate_triangle_adds_nothing() {
+        let mut b = Builder::default();
+        b.triangle(0, &math::IDENTITY, [[1.0; 3], [1.0; 3], [2.0; 3]]);
+        assert!(b.meshes.is_empty());
+    }
+
+    #[test]
+    fn a_quad_is_two_triangles() {
+        let mut b = Builder::default();
+        b.quad(1, &math::IDENTITY, [0.0; 3], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]);
+        let mesh = &b.meshes[0].1;
+        assert_eq!(mesh.indices.len(), 6);
+        assert_eq!(mesh.positions[3..], [[0.0; 3], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]]);
+    }
+
+    #[test]
+    fn a_box_with_mirrored_axes_still_faces_outwards() {
+        let mut b = Builder::default();
+        b.cuboid(0, &math::IDENTITY, [0.0; 3], [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let mesh = &b.meshes[0].1;
+        assert_eq!(mesh.indices.len(), 36);
+        for t in mesh.indices.chunks(3) {
+            let a = mesh.positions[t[0] as usize];
+            assert!(dot(mesh.normals[t[0] as usize], a) > 0.0);
+        }
+    }
+
+    #[test]
+    fn cylinders_have_flat_ends_and_capsules_round_ones() {
+        let (a, c) = ([0.0; 3], [0.0, 0.0, 4.0]);
+        let mut b = Builder::default();
+        b.round(0, &math::IDENTITY, a, c, 1.0, false);
+        assert_eq!(b.meshes[0].1.indices.len(), 16 * (2 + 2) * 3);
+        let mut b = Builder::default();
+        b.round(0, &math::IDENTITY, a, c, 1.0, true);
+        let n = b.meshes[0].1.indices.len();
+        assert!(n > 16 * 24 * 3 && n <= 16 * (2 + 24) * 3, "{n}");
+        let mesh = &b.meshes[0].1;
+        let top = mesh.positions.iter().map(|p| p[2]).fold(f32::MIN, f32::max);
+        let bottom = mesh.positions.iter().map(|p| p[2]).fold(f32::MAX, f32::min);
+        assert!((top - 5.0).abs() < 1e-5 && (bottom + 1.0).abs() < 1e-5, "{top} {bottom}");
+    }
+
+    #[test]
+    fn a_sphere_has_no_side() {
+        let mut b = Builder::default();
+        b.round(0, &math::IDENTITY, [1.0; 3], [1.0; 3], 2.0, true);
+        let mesh = &b.meshes[0].1;
+        assert!(mesh.positions.iter().all(|p| (dot(sub(*p, [1.0; 3]), sub(*p, [1.0; 3])).sqrt() - 2.0).abs() < 1e-4));
+        let top = mesh.positions.iter().map(|p| p[2]).fold(f32::MIN, f32::max);
+        assert!((top - 3.0).abs() < 1e-4, "{top}");
+        assert!(mesh.indices.len() > 16 * 22 * 3 && mesh.indices.len() <= 16 * 24 * 3);
+        assert_eq!(b.primitives, 1);
+    }
+
+    #[test]
+    fn a_round_shape_without_a_radius_counts_but_draws_nothing() {
+        let mut b = Builder::default();
+        for r in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            b.round(0, &math::IDENTITY, [0.0; 3], [0.0, 1.0, 0.0], r, true);
+        }
+        assert_eq!(b.primitives, 4);
+        assert!(b.meshes.is_empty());
+    }
+
+    #[test]
+    fn a_round_shape_along_x_or_z_gets_a_perpendicular_frame() {
+        for end in [[3.0, 0.0, 0.0], [0.0, 0.0, 3.0], [0.0, 3.0, 0.0]] {
+            let mut b = Builder::default();
+            b.round(0, &math::IDENTITY, [0.0; 3], end, 1.0, false);
+            let mesh = &b.meshes[0].1;
+            assert!(mesh.normals.iter().all(|n| n.iter().all(|c| c.is_finite())), "{end:?}");
+            let axis = normalize(end);
+            let radial = mesh.positions.iter().map(|p| sub(*p, scale(axis, dot(*p, axis)))).map(|q| dot(q, q).sqrt());
+            assert!(radial.into_iter().all(|r| r < 1.0 + 1e-5), "{end:?}");
+        }
+    }
+
+    #[test]
+    fn a_bar_between_equal_or_broken_points_is_skipped() {
+        let mut b = Builder::default();
+        b.bar(0, [1.0; 3], [1.0; 3], 0.5);
+        b.bar(0, [0.0; 3], [f32::NAN, 0.0, 0.0], 0.5);
+        assert!(b.meshes.is_empty());
+    }
+
+    #[test]
+    fn a_vertical_bar_has_a_side_too() {
+        let mut b = Builder::default();
+        b.bar(0, [0.0; 3], [0.0, 0.0, 2.0], 1.0);
+        let mesh = &b.meshes[0].1;
+        assert_eq!(mesh.indices.len(), 36);
+        let (lo, hi) = mesh.positions.iter().fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), p| {
+            (std::array::from_fn(|k| lo[k].min(p[k])), std::array::from_fn(|k| hi[k].max(p[k])))
+        });
+        assert!((hi[2] - 2.0).abs() < 1e-5 && lo[2].abs() < 1e-5);
+        assert!((hi[0] - 0.5).abs() < 1e-5 && (lo[0] + 0.5).abs() < 1e-5, "{lo:?} {hi:?}");
+    }
 }

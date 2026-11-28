@@ -370,4 +370,59 @@ mod tests {
         assert!(is_paint(joaat("vehicle_paint2_enveff")));
         assert_eq!(label(1), "Shader 00000001");
     }
+
+    #[test]
+    fn the_name_table_has_one_entry_per_name() {
+        assert_eq!(table().len(), NAMES.len());
+    }
+
+    #[test]
+    fn unknown_hashes_have_no_name() {
+        assert_eq!(name(0), None);
+        assert!(!is_paint(0));
+        assert!(!is_paint(joaat("vehicle_vehglass")));
+    }
+
+    #[test]
+    fn labels_ignore_the_environment_suffix() {
+        assert_eq!(label(joaat("vehicle_paint1_enveff")), "Primary paint");
+        assert_eq!(label(joaat("vehicle_mesh_enveff")), "Body details");
+        assert_eq!(label(joaat("vehicle_mesh2_enveff")), "Body details");
+        assert_eq!(label(joaat("vehicle_vehglass_inner")), "Glass (inside)");
+    }
+
+    #[test]
+    fn shaders_without_a_friendly_label_use_their_name() {
+        assert_eq!(label(joaat("ped_fur")), "ped_fur");
+        assert_eq!(label(joaat("vehicle_basic")), "vehicle_basic");
+        assert_eq!(label(joaat("vehicle_paint3_enveff")), "Paint 3 (pearl/livery)");
+        assert_eq!(label(joaat("vehicle_paint5_enveff")), "Paint 5");
+    }
+
+    #[test]
+    fn registered_materials_get_a_label_and_a_colour() {
+        let hash = 0xC0DE_0001;
+        assert_eq!(color(hash), None);
+        assert_eq!(label(hash), "Shader c0de0001");
+        register(hash, "CONCRETE", [0.5, 0.5, 0.5, 1.0]);
+        assert_eq!(label(hash), "CONCRETE");
+        assert_eq!(color(hash), Some([0.5, 0.5, 0.5, 1.0]));
+        register(hash, String::from("ASPHALT"), [0.1, 0.1, 0.1, 1.0]);
+        assert_eq!(label(hash), "ASPHALT");
+        assert_eq!(color(hash), Some([0.1, 0.1, 0.1, 1.0]));
+    }
+
+    #[test]
+    fn a_game_shader_has_a_label_but_no_colour() {
+        let hash = joaat("vehicle_decal2");
+        assert_eq!(label(hash), "Decals");
+        assert_eq!(color(hash), None, "a game shader has no colour of its own");
+    }
+
+    #[test]
+    fn gta4_skin_shaders_are_found_by_name() {
+        assert!(alpha_is_not_opacity(joaat("gta_ped_skin")));
+        assert!(alpha_is_not_opacity(joaat("gta_ped_skin_blendshape")));
+        assert!(!alpha_is_not_opacity(joaat("gta_ped")));
+    }
 }
