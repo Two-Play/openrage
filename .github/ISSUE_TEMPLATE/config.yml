@@ -4,5 +4,5 @@ contact_links:
     url: https://matrix.to/#/#openRAGE:nope.chat
     about: Help with installing, setting up your game and using OpenRAGE.
   - name: Documentation
-    url: https://two-play.github.io/openRAGE/guide/
+    url: https://openrage.dev/guide/
     about: Getting started, the explorer, modding and every command.
