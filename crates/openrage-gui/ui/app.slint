@@ -1205,6 +1205,9 @@ export component AppWindow inherits Window {
     callback setup-browse-game();
     callback setup-game-dir-edited();
     callback setup-browse-magic();
+    callback setup-download-magic();
+    /// The question before downloading CodeWalker's key blob is shown.
+    in-out property <bool> setup-magic-ask;
     callback setup-pick-detected(string);
     callback setup-run();
     callback setup-leave();
@@ -3842,6 +3845,42 @@ export component AppWindow inherits Window {
                 Button {
                     text: @tr("Browse…");
                     clicked => { root.setup-browse-magic(); }
+                }
+                Button {
+                    text: @tr("Download from CodeWalker…");
+                    enabled: !root.setup-running && !root.setup-magic-ask;
+                    clicked => { root.setup-magic-ask = true; }
+                }
+            }
+            if root.setup-magic-ask: Rectangle {
+                border-radius: Theme.radius;
+                background: Theme.surface-raised;
+                border-width: 1px;
+                border-color: Theme.border;
+                VerticalLayout {
+                    padding: Theme.space-m;
+                    spacing: Theme.space-s;
+                    Text {
+                        wrap: word-wrap;
+                        color: Theme.text;
+                        text: @tr("OpenRAGE ships no keys. This downloads magic.dat from the CodeWalker project on GitHub: CodeWalker's key blob, which holds Rockstar's archive keys in obfuscated form and opens GTA V Legacy and Enhanced. It is saved in OpenRAGE's settings folder and only used on this computer.");
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: Theme.space-s;
+                        Button {
+                            text: @tr("Cancel");
+                            clicked => { root.setup-magic-ask = false; }
+                        }
+                        Button {
+                            text: @tr("Download");
+                            primary: true;
+                            clicked => {
+                                root.setup-magic-ask = false;
+                                root.setup-download-magic();
+                            }
+                        }
+                    }
                 }
             }
         }

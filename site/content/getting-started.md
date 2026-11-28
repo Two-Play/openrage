@@ -100,12 +100,17 @@ your own copy of the game: check the game folder and click **Derive keys**. For 
 
 </div>
 
-- **GTA V Enhanced** (`GTA5_Enhanced.exe`) no longer stores all keys in the executable. In the setup dialog, choose a
-  CodeWalker key blob (`magic.dat`) you obtained yourself under *Key blob*. It is decrypted with the key from *your*
-  executable and checked against `common.rpf` before it is used.
-- **Some updates of GTA V Legacy** (`GTA5.exe`) do not store the keys in plain form either. If the setup says the
-  executable does not contain the NG keys, choose a `magic.dat` under *Key blob* in the same way. Keys set up before
-  for another GTA V folder are tried first: if they open this game's archives, no key blob is needed.
+- **GTA V Enhanced** (`GTA5_Enhanced.exe`) no longer stores all keys in the executable, and **some updates of GTA V
+  Legacy** (`GTA5.exe`) do not either. The setup then asks for a key blob (`magic.dat`). OpenRAGE ships no keys; it
+  uses the key blob of [CodeWalker](https://github.com/dexyfex/CodeWalker), the same one for both editions:
+  - click **Download from CodeWalker…** under *Key blob* and confirm: OpenRAGE downloads
+    [`magic.dat` from CodeWalker's repository](https://github.com/dexyfex/CodeWalker/blob/master/CodeWalker.Core/Resources/magic.dat),
+    checks that it is that exact file and saves it in its settings folder; or
+  - download it yourself from that link and choose it with **Browse…**.
+
+  The key blob is decrypted with the key from *your* executable and checked against `common.rpf` before it is used.
+  Keys set up before for another GTA V folder are tried first: if they open this game's archives, no key blob is
+  needed.
 - The keys are cached once, at `~/.config/openrage/gtav.keys` (Linux), `%APPDATA%\openrage\gtav.keys` (Windows) or
   `~/Library/Application Support/openrage/gtav.keys` (macOS),
   and the game folder is remembered. To add or switch games later: **File → Switch game…**

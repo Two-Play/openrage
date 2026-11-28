@@ -74,6 +74,67 @@ impl std::fmt::Display for KeyBlobRequired {
 
 impl std::error::Error for KeyBlobRequired {}
 
+/// CodeWalker's key blob in its repository, for people to look at.
+pub const CODEWALKER_MAGIC_PAGE: &str =
+    "https://github.com/dexyfex/CodeWalker/blob/master/CodeWalker.Core/Resources/magic.dat";
+
+/// The same file at a fixed commit, so a download always gets these bytes.
+const CODEWALKER_MAGIC_URL: &str = "https://raw.githubusercontent.com/dexyfex/CodeWalker/\
+     485d56bec00262ed7fa472261cce7bbc6202b96e/CodeWalker.Core/Resources/magic.dat";
+
+/// SHA-256 of that file (154,069 bytes). A download with other bytes is refused.
+const CODEWALKER_MAGIC_SHA256: &str = "dc35981f822e892ced3aa81d31e7a96927d573ee28f67417592b5afeaf330832";
+
+/// More than any key blob needs; a larger answer is not the file.
+const MAGIC_MAX_BYTES: u64 = 1 << 20;
+
+/// What a download of CodeWalker's key blob is, for asking the user first.
+pub const CODEWALKER_MAGIC_NOTICE: &str = "OpenRAGE ships no keys. This downloads magic.dat from the CodeWalker \
+     project on GitHub: CodeWalker's key blob, which holds Rockstar's archive keys in obfuscated form and opens \
+     GTA V Legacy and Enhanced. It is saved in OpenRAGE's settings folder and only used on this computer.";
+
+/// Downloads CodeWalker's key blob (only when the user asked for it), checks
+/// that it is the expected file and saves it in OpenRAGE's settings folder.
+/// Returns where it was saved.
+pub fn download_codewalker_magic() -> Result<PathBuf> {
+    use sha2::{Digest, Sha256};
+    use ureq::tls::{Certificate, RootCerts, TlsConfig};
+
+    let path = crate::paths::downloaded_magic().context("no per-user config directory available")?;
+    // The system's certificate authorities (no bundled list).
+    let native = rustls_native_certs::load_native_certs();
+    let certs: Vec<Certificate<'static>> =
+        native.certs.iter().map(|c| Certificate::from_der(c.as_ref()).to_owned()).collect();
+    if certs.is_empty() {
+        bail!("no certificate authorities found on this system to check the download with");
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(60)))
+        .tls_config(TlsConfig::builder().root_certs(RootCerts::new_with_certs(&certs)).build())
+        .build()
+        .into();
+    let data = agent
+        .get(CODEWALKER_MAGIC_URL)
+        .call()
+        .context("downloading magic.dat from CodeWalker's repository")?
+        .into_body()
+        .with_config()
+        .limit(MAGIC_MAX_BYTES)
+        .read_to_vec()
+        .context("reading magic.dat")?;
+    let hash: String = Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+    if hash != CODEWALKER_MAGIC_SHA256 {
+        bail!("the downloaded file is not CodeWalker's magic.dat (SHA-256 {hash})");
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let partial = path.with_extension("dat.part");
+    fs::write(&partial, &data).with_context(|| format!("writing {}", partial.display()))?;
+    fs::rename(&partial, &path).with_context(|| format!("saving {}", path.display()))?;
+    Ok(path)
+}
+
 /// Derives the key set, verifies it against `common.rpf` and caches it.
 ///
 /// `progress` receives short human-readable status lines.

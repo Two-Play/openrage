@@ -723,6 +723,8 @@ fn wire_setup(ui: &AppWindow) {
         pick_path(w.clone(), true, "Select magic.dat", |ui, p| ui.set_setup_magic_path(p.display().to_string().into()))
     });
     let w = ui.as_weak();
+    ui.on_setup_download_magic(move || download_magic(w.clone()));
+    let w = ui.as_weak();
     ui.on_setup_run(move || with_ui(&w, run_setup));
     let w = ui.as_weak();
     ui.on_setup_leave(move || with_ui(&w, leave_setup));

@@ -45,9 +45,12 @@ install -Dm644 "$root/crates/rage-tfit2/LICENSE" "$files/share/doc/openrage/LICE
 # Games live anywhere (Steam libraries on other drives, Flatpak Steam,
 # Heroic, Lutris), mods go next to them and the Proton fix edits the game's
 # prefix: OpenRAGE needs the whole file system, like OpenIV on Windows.
+# The network is only used when the user asks to download CodeWalker's key
+# blob (magic.dat) in the key setup.
 flatpak build-finish "$build" \
     --command=openrage-gui \
     --share=ipc \
+    --share=network \
     --socket=wayland \
     --socket=fallback-x11 \
     --socket=pulseaudio \

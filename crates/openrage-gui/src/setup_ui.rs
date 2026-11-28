@@ -204,6 +204,34 @@ pub(crate) fn pick_path(w: Weak<AppWindow>, file: bool, title: &'static str, app
     });
 }
 
+/// Downloads CodeWalker's key blob (the user confirmed it in the setup
+/// dialog) and puts its path in the key blob field.
+pub(crate) fn download_magic(w: Weak<AppWindow>) {
+    let _ = w.upgrade_in_event_loop(|ui| {
+        ui.set_setup_running(true);
+        ui.set_setup_log("Downloading magic.dat from CodeWalker's repository …".into());
+    });
+    std::thread::spawn(move || {
+        let result = setup::download_codewalker_magic();
+        let _ = w.upgrade_in_event_loop(move |ui| {
+            ui.set_setup_running(false);
+            match result {
+                Ok(path) => {
+                    ui.set_setup_magic_path(path.display().to_string().into());
+                    ui.set_setup_log(format!("Saved {}. Click Derive keys to use it.", path.display()).into());
+                }
+                Err(e) => ui.set_setup_log(
+                    format!(
+                        "Error: {e:#}\nYou can also download it in a browser from\n{}",
+                        setup::CODEWALKER_MAGIC_PAGE
+                    )
+                    .into(),
+                ),
+            }
+        });
+    });
+}
+
 /// What a game folder must hold.
 const NO_GAME: &str = "The folder must contain GTA5_Enhanced.exe, GTA5.exe, GTAIV.exe, RDR2.exe or game_scarlett_master.exe, or RPF9 archives of GTA VI.";
 

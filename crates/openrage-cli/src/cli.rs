@@ -29,6 +29,11 @@ pub(crate) enum Command {
         /// Legacy updates.
         #[arg(long)]
         magic: Option<PathBuf>,
+        /// Download CodeWalker's key blob (magic.dat) from its GitHub repository
+        /// into OpenRAGE's settings folder and use it. OpenRAGE ships no keys:
+        /// this fetches them from CodeWalker, only when you ask for it.
+        #[arg(long, conflicts_with = "magic")]
+        download_magic: bool,
     },
     /// List a directory, an archive, or a directory inside an archive.
     Ls {
