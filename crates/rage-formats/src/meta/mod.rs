@@ -18,13 +18,18 @@
 //! Pointers inside block data are packed: bits 0–11 the 1-based block, bits 12–31
 //! the offset in it. Arrays are 16 bytes: pointer, count (u16), capacity (u16).
 
+pub mod names;
+pub mod psin;
+pub mod pso;
+pub mod rbf;
+pub mod xml;
+
 use rage_core::bytes::{LeRead, f16_to_f32};
 use std::collections::HashMap;
 
 use rage_resource::{Resource, ResourceError};
 
-use crate::names;
-use crate::xml::{self, Writer};
+use xml::Writer;
 
 /// Resource version of meta files.
 pub const VERSION: u32 = 2;

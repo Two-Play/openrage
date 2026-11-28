@@ -7,51 +7,31 @@
 //! * [`meta`], [`pso`], [`rbf`]: metadata (`.ymap`, `.ytyp`, `.ymt`, `.cut`, …) as XML
 #![forbid(unsafe_code)]
 
-pub mod awc;
-pub mod bcpack;
-pub mod bink;
-pub mod bn6;
-pub mod clip;
-pub mod clip6;
-pub mod dds;
-pub mod drawable;
-pub mod drawable6;
-pub mod expression;
-pub mod geometry;
-pub mod gltf;
-pub mod gxt;
-pub mod gxt2;
-pub mod ivaud;
-pub mod ldb;
+pub mod anim;
+pub mod audio;
+pub mod collision;
 pub mod math;
-pub mod media;
 pub mod meta;
-pub mod model_textures;
-pub mod names;
+pub mod model;
 pub mod openformats;
-pub mod paths;
-pub mod psin;
-pub mod pso;
-pub mod rbf;
-pub mod sco;
-pub mod shaders;
-pub mod td6;
+pub mod script;
+pub mod text;
 pub mod texture;
-pub mod ttpf;
-pub mod wad;
-pub mod wbn;
-pub mod wdr;
-pub mod wpfl;
-pub mod wpl;
-pub mod wtd_write;
-pub mod xml;
-pub mod ybn;
-pub mod ybn_write;
-pub mod ydr_write;
-pub mod ypt;
-pub mod ysc;
-pub mod ytd;
-pub mod ytd_write;
+pub mod video;
+pub mod world;
+
+// The modules were all at the top before they were grouped by kind; these
+// keep `rage_formats::drawable` and the like working.
+pub use anim::{clip, clip6, expression, wad};
+pub use audio::{awc, ivaud};
+pub use collision::{bn6, wbn, ybn, ybn_write};
+pub use meta::{names, psin, pso, rbf, xml};
+pub use model::{drawable, drawable6, geometry, gltf, model_textures, shaders, wdr, ydr_write};
+pub use script::{sco, ysc};
+pub use text::{gxt, gxt2, ldb};
+pub use texture::{bcpack, dds, td6, ttpf, wtd_write, ytd, ytd_write};
+pub use video::{bink, media};
+pub use world::{paths, wpfl, wpl, ypt};
 
 /// Encodes RGBA8 pixels as a PNG file.
 pub fn png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, ::png::EncodingError> {
