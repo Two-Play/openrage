@@ -3,7 +3,6 @@
 #![forbid(unsafe_code)]
 
 pub mod anim;
-pub mod asi;
 pub mod audio;
 pub mod config;
 pub mod cutscene;
@@ -12,39 +11,36 @@ pub mod exe_icon;
 pub mod expr;
 pub mod extract;
 pub mod gta4;
-pub mod gta4_cutscene;
-pub mod gta4_effects;
-pub mod gta6_models;
-pub mod gta6_textures;
-pub mod gta6_world;
-pub mod install;
-pub mod journal;
+pub mod gta6;
 pub mod licenses;
 pub mod media;
 pub mod metadata;
-pub mod metaped;
 pub mod models;
+pub mod mods;
 pub mod natives;
 pub mod obj;
-pub mod oiv;
 pub mod openformats;
 pub mod palette;
 pub mod paths;
 pub mod plugins;
 pub mod progress;
 pub mod rdr2;
-pub mod rdr2_install;
 pub mod render;
-pub mod repack;
-pub mod rpf9;
 pub mod setup;
 pub mod suggest;
 pub mod texttable;
 pub mod textures;
-pub mod tint;
 pub mod vehicle_mods;
 pub mod world;
 pub mod xmltree;
+
+// The modules were all at the top before they were grouped by game and by
+// task; these keep `openrage_app::install`, `openrage_app::gta6_models` and
+// the like working.
+pub use gta4::{cutscene as gta4_cutscene, effects as gta4_effects};
+pub use gta6::{models as gta6_models, rpf9, textures as gta6_textures, world as gta6_world};
+pub use mods::{asi, install, journal, oiv, repack};
+pub use rdr2::{install as rdr2_install, metaped, tint};
 
 use std::sync::Arc;
 

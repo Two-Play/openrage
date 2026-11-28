@@ -1,5 +1,8 @@
 //! GTA IV: key setup from the user's own `GTAIV.exe`, game detection and extraction.
 
+pub mod cutscene;
+pub mod effects;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
