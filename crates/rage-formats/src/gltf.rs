@@ -254,8 +254,8 @@ fn placement_nodes(
         children.push((nodes_json.len() + 1).to_string());
         let mesh = rigid.map(|i| format!(",\"mesh\":{i}")).unwrap_or_default();
         let placement = format!("\"name\":\"{}\",\"matrix\":[{}]{mesh}", esc(&n.name), matrix_json(&n.transform));
-        if let (Some(mesh), Some(bind)) = (skinned, binds[n.mesh]) {
-            push_skinned_nodes(&mut nodes_json, skins, placement, (&n.name, mesh), bind);
+        if let (Some(mesh), Some((rig, inverse_bind))) = (skinned, binds[n.mesh]) {
+            push_skinned_nodes(&mut nodes_json, skins, placement, &n.name, mesh, rig, inverse_bind);
         } else {
             nodes_json.push(format!("{{{placement}}}"));
         }
@@ -269,8 +269,10 @@ fn push_skinned_nodes(
     nodes_json: &mut Vec<String>,
     skins: &mut Vec<String>,
     mut placement: String,
-    (name, mesh): (&str, usize),
-    (rig, inverse_bind): (&Skeleton, usize),
+    name: &str,
+    mesh: usize,
+    rig: &Skeleton,
+    inverse_bind: usize,
 ) {
     let mesh_node = nodes_json.len() + 2;
     let first_joint = mesh_node + 1;
