@@ -6,8 +6,8 @@
 
 use std::fmt::Write;
 
-use crate::drawable::{Drawable, Mesh, Shader};
-use crate::math::Mat4;
+use crate::drawable::{Drawable, Mesh, Shader, Skeleton};
+use crate::math::{self, Mat4};
 use crate::texture::Texture;
 
 fn esc(s: &str) -> String {
@@ -72,6 +72,26 @@ impl Builder {
         self.accessors.len() - 1
     }
 
+    fn joints(&mut self, data: &[[u16; 4]]) -> usize {
+        let bytes: Vec<u8> = data.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+        self.skin_accessor(&bytes, data.len(), "VEC4", 5123, Some(34962))
+    }
+
+    fn inverse_bind_matrices(&mut self, skeleton: &Skeleton) -> usize {
+        let transforms = skeleton.world_transforms();
+        let bytes: Vec<u8> =
+            transforms.iter().flat_map(math::inverse_affine).map(finite).flat_map(f32::to_le_bytes).collect();
+        self.skin_accessor(&bytes, transforms.len(), "MAT4", 5126, None)
+    }
+
+    fn skin_accessor(&mut self, bytes: &[u8], count: usize, kind: &str, component: u32, target: Option<u32>) -> usize {
+        let view = self.view(bytes, target);
+        self.accessors.push(format!(
+            "{{\"bufferView\":{view},\"componentType\":{component},\"count\":{count},\"type\":\"{kind}\"}}",
+        ));
+        self.accessors.len() - 1
+    }
+
     fn indices(&mut self, data: &[u32]) -> usize {
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let view = self.view(&bytes, Some(34963));
@@ -99,10 +119,61 @@ fn matrix_json(m: &Mat4) -> String {
     m.iter().map(|v| format!("{}", finite(*v))).collect::<Vec<_>>().join(",")
 }
 
+/// A mesh can be bound when all its vertices have usable, resolved influences.
+pub fn has_skin_weights(mesh: &Mesh, bones: usize) -> bool {
+    !mesh.positions.is_empty()
+        && mesh.bone_tags.is_empty()
+        && mesh.bone_hashes.is_empty()
+        && mesh.bone_indices.len() == mesh.positions.len()
+        && mesh.bone_weights.len() == mesh.positions.len()
+        && mesh
+            .bone_indices
+            .iter()
+            .zip(&mesh.bone_weights)
+            .all(|(joints, weights)| usable_influences(joints, weights, bones))
+}
+
+/// A vertex's influences: weights that add up, each on a bone the skeleton has.
+fn usable_influences(joints: &[u16; 4], weights: &[f32; 4], bones: usize) -> bool {
+    let sum: f32 = weights.iter().sum();
+    sum.is_finite()
+        && sum > 0.0
+        && joints.iter().zip(weights).all(|(&joint, &weight)| {
+            weight.is_finite() && weight >= 0.0 && (weight == 0.0 || usize::from(joint) < bones)
+        })
+}
+
+fn joint_nodes(skeleton: &Skeleton, first_joint: usize) -> (Vec<usize>, Vec<String>) {
+    let mut roots = Vec::new();
+    let mut children = vec![Vec::new(); skeleton.bones.len()];
+    for (i, bone) in skeleton.bones.iter().enumerate() {
+        if let Some(parent) = usize::try_from(bone.parent).ok().filter(|&parent| parent < i) {
+            children[parent].push((first_joint + i).to_string());
+        } else {
+            roots.push(first_joint + i);
+        }
+    }
+    let nodes = skeleton
+        .bones
+        .iter()
+        .zip(children)
+        .map(|(bone, children)| {
+            let name = esc(&bone.name);
+            let local = math::from_trs(bone.translation, bone.rotation, bone.scale);
+            let children =
+                if children.is_empty() { String::new() } else { format!(",\"children\":[{}]", children.join(",")) };
+            format!("{{\"name\":\"{name}\",\"matrix\":[{}]{children}}}", matrix_json(&local))
+        })
+        .collect();
+    (roots, nodes)
+}
+
 /// Writes a single drawable as `.glb`.
 pub fn write_glb<'a>(d: &Drawable, name: &str, lookup: &dyn Fn(&str) -> Option<&'a Texture>) -> Vec<u8> {
     let node = Node { name: name.to_owned(), mesh: 0, transform: crate::math::IDENTITY };
-    write_glb_scene(name, &[(name, d)], &[node], &|_, t| lookup(t), &|_, _| Some([1.0; 4]))
+    write_glb_scene_with_skins(name, &[(name, d)], &[node], &|_, t| lookup(t), &|_, _| Some([1.0; 4]), &|_| {
+        d.skeleton.as_ref()
+    })
 }
 
 /// Writes drawables placed by `nodes` as one `.glb` scene. `lookup` resolves
@@ -117,11 +188,23 @@ pub fn write_glb_scene<'a>(
     lookup: &dyn Fn(usize, &str) -> Option<&'a Texture>,
     material: &dyn Fn(usize, usize) -> Option<[f32; 4]>,
 ) -> Vec<u8> {
+    write_glb_scene_with_skins(name, drawables, nodes, lookup, material, &|_| None)
+}
+
+/// Writes a model scene, resolving the skeleton that each drawable's indices refer to.
+pub fn write_glb_scene_with_skins<'a, 's>(
+    name: &str,
+    drawables: &[(&str, &Drawable)],
+    nodes: &[Node],
+    lookup: &dyn Fn(usize, &str) -> Option<&'a Texture>,
+    material: &dyn Fn(usize, usize) -> Option<[f32; 4]>,
+    skeleton: &dyn Fn(usize) -> Option<&'s Skeleton>,
+) -> Vec<u8> {
     let inputs = Inputs { lookup, material };
     let mut parts = SceneParts::default();
     let mut meshes_json = Vec::new();
-    // glTF mesh index per drawable (only drawables that nodes use).
-    let mut mesh_of: Vec<Option<usize>> = vec![None; drawables.len()];
+    let mut mesh_of = vec![[None; 2]; drawables.len()];
+    let mut binds = vec![None; drawables.len()];
 
     for (di, (dname, d)) in drawables.iter().enumerate() {
         if !nodes.iter().any(|n| n.mesh == di) {
@@ -132,26 +215,18 @@ pub fn write_glb_scene<'a>(
             let json = parts.material_json(&inputs, (di, dname), (si, shader));
             parts.materials.push(json);
         }
-        let primitives = parts.primitives(&inputs, di, d, first_material);
-        if primitives.is_empty() {
-            continue;
+        let rig = skeleton(di).filter(|rig| !rig.bones.is_empty());
+        let primitives = parts.primitives(&inputs, di, d, first_material, rig);
+        for (group, primitives) in primitives.iter().enumerate().filter(|(_, p)| !p.is_empty()) {
+            mesh_of[di][group] = Some(meshes_json.len());
+            meshes_json.push(format!("{{\"name\":\"{}\",\"primitives\":[{}]}}", esc(dname), primitives.join(",")));
         }
-        mesh_of[di] = Some(meshes_json.len());
-        meshes_json.push(format!("{{\"name\":\"{}\",\"primitives\":[{}]}}", esc(dname), primitives.join(",")));
+        if let Some(rig) = rig.filter(|_| mesh_of[di][1].is_some()) {
+            binds[di] = Some((rig, parts.b.inverse_bind_matrices(rig)));
+        }
     }
 
-    // Node 0 is the root converting to Y-up; part nodes are its children.
-    let mut nodes_json = Vec::new();
-    let mut children = Vec::new();
-    for n in nodes {
-        let Some(mesh) = mesh_of.get(n.mesh).copied().flatten() else { continue };
-        children.push((nodes_json.len() + 1).to_string());
-        nodes_json.push(format!(
-            "{{\"name\":\"{}\",\"mesh\":{mesh},\"matrix\":[{}]}}",
-            esc(&n.name),
-            matrix_json(&n.transform)
-        ));
-    }
+    let (nodes_json, children) = placement_nodes(nodes, &mesh_of, &binds, &mut parts.skins);
     let root = format!(
         "{{\"name\":\"{}\",\"matrix\":[{}],\"children\":[{}]}}",
         esc(name),
@@ -160,6 +235,55 @@ pub fn write_glb_scene<'a>(
     );
     let json = parts.scene_json(&root, &nodes_json, &meshes_json);
     glb_container(&json, &parts.b.bin)
+}
+
+/// The scene's nodes below the root (node 0), and which of them are its children.
+fn placement_nodes(
+    nodes: &[Node],
+    mesh_of: &[[Option<usize>; 2]],
+    binds: &[Option<(&Skeleton, usize)>],
+    skins: &mut Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut nodes_json = Vec::new();
+    let mut children = Vec::new();
+    for n in nodes {
+        let Some(&[rigid, skinned]) = mesh_of.get(n.mesh) else { continue };
+        if rigid.is_none() && skinned.is_none() {
+            continue;
+        }
+        children.push((nodes_json.len() + 1).to_string());
+        let mesh = rigid.map(|i| format!(",\"mesh\":{i}")).unwrap_or_default();
+        let placement = format!("\"name\":\"{}\",\"matrix\":[{}]{mesh}", esc(&n.name), matrix_json(&n.transform));
+        if let (Some(mesh), Some((rig, inverse_bind))) = (skinned, binds[n.mesh]) {
+            push_skinned_nodes(&mut nodes_json, skins, placement, &n.name, mesh, rig, inverse_bind);
+        } else {
+            nodes_json.push(format!("{{{placement}}}"));
+        }
+    }
+    (nodes_json, children)
+}
+
+/// The nodes of a placement whose mesh `mesh` is bound to a skeleton: the
+/// placement, below it the skinned mesh and the skeleton's joints.
+fn push_skinned_nodes(
+    nodes_json: &mut Vec<String>,
+    skins: &mut Vec<String>,
+    mut placement: String,
+    name: &str,
+    mesh: usize,
+    rig: &Skeleton,
+    inverse_bind: usize,
+) {
+    let mesh_node = nodes_json.len() + 2;
+    let first_joint = mesh_node + 1;
+    let (roots, bone_nodes) = joint_nodes(rig, first_joint);
+    let roots = std::iter::once(mesh_node).chain(roots).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let _ = write!(placement, ",\"children\":[{roots}]");
+    let joints = (first_joint..first_joint + rig.bones.len()).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    skins.push(format!("{{\"joints\":[{joints}],\"inverseBindMatrices\":{inverse_bind}}}"));
+    nodes_json.push(format!("{{{placement}}}"));
+    nodes_json.push(format!("{{\"name\":\"{}\",\"mesh\":{mesh},\"skin\":{}}}", esc(name), skins.len() - 1));
+    nodes_json.extend(bone_nodes);
 }
 
 /// What the caller of [`write_glb_scene`] provides: texture and material lookups.
@@ -175,6 +299,7 @@ struct SceneParts {
     materials: Vec<String>,
     images: Vec<String>,
     textures: Vec<String>,
+    skins: Vec<String>,
     /// Texture index per image name.
     image_of: Vec<(String, usize)>,
 }
@@ -220,9 +345,16 @@ impl SceneParts {
         Some(self.textures.len() - 1)
     }
 
-    /// The primitives of the meshes of drawable `di` that are drawn.
-    fn primitives(&mut self, inputs: &Inputs, di: usize, d: &Drawable, first_material: usize) -> Vec<String> {
-        let mut primitives = Vec::new();
+    /// The rigid and skinned primitives of drawable `di` that are drawn.
+    fn primitives(
+        &mut self,
+        inputs: &Inputs,
+        di: usize,
+        d: &Drawable,
+        first_material: usize,
+        rig: Option<&Skeleton>,
+    ) -> [Vec<String>; 2] {
+        let mut primitives = [Vec::new(), Vec::new()];
         for mesh in &d.meshes {
             if mesh.positions.is_empty()
                 || mesh.indices.is_empty()
@@ -231,7 +363,8 @@ impl SceneParts {
                 continue;
             }
             let material = ((mesh.shader as usize) < d.shaders.len()).then(|| first_material + mesh.shader as usize);
-            primitives.push(primitive_json(&mut self.b, mesh, material));
+            let skinned = rig.is_some_and(|rig| has_skin_weights(mesh, rig.bones.len()));
+            primitives[usize::from(skinned)].push(primitive_json(&mut self.b, mesh, material, skinned));
         }
         primitives
     }
@@ -247,6 +380,9 @@ impl SceneParts {
             nodes_json.join(","),
             meshes_json.join(",")
         );
+        if !self.skins.is_empty() {
+            let _ = write!(json, ",\"skins\":[{}]", self.skins.join(","));
+        }
         if !self.materials.is_empty() {
             let _ = write!(json, ",\"materials\":[{}]", self.materials.join(","));
         }
@@ -277,7 +413,7 @@ impl SceneParts {
 }
 
 /// One primitive of `mesh`: its attributes and indices go to `b`.
-fn primitive_json(b: &mut Builder, mesh: &Mesh, material: Option<usize>) -> String {
+fn primitive_json(b: &mut Builder, mesh: &Mesh, material: Option<usize>, skinned: bool) -> String {
     let mut attrs = format!("\"POSITION\":{}", b.floats(&mesh.positions, "VEC3", true));
     if mesh.normals.len() == mesh.positions.len() {
         attrs.push_str(&format!(",\"NORMAL\":{}", b.floats(&unit_normals(&mesh.normals), "VEC3", false)));
@@ -288,9 +424,37 @@ fn primitive_json(b: &mut Builder, mesh: &Mesh, material: Option<usize>) -> Stri
     if mesh.colors.len() == mesh.positions.len() {
         attrs.push_str(&format!(",\"COLOR_0\":{}", b.floats(&mesh.colors, "VEC4", false)));
     }
+    if skinned {
+        let (joints, weights) = normalized_skin(mesh);
+        let joints = b.joints(&joints);
+        let weights = b.floats(&weights, "VEC4", false);
+        let _ = write!(attrs, ",\"JOINTS_0\":{joints},\"WEIGHTS_0\":{weights}");
+    }
     let idx = b.indices(&mesh.indices);
     let material = material.map(|m| format!(",\"material\":{m}")).unwrap_or_default();
     format!("{{\"attributes\":{{{attrs}}},\"indices\":{idx}{material}}}")
+}
+
+fn normalized_skin(mesh: &Mesh) -> (Vec<[u16; 4]>, Vec<[f32; 4]>) {
+    let mut joints = mesh.bone_indices.clone();
+    let mut weights = mesh.bone_weights.clone();
+    for (joints, weights) in joints.iter_mut().zip(&mut weights) {
+        let sum: f32 = weights.iter().sum();
+        // Palette remapping can collapse multiple influences into the same joint.
+        for i in 1..joints.len() {
+            if let Some(j) = (0..i).find(|&j| joints[j] == joints[i]) {
+                weights[j] += weights[i];
+                weights[i] = 0.0;
+            }
+        }
+        for (joint, weight) in joints.iter_mut().zip(weights) {
+            if *weight == 0.0 {
+                *joint = 0;
+            }
+            *weight /= sum;
+        }
+    }
+    (joints, weights)
 }
 
 fn unit_normals(normals: &[[f32; 3]]) -> Vec<[f32; 3]> {
@@ -347,5 +511,47 @@ mod tests {
         // Vertices stay in game coordinates; the root node converts Z-up → Y-up.
         assert!(json.contains("\"min\":[0,0,0],\"max\":[1,1,0]"), "{json}");
         assert!(json.contains("\"matrix\":[1,0,0,0,0,0,-1,0,0,1,0,0,0,0,0,1]"), "{json}");
+    }
+    #[test]
+    fn writes_skin_and_keeps_unweighted_primitives_rigid() {
+        use crate::drawable::Bone;
+        let mut rigid = Mesh {
+            positions: vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            indices: vec![0, 1, 2],
+            ..Default::default()
+        };
+        let mut skinned = rigid.clone();
+        rigid.bone_indices = vec![[9, 0, 0, 0]; 3];
+        rigid.bone_weights = vec![[1.0, 0.0, 0.0, 0.0]; 3];
+        skinned.bone_indices = vec![[0, 1, 1, 9]; 3];
+        skinned.bone_weights = vec![[0.25, 0.25, 0.5, 0.0]; 3];
+        let bone = |name: &str, parent, translation| Bone {
+            name: name.into(),
+            parent,
+            translation,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
+            ..Default::default()
+        };
+        let d = Drawable {
+            meshes: vec![rigid, skinned],
+            skeleton: Some(Skeleton { bones: vec![bone("root", -1, [0.0; 3]), bone("tip", 0, [1.0, 0.0, 0.0])] }),
+            ..Default::default()
+        };
+        let glb = write_glb(&d, "tri", &|_| None);
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let json = std::str::from_utf8(&glb[20..20 + json_len]).unwrap();
+        assert_eq!(json.matches("\"JOINTS_0\"").count(), 1);
+        assert_eq!(json.matches("\"WEIGHTS_0\"").count(), 1);
+        assert!(
+            json.contains("\"name\":\"root\",\"matrix\":[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1],\"children\":[4]"),
+            "{json}"
+        );
+        assert!(json.contains("\"skins\":[{\"joints\":[3,4],\"inverseBindMatrices\":6}]"), "{json}");
+        let bin = &glb[28 + json_len..];
+        assert_eq!(&bin[84..92], &[0, 0, 1, 0, 0, 0, 0, 0]);
+        let get_f32 = |offset| f32::from_le_bytes(bin[offset..offset + 4].try_into().unwrap());
+        assert_eq!((get_f32(108), get_f32(112), get_f32(116)), (0.25, 0.75, 0.0));
+        assert_eq!(get_f32(280), -1.0);
     }
 }

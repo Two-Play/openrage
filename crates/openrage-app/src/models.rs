@@ -1360,18 +1360,20 @@ pub fn to_glb(model: &LoadedModel, name: &str, look: &Look) -> Option<Vec<u8>> {
     if nodes.is_empty() {
         return None;
     }
-    Some(rage_formats::gltf::write_glb_scene(
+    Some(rage_formats::gltf::write_glb_scene_with_skins(
         name,
         &meshes,
         &nodes,
         &|d, t| model.texture(&model.drawables[d].1, t),
         &|d, s| model.tint(look, d, s as u16),
+        &|d| model.skeleton.as_ref().or(model.drawables[d].1.skeleton.as_ref()),
     ))
 }
 
 /// Writes several models, each placed one or more times, as one `.glb`
 /// scene (a map file, a cutscene's surroundings). Positions are moved so the
-/// scene's centre is at the origin; `center` says where that was.
+/// scene's centre is at the origin; `center` says where that was. These map
+/// objects intentionally remain rigid rather than exporting model skeletons.
 pub fn scene_to_glb(name: &str, items: &[(&LoadedModel, &Look, &[Mat4])], center: [f32; 3]) -> Option<Vec<u8>> {
     let mut meshes: Vec<(&str, &Drawable)> = Vec::new();
     // For every scene drawable: its model and its index there.

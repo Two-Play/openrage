@@ -76,6 +76,8 @@ fn named(drawables: Vec<Drawable>) -> Vec<(String, Drawable)> {
 
 /// The archive with the skeletons people and animals are put together on.
 const BASE_SKELETONS: &str = "packs.rpf/packs/base/models/metaped_fragments.rpf";
+/// Its canonical female body skeleton identifies this archive when its nested name is unavailable.
+const BASE_SKELETON_MARKER: &str = "ambient_femalebody.#ft";
 
 /// A vertex with less weight than this on known bones moves with the nearest.
 const MIN_WEIGHT: f32 = 0.3;
@@ -98,8 +100,12 @@ fn base_skeletons(game: &Path) -> Skeletons {
 
 fn read_base_skeletons(game: &Path) -> Result<Vec<(String, Skeleton)>> {
     use rayon::prelude::*;
-    let (node, _) = rage_mods::resolve(game, BASE_SKELETONS, None)?;
-    let rage_rpf::vfs::Node::Rpf9Dir(rpf, _) = node else { bail!("no archive") };
+    let rpf = match rage_mods::resolve(game, BASE_SKELETONS, None) {
+        Ok((rage_rpf::vfs::Node::Rpf9Dir(rpf, _), _)) => rpf,
+        Err(rage_rpf::RpfError::NotFound(_)) => recovered_base_archive(game)?,
+        Ok(_) => bail!("{BASE_SKELETONS} is not an archive"),
+        Err(e) => return Err(e.into()),
+    };
     let entries = rpf.entries()?;
     let mut found: Vec<(String, Skeleton)> = (0..entries.len())
         .into_par_iter()
@@ -112,6 +118,30 @@ fn read_base_skeletons(game: &Path) -> Result<Vec<(String, Skeleton)>> {
         .collect();
     found.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(found)
+}
+
+/// Finds the base archive by content when its TOC is readable but its nested
+/// path is unknown. If several archives match, the parallel search picks one.
+fn recovered_base_archive(game: &Path) -> Result<Arc<Rpf9>> {
+    use rayon::prelude::*;
+
+    let (rage_rpf::vfs::Node::Rpf9Dir(packs, _), _) = rage_mods::resolve(game, "packs.rpf", None)? else {
+        bail!("no packs archive");
+    };
+    packs
+        .entries()?
+        .par_iter()
+        .filter(|entry| packs.is_archive(entry))
+        .find_map_any(|entry| {
+            let child = packs.open_child(entry).ok()?;
+            let entries = child.entries().ok()?;
+            let has_body = entries.iter().any(|entry| {
+                let path = child.entry_name(entry);
+                path.rsplit('/').next().is_some_and(|name| name.eq_ignore_ascii_case(BASE_SKELETON_MARKER))
+            });
+            has_body.then(|| Arc::new(child))
+        })
+        .context("base skeleton archive not found in packs.rpf")
 }
 
 /// Binds meshes that name bones of another skeleton (parts of people and

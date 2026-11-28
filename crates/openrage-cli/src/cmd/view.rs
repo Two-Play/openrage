@@ -86,6 +86,17 @@ fn print_model_drawable(model: &openrage_app::models::LoadedModel, name: &str, d
         d.triangle_count(),
         d.shaders.len()
     );
+    let decoded: usize = d.meshes.iter().map(|mesh| mesh.bone_indices.len().min(mesh.bone_weights.len())).sum();
+    if decoded > 0 {
+        let bones = model.skeleton.as_ref().or(d.skeleton.as_ref()).map_or(0, |s| s.bones.len());
+        let weighted: usize = d
+            .meshes
+            .iter()
+            .filter(|mesh| rage_formats::gltf::has_skin_weights(mesh, bones))
+            .map(|mesh| mesh.positions.len())
+            .sum();
+        outln!("  skin weights: {decoded} decoded, {weighted}/{} vertices ready for export", d.vertex_count());
+    }
     for (i, s) in d.shaders.iter().enumerate() {
         let base = s.base_texture().unwrap_or("-");
         let found = if base == "-" || model.texture(d, base).is_some() { "" } else { " (not found)" };
