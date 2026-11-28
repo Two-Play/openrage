@@ -16,7 +16,7 @@ For bigger changes (a new game, a new archive format, a large refactoring), open
 - Run `cargo fmt --all --check` and `cargo test` before opening the pull request.
 - Update the documentation in [`site/`](site/) when the change affects users.
 
-Building from source, the build environment and the project layout are described on the [development page](https://two-play.github.io/openrage/development/).
+Building from source, the build environment and the project layout are described on the [development page](https://two-play.github.io/openRAGE/development/).
 
 ## What we cannot accept
 

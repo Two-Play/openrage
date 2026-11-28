@@ -26,8 +26,8 @@ Plugins stay off until you turn them on in Settings > Plugins.
 On first start OpenRAGE finds your game and sets up the archive keys from
 your own copy of the game. OpenRAGE contains no game files and no keys.
 
-Guide:           https://two-play.github.io/openrage/
-Getting started: https://two-play.github.io/openrage/getting-started/
+Guide:           https://two-play.github.io/openRAGE/
+Getting started: https://two-play.github.io/openRAGE/getting-started/
 Source code:     https://github.com/Two-Play/openrage
 Newest version:  https://github.com/Two-Play/openrage/releases/latest
 
@@ -35,7 +35,7 @@ OpenRAGE is licensed under the GNU General Public License v3.0 (LICENSE),
 crates/rage-tfit2 under the GNU Affero General Public License v3.0
 (LICENSE-AGPL-3.0). Third-party notices: NOTICE.md; the licenses of all
 third-party crates: THIRD_PARTY_LICENSES.md (also in the app under
-Help > About OpenRAGE, and at https://two-play.github.io/openrage/licenses/).
+Help > About OpenRAGE, and at https://two-play.github.io/openRAGE/licenses/).
 
 OpenRAGE is an independent community project. It is not affiliated with or
 endorsed by Rockstar Games or Take-Two Interactive, nor made by the OpenIV team.
