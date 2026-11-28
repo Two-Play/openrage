@@ -157,6 +157,116 @@ fn u64_at(d: &[u8], o: usize) -> Result<u64, AwcError> {
     d.u64_at(o).ok_or_else(|| damaged("truncated"))
 }
 
+fn read_flags_and_count(data: &[u8]) -> Result<(u16, usize), AwcError> {
+    let flags = u16_at(data, 6)?;
+    let count = u32_at(data, 8)? as usize;
+    if count > 1 << 16 {
+        return Err(damaged("too many streams"));
+    }
+    Ok((flags, count))
+}
+
+/// Makes `data` readable: when it does not start with the magic, decrypts
+/// it. Returns whether it was encrypted.
+fn unlock(data: &mut [u8], decrypt: Option<Decrypt>) -> Result<bool, AwcError> {
+    if u32_at(data, 0)? == MAGIC {
+        return Ok(false);
+    }
+    let decrypt = decrypt.ok_or(AwcError::NoKey)?;
+    decrypt(data);
+    if u32_at(data, 0)? != MAGIC {
+        return Err(AwcError::NotAwc);
+    }
+    Ok(true)
+}
+
+/// Where a chunk table that starts at `from` ends: after the table of `count`
+/// words, the chunks they count.
+fn table_end(data: &[u8], from: usize, count: usize) -> Option<usize> {
+    let words = data.get(from..from + count * 4)?.as_chunks::<4>().0;
+    Some(from + count * 4 + words.iter().map(|w| usize::from(w[3] >> 5) * 8).sum::<usize>())
+}
+
+/// Whether the chunks of a table that starts at `from` are inside the file.
+fn table_fits(data: &[u8], from: usize, count: usize) -> bool {
+    let Some(end) = table_end(data, from, count) else { return false };
+    data.get(from + count * 4..end).is_some_and(|table| {
+        table.as_chunks::<8>().0.iter().all(|c| {
+            let v = u64::from_le_bytes(*c);
+            (v & 0x0FFF_FFFF) + ((v >> 28) & 0x0FFF_FFFF) <= data.len() as u64
+        })
+    })
+}
+
+/// GTA VI's two more tables (size in bytes), by the header flags.
+fn gta6_tables_len(flags: u16, count: usize) -> usize {
+    (if flags & 0x20 != 0 { (count + 1) * 4 } else { 0 }) + if flags & 0x40 != 0 { 4 } else { 0 }
+}
+
+/// Whether a stream has chunks only RDR2's containers have.
+fn has_rdr2_chunks(streams: &[(u32, Vec<Chunk>)]) -> bool {
+    streams.iter().flat_map(|(_, c)| c).any(|c| matches!(c.kind, CHUNK_FORMAT_RDR2 | CHUNK_VORBIS_HEADERS))
+}
+
+/// Where the stream table starts, and whether the container is GTA VI's.
+fn chunk_table_start(data: &[u8], flags: u16, count: usize) -> Result<(usize, bool), AwcError> {
+    let mut o = 16;
+    if flags & 1 != 0 {
+        o += 2 * count;
+    }
+    // GTA VI: two more tables, if only with them the chunk table ends
+    // where the header says the data starts.
+    let extra = gta6_tables_len(flags, count);
+    let header_end = u32_at(data, 12)? as usize;
+    // The tables' bytes read as stream words can add up to the same end
+    // by chance: then the chunks decide.
+    let gta6 = extra > 0
+        && table_end(data, o + extra, count) == Some(header_end)
+        && (table_end(data, o, count) != Some(header_end) || !table_fits(data, o, count));
+    if gta6 {
+        o += extra;
+    }
+    Ok((o, gta6))
+}
+
+/// The stream table: id and chunk count of every stream.
+fn read_stream_infos(data: &[u8], count: usize, o: &mut usize) -> Result<Vec<(u32, usize)>, AwcError> {
+    let mut infos = Vec::with_capacity(count);
+    for _ in 0..count {
+        let v = u32_at(data, *o)?;
+        infos.push((v & 0x1FFF_FFFF, (v >> 29) as usize));
+        *o += 4;
+    }
+    Ok(infos)
+}
+
+/// The chunks of every stream; they have to be inside the file.
+fn read_stream_chunks(
+    data: &[u8],
+    infos: Vec<(u32, usize)>,
+    o: &mut usize,
+) -> Result<Vec<(u32, Vec<Chunk>)>, AwcError> {
+    let mut streams = Vec::with_capacity(infos.len());
+    for (id, chunk_count) in infos {
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for _ in 0..chunk_count {
+            let v = u64_at(data, *o)?;
+            *o += 8;
+            let chunk = Chunk {
+                kind: (v >> 56) as u8,
+                size: ((v >> 28) & 0x0FFF_FFFF) as usize,
+                offset: (v & 0x0FFF_FFFF) as usize,
+            };
+            if chunk.offset + chunk.size > data.len() {
+                return Err(damaged("chunk outside the file"));
+            }
+            chunks.push(chunk);
+        }
+        streams.push((id, chunks));
+    }
+    Ok(streams)
+}
+
 impl Awc {
     /// Parses a container. `decrypt` decrypts a buffer with the AWC key
     /// (`None`: no key available).
@@ -170,106 +280,65 @@ impl Awc {
     }
 
     fn parse_for(mut data: Vec<u8>, decrypt: Option<Decrypt>, rdr2: bool) -> Result<Self, AwcError> {
-        let mut encrypted = false;
-        if u32_at(&data, 0)? != MAGIC {
-            let decrypt = decrypt.ok_or(AwcError::NoKey)?;
-            decrypt(&mut data);
-            if u32_at(&data, 0)? != MAGIC {
-                return Err(AwcError::NotAwc);
-            }
-            encrypted = true;
-        }
-        let flags = u16_at(&data, 6)?;
-        let count = u32_at(&data, 8)? as usize;
-        if count > 1 << 16 {
-            return Err(damaged("too many streams"));
-        }
-        let mut o = 16;
-        if flags & 1 != 0 {
-            o += 2 * count;
-        }
-        // GTA VI: two more tables, if only with them the chunk table ends
-        // where the header says the data starts.
-        let extra = if flags & 0x20 != 0 { (count + 1) * 4 } else { 0 } + if flags & 0x40 != 0 { 4 } else { 0 };
-        let table_end = |from: usize| -> Option<usize> {
-            let words = data.get(from..from + count * 4)?.as_chunks::<4>().0;
-            Some(from + count * 4 + words.iter().map(|w| usize::from(w[3] >> 5) * 8).sum::<usize>())
-        };
-        // Whether the chunks of a table that starts at `from` are inside the file.
-        let fits = |from: usize| -> bool {
-            let Some(end) = table_end(from) else { return false };
-            data.get(from + count * 4..end).is_some_and(|table| {
-                table.as_chunks::<8>().0.iter().all(|c| {
-                    let v = u64::from_le_bytes(*c);
-                    (v & 0x0FFF_FFFF) + ((v >> 28) & 0x0FFF_FFFF) <= data.len() as u64
-                })
-            })
-        };
-        let header_end = u32_at(&data, 12)? as usize;
-        // The tables' bytes read as stream words can add up to the same end
-        // by chance: then the chunks decide.
-        let gta6 =
-            extra > 0 && table_end(o + extra) == Some(header_end) && (table_end(o) != Some(header_end) || !fits(o));
-        if gta6 {
-            o += extra;
-        }
-        let rdr2 = rdr2 || gta6;
-        let mut infos = Vec::with_capacity(count);
-        for _ in 0..count {
-            let v = u32_at(&data, o)?;
-            infos.push((v & 0x1FFF_FFFF, (v >> 29) as usize));
-            o += 4;
-        }
-        let mut streams = Vec::with_capacity(count);
-        for (id, chunk_count) in infos {
-            let mut chunks = Vec::with_capacity(chunk_count);
-            for _ in 0..chunk_count {
-                let v = u64_at(&data, o)?;
-                o += 8;
-                let chunk = Chunk {
-                    kind: (v >> 56) as u8,
-                    size: ((v >> 28) & 0x0FFF_FFFF) as usize,
-                    offset: (v & 0x0FFF_FFFF) as usize,
-                };
-                if chunk.offset + chunk.size > data.len() {
-                    return Err(damaged("chunk outside the file"));
-                }
-                chunks.push(chunk);
-            }
-            streams.push((id, chunks));
-        }
+        let encrypted = unlock(&mut data, decrypt)?;
+        let (flags, count) = read_flags_and_count(&data)?;
+        let (mut o, gta6) = chunk_table_start(&data, flags, count)?;
+        let infos = read_stream_infos(&data, count, &mut o)?;
+        let streams = read_stream_chunks(&data, infos, &mut o)?;
 
         // RDR2's containers are not encrypted; their flag bits mean other things.
-        let rdr2 = rdr2
-            || streams.iter().flat_map(|(_, c)| c).any(|c| matches!(c.kind, CHUNK_FORMAT_RDR2 | CHUNK_VORBIS_HEADERS));
+        let rdr2 = rdr2 || gta6 || has_rdr2_chunks(&streams);
         let mut awc = Awc { data, flags, streams, sounds: Vec::new(), stream_format: None, encrypted };
-        if flags & 4 != 0 {
-            awc.read_stream_format()?;
-        } else {
-            awc.read_formats()?;
-            if flags & 2 != 0 && !rdr2 {
-                let decrypt = decrypt.ok_or(AwcError::NoKey)?;
-                for (_, chunks) in &awc.streams {
-                    for c in chunks.iter().filter(|c| c.kind == CHUNK_DATA) {
-                        decrypt(&mut awc.data[c.offset..c.offset + c.size]);
-                    }
-                }
-            }
-        }
-        if flags & 4 != 0 && flags & 8 != 0 && !rdr2 {
-            let decrypt = decrypt.ok_or(AwcError::NoKey)?;
-            let (Some(format), Some(chunk)) = (&awc.stream_format, awc.chunk(0, CHUNK_DATA).cloned()) else {
-                return Err(damaged("stream without data"));
-            };
-            let mut start = chunk.offset;
-            let end = chunk.offset + chunk.size;
-            while start < end {
-                let len = format.block_size.min(end - start);
-                decrypt(&mut awc.data[start..start + len]);
-                start += len;
-            }
-        }
+        awc.read_contents(decrypt, rdr2)?;
         Ok(awc)
+    }
+
+    /// Reads the format chunks and decrypts the sample data.
+    fn read_contents(&mut self, decrypt: Option<Decrypt>, rdr2: bool) -> Result<(), AwcError> {
+        if self.flags & 4 != 0 {
+            self.read_stream_contents(decrypt, rdr2)
+        } else {
+            self.read_sound_contents(decrypt, rdr2)
+        }
+    }
+
+    fn read_stream_contents(&mut self, decrypt: Option<Decrypt>, rdr2: bool) -> Result<(), AwcError> {
+        self.read_stream_format()?;
+        if self.flags & 8 != 0 && !rdr2 {
+            self.decrypt_stream_blocks(decrypt.ok_or(AwcError::NoKey)?)?;
+        }
+        Ok(())
+    }
+
+    fn read_sound_contents(&mut self, decrypt: Option<Decrypt>, rdr2: bool) -> Result<(), AwcError> {
+        self.read_formats()?;
+        if self.flags & 2 != 0 && !rdr2 {
+            self.decrypt_data_chunks(decrypt.ok_or(AwcError::NoKey)?);
+        }
+        Ok(())
+    }
+
+    fn decrypt_data_chunks(&mut self, decrypt: Decrypt) {
+        for (_, chunks) in &self.streams {
+            for c in chunks.iter().filter(|c| c.kind == CHUNK_DATA) {
+                decrypt(&mut self.data[c.offset..c.offset + c.size]);
+            }
+        }
+    }
+
+    /// Decrypts the data of a stream, block by block.
+    fn decrypt_stream_blocks(&mut self, decrypt: Decrypt) -> Result<(), AwcError> {
+        let (Some(format), Some(chunk)) = (&self.stream_format, self.chunk(0, CHUNK_DATA).cloned()) else {
+            return Err(damaged("stream without data"));
+        };
+        let mut start = chunk.offset;
+        let end = chunk.offset + chunk.size;
+        while start < end {
+            let len = format.block_size.min(end - start);
+            decrypt(&mut self.data[start..start + len]);
+            start += len;
+        }
+        Ok(())
     }
 
     pub fn chunk(&self, stream: usize, kind: u8) -> Option<&Chunk> {

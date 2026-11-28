@@ -270,61 +270,76 @@ fn enhanced_layout(res: &Resource, decl: u64) -> Result<Layout, ResourceError> {
     Ok(Layout { decl: VertexDecl { flags, types: DEFAULT_TYPES }, slots })
 }
 
-fn read_geometry(res: &Resource, g: u64, enhanced: bool) -> Result<OfGeometry, ResourceError> {
-    let (vb, ib) = (res.u64(g + 0x18)?, res.u64(g + 0x38)?);
-    let (count, stride, data, layout) = if enhanced {
-        (
-            res.u32(vb + 0x08)? as usize,
-            res.u16(vb + 0x0C)? as usize,
-            res.u64(vb + 0x18)?,
-            enhanced_layout(res, res.u64(vb + 0x38)?)?,
-        )
+/// A vertex buffer: its size, where its data is and how its vertices are laid out.
+struct VertexBuffer {
+    count: usize,
+    stride: usize,
+    data: u64,
+    layout: Layout,
+}
+
+fn read_vertex_buffer(res: &Resource, vb: u64, enhanced: bool) -> Result<VertexBuffer, ResourceError> {
+    if enhanced { read_enhanced_vertex_buffer(res, vb) } else { read_legacy_vertex_buffer(res, vb) }
+}
+
+fn read_enhanced_vertex_buffer(res: &Resource, vb: u64) -> Result<VertexBuffer, ResourceError> {
+    Ok(VertexBuffer {
+        count: res.u32(vb + 0x08)? as usize,
+        stride: res.u16(vb + 0x0C)? as usize,
+        data: res.u64(vb + 0x18)?,
+        layout: enhanced_layout(res, res.u64(vb + 0x38)?)?,
+    })
+}
+
+fn read_legacy_vertex_buffer(res: &Resource, vb: u64) -> Result<VertexBuffer, ResourceError> {
+    Ok(VertexBuffer {
+        count: res.u32(vb + 0x18)? as usize,
+        stride: res.u16(vb + 0x08)? as usize,
+        data: res.u64(vb + 0x10)?,
+        layout: legacy_layout(res, res.u64(vb + 0x30)?)?,
+    })
+}
+
+/// A geometry's table of bones: blend indices point into it.
+fn read_bone_table(res: &Resource, g: u64) -> Result<Vec<u16>, ResourceError> {
+    let table = res.u64(g + 0x68)?;
+    let n = res.u16(g + 0x72)? as u64;
+    if table != 0 && n <= 1024 {
+        (0..n).map(|i| res.u16(table + i * 2)).collect::<Result<_, _>>()
     } else {
-        (
-            res.u32(vb + 0x18)? as usize,
-            res.u16(vb + 0x08)? as usize,
-            res.u64(vb + 0x10)?,
-            legacy_layout(res, res.u64(vb + 0x30)?)?,
-        )
-    };
-    if stride == 0 || count > 1 << 22 {
-        return Err(bad("implausible vertex buffer"));
+        Ok(Vec::new())
     }
-    if layout.slots.iter().any(|&(_, o, e)| o + e.size() > stride) {
-        return Err(bad("a vertex component lies outside the vertex"));
-    }
-    let bytes = res.bytes(data, count * stride)?;
-    // Blend indices point into the geometry's bone table.
-    let table: Vec<u16> = {
-        let table = res.u64(g + 0x68)?;
-        let n = res.u16(g + 0x72)? as u64;
-        if table != 0 && n <= 1024 {
-            (0..n).map(|i| res.u16(table + i * 2)).collect::<Result<_, _>>()?
-        } else {
-            Vec::new()
-        }
-    };
-    let mut attributes = Vec::new();
-    for &(k, off, enc) in &layout.slots {
-        let mut values = Vec::with_capacity(count);
-        for i in 0..count {
-            let raw = &bytes[i * stride + off..i * stride + off + enc.size()];
-            let v = match (k, enc) {
-                // Bytes as they are stored.
-                (component::BLEND_INDICES | component::COLOUR0 | component::COLOUR1, _) if enc.size() == 4 => {
-                    [raw[0], raw[1], raw[2], raw[3]].map(f32::from)
-                }
-                _ => enc.decode(raw),
-            };
-            values.push(v);
-        }
-        if k == component::BLEND_INDICES && !table.is_empty() {
-            for v in &mut values {
-                *v = v.map(|i| table.get(i as usize).copied().map_or(i, f32::from));
+}
+
+/// The values of one vertex component (`slot`: component, byte offset, encoding) of all vertices.
+fn read_attribute(
+    vb: &VertexBuffer,
+    bytes: &[u8],
+    (k, off, enc): (usize, usize, Encoding),
+    table: &[u16],
+) -> (usize, Vec<[f32; 4]>) {
+    let mut values = Vec::with_capacity(vb.count);
+    for i in 0..vb.count {
+        let raw = &bytes[i * vb.stride + off..i * vb.stride + off + enc.size()];
+        let v = match (k, enc) {
+            // Bytes as they are stored.
+            (component::BLEND_INDICES | component::COLOUR0 | component::COLOUR1, _) if enc.size() == 4 => {
+                [raw[0], raw[1], raw[2], raw[3]].map(f32::from)
             }
-        }
-        attributes.push((k, values));
+            _ => enc.decode(raw),
+        };
+        values.push(v);
     }
+    if k == component::BLEND_INDICES && !table.is_empty() {
+        for v in &mut values {
+            *v = v.map(|i| table.get(i as usize).copied().map_or(i, f32::from));
+        }
+    }
+    (k, values)
+}
+
+/// The triangle indices of the index buffer at `ib`; none may reach `vertex_count`.
+fn read_indices(res: &Resource, ib: u64, enhanced: bool, vertex_count: usize) -> Result<Vec<u32>, ResourceError> {
     let index_count = res.u32(ib + 0x08)? as usize;
     let (ptr, size) =
         if enhanced { (res.u64(ib + 0x18)?, res.u16(ib + 0x0C)?.max(2) as usize) } else { (res.u64(ib + 0x10)?, 2) };
@@ -334,73 +349,119 @@ fn read_geometry(res: &Resource, g: u64, enhanced: bool) -> Result<OfGeometry, R
     } else {
         raw.as_chunks::<2>().0.iter().map(|c| u32::from(u16::from_le_bytes(*c))).collect()
     };
-    if indices.iter().any(|&i| i as usize >= count) {
+    if indices.iter().any(|&i| i as usize >= vertex_count) {
         return Err(bad("index outside the vertex buffer"));
     }
-    Ok(OfGeometry { shader: 0, decl: layout.decl, indices, attributes })
+    Ok(indices)
+}
+
+fn read_geometry(res: &Resource, g: u64, enhanced: bool) -> Result<OfGeometry, ResourceError> {
+    let (vb, ib) = (res.u64(g + 0x18)?, res.u64(g + 0x38)?);
+    let buffer = read_vertex_buffer(res, vb, enhanced)?;
+    if buffer.stride == 0 || buffer.count > 1 << 22 {
+        return Err(bad("implausible vertex buffer"));
+    }
+    if buffer.layout.slots.iter().any(|&(_, o, e)| o + e.size() > buffer.stride) {
+        return Err(bad("a vertex component lies outside the vertex"));
+    }
+    let bytes = res.bytes(buffer.data, buffer.count * buffer.stride)?;
+    // Blend indices point into the geometry's bone table.
+    let table = read_bone_table(res, g)?;
+    let attributes = buffer.layout.slots.iter().map(|&slot| read_attribute(&buffer, bytes, slot, &table)).collect();
+    let indices = read_indices(res, ib, enhanced, buffer.count)?;
+    Ok(OfGeometry { shader: 0, decl: buffer.layout.decl, indices, attributes })
+}
+
+fn texture_name(res: &Resource, ptr: u64) -> Result<String, ResourceError> {
+    let name = res.u64(ptr + 0x28)?;
+    Ok(if name != 0 { res.string(name)? } else { String::new() })
+}
+
+/// Texture `k` of an Enhanced shader's parameter list, or `None` when it is not a set texture slot.
+fn read_enhanced_texture(
+    res: &Resource,
+    ptrs: u64,
+    infos: u64,
+    k: u64,
+) -> Result<Option<(String, OfValue)>, ResourceError> {
+    let (hash, slot) = (res.u32(infos + 8 + k * 8)?, res.u32(infos + 12 + k * 8)?);
+    if slot & 3 != 0 {
+        return Ok(None);
+    }
+    let p = res.u64(ptrs + u64::from(slot >> 2) * 8)?;
+    if p == 0 {
+        return Ok(None);
+    }
+    Ok(Some((legacy_texture_param(&param_name(hash).0), OfValue::Texture(texture_name(res, p)?))))
+}
+
+fn read_enhanced_shader(res: &Resource, s: u64) -> Result<OfShader, ResourceError> {
+    let mut shader = OfShader { name: shader_name(res.u32(s)?), ..Default::default() };
+    let ptrs = res.u64(s + 0x10)?;
+    let infos = res.u64(s + 0x20)?;
+    if infos != 0 && ptrs != 0 {
+        let total = res.u8(infos + 4)? as u64;
+        for k in 0..total.min(128) {
+            if let Some(param) = read_enhanced_texture(res, ptrs, infos, k)? {
+                shader.params.push(param);
+            }
+        }
+    }
+    Ok(shader)
+}
+
+/// Legacy parameter `p` of type `t` (see [`read_legacy_shader`]), or `None` for an unset texture.
+fn read_legacy_param(
+    res: &Resource,
+    params: u64,
+    hashes: u64,
+    p: u64,
+    t: u64,
+) -> Result<Option<(String, OfValue)>, ResourceError> {
+    let (name, width) = param_name(res.u32(hashes + p * 4)?);
+    let data = res.u64(params + p * 16 + 8)?;
+    let value = if t == 0 {
+        if data == 0 {
+            return Ok(None);
+        }
+        OfValue::Texture(texture_name(res, data)?)
+    } else {
+        let mut v = (0..t * 4).map(|k| f(res, data + k * 4)).collect::<Result<Vec<_>, _>>()?;
+        if t == 1
+            && let Some(w) = width
+        {
+            v.truncate(w.max(1));
+        }
+        OfValue::Floats(v)
+    };
+    Ok(Some((name, value)))
+}
+
+fn read_legacy_shader(res: &Resource, s: u64) -> Result<OfShader, ResourceError> {
+    let mut shader = OfShader::default();
+    // Parameters: 16 bytes each (data type: 0 texture, else the
+    // number of float4s; data pointer at 8), then their data, then
+    // one name hash per parameter.
+    let params = res.u64(s)?;
+    shader.name = shader_name(res.u32(s + 0x08)?);
+    let n = res.u8(s + 0x10)? as u64;
+    let types: Vec<u64> = (0..n).map(|p| res.u8(params + p * 16).map(u64::from)).collect::<Result<_, _>>()?;
+    let hashes = params + n * 16 + types.iter().sum::<u64>() * 16;
+    for (p, &t) in types.iter().enumerate() {
+        if let Some(param) = read_legacy_param(res, params, hashes, p as u64, t)? {
+            shader.params.push(param);
+        }
+    }
+    Ok(shader)
 }
 
 fn read_shaders(res: &Resource, group: u64, enhanced: bool) -> Result<Vec<OfShader>, ResourceError> {
     let list = res.u64(group + 0x10)?;
     let count = res.u16(group + 0x18)? as u64;
-    let texture_name = |ptr: u64| -> Result<String, ResourceError> {
-        let name = res.u64(ptr + 0x28)?;
-        Ok(if name != 0 { res.string(name)? } else { String::new() })
-    };
     let mut out = Vec::new();
     for i in 0..count.min(512) {
         let s = res.u64(list + i * 8)?;
-        let mut shader = OfShader::default();
-        if enhanced {
-            shader.name = shader_name(res.u32(s)?);
-            let ptrs = res.u64(s + 0x10)?;
-            let infos = res.u64(s + 0x20)?;
-            if infos != 0 && ptrs != 0 {
-                let total = res.u8(infos + 4)? as u64;
-                for k in 0..total.min(128) {
-                    let (hash, slot) = (res.u32(infos + 8 + k * 8)?, res.u32(infos + 12 + k * 8)?);
-                    if slot & 3 != 0 {
-                        continue;
-                    }
-                    let p = res.u64(ptrs + u64::from(slot >> 2) * 8)?;
-                    if p != 0 {
-                        shader
-                            .params
-                            .push((legacy_texture_param(&param_name(hash).0), OfValue::Texture(texture_name(p)?)));
-                    }
-                }
-            }
-        } else {
-            // Parameters: 16 bytes each (data type: 0 texture, else the
-            // number of float4s; data pointer at 8), then their data, then
-            // one name hash per parameter.
-            let params = res.u64(s)?;
-            shader.name = shader_name(res.u32(s + 0x08)?);
-            let n = res.u8(s + 0x10)? as u64;
-            let types: Vec<u64> = (0..n).map(|p| res.u8(params + p * 16).map(u64::from)).collect::<Result<_, _>>()?;
-            let hashes = params + n * 16 + types.iter().sum::<u64>() * 16;
-            for (p, &t) in types.iter().enumerate() {
-                let p = p as u64;
-                let (name, width) = param_name(res.u32(hashes + p * 4)?);
-                let data = res.u64(params + p * 16 + 8)?;
-                let value = if t == 0 {
-                    if data == 0 {
-                        continue;
-                    }
-                    OfValue::Texture(texture_name(data)?)
-                } else {
-                    let mut v = (0..t * 4).map(|k| f(res, data + k * 4)).collect::<Result<Vec<_>, _>>()?;
-                    if t == 1
-                        && let Some(w) = width
-                    {
-                        v.truncate(w.max(1));
-                    }
-                    OfValue::Floats(v)
-                };
-                shader.params.push((name, value));
-            }
-        }
-        out.push(shader);
+        out.push(if enhanced { read_enhanced_shader(res, s)? } else { read_legacy_shader(res, s)? });
     }
     Ok(out)
 }

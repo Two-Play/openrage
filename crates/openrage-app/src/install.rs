@@ -9,17 +9,18 @@
 //! archive. Every step is recorded in the [journal](crate::journal) and can be
 //! undone.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use rage_crypto::GtaVKeys;
-use rage_rpf::{ArchiveEditor, CommitStats, RawEntry, Rpf7, entry_for, file_entry, vfs};
+use rage_rpf::{ArchiveEditor, CommitStats, RawEntry, vfs};
 
 use crate::journal::Journal;
+
+mod ops;
+use ops::apply_ops;
 
 /// A virtual path split into its top-level archive and the path inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,88 +117,6 @@ fn ensure_in_mods(game_dir: &Path, mods: &Path, archive: &str, journal: &Journal
         ),
     )?;
     Ok((dest, rel, true))
-}
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Applies `ops` to an open editor; ops reaching into nested archives rebuild
-/// those (through a temporary file carrying the nested archive's name, which
-/// its encryption key depends on).
-fn apply_ops(
-    editor: &mut ArchiveEditor,
-    ops: &[(String, Op)],
-    keys: &Option<Arc<GtaVKeys>>,
-    temp_root: &Path,
-) -> Result<()> {
-    let mut nested: BTreeMap<String, (rage_rpf::EntryId, Vec<(String, Op)>)> = BTreeMap::new();
-    let mut local: Vec<(String, Op)> = Vec::new();
-    {
-        let rpf = editor.archive();
-        for (path, op) in ops {
-            let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-            let mut dir = Rpf7::ROOT;
-            let mut split = None;
-            for (i, seg) in segs.iter().enumerate().take(segs.len().saturating_sub(1)) {
-                let Some(child) = rpf.find_child(dir, seg) else { break };
-                if rpf.entry(child).is_archive() {
-                    split = Some((i + 1, child));
-                    break;
-                }
-                dir = child;
-            }
-            match split {
-                Some((n, id)) => {
-                    let prefix = segs[..n].join("/");
-                    let rest = segs[n..].join("/");
-                    let op = match op {
-                        Op::Rename(to) => {
-                            let to_rest = to
-                                .strip_prefix(&format!("{prefix}/"))
-                                .with_context(|| format!("cannot move {path} out of {prefix}"))?;
-                            Op::Rename(to_rest.to_owned())
-                        }
-                        other => other.clone(),
-                    };
-                    nested.entry(rpf.path_of(id)).or_insert_with(|| (id, Vec::new())).1.push((rest, op));
-                }
-                None => local.push((segs.join("/"), op.clone())),
-            }
-        }
-    }
-
-    for (nested_path, (id, sub_ops)) in nested {
-        let rpf = editor.archive();
-        let name = rpf.entry(id).name.clone();
-        let bytes = rpf.read(id)?;
-        let dir = temp_root.join(format!("{}-{}", std::process::id(), TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)));
-        fs::create_dir_all(&dir)?;
-        let tmp = dir.join(&name);
-        fs::write(&tmp, bytes)?;
-        let result = (|| -> Result<Vec<u8>> {
-            let mut sub = ArchiveEditor::open(&tmp, keys.clone())?;
-            apply_ops(&mut sub, &sub_ops, keys, temp_root)?;
-            sub.commit(&mut |_| Ok(()))?;
-            Ok(fs::read(&tmp)?)
-        })();
-        let _ = fs::remove_dir_all(&dir);
-        editor
-            .set(&nested_path, file_entry(&nested_path, result.with_context(|| format!("editing {nested_path}"))?)?)?;
-    }
-
-    for (path, op) in local {
-        match op {
-            Op::Set(data) => editor.set(&path, entry_for(&path, data)?)?,
-            Op::SetRaw(entry) => editor.set(&path, entry)?,
-            Op::Remove => {
-                if editor.remove(&path) == 0 {
-                    bail!("{path}: no such entry");
-                }
-            }
-            Op::Rename(to) => editor.rename(&path, &to)?,
-            Op::CreateDir => editor.create_dir(&path)?,
-        }
-    }
-    Ok(())
 }
 
 /// Applies `ops` (paths inside `archive`) to the archive's copy in the mods folder.

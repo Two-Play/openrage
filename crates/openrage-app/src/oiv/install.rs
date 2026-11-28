@@ -16,7 +16,7 @@ use rage_crypto::GtaVKeys;
 use rage_rpf::ArchiveWriter;
 use rage_rpf::vfs::{self, Node};
 
-use super::package::{Command, Package, XmlCmd};
+use super::package::{Command, Package, TextCmd, XmlCmd};
 use super::{text, xml};
 use crate::install::{self, Op};
 use crate::journal::{Entry, Journal};
@@ -232,153 +232,182 @@ impl Run<'_> {
                     .push(format!("\"{raw}\" leaves the game folder; the package is not safe to install"));
                 continue;
             }
-            match cmd {
-                Command::Add { source, target } => {
-                    let Some(data) = self.pkg.file(source).map(<[u8]>::to_vec) else {
-                        self.report.blockers.push(format!("the package lacks content file \"{source}\""));
-                        continue;
-                    };
-                    let vpath = Self::vpath(scope, target);
-                    let action = if self.exists(&vpath) { "Replace" } else { "Add" };
-                    match &scope.archive {
-                        Some(a) => {
-                            self.step(action, &vpath, format!("{} bytes", data.len()));
-                            self.queue(&a.clone(), join(&scope.prefix, &norm(target)), Op::Set(data));
-                        }
-                        None => self.write_loose(&norm(target), data, action)?,
-                    }
-                }
-                Command::Delete { target } => {
-                    let vpath = Self::vpath(scope, target);
-                    if !self.exists(&vpath) {
-                        self.report.warnings.push(format!("{vpath} does not exist; nothing to delete"));
-                        continue;
-                    }
-                    match &scope.archive {
-                        Some(a) => {
-                            self.step("Delete", &vpath, "");
-                            self.queue(&a.clone(), join(&scope.prefix, &norm(target)), Op::Remove);
-                        }
-                        None => {
-                            let rel = norm(target);
-                            let in_mods = rage_mods::mods_dir(self.game_dir)
-                                .and_then(|m| vfs::find_case_insensitive(&m, &rel))
-                                .is_some_and(|p| p.is_file());
-                            if !in_mods {
-                                self.report.warnings.push(format!("{rel}: game files are never deleted; skipped"));
-                                continue;
-                            }
-                            self.step("Delete", &rel, "from the mods folder");
-                            self.staged.insert(rel.to_ascii_lowercase(), None);
-                            if !self.dry {
-                                let mods = install::mods_dir_or_create(self.game_dir)?;
-                                Journal::new(&mods)
-                                    .grouped(Some(&self.group))
-                                    .delete_file(&rel, &format!("{}: deleted {rel}", self.group))?;
-                            }
-                        }
-                    }
-                }
-                Command::Archive { path, create, kind, commands } => {
-                    if !kind.eq_ignore_ascii_case("RPF7") {
-                        self.report.blockers.push(format!("archive type {kind} is not supported for GTA V"));
-                        continue;
-                    }
-                    let vpath = Self::vpath(scope, path);
-                    let exists = self.exists(&vpath);
-                    if !exists && !create {
-                        self.report.blockers.push(format!("archive {vpath} does not exist"));
-                        continue;
-                    }
-                    let inner_scope = match &scope.archive {
-                        None => {
-                            let rel = norm(path);
-                            if !exists {
-                                self.step("Create", &rel, "new archive in the mods folder");
-                                self.created.insert(rel.to_ascii_lowercase());
-                                if !self.dry {
-                                    self.flush()?;
-                                    install::create_archive(
-                                        self.game_dir,
-                                        &rel,
-                                        &format!("{}: created {rel}", self.group),
-                                        Some(&self.group),
-                                    )?;
-                                }
-                            }
-                            Scope { archive: Some(rel), prefix: String::new() }
-                        }
-                        Some(a) => {
-                            let inner = join(&scope.prefix, &norm(path));
-                            if !exists {
-                                self.step("Create", &vpath, "new nested archive");
-                                self.created.insert(vpath.to_ascii_lowercase());
-                                self.queue(&a.clone(), inner.clone(), Op::Set(ArchiveWriter::new().build()?));
-                                // Written now so that changes inside it can find it.
-                                self.flush()?;
-                            }
-                            Scope { archive: Some(a.clone()), prefix: inner }
-                        }
-                    };
-                    self.walk(commands, &inner_scope)?;
-                }
-                Command::Text { path, create, commands } => {
-                    let vpath = Self::vpath(scope, path);
-                    let (before, enc) = match self.read(&vpath) {
-                        Some(bytes) => decode(&bytes),
-                        None if *create => (String::new(), Encoding::Utf8),
-                        None => {
-                            self.report.blockers.push(format!("text file {vpath} does not exist"));
-                            continue;
-                        }
-                    };
-                    let (after, notes) = text::apply(&before, commands);
-                    self.report.warnings.extend(notes.into_iter().map(|n| format!("{vpath}: {n}")));
-                    self.step("Edit", &vpath, format!("{} text command(s)", commands.len()));
-                    self.write_edited(scope, path, encode(&after, enc))?;
-                }
-                Command::Xml { path, commands } => {
-                    let vpath = Self::vpath(scope, path);
-                    let Some(bytes) = self.read(&vpath) else {
-                        self.report.blockers.push(format!("XML file {vpath} does not exist"));
-                        continue;
-                    };
-                    let (mut doc, enc) = decode(&bytes);
-                    let mut failed = false;
-                    for c in commands {
-                        match xml::apply(&doc, c) {
-                            Ok(d) => doc = d,
-                            Err(e) => {
-                                self.report.blockers.push(format!("{vpath}: {e:#}"));
-                                failed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if failed {
-                        continue;
-                    }
-                    self.step("Edit", &vpath, format!("{} XML command(s)", commands.len()));
-                    self.write_edited(scope, path, encode(&doc, enc))?;
-                }
-                Command::Pso { path, commands } => {
-                    let vpath = Self::vpath(scope, path);
-                    let Some(bytes) = self.read(&vpath) else {
-                        self.report.blockers.push(format!("PSO file {vpath} does not exist"));
-                        continue;
-                    };
-                    match edit_pso(&bytes, commands) {
-                        Ok((data, detail)) => {
-                            self.step("Edit", &vpath, detail);
-                            self.write_edited(scope, path, data)?;
-                        }
-                        Err(e) => self.report.blockers.push(format!("{vpath}: {e:#}")),
-                    }
-                }
-                Command::Defragment { archive } => {
-                    self.report.warnings.push(format!("defragmentation of {archive} skipped (only saves disk space)"));
+            self.command(cmd, scope)?;
+        }
+        Ok(())
+    }
+
+    fn command(&mut self, cmd: &Command, scope: &Scope) -> Result<()> {
+        match cmd {
+            Command::Add { source, target } => self.add(scope, source, target),
+            Command::Delete { target } => self.delete(scope, target),
+            Command::Archive { path, create, kind, commands } => self.archive(scope, path, *create, kind, commands),
+            Command::Text { path, create, commands } => self.edit_text(scope, path, *create, commands),
+            Command::Xml { path, commands } => self.edit_xml(scope, path, commands),
+            Command::Pso { path, commands } => self.edit_pso(scope, path, commands),
+            Command::Defragment { archive } => {
+                self.report.warnings.push(format!("defragmentation of {archive} skipped (only saves disk space)"));
+                Ok(())
+            }
+        }
+    }
+
+    fn add(&mut self, scope: &Scope, source: &str, target: &str) -> Result<()> {
+        let Some(data) = self.pkg.file(source).map(<[u8]>::to_vec) else {
+            self.report.blockers.push(format!("the package lacks content file \"{source}\""));
+            return Ok(());
+        };
+        let vpath = Self::vpath(scope, target);
+        let action = if self.exists(&vpath) { "Replace" } else { "Add" };
+        match &scope.archive {
+            Some(a) => {
+                self.step(action, &vpath, format!("{} bytes", data.len()));
+                self.queue(a, join(&scope.prefix, &norm(target)), Op::Set(data));
+            }
+            None => self.write_loose(&norm(target), data, action)?,
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self, scope: &Scope, target: &str) -> Result<()> {
+        let vpath = Self::vpath(scope, target);
+        if !self.exists(&vpath) {
+            self.report.warnings.push(format!("{vpath} does not exist; nothing to delete"));
+            return Ok(());
+        }
+        match &scope.archive {
+            Some(a) => {
+                self.step("Delete", &vpath, "");
+                self.queue(a, join(&scope.prefix, &norm(target)), Op::Remove);
+                Ok(())
+            }
+            None => self.delete_loose(&norm(target)),
+        }
+    }
+
+    fn delete_loose(&mut self, rel: &str) -> Result<()> {
+        let in_mods = rage_mods::mods_dir(self.game_dir)
+            .and_then(|m| vfs::find_case_insensitive(&m, rel))
+            .is_some_and(|p| p.is_file());
+        if !in_mods {
+            self.report.warnings.push(format!("{rel}: game files are never deleted; skipped"));
+            return Ok(());
+        }
+        self.step("Delete", rel, "from the mods folder");
+        self.staged.insert(rel.to_ascii_lowercase(), None);
+        if !self.dry {
+            let mods = install::mods_dir_or_create(self.game_dir)?;
+            Journal::new(&mods)
+                .grouped(Some(&self.group))
+                .delete_file(rel, &format!("{}: deleted {rel}", self.group))?;
+        }
+        Ok(())
+    }
+
+    fn archive(&mut self, scope: &Scope, path: &str, create: bool, kind: &str, commands: &[Command]) -> Result<()> {
+        if !kind.eq_ignore_ascii_case("RPF7") {
+            self.report.blockers.push(format!("archive type {kind} is not supported for GTA V"));
+            return Ok(());
+        }
+        let vpath = Self::vpath(scope, path);
+        let exists = self.exists(&vpath);
+        if !exists && !create {
+            self.report.blockers.push(format!("archive {vpath} does not exist"));
+            return Ok(());
+        }
+        let inner_scope = match &scope.archive {
+            None => self.enter_top_archive(path, exists)?,
+            Some(a) => self.enter_nested_archive(scope, a, path, &vpath, exists)?,
+        };
+        self.walk(commands, &inner_scope)
+    }
+
+    /// The scope of a top-level archive, which is created in the mods folder if it is new.
+    fn enter_top_archive(&mut self, path: &str, exists: bool) -> Result<Scope> {
+        let rel = norm(path);
+        if !exists {
+            self.step("Create", &rel, "new archive in the mods folder");
+            self.created.insert(rel.to_ascii_lowercase());
+            if !self.dry {
+                self.flush()?;
+                install::create_archive(
+                    self.game_dir,
+                    &rel,
+                    &format!("{}: created {rel}", self.group),
+                    Some(&self.group),
+                )?;
+            }
+        }
+        Ok(Scope { archive: Some(rel), prefix: String::new() })
+    }
+
+    /// The scope of an archive inside the top-level archive `a`, which is queued if it is new.
+    fn enter_nested_archive(&mut self, scope: &Scope, a: &str, path: &str, vpath: &str, exists: bool) -> Result<Scope> {
+        let inner = join(&scope.prefix, &norm(path));
+        if !exists {
+            self.step("Create", vpath, "new nested archive");
+            self.created.insert(vpath.to_ascii_lowercase());
+            self.queue(a, inner.clone(), Op::Set(ArchiveWriter::new().build()?));
+            // Written now so that changes inside it can find it.
+            self.flush()?;
+        }
+        Ok(Scope { archive: Some(a.to_owned()), prefix: inner })
+    }
+
+    fn edit_text(&mut self, scope: &Scope, path: &str, create: bool, commands: &[TextCmd]) -> Result<()> {
+        let vpath = Self::vpath(scope, path);
+        let (before, enc) = match self.read(&vpath) {
+            Some(bytes) => decode(&bytes),
+            None if create => (String::new(), Encoding::Utf8),
+            None => {
+                self.report.blockers.push(format!("text file {vpath} does not exist"));
+                return Ok(());
+            }
+        };
+        let (after, notes) = text::apply(&before, commands);
+        self.report.warnings.extend(notes.into_iter().map(|n| format!("{vpath}: {n}")));
+        self.step("Edit", &vpath, format!("{} text command(s)", commands.len()));
+        self.write_edited(scope, path, encode(&after, enc))
+    }
+
+    fn edit_xml(&mut self, scope: &Scope, path: &str, commands: &[XmlCmd]) -> Result<()> {
+        let vpath = Self::vpath(scope, path);
+        let Some(bytes) = self.read(&vpath) else {
+            self.report.blockers.push(format!("XML file {vpath} does not exist"));
+            return Ok(());
+        };
+        let (doc, enc) = decode(&bytes);
+        let Some(doc) = self.apply_xml(&vpath, doc, commands) else { return Ok(()) };
+        self.step("Edit", &vpath, format!("{} XML command(s)", commands.len()));
+        self.write_edited(scope, path, encode(&doc, enc))
+    }
+
+    /// Applies the commands in order; the first that fails becomes a blocker.
+    fn apply_xml(&mut self, vpath: &str, mut doc: String, commands: &[XmlCmd]) -> Option<String> {
+        for c in commands {
+            match xml::apply(&doc, c) {
+                Ok(d) => doc = d,
+                Err(e) => {
+                    self.report.blockers.push(format!("{vpath}: {e:#}"));
+                    return None;
                 }
             }
+        }
+        Some(doc)
+    }
+
+    fn edit_pso(&mut self, scope: &Scope, path: &str, commands: &[XmlCmd]) -> Result<()> {
+        let vpath = Self::vpath(scope, path);
+        let Some(bytes) = self.read(&vpath) else {
+            self.report.blockers.push(format!("PSO file {vpath} does not exist"));
+            return Ok(());
+        };
+        match edit_pso(&bytes, commands) {
+            Ok((data, detail)) => {
+                self.step("Edit", &vpath, detail);
+                self.write_edited(scope, path, data)?;
+            }
+            Err(e) => self.report.blockers.push(format!("{vpath}: {e:#}")),
         }
         Ok(())
     }

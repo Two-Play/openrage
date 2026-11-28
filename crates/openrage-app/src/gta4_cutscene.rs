@@ -381,156 +381,253 @@ fn floats<const N: usize>(line: &str) -> Option<[f32; N]> {
 pub fn parse(data: &[u8]) -> Result<Gta4Cutscene> {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
     let text: String = data[..end].iter().map(|&b| b as char).collect();
-    let mut cut = Gta4Cutscene::default();
-    let mut section: Option<Section> = None;
-    let mut block: Option<String> = None;
-    let mut variations: Vec<Variation> = Vec::new();
-    let mut props: Vec<PropChoice> = Vec::new();
+    let mut parser = CutParser::default();
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
-        let at = || format!("line {}", n + 1);
         if line.is_empty() {
             continue;
         }
+        if !parser.line(n, line)? {
+            break;
+        }
+    }
+    parser.finish()
+}
+
+/// What `parse` has read so far.
+#[derive(Default)]
+struct CutParser {
+    cut: Gta4Cutscene,
+    section: Option<Section>,
+    block: Option<String>,
+    /// Outfits and accessories given before the next section.
+    pending: Pending,
+}
+
+#[derive(Default)]
+struct Pending {
+    variations: Vec<Variation>,
+    props: Vec<PropChoice>,
+}
+
+/// A line of a block, for error messages.
+struct BlockLine<'a> {
+    n: usize,
+    name: &'a str,
+    text: &'a str,
+}
+
+impl BlockLine<'_> {
+    fn bad(&self) -> String {
+        format!("{}: unexpected [{}] line: {}", line_at(self.n), self.name, self.text)
+    }
+}
+
+fn line_at(n: usize) -> String {
+    format!("line {}", n + 1)
+}
+
+impl CutParser {
+    /// Reads one line; false when the text ends here.
+    fn line(&mut self, n: usize, line: &str) -> Result<bool> {
+        if self.tag(n, line)? {
+            return Ok(true);
+        }
+        let Some(name) = self.block.as_deref() else {
+            return Ok(!self.is_padding(line));
+        };
+        let l = BlockLine { n, name, text: line };
+        entry(&l, self.section.as_mut(), &mut self.pending, &mut self.cut)?;
+        Ok(true)
+    }
+
+    /// Handles a line that starts or ends a section or a block.
+    fn tag(&mut self, n: usize, line: &str) -> Result<bool> {
         match line {
             "[SECTION_START]" => {
-                if section.is_some() {
-                    bail!("{}: a section starts inside another one", at());
+                if self.section.is_some() {
+                    bail!("{}: a section starts inside another one", line_at(n));
                 }
                 // Outfits given before the section are its own.
-                section = Some(Section {
-                    variations: std::mem::take(&mut variations),
-                    props: std::mem::take(&mut props),
+                self.section = Some(Section {
+                    variations: std::mem::take(&mut self.pending.variations),
+                    props: std::mem::take(&mut self.pending.props),
                     ..Section::default()
                 });
-                block = None;
-                continue;
+                self.block = None;
             }
             "[SECTION_END]" => {
-                let s = section.take().with_context(|| format!("{}: a section ends that never started", at()))?;
-                cut.sections.push(s);
-                block = None;
-                continue;
+                let s = self
+                    .section
+                    .take()
+                    .with_context(|| format!("{}: a section ends that never started", line_at(n)))?;
+                self.cut.sections.push(s);
+                self.block = None;
             }
-            _ => {}
+            _ => return Ok(self.block_tag(line)),
         }
+        Ok(true)
+    }
+
+    fn block_tag(&mut self, line: &str) -> bool {
         // A closing tag ends the open block, even with another name (a few
         // files close `[TEXT]` with `[/MISSION_TEXT_NAME]`).
         if line.starts_with("[/") && line.ends_with(']') {
-            block = None;
-            continue;
+            self.block = None;
+            return true;
         }
         // A block starts, its `]` sometimes missing (`[MISSION_TEXT_NAME`).
         if let Some(name) = line.strip_prefix('[').map(|l| l.strip_suffix(']').unwrap_or(l))
             && !name.is_empty()
             && name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
         {
-            block = Some(name.to_owned());
-            continue;
+            self.block = Some(name.to_owned());
+            return true;
         }
-        let Some(name) = block.as_deref() else {
-            // Padding after the last section: left-over memory, not text.
-            if section.is_none()
-                && !cut.sections.is_empty()
-                && line.chars().any(|c| !(c == '\t' || (' '..='~').contains(&c)))
-            {
-                break;
-            }
-            // Notes left by the game's tools (`VARIATION FOUND!`).
-            continue;
-        };
-        let bad = || format!("{}: unexpected [{name}] line: {line}", at());
-        match (section.as_mut(), name) {
-            (None, "MISSION_TEXT_NAME") => cut.text_table = Some(line.to_owned()),
-            (None, "TEXT") => {
-                let f: Vec<&str> = line.split_whitespace().collect();
-                let [start, length, key] = f.as_slice() else { bail!(bad()) };
-                let (start, length): (f32, f32) = (start.parse().with_context(bad)?, length.parse().with_context(bad)?);
-                // A cutscene put together from several has a header before
-                // each part: its times count from the part's first section.
-                let part = cut.sections.iter().map(|s| s.duration).sum::<f32>();
-                cut.subtitles.push(Subtitle {
-                    start: part + start / 1000.0,
-                    duration: length / 1000.0,
-                    key: (*key).to_owned(),
-                    table: cut.text_table.clone(),
-                });
-            }
-            (None, "FLAGS") => cut.flags.push(line.to_owned()),
-            (None, "CUTSCENE_HEADER") => {
-                cut.scenes.push(line.split_whitespace().filter_map(|v| v.parse().ok()).collect())
-            }
-            (None, "PLAYER_START") => cut.player_start = Some(floats(line).with_context(bad)?),
-            (Some(s), "MODELS") => {
-                let f: Vec<&str> = line.split_whitespace().collect();
-                if f.len() < 3 || f[0].parse::<u32>().is_err() {
-                    bail!(bad());
-                }
-                // A fourth field is the facial clip, unless it is a number (a flag) or `null`.
-                let face = f
-                    .get(3)
-                    .filter(|v| v.parse::<f32>().is_err() && !v.eq_ignore_ascii_case("null"))
-                    .map(|v| (*v).to_owned());
-                let index = f[0].parse().with_context(bad)?;
-                s.models.push(CutModel { index, model: f[1].to_owned(), anim: f[2].to_owned(), face });
-            }
-            (Some(s), "OFFSET") => s.offset = floats(line).with_context(bad)?,
-            (Some(s), "ORIENT") => s.orient = floats::<1>(line).with_context(bad)?[0],
-            (Some(s), "DURATION") => s.duration = floats::<1>(line).with_context(bad)?[0] / 1000.0,
-            (Some(s), "ANIM") => s.anim = line.to_owned(),
-            (Some(s), "CAMERA") => s.camera = Some(line.to_owned()),
-            (Some(s), "AUDIO") => s.audio = Some(line.to_owned()),
-            (s, "VARIATION") => {
-                let f: Vec<f32> =
-                    line.split_whitespace().map(|v| v.parse()).collect::<Result<_, _>>().with_context(bad)?;
-                let (&[model, component, drawable, texture], time) = (&f[..f.len().min(4)], f.get(4)) else {
-                    bail!(bad())
-                };
-                let v = Variation {
-                    model: model as u32,
-                    component: component as u32,
-                    drawable: drawable as u32,
-                    texture: texture as u32,
-                    time: time.copied().unwrap_or(0.0) / 1000.0,
-                };
-                match s {
-                    Some(s) => s.variations.push(v),
-                    None => variations.push(v),
-                }
-            }
-            (Some(s), "LIGHTS") => s.lights.push(line.to_owned()),
-            (Some(s), "EFFECTS") => s.effects.push(parse_effect(line).with_context(bad)?),
-            (Some(s), "VEHICLE_DETAILS") => {
-                let f: Vec<u32> =
-                    line.split_whitespace().map(|v| v.parse()).collect::<Result<_, _>>().with_context(bad)?;
-                let [model, a, b, c, d, ..] = f[..] else { bail!(bad()) };
-                s.vehicles.push((model, [a, b, c, d]));
-            }
-            (s, "PROPS") => {
-                let f: Vec<u32> =
-                    line.split_whitespace().map(|v| v.parse()).collect::<Result<_, _>>().with_context(bad)?;
-                let &[model, variant, anchor] = f.as_slice() else { bail!(bad()) };
-                let p = PropChoice { model, anchor, variant };
-                match s {
-                    Some(s) => s.props.push(p),
-                    None => props.push(p),
-                }
-            }
-            (Some(s), "REMOVE") => {
-                let (at, model) = line.rsplit_once(char::is_whitespace).with_context(bad)?;
-                s.remove.push((floats(at).with_context(bad)?, model.to_owned()));
-            }
-            // Draw distances, lights, effects, vehicles, objects to remove, …
-            _ => {}
+        false
+    }
+
+    /// Padding after the last section: left-over memory, not text. (Notes
+    /// left by the game's tools, like `VARIATION FOUND!`, are not.)
+    fn is_padding(&self, line: &str) -> bool {
+        self.section.is_none()
+            && !self.cut.sections.is_empty()
+            && line.chars().any(|c| !(c == '\t' || (' '..='~').contains(&c)))
+    }
+
+    fn finish(self) -> Result<Gta4Cutscene> {
+        if self.section.is_some() {
+            bail!("the last section has no [SECTION_END]");
         }
+        if self.cut.sections.is_empty() {
+            bail!("no sections ([SECTION_START] … [SECTION_END])");
+        }
+        Ok(self.cut)
     }
-    if section.is_some() {
-        bail!("the last section has no [SECTION_END]");
+}
+
+fn entry(l: &BlockLine, section: Option<&mut Section>, pending: &mut Pending, cut: &mut Gta4Cutscene) -> Result<()> {
+    match l.name {
+        "VARIATION" => variation(l, section, pending),
+        "PROPS" => props(l, section, pending),
+        _ => match section {
+            None => cut_entry(l, cut),
+            Some(s) => section_entry(l, s),
+        },
     }
-    if cut.sections.is_empty() {
-        bail!("no sections ([SECTION_START] … [SECTION_END])");
+}
+
+/// A line outside any section (the file's header).
+fn cut_entry(l: &BlockLine, cut: &mut Gta4Cutscene) -> Result<()> {
+    let line = l.text;
+    match l.name {
+        "MISSION_TEXT_NAME" => cut.text_table = Some(line.to_owned()),
+        "TEXT" => subtitle(l, cut)?,
+        "FLAGS" => cut.flags.push(line.to_owned()),
+        "CUTSCENE_HEADER" => cut.scenes.push(line.split_whitespace().filter_map(|v| v.parse().ok()).collect()),
+        "PLAYER_START" => cut.player_start = Some(floats(line).with_context(|| l.bad())?),
+        _ => {}
     }
-    Ok(cut)
+    Ok(())
+}
+
+fn subtitle(l: &BlockLine, cut: &mut Gta4Cutscene) -> Result<()> {
+    let f: Vec<&str> = l.text.split_whitespace().collect();
+    let [start, length, key] = f.as_slice() else { bail!(l.bad()) };
+    let (start, length): (f32, f32) =
+        (start.parse().with_context(|| l.bad())?, length.parse().with_context(|| l.bad())?);
+    // A cutscene put together from several has a header before
+    // each part: its times count from the part's first section.
+    let part = cut.sections.iter().map(|s| s.duration).sum::<f32>();
+    cut.subtitles.push(Subtitle {
+        start: part + start / 1000.0,
+        duration: length / 1000.0,
+        key: (*key).to_owned(),
+        table: cut.text_table.clone(),
+    });
+    Ok(())
+}
+
+/// A line inside a section.
+fn section_entry(l: &BlockLine, s: &mut Section) -> Result<()> {
+    let line = l.text;
+    match l.name {
+        "OFFSET" => s.offset = floats(line).with_context(|| l.bad())?,
+        "ORIENT" => s.orient = floats::<1>(line).with_context(|| l.bad())?[0],
+        "DURATION" => s.duration = floats::<1>(line).with_context(|| l.bad())?[0] / 1000.0,
+        "ANIM" => s.anim = line.to_owned(),
+        "CAMERA" => s.camera = Some(line.to_owned()),
+        "AUDIO" => s.audio = Some(line.to_owned()),
+        _ => return section_list_entry(l, s),
+    }
+    Ok(())
+}
+
+fn section_list_entry(l: &BlockLine, s: &mut Section) -> Result<()> {
+    match l.name {
+        "MODELS" => s.models.push(cut_model(l)?),
+        "LIGHTS" => s.lights.push(l.text.to_owned()),
+        "EFFECTS" => s.effects.push(parse_effect(l.text).with_context(|| l.bad())?),
+        "VEHICLE_DETAILS" => s.vehicles.push(vehicle_details(l)?),
+        "REMOVE" => s.remove.push(removed_object(l)?),
+        // Draw distances, lights, effects, vehicles, objects to remove, …
+        _ => {}
+    }
+    Ok(())
+}
+
+fn removed_object(l: &BlockLine) -> Result<([f32; 3], String)> {
+    let (at, model) = l.text.rsplit_once(char::is_whitespace).with_context(|| l.bad())?;
+    Ok((floats(at).with_context(|| l.bad())?, model.to_owned()))
+}
+
+fn cut_model(l: &BlockLine) -> Result<CutModel> {
+    let f: Vec<&str> = l.text.split_whitespace().collect();
+    if f.len() < 3 || f[0].parse::<u32>().is_err() {
+        bail!(l.bad());
+    }
+    // A fourth field is the facial clip, unless it is a number (a flag) or `null`.
+    let face =
+        f.get(3).filter(|v| v.parse::<f32>().is_err() && !v.eq_ignore_ascii_case("null")).map(|v| (*v).to_owned());
+    let index = f[0].parse().with_context(|| l.bad())?;
+    Ok(CutModel { index, model: f[1].to_owned(), anim: f[2].to_owned(), face })
+}
+
+fn vehicle_details(l: &BlockLine) -> Result<(u32, [u32; 4])> {
+    let f: Vec<u32> =
+        l.text.split_whitespace().map(|v| v.parse()).collect::<Result<_, _>>().with_context(|| l.bad())?;
+    let [model, a, b, c, d, ..] = f[..] else { bail!(l.bad()) };
+    Ok((model, [a, b, c, d]))
+}
+
+fn variation(l: &BlockLine, section: Option<&mut Section>, pending: &mut Pending) -> Result<()> {
+    let f: Vec<f32> =
+        l.text.split_whitespace().map(|v| v.parse()).collect::<Result<_, _>>().with_context(|| l.bad())?;
+    let (&[model, component, drawable, texture], time) = (&f[..f.len().min(4)], f.get(4)) else { bail!(l.bad()) };
+    let v = Variation {
+        model: model as u32,
+        component: component as u32,
+        drawable: drawable as u32,
+        texture: texture as u32,
+        time: time.copied().unwrap_or(0.0) / 1000.0,
+    };
+    match section {
+        Some(s) => s.variations.push(v),
+        None => pending.variations.push(v),
+    }
+    Ok(())
+}
+
+fn props(l: &BlockLine, section: Option<&mut Section>, pending: &mut Pending) -> Result<()> {
+    let f: Vec<u32> =
+        l.text.split_whitespace().map(|v| v.parse()).collect::<Result<_, _>>().with_context(|| l.bad())?;
+    let &[model, variant, anchor] = f.as_slice() else { bail!(l.bad()) };
+    let p = PropChoice { model, anchor, variant };
+    match section {
+        Some(s) => s.props.push(p),
+        None => pending.props.push(p),
+    }
+    Ok(())
 }
 
 fn parse_effect(line: &str) -> Option<CutEffect> {

@@ -496,6 +496,131 @@ fn read_other_archive(archive: &DiskArchive, keys: Option<Arc<GtaVKeys>>) -> Bat
     batch
 }
 
+/// A source's id, size and modification time as stored in the index.
+type StoredSource = (i64, i64, i64);
+
+/// What the receiving side of an update knows about the archives to read.
+struct UpdateRun<'a> {
+    total: usize,
+    bytes_total: u64,
+    counted: &'a [&'a DiskArchive],
+}
+
+/// Reads one archive and sends what it yields, unless cancelled.
+fn read_one(s: &mpsc::SyncSender<Batch>, archive: &DiskArchive, keys: &Option<Arc<GtaVKeys>>, cancel: &AtomicBool) {
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let part = |batch| {
+        let _ = s.send(batch);
+    };
+    if let Some(batch) = read_archive(archive, keys.clone(), cancel, &part) {
+        archive.add_read(archive.size as u64);
+        part(batch);
+    }
+}
+
+/// Reads `todo` in parallel and sends the batches; runs on its own thread.
+fn read_all(
+    todo: Vec<&DiskArchive>,
+    sender: mpsc::SyncSender<Batch>,
+    keys: Option<Arc<GtaVKeys>>,
+    cancel: &AtomicBool,
+) {
+    let read = move || {
+        todo.par_iter().for_each_with(sender, |s, archive| read_one(s, archive, &keys, cancel));
+    };
+    // Threads of its own: what is opened meanwhile does not wait
+    // behind the archives, and keeps some processors.
+    let threads = std::thread::available_parallelism().map_or(4, |n| (n.get() * 3 / 4).max(1));
+    match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+        Ok(pool) => pool.install(read),
+        Err(_) => read(),
+    }
+}
+
+/// Writes each batch in its own transaction and reports the progress.
+/// Returns how many archives are complete.
+fn write_received(
+    conn: &mut rusqlite::Connection,
+    receiver: mpsc::Receiver<Batch>,
+    run: &UpdateRun<'_>,
+    stats: &mut UpdateStats,
+    progress: &mut dyn FnMut(&Progress),
+) -> Result<usize, IndexError> {
+    let mut done = 0usize;
+    for batch in receiver {
+        let tx = conn.transaction()?;
+        let added = write_batch(&tx, &batch)?;
+        tx.commit()?;
+        if !batch.partial {
+            done += 1;
+            stats.archives_indexed += 1;
+        }
+        stats.entries_added += added;
+        stats.read_errors += batch.errors;
+        progress(&Progress {
+            archives_done: done,
+            archives_total: run.total,
+            entries: stats.entries_added,
+            bytes_done: run.counted.iter().map(|a| a.bytes_read()).sum(),
+            bytes_total: run.bytes_total,
+            current: batch.rel,
+        });
+    }
+    Ok(done)
+}
+
+/// The archives of the index, by path.
+fn stored_sources(conn: &rusqlite::Connection) -> Result<HashMap<String, StoredSource>, IndexError> {
+    let mut stmt = conn.prepare("SELECT path, id, size, mtime FROM sources")?;
+    Ok(stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?
+        .collect::<Result<_, _>>()?)
+}
+
+/// The ids of the sources to drop; counts the archives that stay and the ones that are gone.
+fn stale_sources(
+    stored: &HashMap<String, StoredSource>,
+    archives: &[DiskArchive],
+    stats: &mut UpdateStats,
+) -> Vec<i64> {
+    let on_disk: HashMap<&str, &DiskArchive> = archives.iter().map(|a| (a.rel.as_str(), a)).collect();
+    let mut stale: Vec<i64> = Vec::new();
+    for (path, &(id, size, mtime)) in stored {
+        if path.is_empty() {
+            stale.push(id); // loose files are always re-listed
+            continue;
+        }
+        match on_disk.get(path.as_str()) {
+            Some(a) if a.size == size && a.mtime == mtime => stats.archives_unchanged += 1,
+            _ => {
+                stale.push(id);
+                if !path.is_empty() {
+                    stats.archives_removed += 1;
+                }
+            }
+        }
+    }
+    stale
+}
+
+/// The archives that are new or differ from the stored ones, big ones first.
+fn archives_to_read<'a>(archives: &'a [DiskArchive], stored: &HashMap<String, StoredSource>) -> Vec<&'a DiskArchive> {
+    let mut todo: Vec<&DiskArchive> = archives
+        .iter()
+        .filter(|a| stored.get(&a.rel).is_none_or(|&(_, size, mtime)| size != a.size || mtime != a.mtime))
+        .collect();
+    todo.sort_by_key(|a| std::cmp::Reverse(a.size)); // big ones first for better parallelism
+    // GTA VI archives are only indexed if the game's executable gives the
+    // keys. Asking one here also loads those before the threads that read
+    // archives wait for each other to do it.
+    if !todo.iter().rev().filter(|a| a.gta6).any(|a| Rpf9::open(&a.path).is_ok_and(|rpf| rpf.is_native())) {
+        todo.retain(|a| !a.gta6);
+    }
+    todo
+}
+
 impl Index {
     /// Brings the index up to date with the game directory.
     pub fn update(
@@ -510,123 +635,57 @@ impl Index {
         let (loose, archives, loose_words) = scan_disk(game_dir);
 
         // Which archives changed?
-        let stored: HashMap<String, (i64, i64, i64)> = {
-            let mut stmt = self.conn.prepare("SELECT path, id, size, mtime FROM sources")?;
-            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?
-                .collect::<Result<_, _>>()?
-        };
-        let on_disk: HashMap<&str, &DiskArchive> = archives.iter().map(|a| (a.rel.as_str(), a)).collect();
-        let mut stale: Vec<i64> = Vec::new();
-        for (path, &(id, size, mtime)) in &stored {
-            if path.is_empty() {
-                stale.push(id); // loose files are always re-listed
-                continue;
-            }
-            match on_disk.get(path.as_str()) {
-                Some(a) if a.size == size && a.mtime == mtime => stats.archives_unchanged += 1,
-                _ => {
-                    stale.push(id);
-                    if !path.is_empty() {
-                        stats.archives_removed += 1;
-                    }
-                }
-            }
-        }
-        let mut todo: Vec<&DiskArchive> = archives
-            .iter()
-            .filter(|a| stored.get(&a.rel).is_none_or(|&(_, size, mtime)| size != a.size || mtime != a.mtime))
-            .collect();
-        todo.sort_by_key(|a| std::cmp::Reverse(a.size)); // big ones first for better parallelism
-        // GTA VI archives are only indexed if the game's executable gives the
-        // keys. Asking one here also loads those before the threads that read
-        // archives wait for each other to do it.
-        if !todo.iter().rev().filter(|a| a.gta6).any(|a| Rpf9::open(&a.path).is_ok_and(|rpf| rpf.is_native())) {
-            todo.retain(|a| !a.gta6);
-        }
+        let stored = stored_sources(&self.conn)?;
+        let stale = stale_sources(&stored, &archives, &mut stats);
+        let todo = archives_to_read(&archives, &stored);
+        self.drop_stale(&stale, Batch { records: loose, dictionary: loose_words, ..Default::default() })?;
 
-        {
-            let tx = self.conn.transaction()?;
-            for id in &stale {
-                tx.execute("DELETE FROM content WHERE rowid IN (SELECT id FROM entries WHERE source = ?1)", [id])?;
-                tx.execute("DELETE FROM entries WHERE source = ?1", [id])?;
-                tx.execute("DELETE FROM sources WHERE id = ?1", [id])?;
-            }
-            let loose_batch = Batch { records: loose, dictionary: loose_words, ..Default::default() };
-            write_batch(&tx, &loose_batch)?;
-            tx.commit()?;
-        }
-
-        let total = todo.len();
-        let bytes_total = todo.iter().map(|a| a.size as u64).sum();
         let counted = todo.clone();
-        let mut done = 0usize;
+        let run =
+            UpdateRun { total: todo.len(), bytes_total: todo.iter().map(|a| a.size as u64).sum(), counted: &counted };
         let (sender, receiver) = mpsc::sync_channel::<Batch>(4);
         let conn = &mut self.conn;
-        let result: Result<(), IndexError> = std::thread::scope(|scope| {
-            scope.spawn(move || {
-                let read = move || {
-                    todo.par_iter().for_each_with(sender, |s, archive| {
-                        if cancel.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let s = &*s;
-                        let part = |batch| {
-                            let _ = s.send(batch);
-                        };
-                        if let Some(batch) = read_archive(archive, keys.clone(), cancel, &part) {
-                            archive.add_read(archive.size as u64);
-                            part(batch);
-                        }
-                    });
-                };
-                // Threads of its own: what is opened meanwhile does not wait
-                // behind the archives, and keeps some processors.
-                let threads = std::thread::available_parallelism().map_or(4, |n| (n.get() * 3 / 4).max(1));
-                match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
-                    Ok(pool) => pool.install(read),
-                    Err(_) => read(),
-                }
-            });
-            for batch in receiver {
-                let tx = conn.transaction()?;
-                let added = write_batch(&tx, &batch)?;
-                tx.commit()?;
-                if !batch.partial {
-                    done += 1;
-                    stats.archives_indexed += 1;
-                }
-                stats.entries_added += added;
-                stats.read_errors += batch.errors;
-                progress(&Progress {
-                    archives_done: done,
-                    archives_total: total,
-                    entries: stats.entries_added,
-                    bytes_done: counted.iter().map(|a| a.bytes_read()).sum(),
-                    bytes_total,
-                    current: batch.rel,
-                });
-            }
-            Ok(())
+        let result: Result<usize, IndexError> = std::thread::scope(|scope| {
+            scope.spawn(move || read_all(todo, sender, keys, cancel));
+            write_received(conn, receiver, &run, &mut stats, progress)
         });
-        result?;
+        let done = result?;
 
-        stats.cancelled = cancel.load(Ordering::Relaxed) && done < total;
+        stats.cancelled = cancel.load(Ordering::Relaxed) && done < run.total;
         if !stats.cancelled {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-            // Caches built from the index (the world map) only need rebuilding
-            // when its contents changed, not after every check. Indexes from
-            // before `changed_at` last changed at their last update.
-            let changed = stats.archives_indexed > 0 || stats.archives_removed > 0;
-            let previous = schema::get_meta(&self.conn, "changed_at")?.or(schema::get_meta(&self.conn, "updated_at")?);
-            match previous {
-                Some(at) if !changed => schema::set_meta(&self.conn, "changed_at", &at)?,
-                _ => schema::set_meta(&self.conn, "changed_at", &now.to_string())?,
-            }
-            schema::set_meta(&self.conn, "updated_at", &now.to_string())?;
-            self.conn.execute_batch("PRAGMA optimize;")?;
+            self.record_update_time(&stats)?;
         }
         stats.seconds = started.elapsed().as_secs_f32();
         Ok(stats)
+    }
+
+    /// Removes the stale sources and writes the loose files, in one transaction.
+    fn drop_stale(&mut self, stale: &[i64], loose_batch: Batch) -> Result<(), IndexError> {
+        let tx = self.conn.transaction()?;
+        for id in stale {
+            tx.execute("DELETE FROM content WHERE rowid IN (SELECT id FROM entries WHERE source = ?1)", [id])?;
+            tx.execute("DELETE FROM entries WHERE source = ?1", [id])?;
+            tx.execute("DELETE FROM sources WHERE id = ?1", [id])?;
+        }
+        write_batch(&tx, &loose_batch)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn record_update_time(&self, stats: &UpdateStats) -> Result<(), IndexError> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        // Caches built from the index (the world map) only need rebuilding
+        // when its contents changed, not after every check. Indexes from
+        // before `changed_at` last changed at their last update.
+        let changed = stats.archives_indexed > 0 || stats.archives_removed > 0;
+        let previous = schema::get_meta(&self.conn, "changed_at")?.or(schema::get_meta(&self.conn, "updated_at")?);
+        match previous {
+            Some(at) if !changed => schema::set_meta(&self.conn, "changed_at", &at)?,
+            _ => schema::set_meta(&self.conn, "changed_at", &now.to_string())?,
+        }
+        schema::set_meta(&self.conn, "updated_at", &now.to_string())?;
+        self.conn.execute_batch("PRAGMA optimize;")?;
+        Ok(())
     }
 }
 

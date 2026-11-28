@@ -143,162 +143,192 @@ pub(crate) fn cmd_rpf8(path: &Path, list: bool, checks: Checks) -> Result<()> {
         }
         Ok(Some((awc.sounds.len(), secs)))
     }
+    /// Indentation and name of the entry a message belongs to.
+    struct At<'a> {
+        indent: &'a str,
+        name: &'a str,
+    }
+    impl Tally {
+        fn fail(&mut self, at: &At, err: impl std::fmt::Display) {
+            self.failed += 1;
+            self.lines.push(format!("{}{}: {err}", at.indent, at.name));
+        }
+    }
+    /// What one level of the archive walk needs besides the archive itself.
+    struct Walk<'a> {
+        depth: usize,
+        list: bool,
+        checks: Checks,
+        indent: &'a str,
+    }
+    fn list_line(e: &rage_rpf::rpf8::Entry, indent: &str, name: &str) -> String {
+        let comp = match e.compression {
+            Compression::None => "",
+            Compression::Deflate => " deflate",
+            Compression::Oodle => " oodle",
+            Compression::Unknown(_) => " ?",
+        };
+        let enc = if e.is_encrypted() { " encrypted" } else { "" };
+        format!("{indent}{name:<60} {:>10}{comp}{enc}", e.size())
+    }
+    fn scan_anims(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+        // Extension id 67 is `.#cd` (`.ycd` on PC).
+        if !(e.ext_id == 67 && e.is_resource) {
+            return;
+        }
+        match rpf
+            .read_resource(e)
+            .map_err(|err| err.to_string())
+            .and_then(|res| rage_formats::clip::parse_ycd(&res).map_err(|err| err.to_string()))
+        {
+            Ok(dict) => {
+                for a in &dict.animations {
+                    for f in 0..a.frames {
+                        for k in 0..a.tracks.len() {
+                            let _ = a.value(k, f as f32);
+                        }
+                    }
+                }
+                t.textures += dict.clips.len();
+                t.triangles += dict.animations.len();
+            }
+            Err(err) => t.fail(at, err),
+        }
+    }
+    fn scan_audio(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+        // Audio containers have no extension (their hash covers the path).
+        if !(e.ext_id == 0xFF && !e.is_resource) {
+            return;
+        }
+        match check_audio(rpf, e) {
+            Ok(Some((sounds, secs))) => {
+                t.textures += sounds;
+                t.triangles += secs.round() as usize;
+            }
+            Ok(None) => {}
+            Err(err) => t.fail(at, err),
+        }
+    }
+    fn pso_rebuild(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry) -> Result<Option<super::verify::PsoRoundTrip>, String> {
+        rpf.read(e).map_err(|err| err.to_string()).and_then(|d| {
+            if rage_formats::pso::is_pso(&d) { super::verify::pso_round_trip(&d, true).map(Some) } else { Ok(None) }
+        })
+    }
+    fn scan_rebuild(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+        use super::verify::PsoRoundTrip;
+        if !(matches!(e.ext_id, 1 | 11 | 73 | 74) && !e.is_resource) {
+            return;
+        }
+        match pso_rebuild(rpf, e) {
+            Ok(None) => {}
+            Ok(Some(r)) => {
+                t.textures += 1;
+                match r {
+                    PsoRoundTrip::Identical => t.identical += 1,
+                    PsoRoundTrip::SameXml => {}
+                    PsoRoundTrip::Unreadable => t.unreadable += 1,
+                }
+            }
+            Err(err) => t.fail(at, err),
+        }
+    }
+    fn scan_meta(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+        // .ymap 73, .ytyp 74, .ymt 11, .ymf 1
+        if !matches!(e.ext_id, 1 | 11 | 73 | 74) {
+            return;
+        }
+        match check_meta(rpf, e) {
+            Ok(problems) => {
+                t.textures += 1;
+                t.triangles += problems;
+                if problems > 0 {
+                    t.lines.push(format!("{}{}: {problems} parts not read", at.indent, at.name));
+                }
+            }
+            Err(err) => t.fail(at, err),
+        }
+    }
+    fn scan_models(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+        if !(matches!(e.ext_id, 2..=4) && e.is_resource) {
+            return;
+        }
+        match check_model(rpf, e) {
+            Ok((n, parts, cloths)) => {
+                t.textures += 1;
+                t.triangles += n;
+                t.parts += parts;
+                t.cloths += cloths;
+            }
+            Err(err) => t.fail(at, err),
+        }
+    }
+    fn scan_texts(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+        // Extension id 76 is `.#ldb` (`.yldb` on PC).
+        if !(e.ext_id == 76 && e.is_resource) {
+            return;
+        }
+        match check_texts(rpf, e) {
+            Ok(n) => {
+                t.textures += 1;
+                t.triangles += n;
+            }
+            Err(err) => t.fail(at, err),
+        }
+    }
+    fn scan_textures(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, at: &At, t: &mut Tally) {
+        if !(e.ext_id == 5 && e.is_resource) {
+            return;
+        }
+        match check_textures(rpf, e) {
+            Ok(n) => t.textures += n,
+            Err(err) => t.fail(at, err),
+        }
+    }
+    /// Parses a non-archive entry the way the selected check says; without one it is only read.
+    fn check_entry(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, checks: Checks, at: &At, t: &mut Tally) {
+        if checks.anims {
+            scan_anims(rpf, e, at, t);
+        } else if checks.audio {
+            scan_audio(rpf, e, at, t);
+        } else if checks.meta && checks.rebuild {
+            scan_rebuild(rpf, e, at, t);
+        } else if checks.meta {
+            scan_meta(rpf, e, at, t);
+        } else if checks.models {
+            scan_models(rpf, e, at, t);
+        } else if checks.texts {
+            scan_texts(rpf, e, at, t);
+        } else if checks.textures {
+            scan_textures(rpf, e, at, t);
+        } else if let Err(err) = rpf.read(e) {
+            t.fail(at, err);
+        }
+    }
+    fn walk_entry(rpf: &Rpf8, e: &rage_rpf::rpf8::Entry, w: &Walk, t: &mut Tally) {
+        t.entries += 1;
+        let name = e.display_name(rpf.header().platform);
+        if w.list {
+            t.lines.push(list_line(e, w.indent, &name));
+        }
+        let at = At { indent: w.indent, name: &name };
+        if e.ext_id != 0 {
+            return check_entry(rpf, e, w.checks, &at, t);
+        }
+        match rpf.open_child(e) {
+            Ok(child) => {
+                t.nested += 1;
+                walk(&child, w.depth + 1, w.list, w.checks, t);
+            }
+            Err(err) => t.fail(&at, err),
+        }
+    }
     fn walk(rpf: &Rpf8, depth: usize, list: bool, checks: Checks, t: &mut Tally) {
-        let Checks { textures, models, texts, meta, rebuild, audio, anims } = checks;
-        let h = rpf.header();
         let Some(entries) = rpf.entries() else { return };
         t.readable += 1;
         let indent = "  ".repeat(depth + 1);
+        let w = Walk { depth, list, checks, indent: &indent };
         for e in entries {
-            t.entries += 1;
-            let name = e.display_name(h.platform);
-            if list {
-                let comp = match e.compression {
-                    Compression::None => "",
-                    Compression::Deflate => " deflate",
-                    Compression::Oodle => " oodle",
-                    Compression::Unknown(_) => " ?",
-                };
-                let enc = if e.is_encrypted() { " encrypted" } else { "" };
-                t.lines.push(format!("{indent}{name:<60} {:>10}{comp}{enc}", e.size()));
-            }
-            if e.ext_id == 0 {
-                match rpf.open_child(e) {
-                    Ok(child) => {
-                        t.nested += 1;
-                        walk(&child, depth + 1, list, checks, t);
-                    }
-                    Err(err) => {
-                        t.failed += 1;
-                        t.lines.push(format!("{indent}{name}: {err}"));
-                    }
-                }
-            } else if anims {
-                // Extension id 67 is `.#cd` (`.ycd` on PC).
-                if e.ext_id == 67 && e.is_resource {
-                    match rpf
-                        .read_resource(e)
-                        .map_err(|err| err.to_string())
-                        .and_then(|res| rage_formats::clip::parse_ycd(&res).map_err(|err| err.to_string()))
-                    {
-                        Ok(dict) => {
-                            for a in &dict.animations {
-                                for f in 0..a.frames {
-                                    for k in 0..a.tracks.len() {
-                                        let _ = a.value(k, f as f32);
-                                    }
-                                }
-                            }
-                            t.textures += dict.clips.len();
-                            t.triangles += dict.animations.len();
-                        }
-                        Err(err) => {
-                            t.failed += 1;
-                            t.lines.push(format!("{indent}{name}: {err}"));
-                        }
-                    }
-                }
-            } else if audio {
-                // Audio containers have no extension (their hash covers the path).
-                if e.ext_id == 0xFF && !e.is_resource {
-                    match check_audio(rpf, e) {
-                        Ok(Some((sounds, secs))) => {
-                            t.textures += sounds;
-                            t.triangles += secs.round() as usize;
-                        }
-                        Ok(None) => {}
-                        Err(err) => {
-                            t.failed += 1;
-                            t.lines.push(format!("{indent}{name}: {err}"));
-                        }
-                    }
-                }
-            } else if meta && rebuild {
-                if matches!(e.ext_id, 1 | 11 | 73 | 74) && !e.is_resource {
-                    let result = rpf.read(e).map_err(|err| err.to_string()).and_then(|d| {
-                        if rage_formats::pso::is_pso(&d) {
-                            super::verify::pso_round_trip(&d, true).map(Some)
-                        } else {
-                            Ok(None)
-                        }
-                    });
-                    use super::verify::PsoRoundTrip;
-                    match result {
-                        Ok(None) => {}
-                        Ok(Some(r)) => {
-                            t.textures += 1;
-                            match r {
-                                PsoRoundTrip::Identical => t.identical += 1,
-                                PsoRoundTrip::SameXml => {}
-                                PsoRoundTrip::Unreadable => t.unreadable += 1,
-                            }
-                        }
-                        Err(err) => {
-                            t.failed += 1;
-                            t.lines.push(format!("{indent}{name}: {err}"));
-                        }
-                    }
-                }
-            } else if meta {
-                // .ymap 73, .ytyp 74, .ymt 11, .ymf 1
-                if matches!(e.ext_id, 1 | 11 | 73 | 74) {
-                    match check_meta(rpf, e) {
-                        Ok(problems) => {
-                            t.textures += 1;
-                            t.triangles += problems;
-                            if problems > 0 {
-                                t.lines.push(format!("{indent}{name}: {problems} parts not read"));
-                            }
-                        }
-                        Err(err) => {
-                            t.failed += 1;
-                            t.lines.push(format!("{indent}{name}: {err}"));
-                        }
-                    }
-                }
-            } else if models {
-                if matches!(e.ext_id, 2..=4) && e.is_resource {
-                    match check_model(rpf, e) {
-                        Ok((n, parts, cloths)) => {
-                            t.textures += 1;
-                            t.triangles += n;
-                            t.parts += parts;
-                            t.cloths += cloths;
-                        }
-                        Err(err) => {
-                            t.failed += 1;
-                            t.lines.push(format!("{indent}{name}: {err}"));
-                        }
-                    }
-                }
-            } else if texts {
-                // Extension id 76 is `.#ldb` (`.yldb` on PC).
-                if e.ext_id == 76 && e.is_resource {
-                    match check_texts(rpf, e) {
-                        Ok(n) => {
-                            t.textures += 1;
-                            t.triangles += n;
-                        }
-                        Err(err) => {
-                            t.failed += 1;
-                            t.lines.push(format!("{indent}{name}: {err}"));
-                        }
-                    }
-                }
-            } else if textures {
-                if e.ext_id == 5 && e.is_resource {
-                    match check_textures(rpf, e) {
-                        Ok(n) => t.textures += n,
-                        Err(err) => {
-                            t.failed += 1;
-                            t.lines.push(format!("{indent}{name}: {err}"));
-                        }
-                    }
-                }
-            } else if let Err(err) = rpf.read(e) {
-                t.failed += 1;
-                t.lines.push(format!("{indent}{name}: {err}"));
-            }
+            walk_entry(rpf, e, &w, t);
         }
     }
     let tallies: Vec<(String, Tally)> = {

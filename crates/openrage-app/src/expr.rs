@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use rage_formats::clip::Animation;
 use rage_formats::drawable::Skeleton;
-use rage_formats::expression::{Expression, Op, Track};
+use rage_formats::expression::{BlendSource, Expression, Op, Track};
 
 /// A bone's local pose.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,6 +42,7 @@ pub struct Program {
 
 const STACK_LIMIT: usize = 4096;
 const STEP_LIMIT: usize = 100_000;
+const REGISTER_LIMIT: usize = 4096;
 
 impl Program {
     /// Binds every stream of `expression` (in order) to `skeleton` and `animation`.
@@ -84,155 +85,209 @@ impl Program {
         frame: f32,
         controls: &mut Controls,
     ) -> usize {
-        let mut stack: Vec<[f32; 4]> = Vec::with_capacity(32);
-        let mut variables = vec![[0.0f32; 4]; self.variables];
-        // RDR2: values stored for register blends.
-        let mut registers: Vec<f32> = Vec::new();
-        let mut pc = 0;
+        let mut machine = Machine {
+            stack: Vec::with_capacity(32),
+            variables: vec![[0.0f32; 4]; self.variables],
+            registers: Vec::new(),
+            pc: 0,
+        };
+        let mut env = Env { slots: &self.slots, pose, rest, parents, animation, frame, controls };
         let mut steps = 0;
-        let pop = |stack: &mut Vec<[f32; 4]>| stack.pop().unwrap_or([0.0; 4]);
-        while pc < self.ops.len() && steps < STEP_LIMIT && stack.len() < STACK_LIMIT {
+        while machine.pc < self.ops.len() && steps < STEP_LIMIT && machine.stack.len() < STACK_LIMIT {
             steps += 1;
-            let op = &self.ops[pc];
-            pc += 1;
-            match op {
-                Op::End | Op::Spring => {}
-                Op::LookAt { look_axis, up_axis } => {
-                    // Own position, the frame whose up axis to keep, the target.
-                    let own = pop(&mut stack);
-                    let frame_rot = pop(&mut stack);
-                    let target = pop(&mut stack);
-                    stack.push(look_at(target, frame_rot, own, *look_axis, *up_axis));
+            let op = &self.ops[machine.pc];
+            machine.pc += 1;
+            machine.exec(op, &mut env);
+        }
+        machine.stack.len()
+    }
+}
+
+/// What a running program reads and writes besides its own stack.
+struct Env<'a> {
+    slots: &'a [Slot],
+    pose: &'a mut [Local],
+    rest: &'a [Local],
+    parents: &'a [Option<usize>],
+    animation: &'a Animation,
+    frame: f32,
+    controls: &'a mut Controls,
+}
+
+impl Env<'_> {
+    fn slot(&self, track: usize) -> Option<Slot> {
+        self.slots.get(track).copied()
+    }
+
+    fn get(&self, slot: Slot, offset: bool) -> [f32; 4] {
+        get(slot, offset, self.pose, self.rest, self.animation, self.frame, self.controls)
+    }
+
+    fn set(&mut self, slot: Slot, offset: bool, v: [f32; 4]) {
+        set(slot, offset, v, self.pose, self.rest, self.controls);
+    }
+}
+
+/// The state of one program run.
+struct Machine {
+    stack: Vec<[f32; 4]>,
+    variables: Vec<[f32; 4]>,
+    /// RDR2: values stored for register blends.
+    registers: Vec<f32>,
+    pc: usize,
+}
+
+impl Machine {
+    fn exec(&mut self, op: &Op, env: &mut Env) {
+        match op {
+            Op::End | Op::Spring => {}
+            Op::LookAt { .. } | Op::Pop | Op::Dup | Op::Push(_) => self.stack_op(op),
+            Op::GetVariable(_) | Op::SetVariable(_) => self.variable_op(op),
+            Op::Jump { kind, target } => self.jump(*kind, *target),
+            Op::Track { kind, track, component, .. } => {
+                let slot = env.slot(*track as usize);
+                self.track(*kind, slot, *component as usize & 3, env);
+            }
+            Op::Blend { quaternion, sources } => self.blend(*quaternion, sources, env),
+            Op::Simple(code) => simple(*code, &mut self.stack, env.frame),
+            Op::Store(index) => self.store(*index as usize),
+            Op::LinearBlend { offset, groups, registers: lanes } => self.linear_blend(offset, groups, lanes),
+            Op::Unknown { pops, pushes, .. } => self.unknown(*pops, *pushes),
+        }
+    }
+
+    fn stack_op(&mut self, op: &Op) {
+        match op {
+            Op::LookAt { look_axis, up_axis } => {
+                // Own position, the frame whose up axis to keep, the target.
+                let own = pop(&mut self.stack);
+                let frame_rot = pop(&mut self.stack);
+                let target = pop(&mut self.stack);
+                self.stack.push(look_at(target, frame_rot, own, *look_axis, *up_axis));
+            }
+            Op::Pop => {
+                self.stack.pop();
+            }
+            Op::Dup => self.stack.push(self.stack.last().copied().unwrap_or([0.0; 4])),
+            Op::Push(v) => self.stack.push(*v),
+            _ => {}
+        }
+    }
+
+    fn variable_op(&mut self, op: &Op) {
+        match op {
+            Op::GetVariable(i) => self.stack.push(self.variables.get(*i as usize).copied().unwrap_or([0.0; 4])),
+            Op::SetVariable(i) => {
+                let v = pop(&mut self.stack);
+                if let Some(slot) = self.variables.get_mut(*i as usize) {
+                    *slot = v;
                 }
-                Op::Pop => {
-                    stack.pop();
-                }
-                Op::Dup => stack.push(stack.last().copied().unwrap_or([0.0; 4])),
-                Op::Push(v) => stack.push(*v),
-                Op::GetVariable(i) => stack.push(variables.get(*i as usize).copied().unwrap_or([0.0; 4])),
-                Op::SetVariable(i) => {
-                    let v = pop(&mut stack);
-                    if let Some(slot) = variables.get_mut(*i as usize) {
-                        *slot = v;
-                    }
-                }
-                Op::Jump { kind, target } => {
-                    let top = stack.last().map_or(0.0, |v| v[0]);
-                    let jump = match kind {
-                        0x2C => top == 0.0,
-                        0x2D => top != 0.0,
-                        // RDR2: takes the condition off the stack, jumps when it is false.
-                        0x70 => pop(&mut stack)[0] == 0.0,
-                        _ => true,
-                    };
-                    if jump {
-                        pc = *target;
-                    }
-                }
-                Op::Track { kind, track, component, .. } => {
-                    let slot = self.slots.get(*track as usize).copied();
-                    let c = *component as usize & 3;
-                    match kind {
-                        0x06..=0x09 => {
-                            let offset = matches!(kind, 0x08 | 0x09);
-                            let v = slot.map_or([0.0; 4], |s| get(s, offset, pose, rest, animation, frame, controls));
-                            stack.push(if matches!(kind, 0x07 | 0x09) { component_of(slot, v, c) } else { v });
-                        }
-                        0x20 => {
-                            let valid = match slot {
-                                Some(Slot::Bone(..)) => true,
-                                Some(Slot::Control(key, track, _)) => track.is_some() || controls.contains_key(&key),
-                                None => false,
-                            };
-                            stack.push([if valid { 1.0 } else { 0.0 }; 4]);
-                        }
-                        // The bone's transform in the model: position or rotation.
-                        0x0A => stack.push(match slot {
-                            Some(Slot::Bone(b, kind)) => {
-                                let (p, q) = object_transform(pose, parents, b);
-                                if kind == 1 { q } else { v3(p) }
-                            }
-                            _ => [0.0, 0.0, 0.0, 1.0],
-                        }),
-                        // A rotation in the model's space into the bone's parent space.
-                        0x23 => {
-                            let q = pop(&mut stack);
-                            let parent = match slot {
-                                Some(Slot::Bone(b, _)) => parents.get(b).copied().flatten(),
-                                _ => None,
-                            };
-                            let pq = parent.map_or([0.0, 0.0, 0.0, 1.0], |p| object_transform(pose, parents, p).1);
-                            stack.push(normalize(quat_mul(conjugate(pq), q)));
-                        }
-                        0x26..=0x29 => {
-                            let v = pop(&mut stack);
-                            if let Some(s) = slot {
-                                let offset = matches!(kind, 0x28 | 0x29);
-                                let value = if matches!(kind, 0x27 | 0x29) {
-                                    let current = get(s, offset, pose, rest, animation, frame, controls);
-                                    with_component(Some(s), current, c, v[0])
-                                } else {
-                                    v
-                                };
-                                set(s, offset, value, pose, rest, controls);
-                            }
-                        }
-                        0x2A => {
-                            stack.pop();
-                        }
-                        _ => {}
-                    }
-                }
-                Op::Blend { quaternion, sources } => {
-                    let mut out = [0.0f32; 4];
-                    for s in sources {
-                        let slot = self.slots.get(s.track as usize).copied();
-                        let input = slot.map_or(0.0, |sl| {
-                            get(sl, false, pose, rest, animation, frame, controls)[s.component as usize & 3]
-                        });
-                        for (a, axis) in s.axes.iter().enumerate() {
-                            out[a] += axis.eval(input);
-                        }
-                    }
-                    stack.push(if *quaternion { from_euler([out[0], out[1], out[2]]) } else { out });
-                }
-                Op::Simple(code) => simple(*code, &mut stack, frame),
-                Op::Store(index) => {
-                    let v = pop(&mut stack);
-                    let i = *index as usize;
-                    if i < 4096 {
-                        if registers.len() <= i {
-                            registers.resize(i + 1, 0.0);
-                        }
-                        registers[i] = v[0];
-                    }
-                }
-                Op::LinearBlend { offset, groups, registers: lanes } => {
-                    let mut out = *offset;
-                    for (g, weights) in groups.iter().enumerate() {
-                        for lane in 0..4 {
-                            let r = lanes
-                                .get(g * 4 + lane)
-                                .map_or(0.0, |&i| registers.get(i as usize).copied().unwrap_or(0.0));
-                            for (axis, w) in weights.iter().enumerate() {
-                                out[axis] += w[lane] * r;
-                            }
-                        }
-                    }
-                    stack.push(out);
-                }
-                Op::Unknown { pops, pushes, .. } => {
-                    for _ in 0..*pops {
-                        stack.pop();
-                    }
-                    // What these give is not known: NaN, which is never written to a bone.
-                    for _ in 0..*pushes {
-                        stack.push([f32::NAN; 4]);
-                    }
+            }
+            _ => {}
+        }
+    }
+
+    fn jump(&mut self, kind: u8, target: usize) {
+        let top = self.stack.last().map_or(0.0, |v| v[0]);
+        let jump = match kind {
+            0x2C => top == 0.0,
+            0x2D => top != 0.0,
+            // RDR2: takes the condition off the stack, jumps when it is false.
+            0x70 => pop(&mut self.stack)[0] == 0.0,
+            _ => true,
+        };
+        if jump {
+            self.pc = target;
+        }
+    }
+
+    fn track(&mut self, kind: u8, slot: Option<Slot>, c: usize, env: &mut Env) {
+        match kind {
+            0x06..=0x09 => {
+                let offset = matches!(kind, 0x08 | 0x09);
+                let v = slot.map_or([0.0; 4], |s| env.get(s, offset));
+                self.stack.push(if matches!(kind, 0x07 | 0x09) { component_of(slot, v, c) } else { v });
+            }
+            0x20 => self.stack.push([if track_valid(slot, env.controls) { 1.0 } else { 0.0 }; 4]),
+            // The bone's transform in the model: position or rotation.
+            0x0A => self.stack.push(model_transform(slot, env)),
+            // A rotation in the model's space into the bone's parent space.
+            0x23 => self.push_parent_space(slot, env),
+            0x26..=0x29 => self.store_track(kind, slot, c, env),
+            0x2A => {
+                self.stack.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn push_parent_space(&mut self, slot: Option<Slot>, env: &Env) {
+        let q = pop(&mut self.stack);
+        let parent = match slot {
+            Some(Slot::Bone(b, _)) => env.parents.get(b).copied().flatten(),
+            _ => None,
+        };
+        let pq = parent.map_or([0.0, 0.0, 0.0, 1.0], |p| object_transform(env.pose, env.parents, p).1);
+        self.stack.push(normalize(quat_mul(conjugate(pq), q)));
+    }
+
+    fn store_track(&mut self, kind: u8, slot: Option<Slot>, c: usize, env: &mut Env) {
+        let v = pop(&mut self.stack);
+        let Some(s) = slot else { return };
+        let offset = matches!(kind, 0x28 | 0x29);
+        let value = if matches!(kind, 0x27 | 0x29) {
+            let current = env.get(s, offset);
+            with_component(Some(s), current, c, v[0])
+        } else {
+            v
+        };
+        env.set(s, offset, value);
+    }
+
+    fn blend(&mut self, quaternion: bool, sources: &[BlendSource], env: &Env) {
+        let mut out = [0.0f32; 4];
+        for s in sources {
+            let slot = env.slot(s.track as usize);
+            let input = slot.map_or(0.0, |sl| env.get(sl, false)[s.component as usize & 3]);
+            for (a, axis) in s.axes.iter().enumerate() {
+                out[a] += axis.eval(input);
+            }
+        }
+        self.stack.push(if quaternion { from_euler([out[0], out[1], out[2]]) } else { out });
+    }
+
+    fn store(&mut self, i: usize) {
+        let v = pop(&mut self.stack);
+        if i < REGISTER_LIMIT {
+            if self.registers.len() <= i {
+                self.registers.resize(i + 1, 0.0);
+            }
+            self.registers[i] = v[0];
+        }
+    }
+
+    fn linear_blend(&mut self, offset: &[f32; 4], groups: &[[[f32; 4]; 3]], lanes: &[u16]) {
+        let mut out = *offset;
+        for (g, weights) in groups.iter().enumerate() {
+            for lane in 0..4 {
+                let r =
+                    lanes.get(g * 4 + lane).map_or(0.0, |&i| self.registers.get(i as usize).copied().unwrap_or(0.0));
+                for (axis, w) in weights.iter().enumerate() {
+                    out[axis] += w[lane] * r;
                 }
             }
         }
-        stack.len()
+        self.stack.push(out);
+    }
+
+    fn unknown(&mut self, pops: u8, pushes: u8) {
+        for _ in 0..pops {
+            self.stack.pop();
+        }
+        // What these give is not known: NaN, which is never written to a bone.
+        for _ in 0..pushes {
+            self.stack.push([f32::NAN; 4]);
+        }
     }
 }
 
@@ -307,6 +362,24 @@ fn object_transform(pose: &[Local], parents: &[Option<usize>], bone: usize) -> (
         rot = normalize(quat_mul(rot, l.rotation));
     }
     (pos, rot)
+}
+
+fn track_valid(slot: Option<Slot>, controls: &Controls) -> bool {
+    match slot {
+        Some(Slot::Bone(..)) => true,
+        Some(Slot::Control(key, track, _)) => track.is_some() || controls.contains_key(&key),
+        None => false,
+    }
+}
+
+fn model_transform(slot: Option<Slot>, env: &Env) -> [f32; 4] {
+    match slot {
+        Some(Slot::Bone(b, kind)) => {
+            let (p, q) = object_transform(env.pose, env.parents, b);
+            if kind == 1 { q } else { v3(p) }
+        }
+        _ => [0.0, 0.0, 0.0, 1.0],
+    }
 }
 
 fn axis(a: u32) -> [f32; 3] {
@@ -392,63 +465,95 @@ fn with_component(slot: Option<Slot>, current: [f32; 4], c: usize, x: f32) -> [f
     }
 }
 
+fn pop(stack: &mut Vec<[f32; 4]>) -> [f32; 4] {
+    stack.pop().unwrap_or([0.0; 4])
+}
+
+fn zip(a: [f32; 4], b: [f32; 4], f: impl Fn(f32, f32) -> f32) -> [f32; 4] {
+    std::array::from_fn(|i| f(a[i], b[i]))
+}
+
+fn flag(b: bool) -> f32 {
+    if b { 1.0 } else { 0.0 }
+}
+
 fn simple(code: u8, stack: &mut Vec<[f32; 4]>, frame: f32) {
-    let pop = |stack: &mut Vec<[f32; 4]>| stack.pop().unwrap_or([0.0; 4]);
-    let map1 = |a: [f32; 4], f: &dyn Fn(f32) -> f32| a.map(f);
-    let zip = |a: [f32; 4], b: [f32; 4], f: &dyn Fn(f32, f32) -> f32| std::array::from_fn(|i| f(a[i], b[i]));
-    let flag = |b: bool| if b { 1.0 } else { 0.0 };
     match code {
         0x0F | 0x10 | 0x11 | 0x12 | 0x1B | 0x1C | 0x1D | 0x1E | 0x1F | 0x21 | 0x22 => {
             let a = pop(stack);
-            stack.push(match code {
-                0x0F => map1(a, &f32::abs),
-                0x10 => map1(a, &|x| -x),
-                0x11 => map1(a, &|x| if x != 0.0 { 1.0 / x } else { 0.0 }),
-                0x12 => map1(a, &|x| x.max(0.0).sqrt()),
-                0x1B => [-a[0], -a[1], -a[2], a[3]],
-                0x1C => map1(a, &|x| x * x),
-                0x1D => map1(a, &f32::to_radians),
-                0x1E => map1(a, &f32::to_degrees),
-                0x1F => map1(a, &|x| x.clamp(0.0, 1.0)),
-                0x21 => from_euler([a[0], a[1], a[2]]),
-                _ => to_euler(a),
-            });
+            stack.push(simple_unary(code, a));
         }
         0x2E..=0x33 | 0x35..=0x38 | 0x40 | 0x48 | 0x49 => {
             let b = pop(stack);
             let a = pop(stack);
-            stack.push(match code {
-                0x2E => zip(a, b, &|x, y| x + y),
-                0x2F => zip(a, b, &|x, y| x - y),
-                0x30 => zip(a, b, &|x, y| x * y),
-                0x31 => zip(a, b, &f32::min),
-                0x32 => zip(a, b, &f32::max),
-                0x33 => quat_mul(a, b),
-                0x35 => zip(a, b, &|x, y| flag(x > y)),
-                0x36 => zip(a, b, &|x, y| flag(x < y)),
-                0x37 => zip(a, b, &|x, y| flag(x >= y)),
-                0x38 => zip(a, b, &|x, y| flag(x <= y)),
-                0x40 => v3(rotate(b, [a[0], a[1], a[2]])),
-                0x48 => zip(a, b, &|x, y| flag(x == y)),
-                _ => zip(a, b, &|x, y| flag(x != y)),
-            });
+            stack.push(simple_binary(code, a, b));
         }
         0x39..=0x3D => {
             let c = pop(stack);
             let b = pop(stack);
             let a = pop(stack);
-            stack.push(match code {
-                0x39 => std::array::from_fn(|i| a[i].max(b[i]).min(c[i])),
-                // The factor is pushed first.
-                0x3A => std::array::from_fn(|i| b[i] + (c[i] - b[i]) * a[i]),
-                0x3B => std::array::from_fn(|i| a[i] * b[i] + c[i]),
-                0x3C => slerp(a, b, c[0]),
-                _ => [a[0], b[0], c[0], 0.0],
-            });
+            stack.push(simple_ternary(code, a, b, c));
         }
         0x3F => stack.push([frame / 30.0; 4]),
         0x46 => stack.push([1.0 / 30.0; 4]),
         _ => {}
+    }
+}
+
+fn simple_unary(code: u8, a: [f32; 4]) -> [f32; 4] {
+    match code {
+        0x0F | 0x10 | 0x11 | 0x12 | 0x1C => simple_unary_math(code, a),
+        0x1B => [-a[0], -a[1], -a[2], a[3]],
+        0x1D => a.map(f32::to_radians),
+        0x1E => a.map(f32::to_degrees),
+        0x1F => a.map(|x| x.clamp(0.0, 1.0)),
+        0x21 => from_euler([a[0], a[1], a[2]]),
+        _ => to_euler(a),
+    }
+}
+
+fn simple_unary_math(code: u8, a: [f32; 4]) -> [f32; 4] {
+    match code {
+        0x0F => a.map(f32::abs),
+        0x10 => a.map(|x| -x),
+        0x11 => a.map(|x| if x != 0.0 { 1.0 / x } else { 0.0 }),
+        0x12 => a.map(|x| x.max(0.0).sqrt()),
+        _ => a.map(|x| x * x),
+    }
+}
+
+fn simple_binary(code: u8, a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    match code {
+        0x35..=0x38 | 0x48 | 0x49 => simple_compare(code, a, b),
+        0x2E => zip(a, b, |x, y| x + y),
+        0x2F => zip(a, b, |x, y| x - y),
+        0x30 => zip(a, b, |x, y| x * y),
+        0x31 => zip(a, b, f32::min),
+        0x32 => zip(a, b, f32::max),
+        0x33 => quat_mul(a, b),
+        _ => v3(rotate(b, [a[0], a[1], a[2]])),
+    }
+}
+
+fn simple_compare(code: u8, a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    match code {
+        0x35 => zip(a, b, |x, y| flag(x > y)),
+        0x36 => zip(a, b, |x, y| flag(x < y)),
+        0x37 => zip(a, b, |x, y| flag(x >= y)),
+        0x38 => zip(a, b, |x, y| flag(x <= y)),
+        0x48 => zip(a, b, |x, y| flag(x == y)),
+        _ => zip(a, b, |x, y| flag(x != y)),
+    }
+}
+
+fn simple_ternary(code: u8, a: [f32; 4], b: [f32; 4], c: [f32; 4]) -> [f32; 4] {
+    match code {
+        0x39 => std::array::from_fn(|i| a[i].max(b[i]).min(c[i])),
+        // The factor is pushed first.
+        0x3A => std::array::from_fn(|i| b[i] + (c[i] - b[i]) * a[i]),
+        0x3B => std::array::from_fn(|i| a[i] * b[i] + c[i]),
+        0x3C => slerp(a, b, c[0]),
+        _ => [a[0], b[0], c[0], 0.0],
     }
 }
 

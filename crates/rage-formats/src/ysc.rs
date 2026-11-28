@@ -284,6 +284,120 @@ pub fn parse(res: &Resource) -> Result<Script, ResourceError> {
     Ok(script)
 }
 
+/// The instruction being decoded: its opcode is at `pc`, its operands follow.
+struct Site<'a> {
+    code: &'a [u8],
+    pc: usize,
+    name: &'static str,
+}
+
+impl<'a> Site<'a> {
+    /// The next `n` bytes after the opcode.
+    fn at(&self, n: usize) -> Result<&'a [u8], ScriptError> {
+        self.code
+            .get(self.pc + 1..self.pc + 1 + n)
+            .ok_or_else(|| ScriptError::PastEnd { name: self.name.to_owned(), at: self.pc })
+    }
+}
+
+/// The operands of an instruction: their length in bytes and text, the jump
+/// or call targets, and the function name `ENTER` carries.
+#[derive(Default)]
+struct Decoded {
+    len: usize,
+    operands: String,
+    targets: Vec<usize>,
+    function: Option<String>,
+}
+
+/// Operand length of the kinds that are plain numbers.
+fn plain_len(kind: O) -> usize {
+    match kind {
+        O::U8 => 1,
+        O::U8x2 | O::U16 | O::S16 | O::Leave => 2,
+        O::U8x3 | O::U24 => 3,
+        O::U32 | O::F32 => 4,
+        _ => 0,
+    }
+}
+
+/// Length and text of the operands that are plain numbers.
+fn decode_plain(kind: O, site: &Site) -> Result<(usize, String), ScriptError> {
+    let len = plain_len(kind);
+    let b = site.at(len)?;
+    let text = match kind {
+        O::U8 | O::U8x2 | O::U8x3 | O::Leave => byte_operands(kind, b),
+        _ => number_operands(kind, b),
+    };
+    Ok((len, text))
+}
+
+fn byte_operands(kind: O, b: &[u8]) -> String {
+    match kind {
+        O::U8 => b[0].to_string(),
+        O::U8x2 => format!("{} {}", b[0], b[1]),
+        O::U8x3 => format!("{} {} {}", b[0], b[1], b[2]),
+        _ => format!("params {}, returns {}", b[0], b[1]),
+    }
+}
+
+fn number_operands(kind: O, b: &[u8]) -> String {
+    match kind {
+        O::U16 => u16::from_le_bytes([b[0], b[1]]).to_string(),
+        O::S16 => i16::from_le_bytes([b[0], b[1]]).to_string(),
+        O::U24 => (b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16).to_string(),
+        O::U32 => (u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i32).to_string(),
+        O::F32 => format!("{}", f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        _ => String::new(),
+    }
+}
+
+fn decode_enter(site: &Site) -> Result<Decoded, ScriptError> {
+    let b = site.at(4)?;
+    let params = b[0];
+    let locals = u16::from_le_bytes([b[1], b[2]]);
+    let name_len = b[3] as usize;
+    let name = site.at(4 + name_len)?[4..].to_vec();
+    let name = String::from_utf8_lossy(name.strip_suffix(&[0]).unwrap_or(&name)).into_owned();
+    let function = if name.is_empty() { None } else { Some(name) };
+    Ok(Decoded {
+        len: 4 + name_len,
+        operands: format!("params {params}, locals {locals}"),
+        function,
+        ..Decoded::default()
+    })
+}
+
+fn decode_switch(site: &Site) -> Result<Decoded, ScriptError> {
+    let pc = site.pc;
+    let count = site.at(1)?[0] as usize;
+    let body = site.at(1 + count * 6)?;
+    let mut targets = Vec::with_capacity(count);
+    let mut cases = Vec::with_capacity(count);
+    for k in 0..count {
+        let e = &body[1 + k * 6..];
+        let value = i32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+        // Each case's jump is relative to the end of that case.
+        let jump = i16::from_le_bytes([e[4], e[5]]) as isize;
+        let target = (pc as isize + 2 + (k as isize + 1) * 6 + jump) as usize;
+        targets.push(target);
+        cases.push(format!("{value}: @{target:#x}"));
+    }
+    Ok(Decoded { len: 1 + count * 6, operands: cases.join(", "), targets, function: None })
+}
+
+fn decode_jump(site: &Site) -> Result<Decoded, ScriptError> {
+    let b = site.at(2)?;
+    let target = (site.pc as isize + 3 + i16::from_le_bytes([b[0], b[1]]) as isize) as usize;
+    Ok(Decoded { len: 2, operands: format!("@{target:#x}"), targets: vec![target], function: None })
+}
+
+fn decode_call(site: &Site) -> Result<Decoded, ScriptError> {
+    let b = site.at(3)?;
+    let target = b[0] as usize | (b[1] as usize) << 8 | (b[2] as usize) << 16;
+    Ok(Decoded { len: 3, operands: format!("@{target:#x}"), targets: vec![target], function: None })
+}
+
 impl Script {
     /// The string at an offset of the string table.
     pub fn string(&self, offset: usize) -> Option<String> {
@@ -322,99 +436,31 @@ impl Script {
         while pc < c.len() {
             let op = c[pc];
             let (name, kind) = *opcodes.get(op as usize).ok_or(ScriptError::UnknownOpcode { opcode: op, at: pc })?;
-            let at = |n: usize| -> Result<&[u8], ScriptError> {
-                c.get(pc + 1..pc + 1 + n).ok_or_else(|| ScriptError::PastEnd { name: name.to_owned(), at: pc })
-            };
-            let mut targets = Vec::new();
-            let mut function = None;
-            let (len, operands) = match kind {
-                O::None => (0, String::new()),
-                O::U8 => (1, at(1)?[0].to_string()),
-                O::U8x2 => {
-                    let b = at(2)?;
-                    (2, format!("{} {}", b[0], b[1]))
-                }
-                O::U8x3 => {
-                    let b = at(3)?;
-                    (3, format!("{} {} {}", b[0], b[1], b[2]))
-                }
-                O::U16 => {
-                    let b = at(2)?;
-                    (2, u16::from_le_bytes([b[0], b[1]]).to_string())
-                }
-                O::S16 => {
-                    let b = at(2)?;
-                    (2, i16::from_le_bytes([b[0], b[1]]).to_string())
-                }
-                O::U24 => {
-                    let b = at(3)?;
-                    (3, (b[0] as u32 | (b[1] as u32) << 8 | (b[2] as u32) << 16).to_string())
-                }
-                O::U32 => {
-                    let b = at(4)?;
-                    (4, (u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i32).to_string())
-                }
-                O::F32 => {
-                    let b = at(4)?;
-                    (4, format!("{}", f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
-                }
-                O::Native => {
-                    let b = at(3)?;
-                    let (args, rets) = (b[0] >> 2, b[0] & 3);
-                    let index = u16::from_be_bytes([b[1], b[2]]) as usize;
-                    let hash = self.natives.get(index).copied().unwrap_or_default();
-                    (3, format!("0x{hash:016X}  args {args}, returns {rets}"))
-                }
-                O::Enter => {
-                    let b = at(4)?;
-                    let params = b[0];
-                    let locals = u16::from_le_bytes([b[1], b[2]]);
-                    let name_len = b[3] as usize;
-                    let name = at(4 + name_len)?[4..].to_vec();
-                    let name = String::from_utf8_lossy(name.strip_suffix(&[0]).unwrap_or(&name)).into_owned();
-                    if !name.is_empty() {
-                        function = Some(name);
-                    }
-                    (4 + name_len, format!("params {params}, locals {locals}"))
-                }
-                O::Leave => {
-                    let b = at(2)?;
-                    (2, format!("params {}, returns {}", b[0], b[1]))
-                }
-                O::Switch => {
-                    let count = at(1)?[0] as usize;
-                    let body = at(1 + count * 6)?;
-                    let next = pc + 2 + count * 6;
-                    let mut cases = Vec::with_capacity(count);
-                    for k in 0..count {
-                        let e = &body[1 + k * 6..];
-                        let value = i32::from_le_bytes([e[0], e[1], e[2], e[3]]);
-                        // Each case's jump is relative to the end of that case.
-                        let jump = i16::from_le_bytes([e[4], e[5]]) as isize;
-                        let target = (pc as isize + 2 + (k as isize + 1) * 6 + jump) as usize;
-                        targets.push(target);
-                        cases.push(format!("{value}: @{target:#x}"));
-                    }
-                    let _ = next;
-                    (1 + count * 6, cases.join(", "))
-                }
-                O::Jump => {
-                    let b = at(2)?;
-                    let target = (pc as isize + 3 + i16::from_le_bytes([b[0], b[1]]) as isize) as usize;
-                    targets.push(target);
-                    (2, format!("@{target:#x}"))
-                }
-                O::Call => {
-                    let b = at(3)?;
-                    let target = b[0] as usize | (b[1] as usize) << 8 | (b[2] as usize) << 16;
-                    targets.push(target);
-                    (3, format!("@{target:#x}"))
-                }
-            };
-            out.push(Instruction { offset: pc, name, operands, targets, function });
-            pc += 1 + len;
+            let d = self.decode_operands(kind, &Site { code: c, pc, name })?;
+            out.push(Instruction { offset: pc, name, operands: d.operands, targets: d.targets, function: d.function });
+            pc += 1 + d.len;
         }
         Ok(out)
+    }
+
+    fn decode_operands(&self, kind: O, site: &Site) -> Result<Decoded, ScriptError> {
+        match kind {
+            O::Native => self.decode_native(site),
+            O::Enter => decode_enter(site),
+            O::Switch => decode_switch(site),
+            O::Jump => decode_jump(site),
+            O::Call => decode_call(site),
+            _ => decode_plain(kind, site).map(|(len, operands)| Decoded { len, operands, ..Decoded::default() }),
+        }
+    }
+
+    fn decode_native(&self, site: &Site) -> Result<Decoded, ScriptError> {
+        let b = site.at(3)?;
+        let (args, rets) = (b[0] >> 2, b[0] & 3);
+        let index = u16::from_be_bytes([b[1], b[2]]) as usize;
+        let hash = self.natives.get(index).copied().unwrap_or_default();
+        let operands = format!("0x{hash:016X}  args {args}, returns {rets}");
+        Ok(Decoded { len: 3, operands, ..Decoded::default() })
     }
 
     /// Disassembly as text: functions with their names, labels at jump

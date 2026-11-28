@@ -175,20 +175,36 @@ pub fn parse_rdr2(file: &[u8]) -> Result<Pso, PsoError> {
 }
 
 fn parse_with(file: &[u8], offset_shift: u32) -> Result<Pso, PsoError> {
-    let err = |m: String| PsoError::Invalid(m);
+    read_pso(file, offset_shift).map_err(PsoError::Invalid)
+}
+
+/// The sections of a file: the three that are read, and every one as it was.
+struct Sections<'a> {
+    data: &'a [u8],
+    map: &'a [u8],
+    schema: &'a [u8],
+    all: Vec<([u8; 4], Vec<u8>)>,
+}
+
+fn section_length(file: &[u8], pos: usize, ident: &[u8; 4]) -> Result<usize, String> {
+    let len = u32_at(file, pos + 4)? as usize;
+    if len < 8 || pos + len > file.len() {
+        return Err(format!("section {} has bad length {len}", String::from_utf8_lossy(ident)));
+    }
+    Ok(len)
+}
+
+fn split_sections(file: &[u8]) -> Result<Sections<'_>, String> {
     let mut data = None;
     let mut map = None;
     let mut schema = None;
-    let mut sections = Vec::new();
+    let mut all = Vec::new();
     let mut pos = 0;
     while pos + 8 <= file.len() {
         let ident: [u8; 4] = file[pos..pos + 4].try_into().unwrap_or_default();
-        let len = u32_at(file, pos + 4).map_err(err)? as usize;
-        if len < 8 || pos + len > file.len() {
-            return Err(err(format!("section {} has bad length {len}", String::from_utf8_lossy(&ident))));
-        }
+        let len = section_length(file, pos, &ident)?;
         let section = &file[pos..pos + len];
-        sections.push((ident, section.to_vec()));
+        all.push((ident, section.to_vec()));
         match &ident {
             b"PSIN" => data = Some(section),
             b"PMAP" => map = Some(section),
@@ -197,70 +213,127 @@ fn parse_with(file: &[u8], offset_shift: u32) -> Result<Pso, PsoError> {
         }
         pos += len;
     }
-    let data = data.ok_or_else(|| err("no PSIN section".into()))?;
-    let map = map.ok_or_else(|| err("no PMAP section".into()))?;
-    let schema = schema.ok_or_else(|| err("no PSCH section".into()))?;
+    let data = data.ok_or("no PSIN section")?;
+    let map = map.ok_or("no PMAP section")?;
+    let schema = schema.ok_or("no PSCH section")?;
+    Ok(Sections { data, map, schema, all })
+}
 
-    let root_block = u32_at(map, 8).map_err(err)? as usize;
-    let mut count = u16_at(map, 12).map_err(err)? as i16;
+/// The root block's number and the block table of the `PMAP` section.
+fn read_blocks(map: &[u8]) -> Result<(usize, Vec<Block>), String> {
+    let root_block = u32_at(map, 8)? as usize;
+    let mut count = u16_at(map, 12)? as i16;
     let mut at = 16;
     if count <= 0 {
-        count = u16_at(map, 16).map_err(err)? as i16;
+        count = u16_at(map, 16)? as i16;
         at = 24;
     }
     let mut blocks = Vec::with_capacity(count.max(0) as usize);
     for i in 0..count.max(0) as usize {
         let p = at + i * 16;
         blocks.push(Block {
-            name: u32_at(map, p).map_err(err)?,
-            offset: u32_at(map, p + 4).map_err(err)? as usize,
-            length: u32_at(map, p + 12).map_err(err)? as usize,
+            name: u32_at(map, p)?,
+            offset: u32_at(map, p + 4)? as usize,
+            length: u32_at(map, p + 12)? as usize,
         });
     }
+    Ok((root_block, blocks))
+}
 
-    let mut structs = HashMap::new();
-    let mut enums = HashMap::new();
-    let mut pairs = Vec::new();
-    let (key_name, item_name) = (names::parse("Key"), names::parse("Item"));
-    let n = u32_at(schema, 8).map_err(err)? as usize;
-    for i in 0..n.min(0x10000) {
-        let name = u32_at(schema, 12 + i * 8).map_err(err)?;
-        let off = u32_at(schema, 16 + i * 8).map_err(err)? as usize;
-        let x = u32_at(schema, off).map_err(err)?;
+fn read_schema_entry(schema: &[u8], p: usize) -> Result<Entry, String> {
+    let beyond = || "schema entry beyond section".to_owned();
+    Ok(Entry {
+        name: u32_at(schema, p)?,
+        kind: *schema.get(p + 4).ok_or_else(beyond)?,
+        sub: *schema.get(p + 5).ok_or_else(beyond)?,
+        offset: u16_at(schema, p + 6)? as usize,
+        key: u32_at(schema, p + 8)?,
+    })
+}
+
+/// A structure of the schema at `off`, whose first word is `x`.
+fn read_struct_info(schema: &[u8], off: usize, x: u32) -> Result<StructInfo, String> {
+    let length = u32_at(schema, off + 4)? as usize;
+    let mut entries = Vec::new();
+    for e in 0..(x & 0xFFFF) as usize {
+        entries.push(read_schema_entry(schema, off + 12 + e * 12)?);
+    }
+    Ok(StructInfo { length, entries })
+}
+
+/// An enum of the schema at `off`, whose first word is `x`, as (name, value) pairs.
+fn read_enum_values(schema: &[u8], off: usize, x: u32, offset_shift: u32) -> Result<Vec<(u32, i32)>, String> {
+    // GTA V: (name, value) pairs; RDR2: name, 8 zero bytes, value.
+    let (size, value_at) = if offset_shift == 20 { (16, 12) } else { (8, 4) };
+    let mut values = Vec::new();
+    for e in 0..(x & 0xFF_FFFF) as usize {
+        let p = off + 4 + e * size;
+        values.push((u32_at(schema, p)?, u32_at(schema, p + value_at)? as i32));
+    }
+    Ok(values)
+}
+
+/// The structures and enums of the `PSCH` section, and the structures that describe map pairs.
+struct Schema {
+    structs: HashMap<u32, StructInfo>,
+    enums: HashMap<u32, Vec<(u32, i32)>>,
+    pairs: Vec<(u32, StructInfo)>,
+}
+
+impl Schema {
+    /// Adds the element at `off`: a structure (also to `pairs` when it has
+    /// the Key and Item fields `pair_names`) or an enum.
+    fn add(
+        &mut self,
+        schema: &[u8],
+        (name, off): (u32, usize),
+        offset_shift: u32,
+        pair_names: (u32, u32),
+    ) -> Result<(), String> {
+        let x = u32_at(schema, off)?;
         match x >> 24 {
             0 => {
-                let length = u32_at(schema, off + 4).map_err(err)? as usize;
-                let mut entries = Vec::new();
-                for e in 0..(x & 0xFFFF) as usize {
-                    let p = off + 12 + e * 12;
-                    entries.push(Entry {
-                        name: u32_at(schema, p).map_err(err)?,
-                        kind: *schema.get(p + 4).ok_or_else(|| err("schema entry beyond section".into()))?,
-                        sub: *schema.get(p + 5).ok_or_else(|| err("schema entry beyond section".into()))?,
-                        offset: u16_at(schema, p + 6).map_err(err)? as usize,
-                        key: u32_at(schema, p + 8).map_err(err)?,
-                    });
+                let info = read_struct_info(schema, off, x)?;
+                if info.find(pair_names.0).is_some() && info.find(pair_names.1).is_some() {
+                    self.pairs.push((name, info.clone()));
                 }
-                let info = StructInfo { length, entries };
-                if info.find(key_name).is_some() && info.find(item_name).is_some() {
-                    pairs.push((name, info.clone()));
-                }
-                structs.entry(name).or_insert(info);
+                self.structs.entry(name).or_insert(info);
             }
             1 => {
-                // GTA V: (name, value) pairs; RDR2: name, 8 zero bytes, value.
-                let (size, value_at) = if offset_shift == 20 { (16, 12) } else { (8, 4) };
-                let mut values = Vec::new();
-                for e in 0..(x & 0xFF_FFFF) as usize {
-                    let p = off + 4 + e * size;
-                    values.push((u32_at(schema, p).map_err(err)?, u32_at(schema, p + value_at).map_err(err)? as i32));
-                }
-                enums.entry(name).or_insert(values);
+                self.enums.entry(name).or_insert(read_enum_values(schema, off, x, offset_shift)?);
             }
-            t => return Err(err(format!("unknown schema element type {t}"))),
+            t => return Err(format!("unknown schema element type {t}")),
         }
+        Ok(())
     }
-    Ok(Pso { data: data.to_vec(), root_block, blocks, structs, enums, offset_shift, sections, pairs })
+}
+
+fn read_schema(schema: &[u8], offset_shift: u32) -> Result<Schema, String> {
+    let mut out = Schema { structs: HashMap::new(), enums: HashMap::new(), pairs: Vec::new() };
+    let pair_names = (names::parse("Key"), names::parse("Item"));
+    let n = u32_at(schema, 8)? as usize;
+    for i in 0..n.min(0x10000) {
+        let name = u32_at(schema, 12 + i * 8)?;
+        let off = u32_at(schema, 16 + i * 8)? as usize;
+        out.add(schema, (name, off), offset_shift, pair_names)?;
+    }
+    Ok(out)
+}
+
+fn read_pso(file: &[u8], offset_shift: u32) -> Result<Pso, String> {
+    let sections = split_sections(file)?;
+    let (root_block, blocks) = read_blocks(sections.map)?;
+    let Schema { structs, enums, pairs } = read_schema(sections.schema, offset_shift)?;
+    Ok(Pso {
+        data: sections.data.to_vec(),
+        root_block,
+        blocks,
+        structs,
+        enums,
+        offset_shift,
+        sections: sections.all,
+        pairs,
+    })
 }
 
 /// Parses a PSO file and writes it as XML (see [`Pso::to_xml`]).
@@ -283,6 +356,24 @@ impl Site {
     fn at(&self, entry: &Entry) -> usize {
         self.block.offset + self.offset + entry.offset
     }
+}
+
+/// The key and item entries of a map's pairs, and the size of a pair.
+#[derive(Clone, Copy)]
+struct PairLayout {
+    key: Entry,
+    item: Entry,
+    len: usize,
+}
+
+/// What the pairs of one map share: the output level and depth, the block they are in, and their layout.
+struct MapPairs<'a> {
+    level: usize,
+    id: usize,
+    block: Block,
+    depth: usize,
+    info: &'a StructInfo,
+    layout: PairLayout,
 }
 
 type ItemText = fn(&[u8]) -> String;
@@ -523,7 +614,7 @@ impl Pso {
             ty::ARRAY => self.array_node(w, site, entry, info, ename),
             ty::ENUM => self.enum_entry(w, site, entry, ename),
             ty::FLAGS => self.flags_entry(w, site, entry, info, ename),
-            ty::MAP => self.map_node(w, site.level, at, entry, info, ename, site.depth),
+            ty::MAP => self.map_node(w, site, entry, info, ename),
             ty::STRING => {
                 let s = self.string_value(entry, at)?;
                 w.string(site.level, ename, &s);
@@ -891,29 +982,59 @@ impl Pso {
         Ok(Some(self.items(loc.abs, loc.count, size)?.into_iter().map(format).collect()))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn map_node(
-        &self,
-        w: &mut Writer,
-        level: usize,
-        at: usize,
-        entry: &Entry,
-        info: &StructInfo,
-        ename: &str,
-        depth: usize,
-    ) -> Result<(), String> {
-        if entry.sub != 1 {
-            return Err(format!("unexpected map subtype {}", entry.sub));
-        }
+    /// The pointer to the pairs of a map and their count.
+    fn map_header(&self, at: usize) -> Result<(u64, usize), String> {
         let d = &self.data[..];
         let x1 = u32_at(d, at)?;
         // RDR2 leaves the rest of the first 8 bytes uninitialised: only the first byte counts.
         let pointer_first = x1 == 0x0100_0000 || (self.offset_shift == 20 && x1 >> 24 == 1);
-        let (ptr, count) = if !pointer_first {
-            (ptr_at(d, at + 16)?, u16_at(d, at + 2)? as usize)
+        if !pointer_first {
+            Ok((ptr_at(d, at + 16)?, u16_at(d, at + 2)? as usize))
         } else {
-            (ptr_at(d, at + 8)?, u16_at(d, at + 16)? as usize)
-        };
+            Ok((ptr_at(d, at + 8)?, u16_at(d, at + 16)? as usize))
+        }
+    }
+
+    /// The size of a map item in RDR2's layout, which sets the stride of the pairs.
+    fn map_item_size(&self, item: &Entry) -> usize {
+        match (item.kind, item.sub) {
+            (ty::STRUCTURE, 0) => self.structs.get(&item.key).map_or(8, |s| s.length),
+            (ty::STRING, 7 | 8) | (ty::UINT | ty::SINT | ty::ENUM | ty::FLOAT, _) => 4,
+            _ => 8,
+        }
+    }
+
+    /// GTA V describes the pairs by a structure with Key and Item fields.
+    /// RDR2 describes them by two type entries of the owning structure
+    /// (the map entry's key: key type index << 16 | item type index), and
+    /// stores each pair as the key (4 bytes, padded to 8) and the item.
+    fn map_pair_layout(&self, block: &Block, info: &StructInfo, entry: &Entry) -> Result<PairLayout, String> {
+        let (key_name, item_name) = (names::parse("Key"), names::parse("Item"));
+        let pair_struct =
+            self.structs.get(&block.name).and_then(|st| Some((*st.find(key_name)?, *st.find(item_name)?, st.length)));
+        if let Some((key, item, len)) = pair_struct {
+            return Ok(PairLayout { key, item, len });
+        }
+        let mut key = *info.entries.get((entry.key >> 16) as usize & 0xFFF).ok_or("map Key entry missing")?;
+        let mut item = *info.entries.get(entry.key as usize & 0xFFF).ok_or("map Item entry missing")?;
+        item.offset = 8;
+        key.offset = 0;
+        Ok(PairLayout { key, item, len: (8 + self.map_item_size(&item)).next_multiple_of(8) })
+    }
+
+    fn map_node(
+        &self,
+        w: &mut Writer,
+        site: &Site,
+        entry: &Entry,
+        info: &StructInfo,
+        ename: &str,
+    ) -> Result<(), String> {
+        let (level, depth) = (site.level, site.depth);
+        if entry.sub != 1 {
+            return Err(format!("unexpected map subtype {}", entry.sub));
+        }
+        let (ptr, count) = self.map_header(site.at(entry))?;
         let (id, mut off) = self.unpack(ptr);
         if count == 0 {
             w.empty(level, ename);
@@ -923,79 +1044,73 @@ impl Pso {
         if off >= block.length {
             off >>= 8;
         }
-        // GTA V describes the pairs by a structure with Key and Item fields.
-        // RDR2 describes them by two type entries of the owning structure
-        // (the map entry's key: key type index << 16 | item type index), and
-        // stores each pair as the key (4 bytes, padded to 8) and the item.
-        let pair_struct = self
-            .structs
-            .get(&block.name)
-            .filter(|st| st.find(names::parse("Key")).is_some() && st.find(names::parse("Item")).is_some());
-        let (key_entry, item_entry, pair_len) = match pair_struct {
-            Some(st) => (
-                *st.find(names::parse("Key")).expect("checked"),
-                *st.find(names::parse("Item")).expect("checked"),
-                st.length,
-            ),
-            None => {
-                let key_info = *info.entries.get((entry.key >> 16) as usize & 0xFFF).ok_or("map Key entry missing")?;
-                let mut item_info = *info.entries.get(entry.key as usize & 0xFFF).ok_or("map Item entry missing")?;
-                item_info.offset = 8;
-                let mut key_info = key_info;
-                key_info.offset = 0;
-                let item_size = match (item_info.kind, item_info.sub) {
-                    (ty::STRUCTURE, 0) => self.structs.get(&item_info.key).map_or(8, |s| s.length),
-                    (ty::STRING, 7 | 8) | (ty::UINT | ty::SINT | ty::ENUM | ty::FLOAT, _) => 4,
-                    _ => 8,
-                };
-                (key_info, item_info, (8 + item_size).next_multiple_of(8))
-            }
-        };
+        let layout = self.map_pair_layout(&block, info, entry)?;
+        let pairs = MapPairs { level, id, block, depth, info, layout };
         w.open(level, ename);
         for _ in 0..count {
             if off >= block.length {
                 w.error(level + 1, format!("map offset out of range (count {count})"));
                 break;
             }
-            let base = block.offset + off;
-            let key_at = base + key_entry.offset;
-            let key = match key_entry.kind {
-                ty::STRING => self.string_value(&key_entry, key_at)?,
-                ty::ENUM | ty::UINT | ty::SINT => names::value(u32_at(d, key_at)?),
-                _ => format!("{:#x}", u32_at(d, key_at)?),
-            };
-            let key = xml::escape(&key);
-            match item_entry.kind {
-                ty::STRING => {
-                    let s = self.string_value(&item_entry, base + item_entry.offset)?;
-                    w.text(level + 1, &format!("Item type=\"String\" key=\"{key}\""), &s);
-                }
-                ty::STRUCTURE if item_entry.key != 0 && item_entry.sub != 3 => {
-                    w.open(level + 1, &format!("Item type=\"{}\" key=\"{key}\"", names::field(item_entry.key)));
-                    self.node(w, level + 1, id, off + item_entry.offset, Tag::None, item_entry.key, depth + 1);
-                    w.close(level + 1, "Item");
-                }
-                ty::STRUCTURE => {
-                    let (pid, poff) = self.unpack(ptr_at(d, base + item_entry.offset)?);
-                    let pb = self.block(pid).ok_or("map item block not found")?;
-                    w.open(level + 1, &format!("Item type=\"{}\" key=\"{key}\"", names::field(pb.name)));
-                    if self.structs.get(&pb.name).is_some_and(|s| !s.entries.is_empty()) {
-                        self.node(w, level + 1, pid, poff, Tag::None, 0, depth + 1);
-                    }
-                    w.close(level + 1, "Item");
-                }
-                _ => {
-                    w.open(level + 1, &format!("Item key=\"{key}\""));
-                    let site = Site { level: level + 2, block_id: id, block, offset: off, depth: depth + 1 };
-                    if let Err(e) = self.entry(w, &site, &item_entry, info, "Value") {
-                        w.error(level + 2, format!("map value: {e}"));
-                    }
-                    w.close(level + 1, "Item");
-                }
-            }
-            off += pair_len;
+            self.map_pair(w, &pairs, off)?;
+            off += layout.len;
         }
         w.close(level, ename);
+        Ok(())
+    }
+
+    /// One key/item pair of a map, at `off` in the map's block.
+    fn map_pair(&self, w: &mut Writer, m: &MapPairs, off: usize) -> Result<(), String> {
+        let base = m.block.offset + off;
+        let key = xml::escape(&self.map_key(&m.layout.key, base + m.layout.key.offset)?);
+        let item = &m.layout.item;
+        match item.kind {
+            ty::STRING => {
+                let s = self.string_value(item, base + item.offset)?;
+                w.text(m.level + 1, &format!("Item type=\"String\" key=\"{key}\""), &s);
+                Ok(())
+            }
+            ty::STRUCTURE if item.key != 0 && item.sub != 3 => {
+                w.open(m.level + 1, &format!("Item type=\"{}\" key=\"{key}\"", names::field(item.key)));
+                self.node(w, m.level + 1, m.id, off + item.offset, Tag::None, item.key, m.depth + 1);
+                w.close(m.level + 1, "Item");
+                Ok(())
+            }
+            ty::STRUCTURE => self.map_pointer_item(w, m, base + item.offset, &key),
+            _ => {
+                self.map_value_item(w, m, off, &key);
+                Ok(())
+            }
+        }
+    }
+
+    fn map_key(&self, key: &Entry, key_at: usize) -> Result<String, String> {
+        Ok(match key.kind {
+            ty::STRING => self.string_value(key, key_at)?,
+            ty::ENUM | ty::UINT | ty::SINT => names::value(u32_at(&self.data, key_at)?),
+            _ => format!("{:#x}", u32_at(&self.data, key_at)?),
+        })
+    }
+
+    /// A map item written like a structure entry, as the pair's `Value`.
+    fn map_value_item(&self, w: &mut Writer, m: &MapPairs, off: usize, key: &str) {
+        w.open(m.level + 1, &format!("Item key=\"{key}\""));
+        let site = Site { level: m.level + 2, block_id: m.id, block: m.block, offset: off, depth: m.depth + 1 };
+        if let Err(e) = self.entry(w, &site, &m.layout.item, m.info, "Value") {
+            w.error(m.level + 2, format!("map value: {e}"));
+        }
+        w.close(m.level + 1, "Item");
+    }
+
+    /// A map item that is a pointer to a structure, whose block names its type.
+    fn map_pointer_item(&self, w: &mut Writer, m: &MapPairs, at: usize, key: &str) -> Result<(), String> {
+        let (pid, poff) = self.unpack(ptr_at(&self.data, at)?);
+        let pb = self.block(pid).ok_or("map item block not found")?;
+        w.open(m.level + 1, &format!("Item type=\"{}\" key=\"{key}\"", names::field(pb.name)));
+        if self.structs.get(&pb.name).is_some_and(|s| !s.entries.is_empty()) {
+            self.node(w, m.level + 1, pid, poff, Tag::None, 0, m.depth + 1);
+        }
+        w.close(m.level + 1, "Item");
         Ok(())
     }
 }

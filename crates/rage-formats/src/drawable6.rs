@@ -382,6 +382,16 @@ impl<'a> Reader<'a> {
             .collect()
     }
 
+    /// The triangle indices of a geometry with `vertices` vertices.
+    fn indices(&self, geometry: usize, vertices: usize) -> Result<Vec<u32>, ModelError> {
+        let descriptor = self.s(geometry + 64, 16)?;
+        let (index, stride) = self.buffer(self.s(descriptor, 64)?)?;
+        if stride != 4 {
+            return Err(bad("an index buffer of an unknown kind"));
+        }
+        clusters(index, vertices)
+    }
+
     /// A geometry of a drawable with `bones` bones.
     fn mesh(&self, geometry: usize, bones: usize) -> Result<Mesh, ModelError> {
         let vb = self.s(geometry + 8, 80)?;
@@ -392,118 +402,154 @@ impl<'a> Reader<'a> {
             return Err(bad("an impossible vertex count"));
         }
         let (data, _) = self.buffer(vb)?;
-        let part = |slot: usize| -> (usize, u8, u8) {
-            let offset = self.sys.u32_at(format + slot * 4).unwrap_or(0) as usize;
-            (offset, self.sys[format + 0xD0 + slot], self.sys[format + 0x104 + slot])
-        };
-        let within = |offset: usize, size: usize| {
-            offset.checked_add(vertices * size).filter(|end| *end <= data.len()).map(|_| offset)
-        };
+        let vertex_data = VertexData { sys: self.sys, format, data, count: vertices };
 
-        let (offset, size, encoding) = part(POSITION);
-        let at = within(offset, usize::from(size)).ok_or_else(|| bad("positions outside their buffer"))?;
-        let positions: Vec<[f32; 3]> = match (size, encoding) {
-            (12, 6) => (0..vertices).map(|i| vec3(data, at + i * 12)).collect::<Option<_>>(),
-            // Fixed point: 24 bits, 24 bits (the lowest byte and two more
-            // above the first number) and 16 bits.
-            (8, 16) => (|| {
-                let (bias, scale, axes) = (vec3(data, 96)?, vec3(data, 112)?, data.u32_at(108)?);
-                let numbers = data[at..at + vertices * 8].as_chunks::<8>().0;
-                Some(
-                    numbers
-                        .iter()
-                        .map(|c| {
-                            let q = u64::from_le_bytes(*c);
-                            let parts = [q >> 8 & 0xFF_FFFF, (q >> 32 & 0xFFFF) << 8 | q & 0xFF, q >> 48];
-                            let p: [f32; 3] = std::array::from_fn(|k| {
-                                (f64::from(bias[k]) + f64::from(scale[k]) * parts[k] as f64) as f32
-                            });
-                            match axes {
-                                0 => [p[2], p[1], p[0]],
-                                1 => [p[1], p[2], p[0]],
-                                _ => p,
-                            }
-                        })
-                        .collect(),
-                )
-            })(),
+        let positions = vertex_data.positions()?;
+        let (uvs, uvs1) = (vertex_data.coordinates(TEXCOORD), vertex_data.coordinates(TEXCOORD + 1));
+        let (bone_indices, bone_weights) = vertex_data.skinning(bones);
+        let shading = vertex_data.shading();
+
+        let indices = self.indices(geometry, vertices)?;
+        let normals = smooth_normals(&positions, &indices);
+        Ok(Mesh { positions, normals, uvs, uvs1, shading, indices, bone_indices, bone_weights, ..Default::default() })
+    }
+}
+
+/// The vertices of a geometry: its vertex buffer and where the format (in the system part) puts each part.
+struct VertexData<'a> {
+    sys: &'a [u8],
+    format: usize,
+    data: &'a [u8],
+    count: usize,
+}
+
+impl<'a> VertexData<'a> {
+    /// A part's offset in the buffer, size and encoding.
+    fn part(&self, slot: usize) -> (usize, u8, u8) {
+        let offset = self.sys.u32_at(self.format + slot * 4).unwrap_or(0) as usize;
+        (offset, self.sys[self.format + 0xD0 + slot], self.sys[self.format + 0x104 + slot])
+    }
+
+    /// `offset` if all vertices' elements of `size` bytes from there lie inside the buffer.
+    fn within(&self, offset: usize, size: usize) -> Option<usize> {
+        offset.checked_add(self.count * size).filter(|end| *end <= self.data.len()).map(|_| offset)
+    }
+
+    fn positions(&self) -> Result<Vec<[f32; 3]>, ModelError> {
+        let (offset, size, encoding) = self.part(POSITION);
+        let at = self.within(offset, usize::from(size)).ok_or_else(|| bad("positions outside their buffer"))?;
+        let positions = match (size, encoding) {
+            (12, 6) => (0..self.count).map(|i| vec3(self.data, at + i * 12)).collect::<Option<_>>(),
+            (8, 16) => self.fixed_point_positions(at),
             _ => return Err(bad(format!("positions of an unknown kind ({size} bytes, encoding {encoding})"))),
+        };
+        positions.ok_or_else(|| bad("positions that are no numbers"))
+    }
+
+    /// Fixed point: 24 bits, 24 bits (the lowest byte and two more
+    /// above the first number) and 16 bits.
+    fn fixed_point_positions(&self, at: usize) -> Option<Vec<[f32; 3]>> {
+        let data = self.data;
+        let (bias, scale, axes) = (vec3(data, 96)?, vec3(data, 112)?, data.u32_at(108)?);
+        let numbers = data[at..at + self.count * 8].as_chunks::<8>().0;
+        Some(
+            numbers
+                .iter()
+                .map(|c| {
+                    let q = u64::from_le_bytes(*c);
+                    let parts = [q >> 8 & 0xFF_FFFF, (q >> 32 & 0xFFFF) << 8 | q & 0xFF, q >> 48];
+                    let p: [f32; 3] =
+                        std::array::from_fn(|k| (f64::from(bias[k]) + f64::from(scale[k]) * parts[k] as f64) as f32);
+                    match axes {
+                        0 => [p[2], p[1], p[0]],
+                        1 => [p[1], p[2], p[0]],
+                        _ => p,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// The texture coordinates of a slot, empty when it has none or of an unknown kind.
+    fn coordinates(&self, slot: usize) -> Vec<[f32; 2]> {
+        let (offset, size, encoding) = self.part(slot);
+        match (size, encoding, self.within(offset, usize::from(size))) {
+            (8, 16, Some(at)) => self.float_coordinates(at),
+            (4, 38, Some(at)) => self.scaled_coordinates(at),
+            _ => Vec::new(),
         }
-        .ok_or_else(|| bad("positions that are no numbers"))?;
+    }
 
-        let coordinates = |slot: usize| -> Vec<[f32; 2]> {
-            let (offset, size, encoding) = part(slot);
-            match (size, encoding, within(offset, usize::from(size))) {
-                (8, 16, Some(at)) => data[at..at + vertices * 8]
-                    .as_chunks::<8>()
-                    .0
-                    .iter()
-                    .map(|c| {
-                        [f32::from_le_bytes([c[0], c[1], c[2], c[3]]), f32::from_le_bytes([c[4], c[5], c[6], c[7]])]
-                    })
-                    .collect(),
-                (4, 38, Some(at)) => {
-                    let scale = data.u32_at(124).map(f32::from_bits).filter(|s| s.is_finite()).unwrap_or(1.0);
-                    let number = |a: u8, b: u8| (f32::from(i16::from_le_bytes([a, b])) / 32767.0).max(-1.0) * scale;
-                    data[at..at + vertices * 4]
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|c| [number(c[0], c[1]), number(c[2], c[3])])
-                        .collect()
-                }
-                _ => Vec::new(),
-            }
-        };
-        let (uvs, uvs1) = (coordinates(TEXCOORD), coordinates(TEXCOORD + 1));
+    fn float_coordinates(&self, at: usize) -> Vec<[f32; 2]> {
+        self.data[at..at + self.count * 8]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| [f32::from_le_bytes([c[0], c[1], c[2], c[3]]), f32::from_le_bytes([c[4], c[5], c[6], c[7]])])
+            .collect()
+    }
 
-        let bytes = |slot: usize, size: usize, encoding: u8| -> Option<&[u8]> {
-            let (offset, own_size, own_encoding) = part(slot);
-            let at = within(offset, size).filter(|_| (usize::from(own_size), own_encoding) == (size, encoding))?;
-            data.get(at..at + vertices * size)
-        };
-        let skinning = |i: usize| -> Option<([u16; 4], [f32; 4])> {
-            if let Some(single) = bytes(BONES[0], 1, 62) {
-                return Some(([u16::from(single[i]), 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
-            }
-            let mut found: Vec<(u8, u16)> = Vec::with_capacity(8);
-            for (weights, numbers) in WEIGHTS.into_iter().zip(BONES) {
-                let Some(w) = bytes(weights, 4, 28) else { continue };
-                if let Some(n) = bytes(numbers, 4, 30) {
-                    found.extend((0..4).map(|k| (w[i * 4 + k], u16::from(n[i * 4 + k]))));
-                } else if let Some(n) = bytes(numbers, 16, 3) {
-                    // The bone is in the lower 12 bits.
-                    let number = |k: usize| u16::from_le_bytes([n[(i * 4 + k) * 4], n[(i * 4 + k) * 4 + 1]]) & 0xFFF;
-                    found.extend((0..4).map(|k| (w[i * 4 + k], number(k))));
-                }
-            }
-            found.sort_by_key(|(w, _)| std::cmp::Reverse(*w));
-            let (mut numbers, mut weights) = ([0; 4], [0.0; 4]);
-            for (k, (w, n)) in found.into_iter().filter(|(w, _)| *w > 0).take(4).enumerate() {
-                numbers[k] = n;
-                weights[k] = f32::from(w) / 255.0;
-            }
-            let total: f32 = weights.iter().sum();
-            (total > 0.0).then(|| (numbers, weights.map(|w| w / total)))
-        };
-        // All vertices, with bones the skeleton has, or none.
-        let (bone_indices, bone_weights) = (0..vertices)
-            .map(|i| skinning(i).filter(|(n, _)| n.iter().all(|n| usize::from(*n) < bones)))
+    fn scaled_coordinates(&self, at: usize) -> Vec<[f32; 2]> {
+        let scale = self.data.u32_at(124).map(f32::from_bits).filter(|s| s.is_finite()).unwrap_or(1.0);
+        let number = |a: u8, b: u8| (f32::from(i16::from_le_bytes([a, b])) / 32767.0).max(-1.0) * scale;
+        self.data[at..at + self.count * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| [number(c[0], c[1]), number(c[2], c[3])])
+            .collect()
+    }
+
+    /// The bytes of a slot if it has exactly this element size and encoding.
+    fn bytes(&self, slot: usize, size: usize, encoding: u8) -> Option<&'a [u8]> {
+        let (offset, own_size, own_encoding) = self.part(slot);
+        let at = self.within(offset, size).filter(|_| (usize::from(own_size), own_encoding) == (size, encoding))?;
+        self.data.get(at..at + self.count * size)
+    }
+
+    /// Bone numbers and weights of every vertex, with bones the skeleton (of `bones` bones) has, or none.
+    fn skinning(&self, bones: usize) -> (Vec<[u16; 4]>, Vec<[f32; 4]>) {
+        (0..self.count)
+            .map(|i| self.skin_of(i).filter(|(n, _)| n.iter().all(|n| usize::from(*n) < bones)))
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default()
             .into_iter()
-            .unzip();
+            .unzip()
+    }
 
-        let shading = bytes(COLOUR, 4, 28).map(|all| all.as_chunks::<4>().0.to_vec()).unwrap_or_default();
-
-        let descriptor = self.s(geometry + 64, 16)?;
-        let (index, stride) = self.buffer(self.s(descriptor, 64)?)?;
-        if stride != 4 {
-            return Err(bad("an index buffer of an unknown kind"));
+    fn skin_of(&self, i: usize) -> Option<([u16; 4], [f32; 4])> {
+        if let Some(single) = self.bytes(BONES[0], 1, 62) {
+            return Some(([u16::from(single[i]), 0, 0, 0], [1.0, 0.0, 0.0, 0.0]));
         }
-        let indices = clusters(index, vertices)?;
-        let normals = smooth_normals(&positions, &indices);
-        Ok(Mesh { positions, normals, uvs, uvs1, shading, indices, bone_indices, bone_weights, ..Default::default() })
+        let mut found = self.weighted_bones(i);
+        found.sort_by_key(|(w, _)| std::cmp::Reverse(*w));
+        let (mut numbers, mut weights) = ([0; 4], [0.0; 4]);
+        for (k, (w, n)) in found.into_iter().filter(|(w, _)| *w > 0).take(4).enumerate() {
+            numbers[k] = n;
+            weights[k] = f32::from(w) / 255.0;
+        }
+        let total: f32 = weights.iter().sum();
+        (total > 0.0).then(|| (numbers, weights.map(|w| w / total)))
+    }
+
+    /// The (weight, bone number) pairs of vertex `i`, from both weight parts.
+    fn weighted_bones(&self, i: usize) -> Vec<(u8, u16)> {
+        let mut found: Vec<(u8, u16)> = Vec::with_capacity(8);
+        for (weights, numbers) in WEIGHTS.into_iter().zip(BONES) {
+            let Some(w) = self.bytes(weights, 4, 28) else { continue };
+            if let Some(n) = self.bytes(numbers, 4, 30) {
+                found.extend((0..4).map(|k| (w[i * 4 + k], u16::from(n[i * 4 + k]))));
+            } else if let Some(n) = self.bytes(numbers, 16, 3) {
+                // The bone is in the lower 12 bits.
+                let number = |k: usize| u16::from_le_bytes([n[(i * 4 + k) * 4], n[(i * 4 + k) * 4 + 1]]) & 0xFFF;
+                found.extend((0..4).map(|k| (w[i * 4 + k], number(k))));
+            }
+        }
+        found
+    }
+
+    fn shading(&self) -> Vec<[u8; 4]> {
+        self.bytes(COLOUR, 4, 28).map(|all| all.as_chunks::<4>().0.to_vec()).unwrap_or_default()
     }
 }
 

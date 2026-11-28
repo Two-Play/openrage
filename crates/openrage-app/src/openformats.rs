@@ -250,69 +250,60 @@ fn same_meshes(a: &OfDrawable, b: &OfDrawable) -> bool {
     })
 }
 
-fn import_drawable(
-    template: &Resource,
-    tpl: OfDrawable,
-    d: &OfDrawable,
-    options: ImportOptions,
-    mut notes: Vec<String>,
-) -> Result<Imported> {
-    // Shaders: the files' shader i is the game file's shader of that name,
-    // the same index when the names agree.
+/// The game file's shader `s` (the files' shader `i`): the same index when the names agree.
+fn shader_index(tpl: &OfDrawable, i: usize, s: &of::OfShader) -> Result<usize> {
+    match tpl.shaders.get(i) {
+        Some(t) if t.name.eq_ignore_ascii_case(&s.name) => Ok(i),
+        _ => tpl.shaders.iter().position(|t| t.name.eq_ignore_ascii_case(&s.name)).with_context(|| {
+            format!("shader {i} ({}.sps) is not one of the model's shaders; its shaders cannot be changed", s.name)
+        }),
+    }
+}
+
+fn same_param_value(a: &of::OfValue, b: &of::OfValue) -> bool {
+    match (a, b) {
+        (of::OfValue::Texture(a), of::OfValue::Texture(b)) => a.eq_ignore_ascii_case(b),
+        (of::OfValue::Floats(a), of::OfValue::Floats(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| close(*x, *y))
+        }
+        _ => false,
+    }
+}
+
+fn shader_params_differ(s: &of::OfShader, t: &of::OfShader) -> bool {
+    s.params.len() != t.params.len()
+        || s.params
+            .iter()
+            .any(|(n, v)| !t.params.iter().any(|(tn, tv)| tn.eq_ignore_ascii_case(n) && same_param_value(v, tv)))
+}
+
+/// Shaders: the files' shader i is the game file's shader of that name,
+/// the same index when the names agree.
+fn map_shaders(tpl: &OfDrawable, d: &OfDrawable, notes: &mut Vec<String>) -> Result<Vec<u16>> {
     let mut shader_map = Vec::new();
     for (i, s) in d.shaders.iter().enumerate() {
-        let index = match tpl.shaders.get(i) {
-            Some(t) if t.name.eq_ignore_ascii_case(&s.name) => i,
-            _ => tpl.shaders.iter().position(|t| t.name.eq_ignore_ascii_case(&s.name)).with_context(|| {
-                format!("shader {i} ({}.sps) is not one of the model's shaders; its shaders cannot be changed", s.name)
-            })?,
-        };
-        let t = &tpl.shaders[index];
-        let differs = s.params.len() != t.params.len()
-            || s.params.iter().any(|(n, v)| {
-                !t.params.iter().any(|(tn, tv)| {
-                    tn.eq_ignore_ascii_case(n)
-                        && match (v, tv) {
-                            (of::OfValue::Texture(a), of::OfValue::Texture(b)) => a.eq_ignore_ascii_case(b),
-                            (of::OfValue::Floats(a), of::OfValue::Floats(b)) => {
-                                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| close(*x, *y))
-                            }
-                            _ => false,
-                        }
-                })
-            });
-        if differs {
+        let index = shader_index(tpl, i, s)?;
+        if shader_params_differ(s, &tpl.shaders[index]) {
             notes.push(format!("shader {i} ({}): changed parameters are not imported, the model's stay", s.name));
         }
         shader_map.push(index as u16);
     }
-    let file_skel = d.skeleton.as_ref();
-    let tpl_skel = tpl.skeleton.as_ref();
-    if let (Some(a), Some(b)) = (file_skel, tpl_skel)
-        && (a.bones.len() != b.bones.len()
-            || a.bones.iter().zip(&b.bones).any(|(x, y)| x.tag != y.tag || x.name != y.name))
-    {
-        notes.push(format!("the skeleton is kept from the game file ({} bones)", b.bones.len()));
-    }
-    // A bone of the files' skeleton → the game file's (by tag, else name).
-    let bone_map = |i: usize| -> Option<usize> {
-        let (Some(fs), Some(ts)) = (file_skel, tpl_skel) else { return Some(i) };
-        let b = fs.bones.get(i)?;
-        ts.bones
-            .iter()
-            .position(|t| t.tag == b.tag && t.name.eq_ignore_ascii_case(&b.name))
-            .or_else(|| ts.bones.iter().position(|t| t.tag == b.tag))
-            .or_else(|| ts.bones.iter().position(|t| t.name.eq_ignore_ascii_case(&b.name)))
-    };
+    Ok(shader_map)
+}
 
-    let mut file = None;
-    if options.always_rebuild_meshes || !same_meshes(d, &tpl) {
-        file = Some(write_meshes(template, &tpl, d, &shader_map, &bone_map, &mut notes)?);
-    } else {
-        notes.push("the meshes are the game file's; they stay as they are".into());
-    }
+/// A bone of the files' skeleton → the game file's (by tag, else name).
+fn map_bone(file_skel: Option<&of::OfSkeleton>, tpl_skel: Option<&of::OfSkeleton>, i: usize) -> Option<usize> {
+    let (Some(fs), Some(ts)) = (file_skel, tpl_skel) else { return Some(i) };
+    let b = fs.bones.get(i)?;
+    ts.bones
+        .iter()
+        .position(|t| t.tag == b.tag && t.name.eq_ignore_ascii_case(&b.name))
+        .or_else(|| ts.bones.iter().position(|t| t.tag == b.tag))
+        .or_else(|| ts.bones.iter().position(|t| t.name.eq_ignore_ascii_case(&b.name)))
+}
 
-    // Embedded textures: changed and new ones go in by name.
+/// Embedded textures: the changed and new ones, renamed to the game file's spelling.
+fn changed_textures(tpl: &OfDrawable, d: &OfDrawable, notes: &mut Vec<String>) -> Vec<Texture> {
     let mut changed = Vec::new();
     for t in &d.textures {
         let mut t = t.texture.clone();
@@ -328,16 +319,59 @@ fn import_drawable(
             notes.push(format!("embedded texture {} is kept (shaders use textures by name)", o.texture.name));
         }
     }
+    changed
+}
+
+fn note_skeleton_kept(file_skel: Option<&of::OfSkeleton>, tpl_skel: Option<&of::OfSkeleton>, notes: &mut Vec<String>) {
+    if let (Some(a), Some(b)) = (file_skel, tpl_skel)
+        && (a.bones.len() != b.bones.len()
+            || a.bones.iter().zip(&b.bones).any(|(x, y)| x.tag != y.tag || x.name != y.name))
+    {
+        notes.push(format!("the skeleton is kept from the game file ({} bones)", b.bones.len()));
+    }
+}
+
+/// The embedded textures `changed` put into the rebuilt file (else the template).
+fn replace_textures(
+    template: &Resource,
+    file: Option<&[u8]>,
+    changed: &[Texture],
+    notes: &mut Vec<String>,
+) -> Result<Vec<u8>> {
+    let base = match file {
+        Some(f) => Resource::from_rsc7(f)?,
+        None => template.clone(),
+    };
+    notes.push(format!(
+        "embedded textures replaced: {}",
+        changed.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+    ));
+    Ok(ydr_write::replace_embedded_textures(&base, changed)?)
+}
+
+fn import_drawable(
+    template: &Resource,
+    tpl: OfDrawable,
+    d: &OfDrawable,
+    options: ImportOptions,
+    mut notes: Vec<String>,
+) -> Result<Imported> {
+    let shader_map = map_shaders(&tpl, d, &mut notes)?;
+    let file_skel = d.skeleton.as_ref();
+    let tpl_skel = tpl.skeleton.as_ref();
+    note_skeleton_kept(file_skel, tpl_skel, &mut notes);
+    let bone_map = |i: usize| map_bone(file_skel, tpl_skel, i);
+
+    let mut file = None;
+    if options.always_rebuild_meshes || !same_meshes(d, &tpl) {
+        file = Some(write_meshes(template, &tpl, d, &shader_map, &bone_map, &mut notes)?);
+    } else {
+        notes.push("the meshes are the game file's; they stay as they are".into());
+    }
+
+    let changed = changed_textures(&tpl, d, &mut notes);
     if !changed.is_empty() {
-        let base = match &file {
-            Some(f) => Resource::from_rsc7(f)?,
-            None => template.clone(),
-        };
-        notes.push(format!(
-            "embedded textures replaced: {}",
-            changed.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
-        ));
-        file = Some(ydr_write::replace_embedded_textures(&base, &changed)?);
+        file = Some(replace_textures(template, file.as_deref(), &changed, &mut notes)?);
     }
     if file.is_none() {
         notes.push("nothing differs from the game file".into());

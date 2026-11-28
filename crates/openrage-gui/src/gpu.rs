@@ -1381,302 +1381,414 @@ pub struct Around<'a> {
 /// Renders several models (each with its own placement and pose) and
 /// particles from `camera`, e.g. all actors of a cutscene.
 pub fn render_scene(items: &[SceneItem], around: &Around, camera: &Camera, w: u32, h: u32) -> Option<slint::Image> {
-    let &Around { lights, sprites, outdoors, live } = around;
     STATE.with(|state| {
         let mut st = state.borrow_mut();
-        let st = &mut *st;
-        let gpu = GPU.as_ref()?;
-        let (w, h) = (w.clamp(1, 8192), h.clamp(1, 8192));
+        render_in(&mut st, items, around, camera, (w, h))
+    })
+}
 
-        // Upload once per model; forget models that are gone. A scene places
-        // the same model many times: look models up by pointer, not by a scan
-        // of every uploaded model for every placement.
-        st.models.append(&mut READY.lock().unwrap_or_else(|e| e.into_inner()));
-        st.models.retain(|m| m.owner.strong_count() > 0);
-        let mut known: HashSet<*const crate::ModelPreview> = st.models.iter().map(|m| m.owner.as_ptr()).collect();
-        let new: Vec<&Arc<crate::ModelPreview>> =
-            items.iter().map(|item| item.preview).filter(|p| known.insert(Arc::as_ptr(p))).collect();
-        if !new.is_empty() {
-            st.models.extend(upload(gpu, new.into_iter().map(|p| build(gpu, p)).collect()));
-        }
+fn render_in(
+    st: &mut State,
+    items: &[SceneItem],
+    around: &Around,
+    camera: &Camera,
+    (w, h): (u32, u32),
+) -> Option<slint::Image> {
+    let &Around { lights, sprites, outdoors, live } = around;
+    let gpu = GPU.as_ref()?;
+    let (w, h) = (w.clamp(1, 8192), h.clamp(1, 8192));
+    sync_resources(gpu, st, items, sprites, (w, h));
+    let t = st.targets.as_mut()?;
 
-        st.sprite_textures.retain(|(owner, _)| owner.strong_count() > 0);
-        for sprite in sprites {
-            let ptr = Arc::as_ptr(&sprite.texture);
-            if !st.sprite_textures.iter().any(|(o, _)| o.as_ptr() == ptr) {
-                let t = &sprite.texture;
-                let view = upload_texture(&gpu.device, &gpu.queue, t.width, t.height, &t.rgba);
-                st.sprite_textures.push((Arc::downgrade(t), plain_bind_group(gpu, &view)));
-            }
-        }
-        if st.targets.as_ref().is_none_or(|t| t.size != (w, h)) {
-            st.targets = Some(targets(gpu, w, h));
-        }
-        let t = st.targets.as_mut()?;
+    let globals = scene_globals(camera, lights, outdoors, (w, h));
+    let globals_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("globals"),
+        contents: bytemuck::bytes_of(&globals),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let globals_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &gpu.globals_layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals_buffer.as_entire_binding() }],
+    });
 
-        let near = (camera.distance * 0.01).max(0.001);
-        let far = camera.distance + camera.radius * 4.0 + 1.0;
-        let mut gpu_lights = [<GpuLight as bytemuck::Zeroable>::zeroed(); MAX_LIGHTS];
-        for (slot, l) in gpu_lights.iter_mut().zip(lights) {
-            let (dir, cos) = match l.spot {
-                Some((d, cone)) => (d, (cone.to_radians() / 2.0).cos()),
-                None => ([0.0, 0.0, -1.0], -1.0),
-            };
-            *slot = GpuLight {
-                position: [l.position[0], l.position[1], l.position[2], l.range],
-                color: [l.color[0], l.color[1], l.color[2], if l.spot.is_some() { 1.0 } else { 0.0 }],
-                direction: [dir[0], dir[1], dir[2], cos],
-            };
+    let cull = Cull::new(camera, outdoors, &globals.view_proj, (w, h));
+    let shown = shown_draws(items, &st.models, &cull);
+    let instances: Vec<Instance> = shown.iter().map(|(_, i)| *i).collect();
+    let instance_buffer = vertex_buffer(gpu, "instances", &instances);
+
+    let rest_pose = &*st.rest_pose.get_or_insert_with(|| palette_group(gpu, None));
+    let skin_groups: Vec<Option<wgpu::BindGroup>> =
+        items.iter().map(|item| item.skin.map(|s| palette_group(gpu, Some(s)))).collect();
+
+    let (sprite_vertices, sprite_runs) = sprite_vertices(sprites, camera);
+    let sprite_buffer = vertex_buffer(gpu, "sprites", &sprite_vertices);
+    let mut encoder = gpu.device.create_command_encoder(&Default::default());
+    let frame = Frame {
+        gpu,
+        outdoors,
+        globals_group: &globals_group,
+        instance_buffer: instance_buffer.as_ref(),
+        shown: &shown,
+        models: &st.models,
+        skin_groups: &skin_groups,
+        rest_pose,
+        sprite_buffer: sprite_buffer.as_ref(),
+        sprite_runs: &sprite_runs,
+        sprite_textures: &st.sprite_textures,
+    };
+    record_pass(&mut encoder, t, &frame);
+    let here = t.pending.as_ref().map_or(0, |(_, other, _)| 1 - other);
+    let submitted = submit_readback(gpu, encoder, t, (w, h), here);
+    let taken = take_picture(gpu, t, here, submitted, live)?;
+    let pixels = read_pixels(t, taken, (w, h))?;
+    if t.pending.as_ref().is_none_or(|(_, kept, _)| *kept != taken) {
+        t.readback[taken].unmap();
+    }
+    Some(slint::Image::from_rgba8_premultiplied(pixels))
+}
+
+/// Uploads what the scene needs and is not there yet: models (forgetting
+/// those that are gone), particle textures and the render targets.
+fn sync_resources(gpu: &Gpu, st: &mut State, items: &[SceneItem], sprites: &[Sprite], (w, h): (u32, u32)) {
+    // Upload once per model; forget models that are gone. A scene places
+    // the same model many times: look models up by pointer, not by a scan
+    // of every uploaded model for every placement.
+    st.models.append(&mut READY.lock().unwrap_or_else(|e| e.into_inner()));
+    st.models.retain(|m| m.owner.strong_count() > 0);
+    let mut known: HashSet<*const crate::ModelPreview> = st.models.iter().map(|m| m.owner.as_ptr()).collect();
+    let new: Vec<&Arc<crate::ModelPreview>> =
+        items.iter().map(|item| item.preview).filter(|p| known.insert(Arc::as_ptr(p))).collect();
+    if !new.is_empty() {
+        st.models.extend(upload(gpu, new.into_iter().map(|p| build(gpu, p)).collect()));
+    }
+
+    st.sprite_textures.retain(|(owner, _)| owner.strong_count() > 0);
+    for sprite in sprites {
+        let ptr = Arc::as_ptr(&sprite.texture);
+        if !st.sprite_textures.iter().any(|(o, _)| o.as_ptr() == ptr) {
+            let t = &sprite.texture;
+            let view = upload_texture(&gpu.device, &gpu.queue, t.width, t.height, &t.rgba);
+            st.sprite_textures.push((Arc::downgrade(t), plain_bind_group(gpu, &view)));
         }
-        // How long the sides of the picture are, one away from the camera.
+    }
+    if st.targets.as_ref().is_none_or(|t| t.size != (w, h)) {
+        st.targets = Some(targets(gpu, w, h));
+    }
+}
+
+/// The lights of a scene in the layout the shader reads.
+fn gpu_lights(lights: &[SceneLight]) -> [GpuLight; MAX_LIGHTS] {
+    let mut gpu_lights = [<GpuLight as bytemuck::Zeroable>::zeroed(); MAX_LIGHTS];
+    for (slot, l) in gpu_lights.iter_mut().zip(lights) {
+        let (dir, cos) = match l.spot {
+            Some((d, cone)) => (d, (cone.to_radians() / 2.0).cos()),
+            None => ([0.0, 0.0, -1.0], -1.0),
+        };
+        *slot = GpuLight {
+            position: [l.position[0], l.position[1], l.position[2], l.range],
+            color: [l.color[0], l.color[1], l.color[2], if l.spot.is_some() { 1.0 } else { 0.0 }],
+            direction: [dir[0], dir[1], dir[2], cos],
+        };
+    }
+    gpu_lights
+}
+
+/// The shader's globals for one picture of `w` × `h`.
+fn scene_globals(camera: &Camera, lights: &[SceneLight], outdoors: Option<Outdoors>, (w, h): (u32, u32)) -> Globals {
+    let near = (camera.distance * 0.01).max(0.001);
+    let far = camera.distance + camera.radius * 4.0 + 1.0;
+    let gpu_lights = gpu_lights(lights);
+    // How long the sides of the picture are, one away from the camera.
+    let tan = (camera.fov / 2.0).tan();
+    let short = w.min(h) as f32;
+    let edge = |axis: [f32; 3], side: u32, last: f32| {
+        let reach = tan * side as f32 / short;
+        [axis[0] * reach, axis[1] * reach, axis[2] * reach, last]
+    };
+    let light = light_at(outdoors.map_or(12.0, |o| o.hour));
+    let wide = |v: [f32; 3], last: f32| [v[0], v[1], v[2], last];
+    Globals {
+        view_proj: view_projection(camera, w, h, near, far),
+        forward: [camera.forward[0], camera.forward[1], camera.forward[2], lights.len().min(MAX_LIGHTS) as f32],
+        lights: gpu_lights,
+        eye: [camera.eye[0], camera.eye[1], camera.eye[2], outdoors.map_or(0.0, |o| o.haze)],
+        right: edge(camera.right, w, if outdoors.is_some() { 1.0 } else { 0.0 }),
+        up: edge(camera.up, h, 0.0),
+        sun: wide(light.towards, outdoors.map_or(0.0, |o| o.seconds)),
+        sun_colour: wide(light.colour, light.lamps),
+        ambient: wide(light.ambient, outdoors.map_or(1.0, |o| o.brightness)),
+        zenith: wide(light.zenith, 0.0),
+        horizon: wide(light.horizon, 0.0),
+        below: wide(light.below, 0.0),
+    }
+}
+
+/// What decides whether a draw is left out of a scene as too far or outside the view.
+struct Cull<'a> {
+    camera: &'a Camera,
+    outdoors: Option<Outdoors>,
+    planes: [[f32; 4]; 6],
+    /// Pixels of something as large as it is far.
+    pixels: f32,
+}
+
+impl<'a> Cull<'a> {
+    fn new(camera: &'a Camera, outdoors: Option<Outdoors>, view_proj: &[f32; 16], (w, h): (u32, u32)) -> Self {
         let tan = (camera.fov / 2.0).tan();
         let short = w.min(h) as f32;
-        let edge = |axis: [f32; 3], side: u32, last: f32| {
-            let reach = tan * side as f32 / short;
-            [axis[0] * reach, axis[1] * reach, axis[2] * reach, last]
-        };
-        let light = light_at(outdoors.map_or(12.0, |o| o.hour));
-        let wide = |v: [f32; 3], last: f32| [v[0], v[1], v[2], last];
-        let globals = Globals {
-            view_proj: view_projection(camera, w, h, near, far),
-            forward: [camera.forward[0], camera.forward[1], camera.forward[2], lights.len().min(MAX_LIGHTS) as f32],
-            lights: gpu_lights,
-            eye: [camera.eye[0], camera.eye[1], camera.eye[2], outdoors.map_or(0.0, |o| o.haze)],
-            right: edge(camera.right, w, if outdoors.is_some() { 1.0 } else { 0.0 }),
-            up: edge(camera.up, h, 0.0),
-            sun: wide(light.towards, outdoors.map_or(0.0, |o| o.seconds)),
-            sun_colour: wide(light.colour, light.lamps),
-            ambient: wide(light.ambient, outdoors.map_or(1.0, |o| o.brightness)),
-            zenith: wide(light.zenith, 0.0),
-            horizon: wide(light.horizon, 0.0),
-            below: wide(light.below, 0.0),
-        };
-        let globals_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("globals"),
-            contents: bytemuck::bytes_of(&globals),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let globals_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &gpu.globals_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals_buffer.as_entire_binding() }],
-        });
+        Cull { camera, outdoors, planes: frustum_planes(view_proj), pixels: short / 2.0 / tan }
+    }
 
-        // Shown draws of every item with their colours (hidden parts and
-        // materials left out, and unskinned ones outside the view).
-        let model_of: HashMap<usize, usize> =
-            st.models.iter().enumerate().map(|(i, m)| (m.owner.as_ptr() as usize, i)).collect();
-        let planes = frustum_planes(&globals.view_proj);
-        // Pixels of something as large as it is far.
-        let pixels = short / 2.0 / tan;
-        let too_small = |model: &math::Mat4, (centre, radius): ([f32; 3], f32)| {
-            let c = math::transform_point(model, centre);
-            let far = (0..3).map(|k| (c[k] - camera.eye[k]).powi(2)).sum::<f32>().sqrt();
-            radius * scale_of(model) * pixels < SMALLEST * (far - radius).max(0.0)
-        };
-        // Whether it lies on others (those come last), the skinned item it is
-        // (or none), the model, the draw; the same ones are drawn together.
-        type Key = (bool, usize, usize, usize);
-        const NO_SKIN: usize = usize::MAX;
-        let models = &st.models;
-        let mut shown: Vec<(Key, Instance)> = items
-            .par_iter()
-            .enumerate()
-            .flat_map_iter(|(index, item)| {
-                let number = model_of.get(&(Arc::as_ptr(item.preview) as usize)).copied();
-                let draws = number.map_or(&[][..], |n| &models[n].draws[..]);
-                let skin = if item.skin.is_some() { index } else { NO_SKIN };
-                let (planes, too_small) = (&planes, &too_small);
-                draws.iter().enumerate().filter_map(move |(k, d)| {
-                    if !item.look.parts.get(d.part).copied().unwrap_or(false) {
-                        return None;
-                    }
-                    if item.skin.is_none()
-                        && (!sphere_visible(planes, &item.model, d.sphere)
-                            || (outdoors.is_some() && too_small(&item.model, d.sphere)))
-                    {
-                        return None;
-                    }
-                    let tint = item.preview.loaded.tint(item.look, d.drawable, d.shader)?;
-                    Some(((d.decal, skin, number?, k), Instance { model: item.model, tint }))
-                })
-            })
-            .collect();
-        shown.par_sort_unstable_by_key(|(key, _)| *key);
-        let instances: Vec<Instance> = shown.iter().map(|(_, i)| *i).collect();
-        let instance_buffer = (!instances.is_empty()).then(|| {
-            gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("instances"),
-                contents: bytemuck::cast_slice(&instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
-        });
+    fn too_small(&self, model: &math::Mat4, (centre, radius): ([f32; 3], f32)) -> bool {
+        let c = math::transform_point(model, centre);
+        let far = (0..3).map(|k| (c[k] - self.camera.eye[k]).powi(2)).sum::<f32>().sqrt();
+        radius * scale_of(model) * self.pixels < SMALLEST * (far - radius).max(0.0)
+    }
+}
 
-        // A bone palette per skinned item; the others share the rest pose.
-        let palette_group = |skin: Option<&[math::Mat4]>| {
-            let mut palette = vec![math::IDENTITY; gpu.bones];
-            for (slot, m) in palette.iter_mut().zip(skin.unwrap_or_default()) {
-                *slot = *m;
-            }
-            let buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("skin"),
-                contents: bytemuck::cast_slice(&palette),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &gpu.skin_layout,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
-            })
-        };
-        let rest_pose = &*st.rest_pose.get_or_insert_with(|| palette_group(None));
-        let skin_groups: Vec<Option<wgpu::BindGroup>> =
-            items.iter().map(|item| item.skin.map(|s| palette_group(Some(s)))).collect();
+// Whether it lies on others (those come last), the skinned item it is
+// (or none), the model, the draw; the same ones are drawn together.
+type Key = (bool, usize, usize, usize);
+const NO_SKIN: usize = usize::MAX;
 
-        let (sprite_vertices, sprite_runs) = sprite_vertices(sprites, camera);
-        let sprite_buffer = (!sprite_vertices.is_empty()).then(|| {
-            gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("sprites"),
-                contents: bytemuck::cast_slice(&sprite_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
-        });
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("model"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &t.msaa,
-                    depth_slice: None,
-                    resolve_target: Some(&t.resolve_view),
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Discard,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &t.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(0, &globals_group, &[]);
-            if let Some(buffer) = &instance_buffer {
-                pass.set_pipeline(&gpu.pipeline);
-                pass.set_vertex_buffer(1, buffer.slice(..));
-                let mut last = (None, None, None);
-                let mut first = 0;
-                let mut decals = false;
-                for run in shown.chunk_by(|a, b| a.0 == b.0) {
-                    let (decal, skin, number, k) = run[0].0;
-                    if decal && !decals {
-                        pass.set_pipeline(&gpu.decal);
-                        decals = true;
-                    }
-                    let model = &st.models[number];
-                    let d = &model.draws[k];
-                    // Only what changes is set.
-                    if last.0 != Some(skin) {
-                        let group = skin_groups.get(skin).and_then(Option::as_ref).unwrap_or(rest_pose);
-                        pass.set_bind_group(2, group, &[]);
-                    }
-                    if last.1 != Some(model.batch) {
-                        pass.set_vertex_buffer(0, model.vertices.slice(..));
-                        pass.set_index_buffer(model.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    }
-                    if last.2 != Some((number, d.texture)) {
-                        pass.set_bind_group(1, &model.textures[d.texture], &[]);
-                    }
-                    last = (Some(skin), Some(model.batch), Some((number, d.texture)));
-                    let count = run.len() as u32;
-                    pass.draw_indexed(d.indices.clone(), d.base_vertex, first..first + count);
-                    first += count;
-                }
-            }
-            if outdoors.is_some() {
-                pass.set_pipeline(&gpu.sky);
-                pass.draw(0..3, 0..1);
-                if outdoors.is_some_and(|o| o.sea) {
-                    pass.set_pipeline(&gpu.sea);
-                    pass.draw(0..4, 0..1);
-                }
-            }
-            // Particles last, over what they are in front of.
-            if let Some(buffer) = &sprite_buffer {
-                pass.set_vertex_buffer(0, buffer.slice(..));
-                for &(first, count, additive, texture) in &sprite_runs {
-                    let Some((_, group)) = st.sprite_textures.iter().find(|(o, _)| o.as_ptr() == texture) else {
-                        continue;
-                    };
-                    pass.set_pipeline(if additive { &gpu.sprite_add } else { &gpu.sprite_blend });
-                    pass.set_bind_group(1, group, &[]);
-                    let range = (first * 6) as u32..((first + count) * 6) as u32;
-                    pass.draw(range, 0..1);
-                }
-            }
-        }
-        let here = t.pending.as_ref().map_or(0, |(_, other, _)| 1 - other);
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &t.resolve,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &t.readback[here],
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(t.padded_row),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
-        let submitted = gpu.queue.submit([encoder.finish()]);
+/// Whether a draw of `item` is in view and large enough to be worth drawing.
+fn is_in_view(item: &SceneItem, d: &Draw, cull: &Cull) -> bool {
+    if item.skin.is_some() {
+        return true;
+    }
+    sphere_visible(&cull.planes, &item.model, d.sphere)
+        && !(cull.outdoors.is_some() && cull.too_small(&item.model, d.sphere))
+}
 
-        t.readback[here].map_async(wgpu::MapMode::Read, .., |_| {});
-        let wait = |index: &wgpu::SubmissionIndex| {
-            let wait = wgpu::PollType::Wait { submission_index: Some(index.clone()), timeout: None };
-            gpu.device.poll(wait).ok()
-        };
-        // While things move, the picture before is taken: it is there by now,
-        // and the graphics card works while the next one is put together.
-        let before = t.pending.take();
-        let taken = match (live, before) {
-            (Some(id), Some((of, other, index))) if of == id => {
-                wait(&index)?;
-                t.pending = Some((id, here, submitted));
-                other
-            }
-            (_, before) => {
-                wait(&submitted)?;
-                if let Some((_, other, _)) = before {
-                    t.readback[other].unmap();
+/// Shown draws of every item with their colours (hidden parts and
+/// materials left out, and unskinned ones outside the view), sorted by key.
+fn shown_draws(items: &[SceneItem], models: &[GpuModel], cull: &Cull) -> Vec<(Key, Instance)> {
+    let model_of: HashMap<usize, usize> =
+        models.iter().enumerate().map(|(i, m)| (m.owner.as_ptr() as usize, i)).collect();
+    let mut shown: Vec<(Key, Instance)> = items
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(index, item)| {
+            let number = model_of.get(&(Arc::as_ptr(item.preview) as usize)).copied();
+            let draws = number.map_or(&[][..], |n| &models[n].draws[..]);
+            let skin = if item.skin.is_some() { index } else { NO_SKIN };
+            draws.iter().enumerate().filter_map(move |(k, d)| {
+                if !item.look.parts.get(d.part).copied().unwrap_or(false) || !is_in_view(item, d, cull) {
+                    return None;
                 }
-                // The first of several is shown twice.
-                t.pending = live.map(|id| (id, here, submitted));
-                here
-            }
-        };
-        let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
-        {
-            let data = t.readback[taken].get_mapped_range(..).ok()?;
-            let out = pixels.make_mut_bytes();
-            let row = (4 * w) as usize;
-            for y in 0..h as usize {
-                let src = y * t.padded_row as usize;
-                out[y * row..(y + 1) * row].copy_from_slice(&data[src..src + row]);
-            }
-        }
-        if t.pending.as_ref().is_none_or(|(_, kept, _)| *kept != taken) {
-            t.readback[taken].unmap();
-        }
-        Some(slint::Image::from_rgba8_premultiplied(pixels))
+                let tint = item.preview.loaded.tint(item.look, d.drawable, d.shader)?;
+                Some(((d.decal, skin, number?, k), Instance { model: item.model, tint }))
+            })
+        })
+        .collect();
+    shown.par_sort_unstable_by_key(|(key, _)| *key);
+    shown
+}
+
+/// A vertex buffer holding `data`; `None` if there is nothing.
+fn vertex_buffer<T: bytemuck::NoUninit>(gpu: &Gpu, label: &str, data: &[T]) -> Option<wgpu::Buffer> {
+    (!data.is_empty()).then(|| {
+        gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(data),
+            usage: wgpu::BufferUsages::VERTEX,
+        })
     })
+}
+
+/// A bone palette per skinned item; the others share the rest pose.
+fn palette_group(gpu: &Gpu, skin: Option<&[math::Mat4]>) -> wgpu::BindGroup {
+    let mut palette = vec![math::IDENTITY; gpu.bones];
+    for (slot, m) in palette.iter_mut().zip(skin.unwrap_or_default()) {
+        *slot = *m;
+    }
+    let buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("skin"),
+        contents: bytemuck::cast_slice(&palette),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &gpu.skin_layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+    })
+}
+
+/// Everything the render pass of a scene draws from.
+struct Frame<'a> {
+    gpu: &'a Gpu,
+    outdoors: Option<Outdoors>,
+    globals_group: &'a wgpu::BindGroup,
+    instance_buffer: Option<&'a wgpu::Buffer>,
+    shown: &'a [(Key, Instance)],
+    models: &'a [GpuModel],
+    skin_groups: &'a [Option<wgpu::BindGroup>],
+    rest_pose: &'a wgpu::BindGroup,
+    sprite_buffer: Option<&'a wgpu::Buffer>,
+    sprite_runs: &'a [SpriteRun],
+    sprite_textures: &'a [(Weak<Image>, wgpu::BindGroup)],
+}
+
+fn record_pass(encoder: &mut wgpu::CommandEncoder, t: &Targets, frame: &Frame) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("model"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &t.msaa,
+            depth_slice: None,
+            resolve_target: Some(&t.resolve_view),
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Discard,
+            },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: &t.depth,
+            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_bind_group(0, frame.globals_group, &[]);
+    if let Some(buffer) = frame.instance_buffer {
+        draw_models(&mut pass, frame, buffer);
+    }
+    if frame.outdoors.is_some() {
+        pass.set_pipeline(&frame.gpu.sky);
+        pass.draw(0..3, 0..1);
+        if frame.outdoors.is_some_and(|o| o.sea) {
+            pass.set_pipeline(&frame.gpu.sea);
+            pass.draw(0..4, 0..1);
+        }
+    }
+    // Particles last, over what they are in front of.
+    if let Some(buffer) = frame.sprite_buffer {
+        draw_sprites(&mut pass, frame, buffer);
+    }
+}
+
+fn draw_models(pass: &mut wgpu::RenderPass, frame: &Frame, buffer: &wgpu::Buffer) {
+    pass.set_pipeline(&frame.gpu.pipeline);
+    pass.set_vertex_buffer(1, buffer.slice(..));
+    let mut last = (None, None, None);
+    let mut first = 0;
+    let mut decals = false;
+    for run in frame.shown.chunk_by(|a, b| a.0 == b.0) {
+        let (decal, skin, number, k) = run[0].0;
+        if decal && !decals {
+            pass.set_pipeline(&frame.gpu.decal);
+            decals = true;
+        }
+        let model = &frame.models[number];
+        let d = &model.draws[k];
+        // Only what changes is set.
+        if last.0 != Some(skin) {
+            let group = frame.skin_groups.get(skin).and_then(Option::as_ref).unwrap_or(frame.rest_pose);
+            pass.set_bind_group(2, group, &[]);
+        }
+        if last.1 != Some(model.batch) {
+            pass.set_vertex_buffer(0, model.vertices.slice(..));
+            pass.set_index_buffer(model.indices.slice(..), wgpu::IndexFormat::Uint32);
+        }
+        if last.2 != Some((number, d.texture)) {
+            pass.set_bind_group(1, &model.textures[d.texture], &[]);
+        }
+        last = (Some(skin), Some(model.batch), Some((number, d.texture)));
+        let count = run.len() as u32;
+        pass.draw_indexed(d.indices.clone(), d.base_vertex, first..first + count);
+        first += count;
+    }
+}
+
+fn draw_sprites(pass: &mut wgpu::RenderPass, frame: &Frame, buffer: &wgpu::Buffer) {
+    pass.set_vertex_buffer(0, buffer.slice(..));
+    for &(first, count, additive, texture) in frame.sprite_runs {
+        let Some((_, group)) = frame.sprite_textures.iter().find(|(o, _)| o.as_ptr() == texture) else {
+            continue;
+        };
+        pass.set_pipeline(if additive { &frame.gpu.sprite_add } else { &frame.gpu.sprite_blend });
+        pass.set_bind_group(1, group, &[]);
+        let range = (first * 6) as u32..((first + count) * 6) as u32;
+        pass.draw(range, 0..1);
+    }
+}
+
+/// Copies the rendered picture into readback buffer `here` and submits.
+fn submit_readback(
+    gpu: &Gpu,
+    mut encoder: wgpu::CommandEncoder,
+    t: &Targets,
+    (w, h): (u32, u32),
+    here: usize,
+) -> wgpu::SubmissionIndex {
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &t.resolve,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &t.readback[here],
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(t.padded_row),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+    );
+    gpu.queue.submit([encoder.finish()])
+}
+
+/// Waits for a picture and returns the readback buffer to take it from.
+fn take_picture(
+    gpu: &Gpu,
+    t: &mut Targets,
+    here: usize,
+    submitted: wgpu::SubmissionIndex,
+    live: Option<u64>,
+) -> Option<usize> {
+    t.readback[here].map_async(wgpu::MapMode::Read, .., |_| {});
+    let wait = |index: &wgpu::SubmissionIndex| {
+        let wait = wgpu::PollType::Wait { submission_index: Some(index.clone()), timeout: None };
+        gpu.device.poll(wait).ok()
+    };
+    // While things move, the picture before is taken: it is there by now,
+    // and the graphics card works while the next one is put together.
+    let before = t.pending.take();
+    match (live, before) {
+        (Some(id), Some((of, other, index))) if of == id => {
+            wait(&index)?;
+            t.pending = Some((id, here, submitted));
+            Some(other)
+        }
+        (_, before) => {
+            wait(&submitted)?;
+            if let Some((_, other, _)) = before {
+                t.readback[other].unmap();
+            }
+            // The first of several is shown twice.
+            t.pending = live.map(|id| (id, here, submitted));
+            Some(here)
+        }
+    }
+}
+
+/// The pixels of readback buffer `taken`, without the row padding.
+fn read_pixels(t: &Targets, taken: usize, (w, h): (u32, u32)) -> Option<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
+    let mut pixels = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(w, h);
+    let data = t.readback[taken].get_mapped_range(..).ok()?;
+    let out = pixels.make_mut_bytes();
+    let row = (4 * w) as usize;
+    for y in 0..h as usize {
+        let src = y * t.padded_row as usize;
+        out[y * row..(y + 1) * row].copy_from_slice(&data[src..src + row]);
+    }
+    drop(data);
+    Some(pixels)
 }
 
 /// Releases all GPU resources. Must run before the program exits: wgpu's own

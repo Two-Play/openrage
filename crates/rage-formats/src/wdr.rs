@@ -26,7 +26,7 @@
 use rage_resource::{Resource, ResourceError};
 
 use crate::drawable::{
-    Bone, Drawable, Encoding, Fragment, FragmentChild, Mesh, Shader, Skeleton, bad, legacy_layout, vec3,
+    Bone, Drawable, Encoding, Fragment, FragmentChild, Mesh, Shader, Skeleton, VertexLayout, bad, legacy_layout, vec3,
 };
 use crate::ytd;
 
@@ -58,66 +58,112 @@ fn pointer_list(res: &Resource, header: u64) -> Result<Vec<u64>, ResourceError> 
     (0..count).map(|i| ptr(res, list + i * 4)).collect()
 }
 
-fn read_geometry(res: &Resource, g: u64) -> Result<Mesh, ResourceError> {
-    let vb = ptr(res, g + 0x0C)?;
-    let ib = ptr(res, g + 0x1C)?;
+/// The vertex data of a geometry with its layout.
+struct Vertices<'a> {
+    layout: &'a VertexLayout,
+    bytes: &'a [u8],
+    stride: usize,
+}
+
+impl Vertices<'_> {
+    /// Decodes the part of vertex `i` in `slot`, if the layout has it inside the vertex.
+    fn attr(&self, slot: Option<(usize, Encoding)>, i: usize) -> Option<[f32; 4]> {
+        slot.filter(|(o, e)| o + e.size() <= self.stride).map(|(o, e)| e.decode(&self.bytes[i * self.stride + o..]))
+    }
+
+    /// Appends vertex `i`, whose position is stored at `pos`, to `mesh`.
+    fn push(&self, mesh: &mut Mesh, pos: (usize, Encoding), i: usize) {
+        let layout = self.layout;
+        let p = pos.1.decode(&self.bytes[i * self.stride + pos.0..]);
+        mesh.positions.push([p[0], p[1], p[2]]);
+        if let Some(n) = self.attr(layout.normal, i) {
+            mesh.normals.push([n[0], n[1], n[2]]);
+        }
+        if let Some(t) = self.attr(layout.uv, i) {
+            mesh.uvs.push([t[0], t[1]]);
+        }
+        if let Some(t) = self.attr(layout.uv1, i) {
+            mesh.uvs1.push([t[0], t[1]]);
+        }
+        if let Some(c) = self.attr(layout.color, i) {
+            mesh.colors.push(c);
+        }
+        if let (Some(w), Some(b)) = (self.attr(layout.weights, i), self.attr(layout.indices, i)) {
+            mesh.bone_weights.push(w);
+            mesh.bone_indices.push(b.map(|v| v as u16));
+        }
+    }
+
+    /// A mesh with the positions and the attributes of `count` vertices (no indices yet).
+    fn mesh(&self, count: usize) -> Result<Mesh, ResourceError> {
+        let pos = self.layout.position.ok_or_else(|| bad("vertices without positions"))?;
+        if pos.0 + pos.1.size() > self.stride {
+            return Err(bad("position outside vertex"));
+        }
+        let mut mesh = Mesh::default();
+        for i in 0..count {
+            self.push(&mut mesh, pos, i);
+        }
+        Ok(mesh)
+    }
+}
+
+/// Blend indices point into the geometry's bone table (skeleton indices).
+fn map_bone_indices(res: &Resource, g: u64, mesh: &mut Mesh) -> Result<(), ResourceError> {
+    if mesh.bone_indices.is_empty() {
+        return Ok(());
+    }
+    let table = ptr(res, g + 0x38)?;
+    let n = res.u16(g + 0x3E)? as u64;
+    if valid(res, table) && n > 0 && n <= 1024 {
+        let ids: Vec<u16> = (0..n).map(|i| res.u16(table + i * 2)).collect::<Result<_, _>>()?;
+        for b in &mut mesh.bone_indices {
+            *b = b.map(|i| ids.get(i as usize).copied().unwrap_or(0));
+        }
+    }
+    Ok(())
+}
+
+/// The triangle indices of the index buffer at `ib`, none reaching `vertex_count`.
+fn read_indices(res: &Resource, ib: u64, vertex_count: usize) -> Result<Vec<u32>, ResourceError> {
+    let index_count = res.u32(ib + 0x04)? as usize;
+    let ib_bytes = res.bytes(ptr(res, ib + 0x08)?, index_count * 2)?;
+    let indices: Vec<u32> = ib_bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c) as u32).collect();
+    if indices.iter().any(|&i| i as usize >= vertex_count) {
+        return Err(bad("index outside the vertex buffer"));
+    }
+    Ok(indices)
+}
+
+/// The vertex declaration at `vb + 0x10`, for vertices of `stride` bytes.
+fn read_layout(res: &Resource, vb: u64, stride: usize) -> Result<VertexLayout, ResourceError> {
+    let mut layout = legacy_layout(res, ptr(res, vb + 0x10)?, stride)?;
+    // Blend indices are stored as plain bytes.
+    if let Some((o, Encoding::Unorm8x4)) = layout.indices {
+        layout.indices = Some((o, Encoding::Uint8x4));
+    }
+    Ok(layout)
+}
+
+/// The vertices of the vertex buffer at `vb` as a mesh without indices, and their number.
+fn read_vertices(res: &Resource, vb: u64) -> Result<(Mesh, usize), ResourceError> {
     let count = res.u16(vb + 0x04)? as usize;
     let data = ptr(res, vb + 0x08)?;
     let stride = res.u32(vb + 0x0C)? as usize;
     if stride == 0 || stride > 256 {
         return Err(bad("implausible vertex buffer"));
     }
-    let mut layout = legacy_layout(res, ptr(res, vb + 0x10)?, stride)?;
-    // Blend indices are stored as plain bytes.
-    if let Some((o, Encoding::Unorm8x4)) = layout.indices {
-        layout.indices = Some((o, Encoding::Uint8x4));
-    }
+    let layout = read_layout(res, vb, stride)?;
     let bytes = res.bytes(data, count * stride)?;
-    let (pos_off, pos_enc) = layout.position.ok_or_else(|| bad("vertices without positions"))?;
-    let attr = |slot: Option<(usize, Encoding)>, i: usize| {
-        slot.filter(|(o, e)| o + e.size() <= stride).map(|(o, e)| e.decode(&bytes[i * stride + o..]))
-    };
-    if pos_off + pos_enc.size() > stride {
-        return Err(bad("position outside vertex"));
-    }
-    let mut mesh = Mesh::default();
-    for i in 0..count {
-        let p = pos_enc.decode(&bytes[i * stride + pos_off..]);
-        mesh.positions.push([p[0], p[1], p[2]]);
-        if let Some(n) = attr(layout.normal, i) {
-            mesh.normals.push([n[0], n[1], n[2]]);
-        }
-        if let Some(t) = attr(layout.uv, i) {
-            mesh.uvs.push([t[0], t[1]]);
-        }
-        if let Some(t) = attr(layout.uv1, i) {
-            mesh.uvs1.push([t[0], t[1]]);
-        }
-        if let Some(c) = attr(layout.color, i) {
-            mesh.colors.push(c);
-        }
-        if let (Some(w), Some(b)) = (attr(layout.weights, i), attr(layout.indices, i)) {
-            mesh.bone_weights.push(w);
-            mesh.bone_indices.push(b.map(|v| v as u16));
-        }
-    }
-    // Blend indices point into the geometry's bone table (skeleton indices).
-    if !mesh.bone_indices.is_empty() {
-        let table = ptr(res, g + 0x38)?;
-        let n = res.u16(g + 0x3E)? as u64;
-        if valid(res, table) && n > 0 && n <= 1024 {
-            let ids: Vec<u16> = (0..n).map(|i| res.u16(table + i * 2)).collect::<Result<_, _>>()?;
-            for b in &mut mesh.bone_indices {
-                *b = b.map(|i| ids.get(i as usize).copied().unwrap_or(0));
-            }
-        }
-    }
-    let index_count = res.u32(ib + 0x04)? as usize;
-    let ib_bytes = res.bytes(ptr(res, ib + 0x08)?, index_count * 2)?;
-    mesh.indices = ib_bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c) as u32).collect();
-    if mesh.indices.iter().any(|&i| i as usize >= count) {
-        return Err(bad("index outside the vertex buffer"));
-    }
+    Ok((Vertices { layout: &layout, bytes, stride }.mesh(count)?, count))
+}
+
+fn read_geometry(res: &Resource, g: u64) -> Result<Mesh, ResourceError> {
+    let vb = ptr(res, g + 0x0C)?;
+    let ib = ptr(res, g + 0x1C)?;
+    let (mut mesh, count) = read_vertices(res, vb)?;
+    map_bone_indices(res, g, &mut mesh)?;
+    mesh.indices = read_indices(res, ib, count)?;
     mesh.indices.truncate(mesh.indices.len() / 3 * 3);
     Ok(mesh)
 }

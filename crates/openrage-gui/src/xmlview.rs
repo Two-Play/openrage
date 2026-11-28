@@ -149,29 +149,8 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
         }
     };
     let Ok(win) = XmlWindow::new() else { return };
-    let name = vpath.rsplit('/').next().unwrap_or(&vpath).to_owned();
-    win.set_theme_mode(ui.get_theme_mode());
-    crate::accent::apply(&win);
-    win.set_mono_font(ui.get_mono_font());
-    win.set_heading(name.clone().into());
-    win.set_path(vpath.clone().into());
-    let mut summary = format!("{} · {}", xml.encoding.name(), vpath);
-    if !xml.errors.is_empty() {
-        summary = format!("{} unreadable parts · {summary}", xml.errors.len());
-    }
-    win.set_summary(summary.into());
-    let line_count = xml.text.lines().count();
     let nodes = tree.count();
-    win.set_status(format!("{nodes} structures · {line_count} lines of XML").into());
-    win.set_cutscene_summary(
-        format!(
-            "{} · stored as {} · {nodes} structures · {line_count} lines of XML{}",
-            xml.root.as_deref().unwrap_or("Metadata"),
-            xml.encoding.name(),
-            if xml.errors.is_empty() { String::new() } else { format!(" · {} unreadable parts", xml.errors.len()) }
-        )
-        .into(),
-    );
+    describe(&win, ui, &vpath, &xml, nodes);
 
     let mut entries = Vec::with_capacity(nodes);
     flatten(&tree, 0, &mut entries);
@@ -182,13 +161,66 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
     }
     let state = Rc::new(RefCell::new(State { entries, expanded, shown: Vec::new(), filter: String::new() }));
 
+    wire_map_and_cast(&win, ui, &vpath, &xml);
+    let lines: Vec<String> = xml.text.lines().map(|l| l.replace('\t', "    ")).collect();
+    win.set_lines(ModelRc::new(Lines { lines }));
+
+    let refresh = refresher(&win, &state);
+    let show_fields = field_shower(&win, &state);
+    refresh();
+    show_fields(0);
+    wire_tree(&win, &state, &refresh, &show_fields);
+
+    let (main, p) = (ui.as_weak(), vpath.clone());
+    win.on_export_xml(move || {
+        if let Some(ui) = main.upgrade() {
+            crate::export_xml(&ui, p.clone());
+        }
+    });
+    // XML stored as text is edited as the file itself; converted XML is read-only.
+    let plain = xml.encoding == openrage_app::metadata::Encoding::Text;
+    win.set_plain_text(plain);
+    let text = Rc::new(xml.text.clone());
+    wire_copy_actions(&win, &state, &text);
+    wire_open_text(&win, ui, vpath, text, (plain, xml.encoding.name()));
+    show_window(win);
+}
+
+/// The window's title, path and summary lines.
+fn describe(win: &XmlWindow, ui: &AppWindow, vpath: &str, xml: &Xml, nodes: usize) {
+    let name = vpath.rsplit('/').next().unwrap_or(vpath).to_owned();
+    win.set_theme_mode(ui.get_theme_mode());
+    crate::accent::apply(win);
+    win.set_mono_font(ui.get_mono_font());
+    win.set_heading(name.into());
+    win.set_path(vpath.to_owned().into());
+    let mut summary = format!("{} · {}", xml.encoding.name(), vpath);
+    if !xml.errors.is_empty() {
+        summary = format!("{} unreadable parts · {summary}", xml.errors.len());
+    }
+    win.set_summary(summary.into());
+    let line_count = xml.text.lines().count();
+    win.set_status(format!("{nodes} structures · {line_count} lines of XML").into());
+    win.set_cutscene_summary(
+        format!(
+            "{} · stored as {} · {nodes} structures · {line_count} lines of XML{}",
+            xml.root.as_deref().unwrap_or("Metadata"),
+            xml.encoding.name(),
+            if xml.errors.is_empty() { String::new() } else { format!(" · {} unreadable parts", xml.errors.len()) }
+        )
+        .into(),
+    );
+}
+
+/// The map button of map files, and the cast of cutscenes.
+fn wire_map_and_cast(win: &XmlWindow, ui: &AppWindow, vpath: &str, xml: &Xml) {
     // Map files of GTA V and VI: their objects in a 3D scene.
     let lower = vpath.to_ascii_lowercase();
     if (lower.ends_with(".ymap") || lower.ends_with(".#map"))
         && !crate::with_app(|a| a.game_dir.as_deref().is_some_and(crate::is_rdr2_dir))
     {
         win.set_is_map(true);
-        let (main, path) = (ui.as_weak(), vpath.clone());
+        let (main, path) = (ui.as_weak(), vpath.to_owned());
         win.on_show_map(move || {
             if let Some(ui) = main.upgrade() {
                 crate::scene::open_map(&ui, path.clone());
@@ -198,44 +230,51 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
     if vpath.to_ascii_lowercase().ends_with(".cut")
         && let Ok(cut) = openrage_app::cutscene::from_xml(&xml.text)
     {
-        show_cast(&win, ui, &vpath, cut);
+        show_cast(win, ui, vpath, cut);
     }
-    let lines: Vec<String> = xml.text.lines().map(|l| l.replace('\t', "    ")).collect();
-    win.set_lines(ModelRc::new(Lines { lines }));
+}
 
-    let refresh = {
-        let (w, state) = (win.as_weak(), Rc::clone(&state));
-        move || {
-            let Some(win) = w.upgrade() else { return };
-            let selected_id = {
-                let s = state.borrow();
-                usize::try_from(win.get_selected_node()).ok().and_then(|r| s.shown.get(r).copied())
-            };
-            let rows = state.borrow_mut().rows();
-            win.set_nodes(ModelRc::new(VecModel::from(rows)));
-            // Keep the same node selected if it is still shown.
-            let row = selected_id.and_then(|id| state.borrow().shown.iter().position(|&s| s == id));
-            win.set_selected_node(row.map_or(-1, |r| r as i32));
-        }
-    };
-    let show_fields = {
-        let (w, state) = (win.as_weak(), Rc::clone(&state));
-        move |row: i32| {
-            let Some(win) = w.upgrade() else { return };
+/// Refills the node list from the state, keeping the selected node if it is still shown.
+fn refresher(win: &XmlWindow, state: &Rc<RefCell<State>>) -> impl Fn() + Clone + use<> {
+    let (w, state) = (win.as_weak(), Rc::clone(state));
+    move || {
+        let Some(win) = w.upgrade() else { return };
+        let selected_id = {
             let s = state.borrow();
-            let Some(&id) = usize::try_from(row).ok().and_then(|r| s.shown.get(r)) else { return };
-            let e = &s.entries[id];
-            win.set_selected_node(row);
-            win.set_node_title(e.label.clone().into());
-            let fields: Vec<InfoRow> =
-                e.fields.iter().map(|(k, v)| InfoRow { key: k.clone().into(), value: v.clone().into() }).collect();
-            win.set_fields(ModelRc::new(VecModel::from(fields)));
-        }
-    };
-    refresh();
-    show_fields(0);
+            usize::try_from(win.get_selected_node()).ok().and_then(|r| s.shown.get(r).copied())
+        };
+        let rows = state.borrow_mut().rows();
+        win.set_nodes(ModelRc::new(VecModel::from(rows)));
+        // Keep the same node selected if it is still shown.
+        let row = selected_id.and_then(|id| state.borrow().shown.iter().position(|&s| s == id));
+        win.set_selected_node(row.map_or(-1, |r| r as i32));
+    }
+}
 
-    let (st, r) = (Rc::clone(&state), refresh.clone());
+/// Selects a row and shows the fields of its node.
+fn field_shower(win: &XmlWindow, state: &Rc<RefCell<State>>) -> impl Fn(i32) + Clone + use<> {
+    let (w, state) = (win.as_weak(), Rc::clone(state));
+    move |row: i32| {
+        let Some(win) = w.upgrade() else { return };
+        let s = state.borrow();
+        let Some(&id) = usize::try_from(row).ok().and_then(|r| s.shown.get(r)) else { return };
+        let e = &s.entries[id];
+        win.set_selected_node(row);
+        win.set_node_title(e.label.clone().into());
+        let fields: Vec<InfoRow> =
+            e.fields.iter().map(|(k, v)| InfoRow { key: k.clone().into(), value: v.clone().into() }).collect();
+        win.set_fields(ModelRc::new(VecModel::from(fields)));
+    }
+}
+
+/// Expanding, selecting and filtering nodes.
+fn wire_tree(
+    win: &XmlWindow,
+    state: &Rc<RefCell<State>>,
+    refresh: &(impl Fn() + Clone + 'static),
+    show_fields: &(impl Fn(i32) + Clone + 'static),
+) {
+    let (st, r) = (Rc::clone(state), refresh.clone());
     win.on_toggle(move |row| {
         let id = { st.borrow().shown.get(row as usize).copied() };
         if let Some(id) = id {
@@ -248,13 +287,13 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
     });
     let f = show_fields.clone();
     win.on_select(f);
-    let (st, r, f) = (Rc::clone(&state), refresh.clone(), show_fields.clone());
+    let (st, r, f) = (Rc::clone(state), refresh.clone(), show_fields.clone());
     win.on_filter_edited(move |text: SharedString| {
         st.borrow_mut().filter = text.trim().to_lowercase();
         r();
         f(0);
     });
-    let (st, r) = (Rc::clone(&state), refresh.clone());
+    let (st, r) = (Rc::clone(state), refresh.clone());
     win.on_expand_all(move |open| {
         {
             let mut s = st.borrow_mut();
@@ -268,16 +307,10 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
         }
         r();
     });
-    let (main, p) = (ui.as_weak(), vpath.clone());
-    win.on_export_xml(move || {
-        if let Some(ui) = main.upgrade() {
-            crate::export_xml(&ui, p.clone());
-        }
-    });
-    // XML stored as text is edited as the file itself; converted XML is read-only.
-    let plain = xml.encoding == openrage_app::metadata::Encoding::Text;
-    win.set_plain_text(plain);
-    let text = Rc::new(xml.text.clone());
+}
+
+/// The copy callbacks of the node list and the raw text.
+fn wire_copy_actions(win: &XmlWindow, state: &Rc<RefCell<State>>, text: &Rc<String>) {
     let w = win.as_weak();
     win.on_copy_text(move |t: SharedString| {
         let msg = copy(t.as_str());
@@ -285,7 +318,22 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
             win.set_status(msg.into());
         }
     });
-    let (w, st, t) = (win.as_weak(), Rc::clone(&state), Rc::clone(&text));
+    wire_node_action(win, state, text);
+    let (w, t) = (win.as_weak(), Rc::clone(text));
+    win.on_line_action(move |row, action: SharedString| {
+        let Some(win) = w.upgrade() else { return };
+        let msg = match action.as_str() {
+            "copy" => copy(t.lines().nth(row as usize).unwrap_or_default()),
+            "copy-all" => copy(&t),
+            _ => return,
+        };
+        win.set_status(msg.into());
+    });
+}
+
+/// What the context menu of a node does.
+fn wire_node_action(win: &XmlWindow, state: &Rc<RefCell<State>>, text: &Rc<String>) {
+    let (w, st, t) = (win.as_weak(), Rc::clone(state), Rc::clone(text));
     win.on_node_action(move |row, action: SharedString| {
         let Some(win) = w.upgrade() else { return };
         let s = st.borrow();
@@ -307,18 +355,17 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
             _ => {}
         }
     });
-    let (w, t) = (win.as_weak(), Rc::clone(&text));
-    win.on_line_action(move |row, action: SharedString| {
-        let Some(win) = w.upgrade() else { return };
-        let msg = match action.as_str() {
-            "copy" => copy(t.lines().nth(row as usize).unwrap_or_default()),
-            "copy-all" => copy(&t),
-            _ => return,
-        };
-        win.set_status(msg.into());
-    });
+}
+
+/// Opens the XML as text: edited as the file itself if `plain`, else as a converted document.
+fn wire_open_text(
+    win: &XmlWindow,
+    ui: &AppWindow,
+    vpath: String,
+    text: Rc<String>,
+    (plain, format): (bool, &'static str),
+) {
     let main = ui.as_weak();
-    let format = xml.encoding.name();
     win.on_open_text(move || {
         if let Some(ui) = main.upgrade() {
             if plain {
@@ -328,6 +375,10 @@ pub fn open(ui: &AppWindow, vpath: String, xml: Xml) {
             }
         }
     });
+}
+
+/// Shows the window and keeps it alive until it is closed.
+fn show_window(win: XmlWindow) {
     let id = NEXT_ID.with(|n| {
         n.set(n.get() + 1);
         n.get()

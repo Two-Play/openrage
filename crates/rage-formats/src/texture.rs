@@ -128,46 +128,50 @@ impl Format {
     }
 
     pub fn name(self) -> String {
-        let n = match self.0 {
-            2 => "R32G32B32A32_FLOAT",
-            10 => "R16G16B16A16_FLOAT",
-            11 => "R16G16B16A16_UNORM",
-            24 => "R10G10B10A2_UNORM",
-            26 => "R11G11B10_FLOAT",
-            28 => "R8G8B8A8_UNORM",
-            29 => "R8G8B8A8_UNORM_SRGB",
-            35 => "R16G16_UNORM",
-            41 => "R32_FLOAT",
-            49 => "R8G8_UNORM",
-            54 => "R16_FLOAT",
-            56 => "R16_UNORM",
-            61 => "R8_UNORM",
-            65 => "A8_UNORM",
-            71 => "BC1",
-            72 => "BC1_SRGB",
-            74 => "BC2",
-            75 => "BC2_SRGB",
-            77 => "BC3",
-            78 => "BC3_SRGB",
-            80 => "BC4",
-            81 => "BC4_SNORM",
-            83 => "BC5",
-            84 => "BC5_SNORM",
-            85 => "B5G6R5",
-            86 => "B5G5R5A1",
-            87 => "B8G8R8A8",
-            88 => "B8G8R8X8",
-            91 => "B8G8R8A8_SRGB",
-            95 => "BC6H_UF16",
-            96 => "BC6H_SF16",
-            98 => "BC7",
-            99 => "BC7_SRGB",
-            115 => "B4G4R4A4",
-            other => return format!("DXGI {other}"),
-        };
-        n.to_owned()
+        match FORMAT_NAMES.iter().find(|(code, _)| *code == self.0) {
+            Some((_, n)) => (*n).to_owned(),
+            None => format!("DXGI {}", self.0),
+        }
     }
 }
+
+/// Display names of the formats [`Format::name`] knows, by DXGI code.
+const FORMAT_NAMES: &[(u32, &str)] = &[
+    (2, "R32G32B32A32_FLOAT"),
+    (10, "R16G16B16A16_FLOAT"),
+    (11, "R16G16B16A16_UNORM"),
+    (24, "R10G10B10A2_UNORM"),
+    (26, "R11G11B10_FLOAT"),
+    (28, "R8G8B8A8_UNORM"),
+    (29, "R8G8B8A8_UNORM_SRGB"),
+    (35, "R16G16_UNORM"),
+    (41, "R32_FLOAT"),
+    (49, "R8G8_UNORM"),
+    (54, "R16_FLOAT"),
+    (56, "R16_UNORM"),
+    (61, "R8_UNORM"),
+    (65, "A8_UNORM"),
+    (71, "BC1"),
+    (72, "BC1_SRGB"),
+    (74, "BC2"),
+    (75, "BC2_SRGB"),
+    (77, "BC3"),
+    (78, "BC3_SRGB"),
+    (80, "BC4"),
+    (81, "BC4_SNORM"),
+    (83, "BC5"),
+    (84, "BC5_SNORM"),
+    (85, "B5G6R5"),
+    (86, "B5G5R5A1"),
+    (87, "B8G8R8A8"),
+    (88, "B8G8R8X8"),
+    (91, "B8G8R8A8_SRGB"),
+    (95, "BC6H_UF16"),
+    (96, "BC6H_SF16"),
+    (98, "BC7"),
+    (99, "BC7_SRGB"),
+    (115, "B4G4R4A4"),
+];
 
 /// Shape of a texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,31 +210,7 @@ impl Texture {
     }
 
     pub fn usage_name(&self) -> &'static str {
-        match self.usage {
-            1 => "default",
-            2 => "terrain",
-            3 => "cloud density",
-            4 => "cloud normal",
-            5 => "cable",
-            6 => "fence",
-            8 => "script",
-            9 => "water flow",
-            10 => "water foam",
-            11 => "water fog",
-            12 => "water ocean",
-            14 => "foam opacity",
-            16 => "diffuse mip sharpen",
-            18 => "diffuse dark",
-            19 => "diffuse alpha opaque",
-            20 => "diffuse",
-            21 => "detail",
-            22 => "normal",
-            23 => "specular",
-            24 => "emissive",
-            25 => "tint palette",
-            26 => "skip processing",
-            _ => "unknown",
-        }
+        USAGE_NAMES.iter().find(|(code, _)| *code == self.usage).map_or("unknown", |(_, n)| n)
     }
 
     /// Decodes the top mip level of the first slice to RGBA8.
@@ -241,128 +221,212 @@ impl Texture {
         let src = self.data.get(..size)?;
         let mut out = vec![0u8; w * h * 4];
         if self.format.block_bytes().is_some() {
-            let mut pixels = vec![0u32; w * h];
-            let result = match self.format.0 {
-                70..=72 => texture2ddecoder::decode_bc1(src, w, h, &mut pixels),
-                73..=75 => texture2ddecoder::decode_bc2(src, w, h, &mut pixels),
-                76..=78 => texture2ddecoder::decode_bc3(src, w, h, &mut pixels),
-                79..=81 => texture2ddecoder::decode_bc4(src, w, h, &mut pixels),
-                82..=84 => texture2ddecoder::decode_bc5(src, w, h, &mut pixels),
-                94 | 95 => texture2ddecoder::decode_bc6_unsigned(src, w, h, &mut pixels),
-                96 => texture2ddecoder::decode_bc6_signed(src, w, h, &mut pixels),
-                97..=99 => texture2ddecoder::decode_bc7(src, w, h, &mut pixels),
-                _ => return None,
-            };
-            result.ok()?;
-            for (o, p) in out.as_chunks_mut::<4>().0.iter_mut().zip(pixels) {
-                let [b, g, r, a] = p.to_le_bytes();
-                o.copy_from_slice(&[r, g, b, a]);
-            }
+            decode_blocks(self.format.0, src, w, h, &mut out)?;
             return Some(out);
         }
         let (row, _) = self.format.pitch(self.width, self.height)?;
+        let raster = Raster { src, row, w, h };
         // Single-channel floats (heights, densities) are scaled from their own range to grey.
         if matches!(self.format.0, 41 | 54) {
-            let mut values = Vec::with_capacity(w * h);
-            for y in 0..h {
-                let line = &src[y * row..];
-                for x in 0..w {
-                    values.push(if self.format.0 == 41 {
-                        f32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?)
-                    } else {
-                        half(u16::from_le_bytes([line[x * 2], line[x * 2 + 1]]))
-                    });
-                }
-            }
-            let finite = values.iter().copied().filter(|v| v.is_finite());
-            let (lo, hi) = finite.fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
-            let span = if hi > lo { hi - lo } else { 1.0 };
-            for (o, v) in out.as_chunks_mut::<4>().0.iter_mut().zip(values) {
-                let g = unit((v - lo) / span);
-                o.copy_from_slice(&[g, g, g, 255]);
-            }
+            raster.scaled_grey(self.format.0, &mut out)?;
             return Some(out);
         }
-        for y in 0..h {
-            let line = &src[y * row..];
-            for x in 0..w {
-                let o = &mut out[(y * w + x) * 4..][..4];
-                let px: [u8; 4] = match self.format.0 {
-                    28 | 29 => line[x * 4..x * 4 + 4].try_into().ok()?,
-                    87 | 91 => {
-                        let p = &line[x * 4..];
-                        [p[2], p[1], p[0], p[3]]
-                    }
-                    88 => {
-                        let p = &line[x * 4..];
-                        [p[2], p[1], p[0], 255]
-                    }
-                    61 => [line[x], line[x], line[x], 255],
-                    // Floating-point formats: shown with values clamped to 0..1
-                    // (single-channel heights are scaled to their range below).
-                    41 => {
-                        let v = f32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?);
-                        let g = unit(v);
-                        [g, g, g, 255]
-                    }
-                    54 => {
-                        let v = half(u16::from_le_bytes([line[x * 2], line[x * 2 + 1]]));
-                        let g = unit(v);
-                        [g, g, g, 255]
-                    }
-                    10 => {
-                        let c =
-                            |i: usize| unit(half(u16::from_le_bytes([line[x * 8 + i * 2], line[x * 8 + i * 2 + 1]])));
-                        [c(0), c(1), c(2), c(3)]
-                    }
-                    2 => {
-                        let c = |i: usize| {
-                            unit(f32::from_le_bytes(
-                                line[x * 16 + i * 4..x * 16 + i * 4 + 4].try_into().unwrap_or_default(),
-                            ))
-                        };
-                        [c(0), c(1), c(2), c(3)]
-                    }
-                    26 => {
-                        let v = u32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?);
-                        [
-                            unit(small_float(v & 0x7FF, 6)),
-                            unit(small_float((v >> 11) & 0x7FF, 6)),
-                            unit(small_float(v >> 22, 5)),
-                            255,
-                        ]
-                    }
-                    24 => {
-                        let v = u32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?);
-                        let c = |s: u32| ((v >> s & 0x3FF) * 255 / 0x3FF) as u8;
-                        [c(0), c(10), c(20), ((v >> 30) * 85) as u8]
-                    }
-                    65 => [255, 255, 255, line[x]],
-                    49 => [line[x * 2], line[x * 2 + 1], 0, 255],
-                    56 => {
-                        let v = line[x * 2 + 1];
-                        [v, v, v, 255]
-                    }
-                    85 => {
-                        let v = u16::from_le_bytes([line[x * 2], line[x * 2 + 1]]);
-                        [expand(v >> 11, 5), expand(v >> 5, 6), expand(v, 5), 255]
-                    }
-                    86 => {
-                        let v = u16::from_le_bytes([line[x * 2], line[x * 2 + 1]]);
-                        [expand(v >> 10, 5), expand(v >> 5, 5), expand(v, 5), if v >> 15 == 1 { 255 } else { 0 }]
-                    }
-                    115 => {
-                        let v = u16::from_le_bytes([line[x * 2], line[x * 2 + 1]]);
-                        [expand(v >> 8, 4), expand(v >> 4, 4), expand(v, 4), expand(v >> 12, 4)]
-                    }
-                    _ => return None,
-                };
-                o.copy_from_slice(&px);
-            }
-        }
+        raster.decode(self.format.0, &mut out)?;
         Some(out)
     }
 }
+
+/// A `texture2ddecoder` block decoder: source blocks, width and height, packed BGRA output.
+type BlockDecoder = fn(&[u8], usize, usize, &mut [u32]) -> Result<(), &'static str>;
+
+/// The decoder for a block-compressed DXGI format.
+fn block_decoder(format: u32) -> Option<BlockDecoder> {
+    Some(match format {
+        70..=72 => texture2ddecoder::decode_bc1,
+        73..=75 => texture2ddecoder::decode_bc2,
+        76..=78 => texture2ddecoder::decode_bc3,
+        79..=81 => texture2ddecoder::decode_bc4,
+        82..=84 => texture2ddecoder::decode_bc5,
+        94 | 95 => texture2ddecoder::decode_bc6_unsigned,
+        96 => texture2ddecoder::decode_bc6_signed,
+        97..=99 => texture2ddecoder::decode_bc7,
+        _ => return None,
+    })
+}
+
+/// Decodes a block-compressed top level of `w` x `h` texels into RGBA8 `out`.
+fn decode_blocks(format: u32, src: &[u8], w: usize, h: usize, out: &mut [u8]) -> Option<()> {
+    let decode = block_decoder(format)?;
+    let mut pixels = vec![0u32; w * h];
+    decode(src, w, h, &mut pixels).ok()?;
+    for (o, p) in out.as_chunks_mut::<4>().0.iter_mut().zip(pixels) {
+        let [b, g, r, a] = p.to_le_bytes();
+        o.copy_from_slice(&[r, g, b, a]);
+    }
+    Some(())
+}
+
+/// The uncompressed top level of a texture: raw bytes, row pitch and size in pixels.
+struct Raster<'a> {
+    src: &'a [u8],
+    row: usize,
+    w: usize,
+    h: usize,
+}
+
+impl Raster<'_> {
+    /// Single-channel float formats (R32_FLOAT, R16_FLOAT) scaled from their finite range to grey.
+    fn scaled_grey(&self, format: u32, out: &mut [u8]) -> Option<()> {
+        let (w, h) = (self.w, self.h);
+        let mut values = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let line = &self.src[y * self.row..];
+            for x in 0..w {
+                values.push(if format == 41 {
+                    f32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?)
+                } else {
+                    half(u16::from_le_bytes([line[x * 2], line[x * 2 + 1]]))
+                });
+            }
+        }
+        let finite = values.iter().copied().filter(|v| v.is_finite());
+        let (lo, hi) = finite.fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+        let span = if hi > lo { hi - lo } else { 1.0 };
+        for (o, v) in out.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+            let g = unit((v - lo) / span);
+            o.copy_from_slice(&[g, g, g, 255]);
+        }
+        Some(())
+    }
+
+    /// Decodes every texel of an uncompressed `format` into RGBA8 `out`.
+    fn decode(&self, format: u32, out: &mut [u8]) -> Option<()> {
+        for y in 0..self.h {
+            let line = &self.src[y * self.row..];
+            for x in 0..self.w {
+                let o = &mut out[(y * self.w + x) * 4..][..4];
+                o.copy_from_slice(&texel(format, line, x)?);
+            }
+        }
+        Some(())
+    }
+}
+
+/// One texel of an uncompressed format as RGBA8, `x` counted in texels from the start of `line`.
+#[inline]
+fn texel(format: u32, line: &[u8], x: usize) -> Option<[u8; 4]> {
+    match format {
+        28 | 29 | 87 | 88 | 91 | 61 | 65 | 49 | 56 => texel_8bit(format, line, x),
+        85 | 86 | 115 => texel_packed16(format, line, x),
+        41 | 54 | 10 | 2 | 26 | 24 => texel_wide(format, line, x),
+        _ => None,
+    }
+}
+
+/// Formats made of 8-bit channels.
+#[inline]
+fn texel_8bit(format: u32, line: &[u8], x: usize) -> Option<[u8; 4]> {
+    Some(match format {
+        28 | 29 => line[x * 4..x * 4 + 4].try_into().ok()?,
+        87 | 91 => {
+            let p = &line[x * 4..];
+            [p[2], p[1], p[0], p[3]]
+        }
+        88 => {
+            let p = &line[x * 4..];
+            [p[2], p[1], p[0], 255]
+        }
+        61 => [line[x], line[x], line[x], 255],
+        65 => [255, 255, 255, line[x]],
+        49 => [line[x * 2], line[x * 2 + 1], 0, 255],
+        56 => {
+            let v = line[x * 2 + 1];
+            [v, v, v, 255]
+        }
+        _ => return None,
+    })
+}
+
+/// Formats packed into 16 bits per texel.
+#[inline]
+fn texel_packed16(format: u32, line: &[u8], x: usize) -> Option<[u8; 4]> {
+    let v = u16::from_le_bytes([line[x * 2], line[x * 2 + 1]]);
+    Some(match format {
+        85 => [expand(v >> 11, 5), expand(v >> 5, 6), expand(v, 5), 255],
+        86 => [expand(v >> 10, 5), expand(v >> 5, 5), expand(v, 5), if v >> 15 == 1 { 255 } else { 0 }],
+        115 => [expand(v >> 8, 4), expand(v >> 4, 4), expand(v, 4), expand(v >> 12, 4)],
+        _ => return None,
+    })
+}
+
+/// Floating-point and 10/11-bit formats: shown with values clamped to 0..1
+/// (single-channel heights are scaled to their range by [`Raster::scaled_grey`]).
+#[inline]
+fn texel_wide(format: u32, line: &[u8], x: usize) -> Option<[u8; 4]> {
+    Some(match format {
+        41 => {
+            let v = f32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?);
+            let g = unit(v);
+            [g, g, g, 255]
+        }
+        54 => {
+            let v = half(u16::from_le_bytes([line[x * 2], line[x * 2 + 1]]));
+            let g = unit(v);
+            [g, g, g, 255]
+        }
+        10 => {
+            let c = |i: usize| unit(half(u16::from_le_bytes([line[x * 8 + i * 2], line[x * 8 + i * 2 + 1]])));
+            [c(0), c(1), c(2), c(3)]
+        }
+        2 => {
+            let c = |i: usize| {
+                unit(f32::from_le_bytes(line[x * 16 + i * 4..x * 16 + i * 4 + 4].try_into().unwrap_or_default()))
+            };
+            [c(0), c(1), c(2), c(3)]
+        }
+        26 => {
+            let v = u32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?);
+            [
+                unit(small_float(v & 0x7FF, 6)),
+                unit(small_float((v >> 11) & 0x7FF, 6)),
+                unit(small_float(v >> 22, 5)),
+                255,
+            ]
+        }
+        24 => {
+            let v = u32::from_le_bytes(line[x * 4..x * 4 + 4].try_into().ok()?);
+            let c = |s: u32| ((v >> s & 0x3FF) * 255 / 0x3FF) as u8;
+            [c(0), c(10), c(20), ((v >> 30) * 85) as u8]
+        }
+        _ => return None,
+    })
+}
+
+/// Display names of the texture usage classes, by stored code.
+const USAGE_NAMES: &[(u8, &str)] = &[
+    (1, "default"),
+    (2, "terrain"),
+    (3, "cloud density"),
+    (4, "cloud normal"),
+    (5, "cable"),
+    (6, "fence"),
+    (8, "script"),
+    (9, "water flow"),
+    (10, "water foam"),
+    (11, "water fog"),
+    (12, "water ocean"),
+    (14, "foam opacity"),
+    (16, "diffuse mip sharpen"),
+    (18, "diffuse dark"),
+    (19, "diffuse alpha opaque"),
+    (20, "diffuse"),
+    (21, "detail"),
+    (22, "normal"),
+    (23, "specular"),
+    (24, "emissive"),
+    (25, "tint palette"),
+    (26, "skip processing"),
+];
 
 /// A value clamped to 0..1 as an 8-bit channel.
 fn unit(v: f32) -> u8 {

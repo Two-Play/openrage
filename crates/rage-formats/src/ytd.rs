@@ -260,21 +260,32 @@ fn read_rdr2(res: &Resource, p: u64) -> Result<(Texture, u64), ResourceError> {
 /// One tightly packed row of a stored texture: offset from the data pointer, length.
 pub(crate) type Row = (usize, usize);
 
-/// An RDR2 texture's description (without pixel data), its data pointer,
-/// and where its tightly packed rows lie in the padded stored data: the
-/// offset from the data pointer and the length of each row, in order.
-pub(crate) fn rdr2_rows(res: &Resource, p: u64) -> Result<(Texture, u64, Vec<Row>), ResourceError> {
-    let name = res.string(res.u64(p + 0x28)?)?;
+/// Where an RDR2 texture's padded pixel data is stored.
+struct Rdr2Store {
+    data_ptr: u64,
+    stride: usize,
+    stored_blocks: usize,
+}
+
+/// Dimension and slice count of an RDR2 texture.
+fn rdr2_shape(res: &Resource, p: u64) -> Result<(Dimension, u32), ResourceError> {
     let depth = res.u16(p + 0x1C)? as u32;
     let dimension = match res.u8(p + 0x1E)? {
         2 => Dimension::Cube,
         3 => Dimension::Texture3D,
         _ => Dimension::Texture2D,
     };
+    Ok((dimension, if dimension == Dimension::Cube { depth.max(6) } else { depth.max(1) }))
+}
+
+/// Reads an RDR2 texture's description (without pixel data) and where its data is stored.
+fn rdr2_header(res: &Resource, p: u64) -> Result<(Texture, Rdr2Store), ResourceError> {
+    let name = res.string(res.u64(p + 0x28)?)?;
+    let (dimension, depth) = rdr2_shape(res, p)?;
     let tex = Texture {
         width: res.u16(p + 0x18)? as u32,
         height: res.u16(p + 0x1A)? as u32,
-        depth: if dimension == Dimension::Cube { depth.max(6) } else { depth.max(1) },
+        depth,
         levels: res.u8(p + 0x22)?.max(1) as u32,
         format: Format(res.u8(p + 0x1F)? as u32),
         dimension,
@@ -282,9 +293,67 @@ pub(crate) fn rdr2_rows(res: &Resource, p: u64) -> Result<(Texture, u64, Vec<Row
         data: Vec::new(),
         name,
     };
+    Ok((tex, rdr2_store(res, p)?))
+}
+
+fn rdr2_store(res: &Resource, p: u64) -> Result<Rdr2Store, ResourceError> {
     let data_ptr = res.u64(p + 0x38)?;
     let stride = res.u32(p + 0x0C)? as usize;
     let stored_blocks = res.u32(p + 0x08)? as usize;
+    Ok(Rdr2Store { data_ptr, stride, stored_blocks })
+}
+
+fn blocks_per_slice(grids: &[[usize; 4]]) -> usize {
+    grids.iter().map(|[_, _, c, r]| c * r).sum()
+}
+
+/// Some single-level textures (one-byte masks, render targets) pad their
+/// rows to 8 and their width irregularly: the pitch is what the size says.
+fn fit_single_level_pitch(grids: &mut [[usize; 4]], levels: u32, stored_blocks: usize, reserved_slices: usize) {
+    if blocks_per_slice(grids) * reserved_slices == stored_blocks || levels != 1 {
+        return;
+    }
+    let [cols, rows, _, _] = grids[0];
+    let padded_rows = rows.next_multiple_of(8);
+    let per = stored_blocks / reserved_slices.max(1);
+    if per.is_multiple_of(padded_rows) && per / padded_rows >= cols {
+        grids[0] = [cols, rows, per / padded_rows, padded_rows];
+    }
+}
+
+fn rdr2_size_mismatch(tex: &Texture, store: &Rdr2Store, slices: usize) -> ResourceError {
+    bad(format!(
+        "{}: stored size {}×{} does not match {}×{} {} with {} levels and {slices} slices",
+        tex.name,
+        store.stored_blocks,
+        store.stride,
+        tex.width,
+        tex.height,
+        tex.format.name(),
+        tex.levels
+    ))
+}
+
+/// The tightly packed rows inside the padded data: slices one after another, each with its mip levels.
+fn rdr2_row_layout(grids: &[[usize; 4]], slices: usize, block: usize) -> Vec<Row> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for _ in 0..slices {
+        for &[cols, rows, pcols, prows] in grids {
+            for r in 0..rows {
+                out.push((at + r * pcols * block, cols * block));
+            }
+            at += pcols * prows * block;
+        }
+    }
+    out
+}
+
+/// An RDR2 texture's description (without pixel data), its data pointer,
+/// and where its tightly packed rows lie in the padded stored data: the
+/// offset from the data pointer and the length of each row, in order.
+pub(crate) fn rdr2_rows(res: &Resource, p: u64) -> Result<(Texture, u64, Vec<Row>), ResourceError> {
+    let (tex, store) = rdr2_header(res, p)?;
     let unsupported = || bad(format!("{}: unsupported format {}", tex.name, tex.format.name()));
     let block = tex.format.block_or_pixel_bytes() as usize;
     if tex.format.block_bytes().is_none() && tex.format.bits_per_pixel().is_none() {
@@ -296,41 +365,13 @@ pub(crate) fn rdr2_rows(res: &Resource, p: u64) -> Result<(Texture, u64, Vec<Row
         .map(|l| rdr2_level_grid(tex.format, tex.width, tex.height, tex.levels, l))
         .collect::<Option<_>>()
         .ok_or_else(unsupported)?;
-    let per_slice: usize = grids.iter().map(|[_, _, c, r]| c * r).sum();
-    // Some single-level textures (one-byte masks, render targets) pad their
-    // rows to 8 and their width irregularly: the pitch is what the size says.
-    if per_slice * reserved_slices != stored_blocks && tex.levels == 1 {
-        let [cols, rows, _, _] = grids[0];
-        let padded_rows = rows.next_multiple_of(8);
-        let per = stored_blocks / reserved_slices.max(1);
-        if per.is_multiple_of(padded_rows) && per / padded_rows >= cols {
-            grids[0] = [cols, rows, per / padded_rows, padded_rows];
-        }
+    fit_single_level_pitch(&mut grids, tex.levels, store.stored_blocks, reserved_slices);
+    if store.stride != block || blocks_per_slice(&grids) * reserved_slices != store.stored_blocks {
+        return Err(rdr2_size_mismatch(&tex, &store, slices));
     }
-    let per_slice: usize = grids.iter().map(|[_, _, c, r]| c * r).sum();
-    if stride != block || per_slice * reserved_slices != stored_blocks {
-        return Err(bad(format!(
-            "{}: stored size {stored_blocks}×{stride} does not match {}×{} {} with {} levels and {slices} slices",
-            tex.name,
-            tex.width,
-            tex.height,
-            tex.format.name(),
-            tex.levels
-        )));
-    }
-    res.bytes(data_ptr, stored_blocks * stride)?;
-    let mut out = Vec::new();
-    let mut at = 0;
-    // Slices one after another, each with its mip levels.
-    for _ in 0..slices {
-        for &[cols, rows, pcols, prows] in &grids {
-            for r in 0..rows {
-                out.push((at + r * pcols * block, cols * block));
-            }
-            at += pcols * prows * block;
-        }
-    }
-    Ok((tex, data_ptr, out))
+    res.bytes(store.data_ptr, store.stored_blocks * store.stride)?;
+    let rows = rdr2_row_layout(&grids, slices, block);
+    Ok((tex, store.data_ptr, rows))
 }
 
 /// Reads a texture dictionary located at `root` (e.g. one embedded in a drawable).

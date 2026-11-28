@@ -158,6 +158,60 @@ fn track_values(res: &Resource, track: u64, frames: usize) -> Result<Option<Trac
     Ok(Some((track, values)))
 }
 
+/// Channel types of a constant quaternion and a constant vector.
+const CHANNEL_CONSTANT_QUATERNION: u8 = 9;
+const CHANNEL_CONSTANT_VECTOR: u8 = 13;
+
+/// A constant quaternion channel, for every frame.
+fn constant_quaternion(res: &Resource, ch: u64, frames: usize) -> Result<Vec<[f32; 4]>, ResourceError> {
+    let at = ptr(res, ch + 0x08)?;
+    let q = [f32_at(res, at)?, f32_at(res, at + 4)?, f32_at(res, at + 8)?, f32_at(res, at + 12)?];
+    Ok(vec![q; frames])
+}
+
+/// A constant vector channel, for every frame.
+fn constant_vector(res: &Resource, ch: u64, frames: usize) -> Result<Vec<[f32; 4]>, ResourceError> {
+    let at = ptr(res, ch + 0x08)?;
+    Ok(vec![[f32_at(res, at)?, f32_at(res, at + 4)?, f32_at(res, at + 8)?, 0.0]; frames])
+}
+
+/// A single channel holding a constant value of the wanted shape, for every frame.
+fn constant_block(res: &Resource, ch: u64, quat: bool, frames: usize) -> Result<Option<Vec<[f32; 4]>>, ResourceError> {
+    let kind = res.u8(ch + 0x05)?;
+    if quat && kind == CHANNEL_CONSTANT_QUATERNION {
+        return constant_quaternion(res, ch, frames).map(Some);
+    }
+    if !quat && kind == CHANNEL_CONSTANT_VECTOR {
+        return constant_vector(res, ch, frames).map(Some);
+    }
+    Ok(None)
+}
+
+/// Four float channels as normalised quaternions.
+fn quaternion_block(res: &Resource, channels: [u64; 4], frames: usize) -> Result<Vec<[f32; 4]>, ResourceError> {
+    let [x, y, z, w] = channels.map(|ch| float_channel(res, ch, frames));
+    let (x, y, z, w) = (x?, y?, z?, w?);
+    Ok((0..frames)
+        .map(|f| {
+            let q = [x[f], y[f], z[f], w[f]];
+            let len = q.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if len > 1e-6 { q.map(|v| v / len) } else { [0.0, 0.0, 0.0, 1.0] }
+        })
+        .collect())
+}
+
+/// Three float channels as vectors.
+fn vector_block(res: &Resource, [x, y, z]: [u64; 3], frames: usize) -> Result<Vec<[f32; 4]>, ResourceError> {
+    let (x, y, z) = (float_channel(res, x, frames)?, float_channel(res, y, frames)?, float_channel(res, z, frames)?);
+    Ok((0..frames).map(|f| [x[f], y[f], z[f], 0.0]).collect())
+}
+
+/// A float track's block: its single channel as vectors `(value, 0, 0)`.
+fn float_block(res: &Resource, channels: &[u64], frames: usize) -> Result<Option<Vec<[f32; 4]>>, ResourceError> {
+    let [ch] = channels else { return Ok(None) };
+    Ok(Some(float_channel(res, *ch, frames)?.into_iter().map(|v| [v, 0.0, 0.0, 0.0]).collect()))
+}
+
 /// One block of a track: `frames` values from its channel group, or `None`
 /// for layouts that are skipped.
 fn block_values(
@@ -170,40 +224,15 @@ fn block_values(
     let count = res.u32(group + 0x14)? as u64;
     let channels: Vec<u64> = (0..count.min(4)).map(|k| ptr(res, group + 0x04 + k * 4)).collect::<Result<_, _>>()?;
     if is_float_kind(kind) {
-        let [ch] = channels.as_slice() else { return Ok(None) };
-        return Ok(Some(float_channel(res, *ch, frames)?.into_iter().map(|v| [v, 0.0, 0.0, 0.0]).collect()));
+        return float_block(res, &channels, frames);
     }
-    let values: Vec<[f32; 4]> = match (quat, channels.as_slice()) {
-        (true, [ch]) if res.u8(ch + 0x05)? == 9 => {
-            let at = ptr(res, ch + 0x08)?;
-            let q = [f32_at(res, at)?, f32_at(res, at + 4)?, f32_at(res, at + 8)?, f32_at(res, at + 12)?];
-            vec![q; frames]
-        }
-        (false, [ch]) if res.u8(ch + 0x05)? == 13 => {
-            let at = ptr(res, ch + 0x08)?;
-            vec![[f32_at(res, at)?, f32_at(res, at + 4)?, f32_at(res, at + 8)?, 0.0]; frames]
-        }
-        (true, [x, y, z, w]) => {
-            let c = [*x, *y, *z, *w].map(|ch| float_channel(res, ch, frames));
-            let [x, y, z, w] = c;
-            let (x, y, z, w) = (x?, y?, z?, w?);
-            (0..frames)
-                .map(|f| {
-                    let q = [x[f], y[f], z[f], w[f]];
-                    let len = q.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    if len > 1e-6 { q.map(|v| v / len) } else { [0.0, 0.0, 0.0, 1.0] }
-                })
-                .collect()
-        }
-        (false, [x, y, z]) => {
-            let (x, y, z) =
-                (float_channel(res, *x, frames)?, float_channel(res, *y, frames)?, float_channel(res, *z, frames)?);
-            (0..frames).map(|f| [x[f], y[f], z[f], 0.0]).collect()
-        }
+    match (quat, channels.as_slice()) {
+        (_, [ch]) => constant_block(res, *ch, quat, frames),
+        (true, [x, y, z, w]) => Ok(Some(quaternion_block(res, [*x, *y, *z, *w], frames)?)),
+        (false, [x, y, z]) => Ok(Some(vector_block(res, [*x, *y, *z], frames)?)),
         // A handful of rotations in Euler form and other rare layouts.
-        _ => return Ok(None),
-    };
-    Ok(Some(values))
+        _ => Ok(None),
+    }
 }
 
 fn read_animation(res: &Resource, a: u64) -> Result<(String, Animation), ResourceError> {

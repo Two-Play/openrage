@@ -1387,7 +1387,18 @@ fn wire_map(win: &SceneWindow, state: &Shared, main: slint::Weak<AppWindow>, nam
     });
 }
 
-fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
+fn wire(win: &SceneWindow, state: &Shared) {
+    wire_view(win, state);
+    wire_fly(win, state);
+    wire_fly_release(win, state);
+    wire_playback(win, state);
+    wire_sound_and_camera(win, state);
+    wire_camera(win, state);
+    wire_toggles(win, state);
+}
+
+/// Weather sliders.
+fn wire_view(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_view_changed(move || {
         let Some(win) = w.upgrade() else { return };
@@ -1403,6 +1414,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         move_water(&win, &s);
         render_frame(&win, &s);
     });
+}
+
+/// Fly mode: the toggle and pressed keys.
+fn wire_fly(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_fly(move || toggle_fly(&w, &s));
     let (w, s) = (win.as_weak(), Rc::clone(state));
@@ -1425,6 +1440,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
             });
         }
     });
+}
+
+/// Fly mode: releasing keys and losing focus.
+fn wire_fly_release(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_key_up(move |text, shift| {
         let mut stopped = false;
@@ -1448,6 +1467,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
             st.fly_timer.stop();
         }
     });
+}
+
+/// Play and seek.
+fn wire_playback(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_play(move || {
         let Some(win) = w.upgrade() else { return };
@@ -1468,6 +1491,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         }
         render_frame(&win, &s);
     });
+}
+
+/// Sound and the cutscene camera.
+fn wire_sound_and_camera(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_sound(move || {
         let Some(win) = w.upgrade() else { return };
@@ -1486,6 +1513,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         }
         render_frame(&win, &s);
     });
+}
+
+/// Orbit and zoom.
+fn wire_camera(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_rotate(move |dx, dy| {
         let Some(win) = w.upgrade() else { return };
@@ -1519,6 +1550,10 @@ fn wire(win: &SceneWindow, state: &Rc<RefCell<Option<State>>>) {
         }
         render_frame(&win, &s);
     });
+}
+
+/// Lights, surroundings and resizing.
+fn wire_toggles(win: &SceneWindow, state: &Shared) {
     let (w, s) = (win.as_weak(), Rc::clone(state));
     win.on_toggle_lights({
         let (w, s) = (w.clone(), Rc::clone(&s));

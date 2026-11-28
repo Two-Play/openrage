@@ -11,7 +11,22 @@ pub(crate) fn start_extract(ui: &AppWindow) {
         export_sounds(ui);
         return;
     }
-    // GTA IV: the selected entry, or the whole folder (or an archive on disk).
+    if extract_gta4(ui) || extract_rdr2(ui) || extract_gta6(ui) {
+        return;
+    }
+    let target = with_app(archive_target);
+    let (rpf, id) = match target {
+        Ok(t) => t,
+        Err(msg) => {
+            ui.set_status(msg.into());
+            return;
+        }
+    };
+    extract_archive_entry(ui, rpf, id);
+}
+
+/// GTA IV: the selected entry, or the whole folder (or an archive on disk). True when it handled the request.
+fn extract_gta4(ui: &AppWindow) -> bool {
     let gta4 = with_app(|a| {
         let listing = a.listing.as_ref()?;
         let item = a.selected.map(|s| &listing.items[s]);
@@ -36,15 +51,18 @@ pub(crate) fn start_extract(ui: &AppWindow) {
             spawn_extract(ui, move |out, cancel, progress| {
                 openrage_app::gta4::extract(&arc, id, out, cancel, progress)
             });
-            return;
+            true
         }
         Some(Err(e)) => {
             ui.set_status(e.to_string().into());
-            return;
+            true
         }
-        None => {}
+        None => false,
     }
-    // Red Dead Redemption 2: the selected file or folder, or the whole folder.
+}
+
+/// Red Dead Redemption 2: the selected file or folder, or the whole folder. True when it handled the request.
+fn extract_rdr2(ui: &AppWindow) -> bool {
     let rdr2 = with_app(|a| {
         let listing = a.listing.as_ref()?;
         let Location::Rpf8(rpf, dir) = &listing.location else { return None };
@@ -55,13 +73,15 @@ pub(crate) fn start_extract(ui: &AppWindow) {
             None => (Arc::clone(rpf), dir.clone(), None),
         })
     });
-    if let Some((rpf, dir, file)) = rdr2 {
-        spawn_extract(ui, move |out, cancel, progress| {
-            openrage_app::extract::extract_rpf8(&rpf, &dir, file, out, cancel, progress)
-        });
-        return;
-    }
-    // GTA VI: the selected file or folder of the recovery view, or the whole folder.
+    let Some((rpf, dir, file)) = rdr2 else { return false };
+    spawn_extract(ui, move |out, cancel, progress| {
+        openrage_app::extract::extract_rpf8(&rpf, &dir, file, out, cancel, progress)
+    });
+    true
+}
+
+/// GTA VI: the selected file or folder of the recovery view, or the whole folder. True when it handled the request.
+fn extract_gta6(ui: &AppWindow) -> bool {
     let gta6 = with_app(|a| {
         let listing = a.listing.as_ref()?;
         let Location::Rpf9(rpf, dir) = &listing.location else { return None };
@@ -73,40 +93,43 @@ pub(crate) fn start_extract(ui: &AppWindow) {
             None => (Arc::clone(rpf), dir.clone(), None),
         })
     });
-    if let Some((rpf, dir, file)) = gta6 {
-        spawn_extract(ui, move |out, cancel, progress| {
-            openrage_app::rpf9::extract(&rpf, &dir, file, out, false, cancel, progress)
-        });
-        return;
-    }
-    let target = with_app(|a| -> Result<(Arc<Rpf7>, EntryId), String> {
-        let listing = a.listing.as_ref().ok_or("nothing to extract")?;
-        let item = a.selected.map(|s| &listing.items[s]);
-        match (&listing.location, item) {
-            (Location::Search { .. } | Location::Changes { .. }, Some(item)) if item.mark != Some(Mark::Removed) => {
-                let dir = a.game_dir.clone().ok_or("no game directory")?;
-                match vfs::resolve(&dir, item.vpath.as_deref().unwrap_or_default(), a.keys.clone()) {
-                    Ok(Node::ArchiveFile(rpf, id) | Node::ArchiveDir(rpf, id)) => Ok((rpf, id)),
-                    Ok(_) => Err("Only archive contents can be extracted.".into()),
-                    Err(e) => Err(e.to_string()),
-                }
-            }
-            (Location::Archive(rpf, _), Some(item)) => Ok((Arc::clone(rpf), item.entry.expect("archive item"))),
-            (Location::Archive(rpf, dir), None) => Ok((Arc::clone(rpf), *dir)),
-            (Location::Disk(dir), Some(item)) if item.kind == ItemKind::Archive => {
-                let rpf = Rpf7::open(&dir.join(&item.name), a.keys.clone()).map_err(|e| e.to_string())?;
-                Ok((Arc::new(rpf), Rpf7::ROOT))
-            }
-            _ => Err("Select an archive or something inside an archive to extract.".into()),
-        }
+    let Some((rpf, dir, file)) = gta6 else { return false };
+    spawn_extract(ui, move |out, cancel, progress| {
+        openrage_app::rpf9::extract(&rpf, &dir, file, out, false, cancel, progress)
     });
-    let (rpf, id) = match target {
-        Ok(t) => t,
-        Err(msg) => {
-            ui.set_status(msg.into());
-            return;
+    true
+}
+
+/// The archive (and entry in it) the current selection extracts from.
+fn archive_target(a: &mut App) -> Result<(Arc<Rpf7>, EntryId), String> {
+    let listing = a.listing.as_ref().ok_or("nothing to extract")?;
+    let item = a.selected.map(|s| &listing.items[s]);
+    match (&listing.location, item) {
+        (Location::Search { .. } | Location::Changes { .. }, Some(item)) if item.mark != Some(Mark::Removed) => {
+            resolve_listed(a, item)
         }
-    };
+        (Location::Archive(rpf, _), Some(item)) => Ok((Arc::clone(rpf), item.entry.expect("archive item"))),
+        (Location::Archive(rpf, dir), None) => Ok((Arc::clone(rpf), *dir)),
+        (Location::Disk(dir), Some(item)) if item.kind == ItemKind::Archive => {
+            let rpf = Rpf7::open(&dir.join(&item.name), a.keys.clone()).map_err(|e| e.to_string())?;
+            Ok((Arc::new(rpf), Rpf7::ROOT))
+        }
+        _ => Err("Select an archive or something inside an archive to extract.".into()),
+    }
+}
+
+/// The archive entry a search or changes row points at.
+fn resolve_listed(a: &App, item: &browser::Item) -> Result<(Arc<Rpf7>, EntryId), String> {
+    let dir = a.game_dir.clone().ok_or("no game directory")?;
+    match vfs::resolve(&dir, item.vpath.as_deref().unwrap_or_default(), a.keys.clone()) {
+        Ok(Node::ArchiveFile(rpf, id) | Node::ArchiveDir(rpf, id)) => Ok((rpf, id)),
+        Ok(_) => Err("Only archive contents can be extracted.".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Asks for a folder and extracts one archive entry there in the background.
+fn extract_archive_entry(ui: &AppWindow, rpf: Arc<Rpf7>, id: EntryId) {
     let cancel = with_app(|a| {
         a.cancel.store(false, Ordering::Relaxed);
         Arc::clone(&a.cancel)
@@ -123,17 +146,7 @@ pub(crate) fn start_extract(ui: &AppWindow) {
                 let _ = weak.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
             }
         });
-        let msg = match result {
-            Ok(s) if s.cancelled => format!("Cancelled after {} files.", s.files),
-            Ok(s) => {
-                let mut m = format!("Extracted {} files ({}) to {}", s.files, human_size(s.bytes), s.target.display());
-                if !s.failures.is_empty() {
-                    m.push_str(&format!(" — {} failures, first: {}", s.failures.len(), s.failures[0]));
-                }
-                m
-            }
-            Err(e) => format!("Extraction failed: {e:#}"),
-        };
+        let msg = extract_message(result);
         let _ = weak.upgrade_in_event_loop(move |ui| set_busy(&ui, false, msg));
     });
 }
@@ -177,4 +190,19 @@ pub(crate) fn spawn_extract(
         };
         let _ = weak.upgrade_in_event_loop(move |ui| set_busy(&ui, false, msg));
     });
+}
+
+/// The status line for a finished extraction.
+fn extract_message(result: anyhow::Result<openrage_app::extract::ExtractSummary>) -> String {
+    match result {
+        Ok(s) if s.cancelled => format!("Cancelled after {} files.", s.files),
+        Ok(s) => {
+            let mut m = format!("Extracted {} files ({}) to {}", s.files, human_size(s.bytes), s.target.display());
+            if !s.failures.is_empty() {
+                m.push_str(&format!(" — {} failures, first: {}", s.failures.len(), s.failures[0]));
+            }
+            m
+        }
+        Err(e) => format!("Extraction failed: {e:#}"),
+    }
 }

@@ -87,60 +87,106 @@ pub fn is_bink(data: &[u8]) -> bool {
     data.starts_with(b"KB2") || (data.starts_with(b"BIK") && data.get(3).is_some_and(u8::is_ascii_alphanumeric))
 }
 
+/// A 32-bit word of the header.
+fn header_u32(data: &[u8], at: usize) -> Result<u32, BinkError> {
+    match data.u32_at(at) {
+        Some(v) => Ok(v),
+        None => bad(format!("the header ends before {at:#x}")),
+    }
+}
+
+/// The fixed part of the header.
+struct Head {
+    version: u8,
+    revision: u8,
+    frames: usize,
+    width: u32,
+    height: u32,
+    fps: (u32, u32),
+    flags: u32,
+    /// Number of sound tracks.
+    count: usize,
+}
+
 /// Reads the header and the frame index.
 pub fn read(data: &[u8]) -> Result<Bink, BinkError> {
     if !is_bink(data) {
         return bad("no Bink signature");
     }
-    let u32_at = |at: usize| match data.u32_at(at) {
-        Some(v) => Ok(v),
-        None => bad(format!("the header ends before {at:#x}")),
-    };
+    let Head { version, revision, frames, width, height, fps, flags, count } = read_head(data)?;
+    let mut at = 0x2C + if revision == b'k' || (version == 2 && revision >= b'i') { 4 } else { 0 };
+    let tracks = read_tracks(data, at, count)?;
+    at += 12 * count;
+    if frames > (data.len() - at.min(data.len())) / 4 {
+        return bad(format!("{frames} frames do not fit the file"));
+    }
+    let packets = read_packets(data, at, frames)?;
+    Ok(Bink { version, revision, width, height, fps, flags, tracks, packets })
+}
+
+fn read_head(data: &[u8]) -> Result<Head, BinkError> {
     let version = if data[0] == b'K' { 2 } else { 1 };
-    let revision = u32_at(0)?.to_le_bytes()[3];
-    let frames = u32_at(0x08)? as usize;
-    let (width, height) = (u32_at(0x14)?, u32_at(0x18)?);
+    let revision = header_u32(data, 0)?.to_le_bytes()[3];
+    let frames = header_u32(data, 0x08)? as usize;
+    let (width, height) = read_size(data)?;
+    let fps = read_fps(data)?;
+    let flags = header_u32(data, 0x24)?;
+    let count = header_u32(data, 0x28)? as usize;
+    if count > MAX_TRACKS {
+        return bad(format!("{count} sound tracks"));
+    }
+    Ok(Head { version, revision, frames, width, height, fps, flags, count })
+}
+
+/// Frames per second: numerator and denominator.
+fn read_fps(data: &[u8]) -> Result<(u32, u32), BinkError> {
+    let fps = (header_u32(data, 0x1C)?, header_u32(data, 0x20)?);
+    if fps.0 == 0 || fps.1 == 0 {
+        return bad("no frame rate");
+    }
+    Ok(fps)
+}
+
+/// Width and height, which have to be within the limits of RAD's tools.
+fn read_size(data: &[u8]) -> Result<(u32, u32), BinkError> {
+    let (width, height) = (header_u32(data, 0x14)?, header_u32(data, 0x18)?);
     let coded = |side: u32| u64::from(side).next_multiple_of(32);
     if width == 0 || height == 0 || width > MAX_WIDTH || height > MAX_WIDTH || coded(width) * coded(height) > MAX_PIXELS
     {
         return bad(format!("{width} × {height} pixels"));
     }
-    let fps = (u32_at(0x1C)?, u32_at(0x20)?);
-    if fps.0 == 0 || fps.1 == 0 {
-        return bad("no frame rate");
-    }
-    let flags = u32_at(0x24)?;
-    let count = u32_at(0x28)? as usize;
-    if count > MAX_TRACKS {
-        return bad(format!("{count} sound tracks"));
-    }
-    let mut at = 0x2C + if revision == b'k' || (version == 2 && revision >= b'i') { 4 } else { 0 };
+    Ok((width, height))
+}
+
+/// The sound tracks: `count` of them, their infos and then their ids.
+fn read_tracks(data: &[u8], at: usize, count: usize) -> Result<Vec<Track>, BinkError> {
     let mut tracks = Vec::with_capacity(count);
     for i in 0..count {
-        let info = u32_at(at + 4 * count + 4 * i)?;
+        let info = header_u32(data, at + 4 * count + 4 * i)?;
         tracks.push(Track {
-            id: u32_at(at + 8 * count + 4 * i)?,
+            id: header_u32(data, at + 8 * count + 4 * i)?,
             sample_rate: info & 0xFFFF,
             channels: if info & 0x2000_0000 != 0 { 2 } else { 1 },
             dct: info & 0x1000_0000 != 0,
         });
     }
-    at += 12 * count;
-    if frames > (data.len() - at.min(data.len())) / 4 {
-        return bad(format!("{frames} frames do not fit the file"));
-    }
+    Ok(tracks)
+}
+
+/// The frame index.
+fn read_packets(data: &[u8], at: usize, frames: usize) -> Result<Vec<Packet>, BinkError> {
     // One more entry than frames, the last is the end of the file.
     let mut packets = Vec::with_capacity(frames);
     for i in 0..frames {
-        let here = u32_at(at + 4 * i)?;
-        let next = if i + 1 < frames { u32_at(at + 4 * i + 4)? as usize & !1 } else { data.len() };
+        let here = header_u32(data, at + 4 * i)?;
+        let next = if i + 1 < frames { header_u32(data, at + 4 * i + 4)? as usize & !1 } else { data.len() };
         let (start, end) = (here as usize & !1, next.min(data.len()));
         if start > end {
             return bad(format!("frame {i} lies outside the file"));
         }
         packets.push(Packet { key: i == 0 || here & 1 != 0, start, end });
     }
-    Ok(Bink { version, revision, width, height, fps, flags, tracks, packets })
+    Ok(packets)
 }
 
 impl Bink {

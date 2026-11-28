@@ -26,6 +26,21 @@ pub(crate) fn cmd_model(
         }
         None => openrage_app::models::load(game_dir, keys.clone(), path)?,
     };
+    print_model(&model);
+    let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("model");
+    if let Some(out) = export {
+        let glb =
+            openrage_app::models::to_glb(&model, stem, &model.default_look()).context("model has nothing to export")?;
+        fs::write(out, &glb).with_context(|| format!("writing {}", out.display()))?;
+        outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
+    }
+    if let Some(out) = render {
+        render_model(game_dir, keys, &model, out, (yaw, anim))?;
+    }
+    Ok(())
+}
+
+fn print_model(model: &openrage_app::models::LoadedModel) {
     if let Some(p) = &model.ped {
         outln!("{}: outfit {} of {}", p.name, p.outfit, p.outfits);
     }
@@ -33,18 +48,7 @@ pub(crate) fn cmd_model(
         outln!("skeleton: {} bones", s.bones.len());
     }
     for (name, d) in &model.drawables {
-        outln!(
-            "{name}: {} meshes, {} vertices, {} triangles, {} shaders",
-            d.meshes.len(),
-            d.vertex_count(),
-            d.triangle_count(),
-            d.shaders.len()
-        );
-        for (i, s) in d.shaders.iter().enumerate() {
-            let base = s.base_texture().unwrap_or("-");
-            let found = if base == "-" || model.texture(d, base).is_some() { "" } else { " (not found)" };
-            outln!("  shader {i:>2} {:08x}  base {base}{found}  [{}]", s.name_hash, s.textures.join(", "));
-        }
+        print_model_drawable(model, name, d);
     }
     for (name, dict) in &model.external {
         outln!("textures from {name}: {}", dict.textures.len());
@@ -72,50 +76,68 @@ pub(crate) fn cmd_model(
         };
         outln!("  {:<24} {kind}", m.label);
     }
-    let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("model");
-    if let Some(out) = export {
-        let glb =
-            openrage_app::models::to_glb(&model, stem, &model.default_look()).context("model has nothing to export")?;
-        fs::write(out, &glb).with_context(|| format!("writing {}", out.display()))?;
-        outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
+}
+
+fn print_model_drawable(model: &openrage_app::models::LoadedModel, name: &str, d: &rage_formats::drawable::Drawable) {
+    outln!(
+        "{name}: {} meshes, {} vertices, {} triangles, {} shaders",
+        d.meshes.len(),
+        d.vertex_count(),
+        d.triangle_count(),
+        d.shaders.len()
+    );
+    for (i, s) in d.shaders.iter().enumerate() {
+        let base = s.base_texture().unwrap_or("-");
+        let found = if base == "-" || model.texture(d, base).is_some() { "" } else { " (not found)" };
+        outln!("  shader {i:>2} {:08x}  base {base}{found}  [{}]", s.name_hash, s.textures.join(", "));
     }
-    if let Some(out) = render {
-        use openrage_app::render;
-        let materials = render::Materials::new(&model);
-        let view = render::View { yaw: yaw.to_radians(), ..Default::default() };
-        let started = Instant::now();
-        let look = model.default_look();
-        let skin = match anim {
-            Some(spec) => {
-                let (ycd, rest) = spec.rsplit_once(':').context("--anim wants <ycd>:<clip>[@seconds]")?;
-                let (clip, secs) = match rest.split_once('@') {
-                    Some((c, t)) => (c, t.parse::<f32>().context("bad time")?),
-                    None => (rest, 0.0),
-                };
-                // A cutscene (.cut) plays its sections joined into one clip per actor.
-                let dict = openrage_app::anim::load_clips(game_dir, keys, ycd)?;
-                let c = dict.clips.iter().find(|c| c.name.eq_ignore_ascii_case(clip)).context("no such clip")?;
-                let (_, part, at) = c.part_at(secs).context("clip without animation")?;
-                let a = &dict.animations[part.animation];
-                let skel = model.skeleton.as_ref().context("the model has no skeleton")?;
-                let binding = openrage_app::anim::Binding::new(skel, a).with_expressions(skel, a, &model.expressions);
-                outln!(
-                    "animating {} of {} bones ({:.1} s clip)",
-                    binding.animated_bones(),
-                    skel.bones.len(),
-                    c.duration()
-                );
-                Some(binding.skin(skel, a, a.frame_at(at)))
-            }
-            None => None,
-        };
-        let (lo, hi) = render::bounds(&model, &look.parts).context("nothing to render")?;
-        let camera = render::orbit_camera(lo, hi, view);
-        let rgba = render::render_camera(&model, &look, &materials, &camera, skin.as_deref(), 960, 600);
-        let ms = started.elapsed().as_millis();
-        fs::write(out, rage_formats::png(960, 600, &rgba)?)?;
-        outln!("Rendered {} in {ms} ms", out.display());
-    }
+}
+
+/// The pose of `--anim <ycd>:<clip>[@seconds]` for the model's skeleton.
+fn anim_skin(
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    model: &openrage_app::models::LoadedModel,
+    spec: &str,
+) -> Result<Vec<rage_formats::math::Mat4>> {
+    let (ycd, rest) = spec.rsplit_once(':').context("--anim wants <ycd>:<clip>[@seconds]")?;
+    let (clip, secs) = match rest.split_once('@') {
+        Some((c, t)) => (c, t.parse::<f32>().context("bad time")?),
+        None => (rest, 0.0),
+    };
+    // A cutscene (.cut) plays its sections joined into one clip per actor.
+    let dict = openrage_app::anim::load_clips(game_dir, keys, ycd)?;
+    let c = dict.clips.iter().find(|c| c.name.eq_ignore_ascii_case(clip)).context("no such clip")?;
+    let (_, part, at) = c.part_at(secs).context("clip without animation")?;
+    let a = &dict.animations[part.animation];
+    let skel = model.skeleton.as_ref().context("the model has no skeleton")?;
+    let binding = openrage_app::anim::Binding::new(skel, a).with_expressions(skel, a, &model.expressions);
+    outln!("animating {} of {} bones ({:.1} s clip)", binding.animated_bones(), skel.bones.len(), c.duration());
+    Ok(binding.skin(skel, a, a.frame_at(at)))
+}
+
+fn render_model(
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    model: &openrage_app::models::LoadedModel,
+    out: &Path,
+    (yaw, anim): (f32, Option<&str>),
+) -> Result<()> {
+    use openrage_app::render;
+    let materials = render::Materials::new(model);
+    let view = render::View { yaw: yaw.to_radians(), ..Default::default() };
+    let started = Instant::now();
+    let look = model.default_look();
+    let skin = match anim {
+        Some(spec) => Some(anim_skin(game_dir, keys, model, spec)?),
+        None => None,
+    };
+    let (lo, hi) = render::bounds(model, &look.parts).context("nothing to render")?;
+    let camera = render::orbit_camera(lo, hi, view);
+    let rgba = render::render_camera(model, &look, &materials, &camera, skin.as_deref(), 960, 600);
+    let ms = started.elapsed().as_millis();
+    fs::write(out, rage_formats::png(960, 600, &rgba)?)?;
+    outln!("Rendered {} in {ms} ms", out.display());
     Ok(())
 }
 
@@ -616,48 +638,70 @@ pub(crate) fn cmd_media(
     swf: Option<&Path>,
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
-    let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
-    let data = match node {
-        Node::ArchiveFile(rpf, id) => rpf.read(id)?,
-        Node::PlainFile(p) => fs::read(p)?,
-        Node::Rpf8File(rpf, i) => {
-            rpf.read(rpf.entries().and_then(|e| e.get(i)).context("archive table not readable")?)?
-        }
-        Node::Rpf9File(rpf, i) => rpf.read_at(i)?,
-        Node::Gta4File(a, id) => a.read(id)?,
-        _ => bail!("{path} is not a file"),
-    };
-    for (k, v) in openrage_app::media::rows(&data)? {
-        outln!("{k:<14}{v}");
-    }
+    let data = print_media_rows(game_dir, path, keys)?;
     if let Some(dir) = frames {
-        let mut player = rage_formats::bink::Player::new(&data)?;
-        fs::create_dir_all(dir)?;
-        let total = player.video.frames();
-        for i in 0..total {
-            player.advance().with_context(|| format!("frame {i}"))?;
-            if i % every.max(1) == 0 {
-                let f = player.frame();
-                fs::write(dir.join(format!("{i:05}.png")), rage_formats::png(f.width, f.height, &f.rgba())?)?;
-            }
-        }
-        outln!("Wrote {} of {total} frames to {}", total.div_ceil(every.max(1)), dir.display());
+        write_bink_frames(&data, dir, every)?;
     }
     if let Some(out) = wav {
-        let video = rage_formats::bink::read(&data)?;
-        if video.tracks.is_empty() {
-            bail!("{path} has no sound");
-        }
-        for i in 0..video.tracks.len() {
-            let Some(pcm) = video.sound(&data, i) else { continue };
-            let file = if i == 0 { out.to_path_buf() } else { out.with_extension(format!("{}.wav", i + 1)) };
-            fs::write(&file, pcm?.to_wav())?;
-            outln!("Wrote {}", file.display());
-        }
+        write_bink_sound(&data, path, out)?;
     }
     if let Some(out) = swf {
         fs::write(out, rage_formats::media::gfx_to_swf(&data)?)?;
         outln!("Wrote {}", out.display());
+    }
+    Ok(())
+}
+
+/// Reads the file and prints what is known about it; returns its bytes.
+fn print_media_rows(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<Vec<u8>> {
+    let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
+    let data = read_media_file(node, path)?;
+    for (k, v) in openrage_app::media::rows(&data)? {
+        outln!("{k:<14}{v}");
+    }
+    Ok(data)
+}
+
+fn read_media_file(node: Node, path: &str) -> Result<Vec<u8>> {
+    match node {
+        Node::ArchiveFile(rpf, id) => rpf.read(id).map_err(Into::into),
+        Node::PlainFile(p) => fs::read(p).map_err(Into::into),
+        Node::Rpf8File(rpf, i) => read_rpf8_entry(&rpf, i),
+        Node::Rpf9File(rpf, i) => rpf.read_at(i).map_err(Into::into),
+        Node::Gta4File(a, id) => a.read(id).map_err(Into::into),
+        _ => bail!("{path} is not a file"),
+    }
+}
+
+fn read_rpf8_entry(rpf: &rage_rpf::Rpf8, i: usize) -> Result<Vec<u8>> {
+    Ok(rpf.read(rpf.entries().and_then(|e| e.get(i)).context("archive table not readable")?)?)
+}
+
+fn write_bink_frames(data: &[u8], dir: &Path, every: usize) -> Result<()> {
+    let mut player = rage_formats::bink::Player::new(data)?;
+    fs::create_dir_all(dir)?;
+    let total = player.video.frames();
+    for i in 0..total {
+        player.advance().with_context(|| format!("frame {i}"))?;
+        if i % every.max(1) == 0 {
+            let f = player.frame();
+            fs::write(dir.join(format!("{i:05}.png")), rage_formats::png(f.width, f.height, &f.rgba())?)?;
+        }
+    }
+    outln!("Wrote {} of {total} frames to {}", total.div_ceil(every.max(1)), dir.display());
+    Ok(())
+}
+
+fn write_bink_sound(data: &[u8], path: &str, out: &Path) -> Result<()> {
+    let video = rage_formats::bink::read(data)?;
+    if video.tracks.is_empty() {
+        bail!("{path} has no sound");
+    }
+    for i in 0..video.tracks.len() {
+        let Some(pcm) = video.sound(data, i) else { continue };
+        let file = if i == 0 { out.to_path_buf() } else { out.with_extension(format!("{}.wav", i + 1)) };
+        fs::write(&file, pcm?.to_wav())?;
+        outln!("Wrote {}", file.display());
     }
     Ok(())
 }

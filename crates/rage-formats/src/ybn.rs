@@ -55,74 +55,98 @@ fn f32_at(res: &Resource, at: u64) -> Result<f32, ResourceError> {
     Ok(f32::from_bits(res.u32(at)?))
 }
 
-fn bound(
-    res: &Resource,
-    at: u64,
-    m: &Mat4,
-    b: &mut Builder,
-    stats: &mut Stats,
-    depth: usize,
-) -> Result<(), ResourceError> {
-    if depth > 8 {
-        return Err(ResourceError::Format("bounds nested too deeply".into()));
+/// The state of walking a tree of bounds: the file and what is built from it.
+struct Walk<'a> {
+    res: &'a Resource,
+    b: &'a mut Builder,
+    stats: &'a mut Stats,
+}
+
+/// The transform of composite child `i` (identity without a transform list).
+fn child_transform(res: &Resource, transforms: u64, i: u64) -> Result<Mat4, ResourceError> {
+    let mut t = math::IDENTITY;
+    if transforms != 0 {
+        let raw = res.bytes(transforms + i * 64, 64)?;
+        for (k, c) in raw.as_chunks::<4>().0.iter().enumerate() {
+            t[k] = f32::from_le_bytes(*c);
+        }
+        // The w components hold other data.
+        (t[3], t[7], t[11], t[15]) = (0.0, 0.0, 0.0, 1.0);
     }
-    stats.bounds += 1;
-    let kind = res.u8(at + 0x10)?;
-    let material = res.u8(at + 0x4C)?;
-    match kind {
-        kind::COMPOSITE => {
-            let children = res.u64(at + 0x70)?;
-            let transforms = res.u64(at + 0x78)?;
-            let count = res.u16(at + 0xA0)? as u64;
-            for i in 0..count.min(4096) {
-                let child = res.u64(children + i * 8)?;
-                if child == 0 {
-                    continue;
-                }
-                let mut t = math::IDENTITY;
-                if transforms != 0 {
-                    let raw = res.bytes(transforms + i * 64, 64)?;
-                    for (k, c) in raw.as_chunks::<4>().0.iter().enumerate() {
-                        t[k] = f32::from_le_bytes(*c);
-                    }
-                    // The w components hold other data.
-                    (t[3], t[7], t[11], t[15]) = (0.0, 0.0, 0.0, 1.0);
-                }
-                bound(res, child, &math::mul(m, &t), b, stats, depth + 1)?;
+    Ok(t)
+}
+
+impl Walk<'_> {
+    fn bound(&mut self, at: u64, m: &Mat4, depth: usize) -> Result<(), ResourceError> {
+        if depth > 8 {
+            return Err(ResourceError::Format("bounds nested too deeply".into()));
+        }
+        self.stats.bounds += 1;
+        let kind = self.res.u8(at + 0x10)?;
+        let material = self.res.u8(at + 0x4C)?;
+        match kind {
+            kind::COMPOSITE => self.composite(at, m, depth),
+            kind::GEOMETRY | kind::BVH => geometry(self.res, at, m, self.b, self.stats),
+            kind::SPHERE => self.sphere(at, m, material),
+            kind::BOX => self.cuboid(at, m, material),
+            kind::CAPSULE => self.capsule(at, m, material),
+            kind::CYLINDER | kind::DISC => self.cylinder(kind, at, m, material),
+            _ => Ok(()),
+        }
+    }
+
+    fn composite(&mut self, at: u64, m: &Mat4, depth: usize) -> Result<(), ResourceError> {
+        let res = self.res;
+        let children = res.u64(at + 0x70)?;
+        let transforms = res.u64(at + 0x78)?;
+        let count = res.u16(at + 0xA0)? as u64;
+        for i in 0..count.min(4096) {
+            let child = res.u64(children + i * 8)?;
+            if child == 0 {
+                continue;
             }
+            let t = child_transform(res, transforms, i)?;
+            self.bound(child, &math::mul(m, &t), depth + 1)?;
         }
-        kind::GEOMETRY | kind::BVH => geometry(res, at, m, b, stats)?,
-        kind::SPHERE => {
-            let c = vec3(res, at + 0x50)?;
-            b.round(material, m, c, c, f32_at(res, at + 0x14)?, true);
-        }
-        kind::BOX => {
-            let (lo, hi) = (vec3(res, at + 0x30)?, vec3(res, at + 0x20)?);
-            let c = scale(add(lo, hi), 0.5);
-            let h = scale(sub(hi, lo), 0.5);
-            b.cuboid(material, m, c, [[h[0], 0.0, 0.0], [0.0, h[1], 0.0], [0.0, 0.0, h[2]]]);
-        }
-        kind::CAPSULE => {
-            let c = vec3(res, at + 0x40)?;
-            let margin = f32_at(res, at + 0x2C)?;
-            let half = f32_at(res, at + 0x14)? - margin;
-            b.round(material, m, sub(c, [0.0, half, 0.0]), add(c, [0.0, half, 0.0]), margin, true);
-        }
-        kind::CYLINDER | kind::DISC => {
-            let (lo, hi) = (vec3(res, at + 0x30)?, vec3(res, at + 0x20)?);
-            let c = scale(add(lo, hi), 0.5);
-            let (r, half) = if kind == kind::DISC {
-                (f32_at(res, at + 0x14)?, f32_at(res, at + 0x2C)?)
-            } else {
-                ((hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0)
-            };
-            // Cylinders stand along Y, discs lie along X.
-            let axis = if kind == kind::DISC { [half, 0.0, 0.0] } else { [0.0, half, 0.0] };
-            b.round(material, m, sub(c, axis), add(c, axis), r, false);
-        }
-        _ => {}
+        Ok(())
     }
-    Ok(())
+
+    fn sphere(&mut self, at: u64, m: &Mat4, material: u8) -> Result<(), ResourceError> {
+        let c = vec3(self.res, at + 0x50)?;
+        self.b.round(material, m, c, c, f32_at(self.res, at + 0x14)?, true);
+        Ok(())
+    }
+
+    fn cuboid(&mut self, at: u64, m: &Mat4, material: u8) -> Result<(), ResourceError> {
+        let (lo, hi) = (vec3(self.res, at + 0x30)?, vec3(self.res, at + 0x20)?);
+        let c = scale(add(lo, hi), 0.5);
+        let h = scale(sub(hi, lo), 0.5);
+        self.b.cuboid(material, m, c, [[h[0], 0.0, 0.0], [0.0, h[1], 0.0], [0.0, 0.0, h[2]]]);
+        Ok(())
+    }
+
+    fn capsule(&mut self, at: u64, m: &Mat4, material: u8) -> Result<(), ResourceError> {
+        let c = vec3(self.res, at + 0x40)?;
+        let margin = f32_at(self.res, at + 0x2C)?;
+        let half = f32_at(self.res, at + 0x14)? - margin;
+        self.b.round(material, m, sub(c, [0.0, half, 0.0]), add(c, [0.0, half, 0.0]), margin, true);
+        Ok(())
+    }
+
+    /// A cylinder or a disc (`kind`).
+    fn cylinder(&mut self, kind: u8, at: u64, m: &Mat4, material: u8) -> Result<(), ResourceError> {
+        let (lo, hi) = (vec3(self.res, at + 0x30)?, vec3(self.res, at + 0x20)?);
+        let c = scale(add(lo, hi), 0.5);
+        let (r, half) = if kind == kind::DISC {
+            (f32_at(self.res, at + 0x14)?, f32_at(self.res, at + 0x2C)?)
+        } else {
+            ((hi[0] - lo[0]) / 2.0, (hi[1] - lo[1]) / 2.0)
+        };
+        // Cylinders stand along Y, discs lie along X.
+        let axis = if kind == kind::DISC { [half, 0.0, 0.0] } else { [0.0, half, 0.0] };
+        self.b.round(material, m, sub(c, axis), add(c, axis), r, false);
+        Ok(())
+    }
 }
 
 fn geometry(res: &Resource, at: u64, m: &Mat4, b: &mut Builder, stats: &mut Stats) -> Result<(), ResourceError> {
@@ -206,7 +230,7 @@ pub fn parse(res: &Resource) -> Result<(Drawable, Stats), ResourceError> {
 pub fn parse_at(res: &Resource, at: u64) -> Result<(Drawable, Stats), ResourceError> {
     let mut b = Builder::default();
     let mut stats = Stats::default();
-    bound(res, at, &math::IDENTITY, &mut b, &mut stats, 0)?;
+    Walk { res, b: &mut b, stats: &mut stats }.bound(at, &math::IDENTITY, 0)?;
     Ok(finish(b, stats))
 }
 

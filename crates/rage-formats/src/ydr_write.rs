@@ -394,6 +394,111 @@ fn group_at(res: &Resource, place: Place) -> Result<u64, ResourceError> {
     res.u64(owner + 0x10)
 }
 
+/// A model of the template: whether it is skinned, where its geometries and their shaders are, their number.
+struct ModelHeader {
+    skinned: bool,
+    geoms: u64,
+    mapping: u64,
+    count: u64,
+}
+
+fn read_model_header(res: &Resource, model: u64) -> Result<ModelHeader, ResourceError> {
+    let skinned = (res.u32(model + 0x28)? >> 8) & 0xFF != 0;
+    let geoms = res.u64(model + 0x08)?;
+    let mapping = res.u64(model + 0x20)?;
+    Ok(ModelHeader { skinned, geoms, mapping, count: res.u16(model + 0x10)? as u64 })
+}
+
+/// A geometry's vertex layout and, if skinned, its bone table.
+type LayoutAndBones = (Layout, Option<Vec<u16>>);
+
+/// The bone table and blend slots of a skinned geometry this writer can fill; `None` for the others.
+fn skinned_layout(
+    res: &Resource,
+    geometry: u64,
+    table: u64,
+    decl: u64,
+    stride: usize,
+) -> Result<Option<LayoutAndBones>, ResourceError> {
+    // Skinned geometries this writer cannot fill are skipped.
+    let Ok(layout) = read_layout(res, decl, stride) else { return Ok(None) };
+    let blend = |slot, format| layout.slots.iter().any(|&(s, _, f)| s == slot && f == format);
+    let count = res.u16(geometry + 0x72)? as u64;
+    if table == 0 || count == 0 || count > 256 || !blend(16, 28) || !blend(20, 30) {
+        return Ok(None);
+    }
+    let bones = (0..count).map(|i| res.u16(table + i * 2)).collect::<Result<Vec<_>, _>>()?;
+    Ok(Some((layout, Some(bones))))
+}
+
+/// The layout of an unskinned geometry (one without a bone table).
+fn fixed_layout(res: &Resource, table: u64, decl: u64, stride: usize) -> Result<Option<LayoutAndBones>, ResourceError> {
+    if table != 0 {
+        return Ok(None);
+    }
+    Ok(Some((read_layout(res, decl, stride)?, None)))
+}
+
+/// The geometry of `model` to copy for its shader, if it can be copied.
+fn read_template_geometry(
+    res: &Resource,
+    model: u64,
+    skinned: bool,
+    geometry: u64,
+) -> Result<Option<TemplateGeometry>, ResourceError> {
+    let table = res.u64(geometry + 0x68)?;
+    let vertex_buffer = res.u64(geometry + 0x18)?;
+    let index_buffer = res.u64(geometry + 0x38)?;
+    let stride = res.u32(vertex_buffer + 0x0C)? as usize;
+    let decl = res.u64(vertex_buffer + 0x38)?;
+    let found = if skinned {
+        skinned_layout(res, geometry, table, decl, stride)?
+    } else {
+        fixed_layout(res, table, decl, stride)?
+    };
+    let Some((layout, bones)) = found else { return Ok(None) };
+    Ok(Some(TemplateGeometry { geometry, vertex_buffer, index_buffer, model, stride, layout, bones }))
+}
+
+/// Adds the geometries of `model` whose shader has none yet to `fixed` or `skinned`.
+fn collect_model_geometries(
+    res: &Resource,
+    model: u64,
+    fixed: &mut Vec<(u16, TemplateGeometry)>,
+    skinned: &mut Vec<(u16, TemplateGeometry)>,
+) -> Result<(), ResourceError> {
+    let header = read_model_header(res, model)?;
+    for g in 0..header.count {
+        let geometry = res.u64(header.geoms + g * 8)?;
+        let shader = if header.mapping != 0 { res.u16(header.mapping + g * 2)? } else { 0 };
+        let out = if header.skinned { &mut *skinned } else { &mut *fixed };
+        if out.iter().any(|(s, _)| *s == shader) {
+            continue;
+        }
+        if let Some(found) = read_template_geometry(res, model, header.skinned, geometry)? {
+            out.push((shader, found));
+        }
+    }
+    Ok(())
+}
+
+/// Adds the geometries of the models of the level of detail list at `list` to `fixed` or `skinned`.
+fn collect_lod_geometries(
+    res: &Resource,
+    list: u64,
+    fixed: &mut Vec<(u16, TemplateGeometry)>,
+    skinned: &mut Vec<(u16, TemplateGeometry)>,
+) -> Result<(), ResourceError> {
+    let models = res.u64(list)?;
+    for m in 0..res.u16(list + 8)? as u64 {
+        let model = res.u64(models + m * 8)?;
+        if model != 0 {
+            collect_model_geometries(res, model, fixed, skinned)?;
+        }
+    }
+    Ok(())
+}
+
 /// The template's geometries, one per shader index (the first found).
 /// Fixed (unskinned) geometries when the template has any; otherwise the
 /// skinned ones (vehicles: the whole body is one skinned model, every vertex
@@ -403,51 +508,8 @@ fn template_geometries(res: &Resource, root: u64) -> Result<Vec<(u16, TemplateGe
     let mut skinned: Vec<(u16, TemplateGeometry)> = Vec::new();
     for lod in 0..4 {
         let list = res.u64(root + 0x50 + lod * 8)?;
-        if list == 0 {
-            continue;
-        }
-        let models = res.u64(list)?;
-        for m in 0..res.u16(list + 8)? as u64 {
-            let model = res.u64(models + m * 8)?;
-            if model == 0 {
-                continue;
-            }
-            let is_skinned = (res.u32(model + 0x28)? >> 8) & 0xFF != 0;
-            let geoms = res.u64(model + 0x08)?;
-            let mapping = res.u64(model + 0x20)?;
-            for g in 0..res.u16(model + 0x10)? as u64 {
-                let geometry = res.u64(geoms + g * 8)?;
-                let shader = if mapping != 0 { res.u16(mapping + g * 2)? } else { 0 };
-                let out = if is_skinned { &mut skinned } else { &mut fixed };
-                if out.iter().any(|(s, _)| *s == shader) {
-                    continue;
-                }
-                let table = res.u64(geometry + 0x68)?;
-                let vertex_buffer = res.u64(geometry + 0x18)?;
-                let index_buffer = res.u64(geometry + 0x38)?;
-                let stride = res.u32(vertex_buffer + 0x0C)? as usize;
-                let decl = res.u64(vertex_buffer + 0x38)?;
-                let (layout, bones) = if is_skinned {
-                    // Skinned geometries this writer cannot fill are skipped.
-                    let Ok(layout) = read_layout(res, decl, stride) else { continue };
-                    let blend = |slot, format| layout.slots.iter().any(|&(s, _, f)| s == slot && f == format);
-                    let count = res.u16(geometry + 0x72)? as u64;
-                    if table == 0 || count == 0 || count > 256 || !blend(16, 28) || !blend(20, 30) {
-                        continue;
-                    }
-                    let bones = (0..count).map(|i| res.u16(table + i * 2)).collect::<Result<Vec<_>, _>>()?;
-                    (layout, Some(bones))
-                } else {
-                    if table != 0 {
-                        continue;
-                    }
-                    (read_layout(res, decl, stride)?, None)
-                };
-                out.push((
-                    shader,
-                    TemplateGeometry { geometry, vertex_buffer, index_buffer, model, stride, layout, bones },
-                ));
-            }
+        if list != 0 {
+            collect_lod_geometries(res, list, &mut fixed, &mut skinned)?;
         }
     }
     Ok(if fixed.is_empty() { skinned } else { fixed })
@@ -971,68 +1033,90 @@ impl Prepared<'_> {
     }
 }
 
-fn check_part(template: &Resource, part: &Part) -> Result<(u64, Vec<(u16, TemplateGeometry)>), ResourceError> {
-    let lods = part.lods;
-    let at = |what: String| match part.place {
+/// Prefixes a complaint with the place it is about.
+fn at_place(place: Place, what: String) -> String {
+    match place {
         Place::Main => what,
         Place::Child(i) => format!("child model {i}: {what}"),
         Place::Entry(i) => format!("drawable {i}: {what}"),
+    }
+}
+
+/// The materials of a part may only use shaders the template has.
+fn check_materials(part: &Part, usable: &[u16]) -> Result<(), ResourceError> {
+    let Some(mats) = part.materials else { return Ok(()) };
+    for (k, mat) in mats.iter().enumerate() {
+        if !usable.contains(&mat.shader) {
+            return Err(bad(at_place(
+                part.place,
+                format!("material {k} uses shader {}, the template only has {usable:?}", mat.shader),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A mesh must be drawn with a shader (its own, or its material's) the template has.
+fn check_mesh_shader(part: &Part, usable: &[u16], m: &NewMesh, what: &str) -> Result<(), ResourceError> {
+    let source = match part.materials {
+        Some(mats) => mats.get(m.shader as usize).map(|mat| mat.shader),
+        None => Some(m.shader),
     };
+    match source {
+        Some(s) if usable.contains(&s) => Ok(()),
+        _ if part.materials.is_some() => Err(bad(format!("{what} uses material {}, which does not exist", m.shader))),
+        _ => Err(bad(format!("{what} uses shader {}, the template only has {usable:?}", m.shader))),
+    }
+}
+
+/// Whether a per-vertex list is given but not for every one of the `n` vertices.
+fn wrong_length(len: usize, n: usize) -> bool {
+    len != 0 && len != n
+}
+
+fn check_mesh_data(m: &NewMesh, what: &str) -> Result<(), ResourceError> {
+    let n = m.positions.len();
+    if n == 0 || m.indices.is_empty() || !m.indices.len().is_multiple_of(3) {
+        return Err(bad(format!("{what} has no triangles")));
+    }
+    if n > MAX_VERTICES {
+        return Err(bad(format!("{what} has {n} vertices; split it (at most {MAX_VERTICES} per mesh)")));
+    }
+    if m.indices.iter().any(|&k| k as usize >= n) {
+        return Err(bad(format!("{what} has triangles pointing at missing vertices")));
+    }
+    let lengths = [m.normals.len(), m.uvs.len(), m.colors.len(), m.bones.len(), m.blend.len()];
+    if lengths.iter().any(|&len| wrong_length(len, n)) {
+        return Err(bad(format!("{what} has per-vertex data of the wrong length")));
+    }
+    if m.positions.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(bad(format!("{what} has positions that are not numbers")));
+    }
+    Ok(())
+}
+
+/// Checks every mesh of the detail levels of a part.
+fn check_levels(part: &Part, usable: &[u16]) -> Result<(), ResourceError> {
+    for (level, meshes) in part.lods.iter().enumerate() {
+        for (i, m) in meshes.iter().enumerate() {
+            let what = at_place(part.place, format!("level {level}, mesh {i}"));
+            check_mesh_shader(part, usable, m, &what)?;
+            check_mesh_data(m, &what)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_part(template: &Resource, part: &Part) -> Result<(u64, Vec<(u16, TemplateGeometry)>), ResourceError> {
+    let lods = part.lods;
     if lods.is_empty() || lods.len() > 4 || lods.iter().any(|l| l.is_empty()) {
-        return Err(bad(at("give one to four detail levels, each with meshes".into())));
+        return Err(bad(at_place(part.place, "give one to four detail levels, each with meshes".into())));
     }
     let root = drawable_at(template, part.place)?;
     let geometries = template_geometries(template, root)?;
     let usable: Vec<u16> = geometries.iter().map(|(s, _)| *s).collect();
-    if let Some(mats) = part.materials {
-        for (k, mat) in mats.iter().enumerate() {
-            if !usable.contains(&mat.shader) {
-                return Err(bad(at(format!(
-                    "material {k} uses shader {}, the template only has {usable:?}",
-                    mat.shader
-                ))));
-            }
-        }
-    }
-    let source = |m: &NewMesh| -> Option<u16> {
-        match part.materials {
-            Some(mats) => mats.get(m.shader as usize).map(|mat| mat.shader),
-            None => Some(m.shader),
-        }
-    };
-    for (level, meshes) in lods.iter().enumerate() {
-        for (i, m) in meshes.iter().enumerate() {
-            let what = at(format!("level {level}, mesh {i}"));
-            let n = m.positions.len();
-            match source(m) {
-                Some(s) if usable.contains(&s) => {}
-                _ if part.materials.is_some() => {
-                    return Err(bad(format!("{what} uses material {}, which does not exist", m.shader)));
-                }
-                _ => return Err(bad(format!("{what} uses shader {}, the template only has {usable:?}", m.shader))),
-            }
-            if n == 0 || m.indices.is_empty() || m.indices.len() % 3 != 0 {
-                return Err(bad(format!("{what} has no triangles")));
-            }
-            if n > MAX_VERTICES {
-                return Err(bad(format!("{what} has {n} vertices; split it (at most {MAX_VERTICES} per mesh)")));
-            }
-            if m.indices.iter().any(|&k| k as usize >= n) {
-                return Err(bad(format!("{what} has triangles pointing at missing vertices")));
-            }
-            if (!m.normals.is_empty() && m.normals.len() != n)
-                || (!m.uvs.is_empty() && m.uvs.len() != n)
-                || (!m.colors.is_empty() && m.colors.len() != n)
-                || (!m.bones.is_empty() && m.bones.len() != n)
-                || (!m.blend.is_empty() && m.blend.len() != n)
-            {
-                return Err(bad(format!("{what} has per-vertex data of the wrong length")));
-            }
-            if m.positions.iter().flatten().any(|v| !v.is_finite()) {
-                return Err(bad(format!("{what} has positions that are not numbers")));
-            }
-        }
-    }
+    check_materials(part, &usable)?;
+    check_levels(part, &usable)?;
     Ok((root, geometries))
 }
 

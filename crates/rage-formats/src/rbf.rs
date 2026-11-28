@@ -103,6 +103,133 @@ impl Reader<'_> {
     }
 }
 
+/// Descriptor index that closes the current element (`FF FF`).
+const INDEX_CLOSE: u8 = 0xFF;
+/// Descriptor index that introduces element content (`FD FF`).
+const INDEX_CONTENT: u8 = 0xFD;
+/// Second byte of the close and content markers.
+const MARKER_TAIL: u8 = 0xFF;
+
+const TYPE_ELEMENT: u8 = 0x00;
+const TYPE_UINT: u8 = 0x10;
+const TYPE_TRUE: u8 = 0x20;
+const TYPE_FALSE: u8 = 0x30;
+const TYPE_FLOAT: u8 = 0x40;
+const TYPE_FLOAT3: u8 = 0x50;
+const TYPE_STRING: u8 = 0x60;
+
+struct Parser<'a> {
+    r: Reader<'a>,
+    wide: bool,
+    names: Vec<String>,
+    stack: Vec<Element>,
+}
+
+impl Parser<'_> {
+    /// Closes the current element; the root element, once closed, is returned.
+    fn close(&mut self) -> Result<Option<Element>, RbfError> {
+        if self.r.u8()? != MARKER_TAIL {
+            return Err(RbfError::Invalid("bad close tag".into()));
+        }
+        let done = self.stack.pop().ok_or_else(|| RbfError::Invalid("close tag without element".into()))?;
+        match self.stack.last_mut() {
+            Some(parent) => {
+                parent.add(Value::Element(done));
+                Ok(None)
+            }
+            None => Ok(Some(done)),
+        }
+    }
+
+    fn content(&mut self) -> Result<(), RbfError> {
+        if self.r.u8()? != MARKER_TAIL {
+            return Err(RbfError::Invalid("bad content marker".into()));
+        }
+        let n = self.r.u32()? as usize;
+        let bytes = self.r.take(n)?.to_vec();
+        self.stack
+            .last_mut()
+            .ok_or_else(|| RbfError::Invalid("content outside element".into()))?
+            .children
+            .push(Value::Bytes(bytes));
+        Ok(())
+    }
+
+    /// One named record: an element start or a value for the current element.
+    fn record(&mut self, index: u8) -> Result<(), RbfError> {
+        let kind = self.r.u8()?;
+        if index as usize == self.names.len() {
+            let name = self.r.string()?;
+            self.names.push(name);
+        }
+        let name = self
+            .names
+            .get(index as usize)
+            .cloned()
+            .ok_or_else(|| RbfError::Invalid(format!("unknown name {index}")))?;
+        let Some(value) = self.value(kind, name)? else { return Ok(()) };
+        self.stack.last_mut().ok_or_else(|| RbfError::Invalid("value outside element".into()))?.add(value);
+        Ok(())
+    }
+
+    /// The value of a record, or `None` when it opened an element instead.
+    fn value(&mut self, kind: u8, name: String) -> Result<Option<Value>, RbfError> {
+        let value = match kind {
+            TYPE_ELEMENT => {
+                self.open_element(name)?;
+                return Ok(None);
+            }
+            TYPE_UINT | TYPE_FLOAT | TYPE_FLOAT3 => self.number(kind, name)?,
+            TYPE_TRUE => Value::Bool(name, true),
+            TYPE_FALSE => Value::Bool(name, false),
+            TYPE_STRING => Value::Str(name, self.r.string()?),
+            t => return Err(RbfError::Invalid(format!("unsupported data type {t:#04x}"))),
+        };
+        Ok(Some(value))
+    }
+
+    fn open_element(&mut self, name: String) -> Result<(), RbfError> {
+        let _ = (self.r.u16()?, self.r.u16()?);
+        let pending = self.r.u16()? as usize;
+        self.stack.push(Element { name, pending, ..Default::default() });
+        Ok(())
+    }
+
+    fn number(&mut self, kind: u8, name: String) -> Result<Value, RbfError> {
+        if self.wide { self.wide_number(kind, name) } else { self.narrow_number(kind, name) }
+    }
+
+    /// GTA VI: integers and floats of 8 bytes.
+    fn wide_number(&mut self, kind: u8, name: String) -> Result<Value, RbfError> {
+        let r = &mut self.r;
+        Ok(match kind {
+            TYPE_UINT => Value::Uint64(name, r.u64()?),
+            TYPE_FLOAT => Value::Float64(name, r.f64()?),
+            _ => Value::Float3(name, [r.f64()? as f32, r.f64()? as f32, r.f64()? as f32]),
+        })
+    }
+
+    fn narrow_number(&mut self, kind: u8, name: String) -> Result<Value, RbfError> {
+        let r = &mut self.r;
+        Ok(match kind {
+            TYPE_UINT => Value::Uint(name, r.u32()?),
+            TYPE_FLOAT => Value::Float(name, r.f32()?),
+            _ => Value::Float3(name, [r.f32()?, r.f32()?, r.f32()?]),
+        })
+    }
+
+    /// Handles one record; the root element, once closed, is returned.
+    fn step(&mut self) -> Result<Option<Element>, RbfError> {
+        let index = self.r.u8()?;
+        match index {
+            INDEX_CLOSE => return self.close(),
+            INDEX_CONTENT => self.content()?,
+            _ => self.record(index)?,
+        }
+        Ok(None)
+    }
+}
+
 /// Parses the file into its root element.
 pub fn parse(data: &[u8]) -> Result<Element, RbfError> {
     if !is_rbf(data) {
@@ -110,63 +237,11 @@ pub fn parse(data: &[u8]) -> Result<Element, RbfError> {
     }
     // GTA VI: with these four bytes, numbers take 8 bytes.
     let wide = data.get(4..8) == Some(&[0xFB, 0xFF, 0x01, 0x00]);
-    let mut r = Reader { d: data, pos: if wide { 8 } else { 4 } };
-    let mut names: Vec<String> = Vec::new();
-    let mut stack: Vec<Element> = Vec::new();
-    while r.pos < data.len() {
-        let index = r.u8()?;
-        match index {
-            0xFF => {
-                if r.u8()? != 0xFF {
-                    return Err(RbfError::Invalid("bad close tag".into()));
-                }
-                let done = stack.pop().ok_or_else(|| RbfError::Invalid("close tag without element".into()))?;
-                match stack.last_mut() {
-                    Some(parent) => parent.add(Value::Element(done)),
-                    None => return Ok(done),
-                }
-            }
-            0xFD => {
-                if r.u8()? != 0xFF {
-                    return Err(RbfError::Invalid("bad content marker".into()));
-                }
-                let n = r.u32()? as usize;
-                let bytes = r.take(n)?.to_vec();
-                stack
-                    .last_mut()
-                    .ok_or_else(|| RbfError::Invalid("content outside element".into()))?
-                    .children
-                    .push(Value::Bytes(bytes));
-            }
-            _ => {
-                let kind = r.u8()?;
-                if index as usize == names.len() {
-                    names.push(r.string()?);
-                }
-                let name = names
-                    .get(index as usize)
-                    .cloned()
-                    .ok_or_else(|| RbfError::Invalid(format!("unknown name {index}")))?;
-                let value = match kind {
-                    0x00 => {
-                        let _ = (r.u16()?, r.u16()?);
-                        let pending = r.u16()? as usize;
-                        stack.push(Element { name, pending, ..Default::default() });
-                        continue;
-                    }
-                    0x10 if wide => Value::Uint64(name, r.u64()?),
-                    0x40 if wide => Value::Float64(name, r.f64()?),
-                    0x50 if wide => Value::Float3(name, [r.f64()? as f32, r.f64()? as f32, r.f64()? as f32]),
-                    0x10 => Value::Uint(name, r.u32()?),
-                    0x20 => Value::Bool(name, true),
-                    0x30 => Value::Bool(name, false),
-                    0x40 => Value::Float(name, r.f32()?),
-                    0x50 => Value::Float3(name, [r.f32()?, r.f32()?, r.f32()?]),
-                    0x60 => Value::Str(name, r.string()?),
-                    t => return Err(RbfError::Invalid(format!("unsupported data type {t:#04x}"))),
-                };
-                stack.last_mut().ok_or_else(|| RbfError::Invalid("value outside element".into()))?.add(value);
-            }
+    let r = Reader { d: data, pos: if wide { 8 } else { 4 } };
+    let mut p = Parser { r, wide, names: Vec::new(), stack: Vec::new() };
+    while p.r.pos < data.len() {
+        if let Some(root) = p.step()? {
+            return Ok(root);
         }
     }
     Err(RbfError::Invalid("unexpected end of file".into()))
@@ -195,18 +270,79 @@ fn bool_text(b: bool) -> &'static str {
     if b { "True" } else { "False" }
 }
 
+/// The attribute as `(name, text)`; other kinds are not attributes.
+fn attribute_text(a: &Value) -> Option<(&String, String)> {
+    Some(match a {
+        Value::Str(n, v) => (n, xml::escape(v)),
+        Value::Float(n, v) => (n, xml::float(*v)),
+        Value::Uint(n, v) => (n, v.to_string()),
+        Value::Uint64(n, v) => (n, uint64(*v)),
+        Value::Float64(n, v) => (n, float64(*v)),
+        Value::Bool(n, v) => (n, bool_text(*v).to_owned()),
+        _ => return None,
+    })
+}
+
+/// Floats per row for the float-list content types.
+fn floats_per_row(kind: &str) -> usize {
+    match kind {
+        "matrix34" | "vector3_array" => 3,
+        "float_array" => 1,
+        "vector2_array" | "vec2v_array" => 2,
+        _ => 4,
+    }
+}
+
+/// Text content: the bytes up to a trailing NUL.
+fn content_text(b: &[u8]) -> String {
+    String::from_utf8_lossy(b.strip_suffix(&[0]).unwrap_or(b)).into_owned()
+}
+
+fn write_content(w: &mut Writer, inner: usize, e: &Element, b: &[u8]) {
+    match e.attribute("content") {
+        Some("char_array") => {
+            let v: Vec<String> = b.iter().map(|x| x.to_string()).collect();
+            w.raw_array_lines(inner, &v);
+        }
+        Some("short_array") => {
+            let v: Vec<String> = b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c).to_string()).collect();
+            w.raw_array_lines(inner, &v);
+        }
+        // Matrices and float lists: little-endian floats, a row per line
+        // (matrix34: the three axes and the position).
+        Some(
+            kind @ ("matrix34" | "matrix44" | "float_array" | "vector2_array" | "vec2v_array" | "vector3_array"
+            | "vector4_array"),
+        ) => {
+            let floats: Vec<String> = b.as_chunks::<4>().0.iter().map(|c| xml::float(f32::from_le_bytes(*c))).collect();
+            let rows: Vec<String> = floats.chunks(floats_per_row(kind)).map(|r| r.join(", ")).collect();
+            w.raw_array_lines(inner, &rows);
+        }
+        Some(other) => w.error(inner, format!("unexpected content type {other}")),
+        None => w.raw_array_lines(inner, &[xml::escape(&content_text(b))]),
+    }
+}
+
+fn write_child(w: &mut Writer, inner: usize, e: &Element, child: &Value) {
+    match child {
+        Value::Bytes(b) => write_content(w, inner, e, b),
+        Value::Element(c) => write(w, inner, c),
+        Value::Uint(n, v) => w.value(inner, n, &format!("0x{v:08X}")),
+        Value::Uint64(n, v) => w.value(inner, n, &uint64(*v)),
+        Value::Float64(n, v) => w.value(inner, n, &float64(*v)),
+        Value::Bool(n, v) => w.value(inner, n, bool_text(*v)),
+        Value::Float(n, v) => w.value(inner, n, &xml::float(*v)),
+        Value::Float3(n, v) => w.empty(
+            inner,
+            &format!("{n} x=\"{}\" y=\"{}\" z=\"{}\"", xml::float(v[0]), xml::float(v[1]), xml::float(v[2])),
+        ),
+        Value::Str(n, v) => w.string(inner, n, v),
+    }
+}
+
 fn write(w: &mut Writer, level: usize, e: &Element) {
     let mut tag = e.name.clone();
-    for a in &e.attributes {
-        let (name, value) = match a {
-            Value::Str(n, v) => (n, xml::escape(v)),
-            Value::Float(n, v) => (n, xml::float(*v)),
-            Value::Uint(n, v) => (n, v.to_string()),
-            Value::Uint64(n, v) => (n, uint64(*v)),
-            Value::Float64(n, v) => (n, float64(*v)),
-            Value::Bool(n, v) => (n, bool_text(*v).to_owned()),
-            _ => continue,
-        };
+    for (name, value) in e.attributes.iter().filter_map(attribute_text) {
         tag.push_str(&format!(" {name}=\"{value}\""));
     }
     if e.children.is_empty() {
@@ -214,58 +350,12 @@ fn write(w: &mut Writer, level: usize, e: &Element) {
     }
     // A single text child stays on one line.
     if let ([Value::Bytes(b)], true) = (e.children.as_slice(), e.attributes.is_empty()) {
-        let text = String::from_utf8_lossy(b.strip_suffix(&[0]).unwrap_or(b)).into_owned();
-        return w.text(level, &tag, &text);
+        return w.text(level, &tag, &content_text(b));
     }
     w.open(level, &tag);
     let inner = level + 1;
     for child in &e.children {
-        match child {
-            Value::Bytes(b) => match e.attribute("content") {
-                Some("char_array") => {
-                    let v: Vec<String> = b.iter().map(|x| x.to_string()).collect();
-                    w.raw_array_lines(inner, &v);
-                }
-                Some("short_array") => {
-                    let v: Vec<String> =
-                        b.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c).to_string()).collect();
-                    w.raw_array_lines(inner, &v);
-                }
-                // Matrices and float lists: little-endian floats, a row per line
-                // (matrix34: the three axes and the position).
-                Some(
-                    kind @ ("matrix34" | "matrix44" | "float_array" | "vector2_array" | "vec2v_array" | "vector3_array"
-                    | "vector4_array"),
-                ) => {
-                    let per_row = match kind {
-                        "matrix34" | "vector3_array" => 3,
-                        "float_array" => 1,
-                        "vector2_array" | "vec2v_array" => 2,
-                        _ => 4,
-                    };
-                    let floats: Vec<String> =
-                        b.as_chunks::<4>().0.iter().map(|c| xml::float(f32::from_le_bytes(*c))).collect();
-                    let rows: Vec<String> = floats.chunks(per_row).map(|r| r.join(", ")).collect();
-                    w.raw_array_lines(inner, &rows);
-                }
-                Some(other) => w.error(inner, format!("unexpected content type {other}")),
-                None => {
-                    let text = String::from_utf8_lossy(b.strip_suffix(&[0]).unwrap_or(b)).into_owned();
-                    w.raw_array_lines(inner, &[xml::escape(&text)]);
-                }
-            },
-            Value::Element(c) => write(w, inner, c),
-            Value::Uint(n, v) => w.value(inner, n, &format!("0x{v:08X}")),
-            Value::Uint64(n, v) => w.value(inner, n, &uint64(*v)),
-            Value::Float64(n, v) => w.value(inner, n, &float64(*v)),
-            Value::Bool(n, v) => w.value(inner, n, bool_text(*v)),
-            Value::Float(n, v) => w.value(inner, n, &xml::float(*v)),
-            Value::Float3(n, v) => w.empty(
-                inner,
-                &format!("{n} x=\"{}\" y=\"{}\" z=\"{}\"", xml::float(v[0]), xml::float(v[1]), xml::float(v[2])),
-            ),
-            Value::Str(n, v) => w.string(inner, n, v),
-        }
+        write_child(w, inner, e, child);
     }
     w.close(level, &e.name);
 }

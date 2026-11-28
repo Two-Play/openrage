@@ -305,75 +305,166 @@ impl Psin<'_> {
         at: usize,
         open: &mut HashSet<(u32, usize)>,
     ) {
-        let d = self.data;
-        let missing = |w: &mut Writer| w.error(level, format!("{name}: outside the file"));
-        let number = |w: &mut Writer, v: Option<String>| match v {
-            Some(v) => w.value(level, name, &v),
-            None => w.error(level, format!("{name}: outside the file")),
-        };
+        if let Some(text) = self.number_text(m.kind, at) {
+            return match text {
+                Some(v) => w.value(level, name, &v),
+                None => outside(w, level, name),
+            };
+        }
         match m.kind {
-            0x01 => number(w, d.get(at).map(|b| (*b != 0).to_string())),
-            0x10 => number(w, d.get(at).map(|b| (*b as i8).to_string())),
-            0x11 => number(w, d.get(at).map(u8::to_string)),
-            0x12 => number(w, d.u16_at(at).map(|v| (v as i16).to_string())),
-            0x13 => number(w, d.u16_at(at).map(|v| v.to_string())),
-            0x14 => number(w, d.u32_at(at).map(|v| (v as i32).to_string())),
-            0x15 => number(w, d.u32_at(at).map(|v| v.to_string())),
-            0x16 | 0x08 => number(w, d.u64_at(at).map(|v| (v as i64).to_string())),
-            0x17 => number(w, d.u64_at(at).map(|v| v.to_string())),
-            0x20 => number(w, d.u16_at(at).map(|v| xml::float(half(v)))),
-            0x21 => number(w, self.floats(at, 1).map(|f| f[0].clone())),
-            0x4A | 0x4B | 0x4D => number(w, d.u32_at(at).map(|v| format!("0x{v:08X}"))),
-            0x4F => number(w, d.u64_at(at).map(|v| format!("0x{v:016X}"))),
-            0x30 | 0x32 | 0x31 | 0x33 | 0x34 | 0x35 | 0x0C | 0x0D => {
-                let n = match m.kind {
-                    0x30 => 2,
-                    0x32 => 3,
-                    _ => 4,
-                };
-                match self.floats(at, n) {
-                    Some(f) => {
-                        let parts: Vec<String> =
-                            f.iter().zip(["x", "y", "z", "w"]).map(|(v, axis)| format!("{axis}=\"{v}\"")).collect();
-                        w.empty(level, &format!("{name} {}", parts.join(" ")));
-                    }
-                    None => missing(w),
-                }
+            0x30 | 0x32 | 0x31 | 0x33 | 0x34 | 0x35 | 0x0C | 0x0D | 0x36 => {
+                self.float_value(w, level, name, m.kind, at)
             }
-            0x36 => match self.floats(at, 16) {
-                Some(f) => w.raw_array(level, name, &f, 4),
-                None => missing(w),
-            },
             0x60 | 0x63 | 0x64 | 0x62 | 0x65 | 0x68 => self.enumeration(w, level, name, m, at),
-            0x05 => self.members(w, level, name, name, m.reference, at, open),
-            0x07 => match self.pointer(at) {
-                Some((kind, target, _)) => {
-                    let tag = format!("{name} type=\"{}\"", hash_name(kind));
-                    self.members(w, level, &tag, name, kind, target, open);
-                }
-                None => w.empty(level, name),
-            },
-            0x44 if d.get(at + 15).is_some_and(|b| b & 0x80 != 0) => {
-                let len = usize::from(d[at + 15] & 0x7F).min(15);
-                w.string(level, name, &String::from_utf8_lossy(&d[at..at + len]));
-            }
-            0x42 | 0x44 => match self.pointer(at) {
-                Some((_, target, end)) => match self.string_at(target, end) {
-                    Some(text) => w.string(level, name, &text),
-                    None => w.error(level, format!("{name}: a string without an end")),
-                },
-                None => w.empty(level, name),
-            },
-            0x40 => match d.get(at..at + m.reference as usize) {
-                Some(bytes) => {
-                    let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-                    w.string(level, name, &String::from_utf8_lossy(&bytes[..len]));
-                }
-                None => missing(w),
-            },
+            0x05 | 0x07 => self.struct_value(w, level, name, m, at, open),
+            0x42 | 0x44 | 0x40 => self.text_value(w, level, name, m, at),
             0x50 | 0x53 | 0x54 | 0x5C | 0x52 => self.array(w, level, name, m, members, at, open),
             0x71 | 0x73 | 0x75 => self.map(w, level, name, m, members, at, open),
             other => w.error(level, format!("{name}: type {other:#04x} is not understood")),
+        }
+    }
+
+    /// The text of a scalar member: `None` for other kinds, `Some(None)` when it lies outside the file.
+    fn number_text(&self, kind: u8, at: usize) -> Option<Option<String>> {
+        self.byte_text(kind, at)
+            .or_else(|| self.word_text(kind, at))
+            .or_else(|| self.dword_text(kind, at))
+            .or_else(|| self.qword_text(kind, at))
+    }
+
+    fn byte_text(&self, kind: u8, at: usize) -> Option<Option<String>> {
+        let d = self.data;
+        Some(match kind {
+            0x01 => d.get(at).map(|b| (*b != 0).to_string()),
+            0x10 => d.get(at).map(|b| (*b as i8).to_string()),
+            0x11 => d.get(at).map(u8::to_string),
+            _ => return None,
+        })
+    }
+
+    fn word_text(&self, kind: u8, at: usize) -> Option<Option<String>> {
+        let d = self.data;
+        Some(match kind {
+            0x12 => d.u16_at(at).map(|v| (v as i16).to_string()),
+            0x13 => d.u16_at(at).map(|v| v.to_string()),
+            0x20 => d.u16_at(at).map(|v| xml::float(half(v))),
+            _ => return None,
+        })
+    }
+
+    fn dword_text(&self, kind: u8, at: usize) -> Option<Option<String>> {
+        let d = self.data;
+        Some(match kind {
+            0x14 => d.u32_at(at).map(|v| (v as i32).to_string()),
+            0x15 => d.u32_at(at).map(|v| v.to_string()),
+            0x21 => self.floats(at, 1).map(|f| f[0].clone()),
+            0x4A | 0x4B | 0x4D => d.u32_at(at).map(|v| format!("0x{v:08X}")),
+            _ => return None,
+        })
+    }
+
+    fn qword_text(&self, kind: u8, at: usize) -> Option<Option<String>> {
+        let d = self.data;
+        Some(match kind {
+            0x16 | 0x08 => d.u64_at(at).map(|v| (v as i64).to_string()),
+            0x17 => d.u64_at(at).map(|v| v.to_string()),
+            0x4F => d.u64_at(at).map(|v| format!("0x{v:016X}")),
+            _ => return None,
+        })
+    }
+
+    /// Floats: a vector of two to four as attributes, or a 4 x 4 matrix.
+    fn float_value(&self, w: &mut Writer, level: usize, name: &str, kind: u8, at: usize) {
+        if kind != 0x36 {
+            return self.vector_value(w, level, name, kind, at);
+        }
+        match self.floats(at, 16) {
+            Some(f) => w.raw_array(level, name, &f, 4),
+            None => outside(w, level, name),
+        }
+    }
+
+    fn vector_value(&self, w: &mut Writer, level: usize, name: &str, kind: u8, at: usize) {
+        let n = match kind {
+            0x30 => 2,
+            0x32 => 3,
+            _ => 4,
+        };
+        match self.floats(at, n) {
+            Some(f) => {
+                let parts: Vec<String> =
+                    f.iter().zip(["x", "y", "z", "w"]).map(|(v, axis)| format!("{axis}=\"{v}\"")).collect();
+                w.empty(level, &format!("{name} {}", parts.join(" ")));
+            }
+            None => outside(w, level, name),
+        }
+    }
+
+    /// A struct inline, or behind a pointer that names its type.
+    fn struct_value(
+        &self,
+        w: &mut Writer,
+        level: usize,
+        name: &str,
+        m: &Member,
+        at: usize,
+        open: &mut HashSet<(u32, usize)>,
+    ) {
+        if m.kind == 0x05 {
+            return self.members(w, level, name, name, m.reference, at, open);
+        }
+        self.struct_pointer_value(w, level, name, at, open)
+    }
+
+    /// A pointer to a struct whose type it names.
+    fn struct_pointer_value(
+        &self,
+        w: &mut Writer,
+        level: usize,
+        name: &str,
+        at: usize,
+        open: &mut HashSet<(u32, usize)>,
+    ) {
+        match self.pointer(at) {
+            Some((kind, target, _)) => {
+                let tag = format!("{name} type=\"{}\"", hash_name(kind));
+                self.members(w, level, &tag, name, kind, target, open);
+            }
+            None => w.empty(level, name),
+        }
+    }
+
+    fn text_value(&self, w: &mut Writer, level: usize, name: &str, m: &Member, at: usize) {
+        if m.kind == 0x40 {
+            return self.fixed_string_value(w, level, name, m, at);
+        }
+        self.string_value(w, level, name, m.kind, at)
+    }
+
+    /// A string inline in the member (up to 15 bytes) or behind a pointer.
+    fn string_value(&self, w: &mut Writer, level: usize, name: &str, kind: u8, at: usize) {
+        let d = self.data;
+        if kind == 0x44 && d.get(at + 15).is_some_and(|b| b & 0x80 != 0) {
+            let len = usize::from(d[at + 15] & 0x7F).min(15);
+            return w.string(level, name, &String::from_utf8_lossy(&d[at..at + len]));
+        }
+        match self.pointer(at) {
+            Some((_, target, end)) => match self.string_at(target, end) {
+                Some(text) => w.string(level, name, &text),
+                None => w.error(level, format!("{name}: a string without an end")),
+            },
+            None => w.empty(level, name),
+        }
+    }
+
+    /// A string in a buffer of fixed size.
+    fn fixed_string_value(&self, w: &mut Writer, level: usize, name: &str, m: &Member, at: usize) {
+        match self.data.get(at..at + m.reference as usize) {
+            Some(bytes) => {
+                let len = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+                w.string(level, name, &String::from_utf8_lossy(&bytes[..len]));
+            }
+            None => outside(w, level, name),
         }
     }
 
@@ -557,6 +648,10 @@ impl Psin<'_> {
         }
         w.close(level, name);
     }
+}
+
+fn outside(w: &mut Writer, level: usize, name: &str) {
+    w.error(level, format!("{name}: outside the file"))
 }
 
 /// A 16-bit float.

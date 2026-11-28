@@ -33,139 +33,203 @@ pub struct ObjMesh {
 /// negative indices from the end), `usemtl`, and `o`/`g` (the part each
 /// vertex belongs to). One mesh per material, in the order they first appear.
 pub fn read(text: &str) -> Result<Vec<ObjMesh>> {
-    let (mut v, mut vt, mut vn) = (Vec::<[f32; 3]>::new(), Vec::<[f32; 2]>::new(), Vec::<[f32; 3]>::new());
-    let mut meshes: Vec<ObjMesh> = Vec::new();
-    let mut seen: Vec<HashMap<(usize, usize, usize, usize), u32>> = Vec::new();
-    // Part names, and the current one (index into `names`).
-    let mut names: Vec<String> = vec![String::new()];
-    let mut part = 0usize;
-    let mut current = 0usize;
-    let mut has_uv = false;
-    let mut has_normals = false;
-    let num = |s: Option<&str>, line: usize| -> Result<f32> {
-        match s.map(str::parse::<f32>) {
-            Some(Ok(x)) => Ok(x),
-            _ => bail!("line {line}: number missing or invalid"),
-        }
-    };
-    let index = |s: &str, len: usize, line: usize| -> Result<usize> {
-        let k: i64 = s.parse().map_err(|_| anyhow::anyhow!("line {line}: bad index {s:?}"))?;
-        let k = if k < 0 { len as i64 + k } else { k - 1 };
-        if k < 0 || k as usize >= len {
-            bail!("line {line}: index {s} out of range");
-        }
-        Ok(k as usize)
-    };
-    let mesh_for = |name: &str, meshes: &mut Vec<ObjMesh>, seen: &mut Vec<HashMap<_, u32>>| -> usize {
-        match meshes.iter().position(|m| m.material == name) {
-            Some(i) => i,
-            None => {
-                meshes.push(ObjMesh { material: name.to_owned(), ..Default::default() });
-                seen.push(HashMap::new());
-                meshes.len() - 1
-            }
-        }
-    };
-    let mut material = String::from("default");
-    let mut started = false;
+    let mut reader = ObjReader::new();
     for (n, raw) in text.lines().enumerate() {
-        let line = n + 1;
+        reader.line(n + 1, raw)?;
+    }
+    reader.finish()
+}
+
+/// A vertex of a mesh: its position, texture coordinate and normal (each
+/// index + 1, 0 for none) and part.
+type VertexKey = (usize, usize, usize, usize);
+
+/// What `read` has gathered so far.
+struct ObjReader {
+    v: Vec<[f32; 3]>,
+    vt: Vec<[f32; 2]>,
+    vn: Vec<[f32; 3]>,
+    meshes: Vec<ObjMesh>,
+    /// Per mesh: the vertices already added.
+    seen: Vec<HashMap<VertexKey, u32>>,
+    /// Part names, and the current one (index into `names`).
+    names: Vec<String>,
+    part: usize,
+    current: usize,
+    has_uv: bool,
+    has_normals: bool,
+    material: String,
+    started: bool,
+}
+
+fn num(s: Option<&str>, line: usize) -> Result<f32> {
+    match s.map(str::parse::<f32>) {
+        Some(Ok(x)) => Ok(x),
+        _ => bail!("line {line}: number missing or invalid"),
+    }
+}
+
+fn index(s: &str, len: usize, line: usize) -> Result<usize> {
+    let k: i64 = s.parse().map_err(|_| anyhow::anyhow!("line {line}: bad index {s:?}"))?;
+    let k = if k < 0 { len as i64 + k } else { k - 1 };
+    if k < 0 || k as usize >= len {
+        bail!("line {line}: index {s} out of range");
+    }
+    Ok(k as usize)
+}
+
+/// An optional index (+ 1) of a face corner: 0 when it is empty or missing.
+/// `used` is set when there is one.
+fn optional_index(s: Option<&str>, len: usize, line: usize, used: &mut bool) -> Result<usize> {
+    match s {
+        Some(s) if !s.is_empty() => {
+            *used = true;
+            Ok(index(s, len, line)? + 1)
+        }
+        _ => Ok(0),
+    }
+}
+
+/// Three numbers, as a position or normal in the game's axes.
+fn vec3(it: &mut std::str::SplitWhitespace, line: usize) -> Result<[f32; 3]> {
+    let (x, y, z) = (num(it.next(), line)?, num(it.next(), line)?, num(it.next(), line)?);
+    Ok([x, -z, y])
+}
+
+/// A texture coordinate, `v` flipped.
+fn uv(it: &mut std::str::SplitWhitespace, line: usize) -> Result<[f32; 2]> {
+    let u = num(it.next(), line)?;
+    let t = it.next().map_or(Ok(0.0), |s| num(Some(s), line))?;
+    Ok([u, 1.0 - t])
+}
+
+fn part_index(mesh: &mut ObjMesh, name: &str) -> usize {
+    match mesh.part_names.iter().position(|n| n == name) {
+        Some(k) => k,
+        None => {
+            mesh.part_names.push(name.to_owned());
+            mesh.part_names.len() - 1
+        }
+    }
+}
+
+impl ObjReader {
+    fn new() -> Self {
+        ObjReader {
+            v: Vec::new(),
+            vt: Vec::new(),
+            vn: Vec::new(),
+            meshes: Vec::new(),
+            seen: Vec::new(),
+            names: vec![String::new()],
+            part: 0,
+            current: 0,
+            has_uv: false,
+            has_normals: false,
+            material: String::from("default"),
+            started: false,
+        }
+    }
+
+    fn line(&mut self, line: usize, raw: &str) -> Result<()> {
         let mut it = raw.split_whitespace();
         match it.next() {
-            Some("v") => {
-                let (x, y, z) = (num(it.next(), line)?, num(it.next(), line)?, num(it.next(), line)?);
-                v.push([x, -z, y]);
-            }
-            Some("vt") => {
-                let u = num(it.next(), line)?;
-                let t = it.next().map_or(Ok(0.0), |s| num(Some(s), line))?;
-                vt.push([u, 1.0 - t]);
-            }
-            Some("vn") => {
-                let (x, y, z) = (num(it.next(), line)?, num(it.next(), line)?, num(it.next(), line)?);
-                vn.push([x, -z, y]);
-            }
-            Some("o" | "g") => {
-                let name = it.collect::<Vec<_>>().join(" ");
-                part = names.iter().position(|n| *n == name).unwrap_or_else(|| {
-                    names.push(name);
-                    names.len() - 1
-                });
-            }
-            Some("usemtl") => {
-                material = it.collect::<Vec<_>>().join(" ");
-                started = false;
-            }
-            Some("f") => {
-                if !started {
-                    current = mesh_for(&material, &mut meshes, &mut seen);
-                    started = true;
-                }
-                let mut corners = Vec::new();
-                for corner in it {
-                    let mut f = corner.split('/');
-                    let p = index(f.next().unwrap_or(""), v.len(), line)?;
-                    let t = match f.next() {
-                        Some(s) if !s.is_empty() => {
-                            has_uv = true;
-                            index(s, vt.len(), line)? + 1
-                        }
-                        _ => 0,
-                    };
-                    let nn = match f.next() {
-                        Some(s) if !s.is_empty() => {
-                            has_normals = true;
-                            index(s, vn.len(), line)? + 1
-                        }
-                        _ => 0,
-                    };
-                    let mesh = &mut meshes[current];
-                    let key = (p, t, nn, part);
-                    let i = match seen[current].get(&key) {
-                        Some(&i) => i,
-                        None => {
-                            let i = mesh.positions.len() as u32;
-                            let k = match mesh.part_names.iter().position(|n| *n == names[part]) {
-                                Some(k) => k,
-                                None => {
-                                    mesh.part_names.push(names[part].clone());
-                                    mesh.part_names.len() - 1
-                                }
-                            };
-                            mesh.parts.push(k as u16);
-                            mesh.positions.push(v[p]);
-                            mesh.uvs.push(if t > 0 { vt[t - 1] } else { [0.0, 0.0] });
-                            mesh.normals.push(if nn > 0 { vn[nn - 1] } else { [0.0, 0.0, 0.0] });
-                            seen[current].insert(key, i);
-                            i
-                        }
-                    };
-                    corners.push(i);
-                }
-                if corners.len() < 3 {
-                    bail!("line {line}: a face needs at least three corners");
-                }
-                for k in 1..corners.len() - 1 {
-                    meshes[current].indices.extend([corners[0], corners[k], corners[k + 1]]);
-                }
+            Some("f") => self.face(it, line),
+            Some(kind) => self.declaration(kind, it, line),
+            None => Ok(()),
+        }
+    }
+
+    fn declaration(&mut self, kind: &str, mut it: std::str::SplitWhitespace, line: usize) -> Result<()> {
+        match kind {
+            "v" => self.v.push(vec3(&mut it, line)?),
+            "vt" => self.vt.push(uv(&mut it, line)?),
+            "vn" => self.vn.push(vec3(&mut it, line)?),
+            "o" | "g" => self.set_part(it.collect::<Vec<_>>().join(" ")),
+            "usemtl" => {
+                self.material = it.collect::<Vec<_>>().join(" ");
+                self.started = false;
             }
             _ => {}
         }
+        Ok(())
     }
-    meshes.retain(|m| !m.indices.is_empty());
-    if meshes.is_empty() {
-        bail!("the OBJ file has no faces");
+
+    fn set_part(&mut self, name: String) {
+        self.part = self.names.iter().position(|n| *n == name).unwrap_or_else(|| {
+            self.names.push(name);
+            self.names.len() - 1
+        });
     }
-    for m in &mut meshes {
-        if !has_uv {
-            m.uvs.clear();
+
+    /// The mesh of the current material, added if it is new.
+    fn current_mesh(&mut self) -> usize {
+        let name = &self.material;
+        match self.meshes.iter().position(|m| m.material == *name) {
+            Some(i) => i,
+            None => {
+                self.meshes.push(ObjMesh { material: name.to_owned(), ..Default::default() });
+                self.seen.push(HashMap::new());
+                self.meshes.len() - 1
+            }
         }
-        // Normals only when every corner had one; otherwise they are computed.
-        if !has_normals || m.normals.contains(&[0.0; 3]) {
-            m.normals.clear();
-        }
     }
-    Ok(meshes)
+
+    fn face(&mut self, corners: std::str::SplitWhitespace, line: usize) -> Result<()> {
+        if !self.started {
+            self.current = self.current_mesh();
+            self.started = true;
+        }
+        let mut fan = Vec::new();
+        for corner in corners {
+            fan.push(self.corner(corner, line)?);
+        }
+        if fan.len() < 3 {
+            bail!("line {line}: a face needs at least three corners");
+        }
+        for k in 1..fan.len() - 1 {
+            self.meshes[self.current].indices.extend([fan[0], fan[k], fan[k + 1]]);
+        }
+        Ok(())
+    }
+
+    /// The index in the current mesh of a face corner (`p`, `p/t`, `p//n`, `p/t/n`).
+    fn corner(&mut self, corner: &str, line: usize) -> Result<u32> {
+        let mut f = corner.split('/');
+        let p = index(f.next().unwrap_or(""), self.v.len(), line)?;
+        let t = optional_index(f.next(), self.vt.len(), line, &mut self.has_uv)?;
+        let nn = optional_index(f.next(), self.vn.len(), line, &mut self.has_normals)?;
+        let key = (p, t, nn, self.part);
+        if let Some(&i) = self.seen[self.current].get(&key) {
+            return Ok(i);
+        }
+        let mesh = &mut self.meshes[self.current];
+        let i = mesh.positions.len() as u32;
+        let k = part_index(mesh, &self.names[self.part]);
+        mesh.parts.push(k as u16);
+        mesh.positions.push(self.v[p]);
+        mesh.uvs.push(if t > 0 { self.vt[t - 1] } else { [0.0, 0.0] });
+        mesh.normals.push(if nn > 0 { self.vn[nn - 1] } else { [0.0, 0.0, 0.0] });
+        self.seen[self.current].insert(key, i);
+        Ok(i)
+    }
+
+    fn finish(mut self) -> Result<Vec<ObjMesh>> {
+        self.meshes.retain(|m| !m.indices.is_empty());
+        if self.meshes.is_empty() {
+            bail!("the OBJ file has no faces");
+        }
+        for m in &mut self.meshes {
+            if !self.has_uv {
+                m.uvs.clear();
+            }
+            // Normals only when every corner had one; otherwise they are computed.
+            if !self.has_normals || m.normals.contains(&[0.0; 3]) {
+                m.normals.clear();
+            }
+        }
+        Ok(self.meshes)
+    }
 }
 
 /// What a `.mtl` says about a material: its colour texture (`map_Kd`) and

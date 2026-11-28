@@ -4,143 +4,74 @@ use crate::*;
 use rage_formats::{drawable, ydr_write};
 use ydr_write::Place;
 
+#[derive(Default)]
+struct TextureStats {
+    dicts: usize,
+    textures: usize,
+    decoded: usize,
+    undecodable: std::collections::BTreeMap<String, usize>,
+    errors: Vec<String>,
+    models: usize,
+    grown: usize,
+    unreadable: Vec<String>,
+}
+
+impl TextureStats {
+    fn add(&mut self, other: TextureStats) {
+        self.dicts += other.dicts;
+        self.textures += other.textures;
+        self.decoded += other.decoded;
+        self.models += other.models;
+        self.grown += other.grown;
+        self.unreadable.extend(other.unreadable);
+        self.errors.extend(other.errors);
+        for (k, v) in other.undecodable {
+            *self.undecodable.entry(k).or_default() += v;
+        }
+    }
+}
+
 pub(crate) fn cmd_verify_textures(
     game_dir: &Path,
     within: &str,
     rebuild: bool,
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
-    #[derive(Default)]
-    struct Stats {
-        dicts: usize,
-        textures: usize,
-        decoded: usize,
-        undecodable: std::collections::BTreeMap<String, usize>,
-        errors: Vec<String>,
-        models: usize,
-        grown: usize,
-        unreadable: Vec<String>,
-    }
     let starts = archive_roots(game_dir, within, keys)?;
     let started = Instant::now();
     let (all, nested) = for_each_entry_parallel(
         &starts,
         |e| e.resource_version().is_some(),
-        |a, id, p, s: &mut Stats| {
+        |a, id, p, s: &mut TextureStats| {
             // Models with textures of their own: check the writer in memory.
             if rebuild
                 && openrage_app::textures::gta5_model_ext(p).is_some()
                 && let rage_rpf::EntryKind::Resource { system_flags, graphics_flags, .. } = a.entry(id).kind
             {
-                let check = a.read_resource(id).map_err(anyhow::Error::from).and_then(|res| {
-                    openrage_app::textures::check_model_textures(&res, p, system_flags, graphics_flags)
-                });
-                match check {
-                    Ok(openrage_app::textures::ModelCheck::Ok { grown }) => {
-                        s.models += 1;
-                        s.grown += grown as usize;
-                    }
-                    Ok(openrage_app::textures::ModelCheck::NoTextures) => {}
-                    Ok(openrage_app::textures::ModelCheck::Unreadable(why)) => s.unreadable.push(format!("{p}: {why}")),
-                    Err(e) => s.errors.push(format!("{p}: model textures: {e:#}")),
-                }
+                check_model_textures_entry(a, id, p, (system_flags, graphics_flags), s);
                 return;
             }
             if !a.entry(id).name.to_ascii_lowercase().ends_with(".ytd") || a.entry(id).resource_version().is_none() {
                 return;
             }
             s.dicts += 1;
-            let dict = match a
-                .read_resource(id)
-                .map_err(anyhow::Error::from)
-                .and_then(|r| Ok(rage_formats::ytd::parse(&r)?))
-            {
-                Ok(d) => d,
-                Err(e) => return s.errors.push(format!("{p}: {e:#}")),
-            };
-            s.errors.extend(dict.errors.iter().map(|e| format!("{p}: {e}")));
-            if rebuild && dict.errors.is_empty() {
-                let check = rage_formats::ytd_write::rebuild(&dict)
-                    .and_then(|file| rage_resource::Resource::from_rsc7(&file))
-                    .and_then(|res| rage_formats::ytd::parse(&res));
-                match check {
-                    Ok(back) => {
-                        let mut a: Vec<_> = dict
-                            .textures
-                            .iter()
-                            .map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data))
-                            .collect();
-                        let mut b: Vec<_> = back
-                            .textures
-                            .iter()
-                            .map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data))
-                            .collect();
-                        a.sort_by(|x, y| x.0.cmp(y.0));
-                        b.sort_by(|x, y| x.0.cmp(y.0));
-                        if a != b || !back.errors.is_empty() {
-                            s.errors.push(format!("{p}: rebuilt dictionary differs from the original"));
-                        }
-                        // Structures must match byte for byte, apart from pointers.
-                        let pointers: &[(usize, usize)] = match dict.layout {
-                            rage_formats::ytd::Layout::Legacy => &[(0x28, 0x30), (0x70, 0x78)],
-                            rage_formats::ytd::Layout::Enhanced | rage_formats::ytd::Layout::Rdr2 => &[(0x28, 0x40)],
-                            rage_formats::ytd::Layout::Gta4 => &[(0x14, 0x18), (0x48, 0x4C)],
-                        };
-                        let masked = |t: &[u8]| {
-                            let mut t = t.to_vec();
-                            for &(from, to) in pointers {
-                                t[from..to].fill(0);
-                            }
-                            t
-                        };
-                        for (t, st) in dict.textures.iter().zip(&dict.stored) {
-                            let Some(j) = back.textures.iter().position(|x| x.name == t.name) else { continue };
-                            let (x, y) = (masked(&st.template), masked(&back.stored[j].template));
-                            if x != y {
-                                let diffs: Vec<String> = (0..x.len())
-                                    .filter(|&i| x[i] != y[i])
-                                    .map(|i| format!("{i:#x}: {:02x}→{:02x}", x[i], y[i]))
-                                    .collect();
-                                s.errors.push(format!(
-                                    "{p}/{}: rebuilt texture structure differs ({}x{} {} mips {}; {})",
-                                    t.name,
-                                    t.width,
-                                    t.height,
-                                    t.format.name(),
-                                    t.levels,
-                                    diffs.join(", ")
-                                ));
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
-                }
-            }
-            for t in &dict.textures {
-                s.textures += 1;
-                match t.to_rgba() {
-                    Some(_) => s.decoded += 1,
-                    None => *s.undecodable.entry(t.format.name()).or_default() += 1,
-                }
-            }
+            check_ytd_entry(a, id, p, rebuild, s);
         },
     );
-    let mut total = Stats { errors: nested, ..Default::default() };
+    let mut total = TextureStats { errors: nested, ..Default::default() };
     for s in all {
-        total.dicts += s.dicts;
-        total.textures += s.textures;
-        total.decoded += s.decoded;
-        total.models += s.models;
-        total.grown += s.grown;
-        total.unreadable.extend(s.unreadable);
-        total.errors.extend(s.errors);
-        for (k, v) in s.undecodable {
-            *total.undecodable.entry(k).or_default() += v;
-        }
+        total.add(s);
     }
     total.errors.sort();
     total.unreadable.sort();
+    print_texture_stats(&total, rebuild, started);
+    if !total.errors.is_empty() {
+        bail!("{} errors", total.errors.len());
+    }
+    Ok(())
+}
+
+fn print_texture_stats(total: &TextureStats, rebuild: bool, started: Instant) {
     for e in total.errors.iter().take(50) {
         outln!("FAIL {e}");
     }
@@ -165,10 +96,117 @@ pub(crate) fn cmd_verify_textures(
         total.errors.len(),
         started.elapsed().as_secs_f32()
     );
-    if !total.errors.is_empty() {
-        bail!("{} errors", total.errors.len());
+}
+
+/// A model with textures of its own: the writer is checked in memory.
+fn check_model_textures_entry(
+    a: &Rpf7,
+    id: EntryId,
+    p: &str,
+    (system_flags, graphics_flags): (u32, u32),
+    s: &mut TextureStats,
+) {
+    let check = a
+        .read_resource(id)
+        .map_err(anyhow::Error::from)
+        .and_then(|res| openrage_app::textures::check_model_textures(&res, p, system_flags, graphics_flags));
+    match check {
+        Ok(openrage_app::textures::ModelCheck::Ok { grown }) => {
+            s.models += 1;
+            s.grown += grown as usize;
+        }
+        Ok(openrage_app::textures::ModelCheck::NoTextures) => {}
+        Ok(openrage_app::textures::ModelCheck::Unreadable(why)) => s.unreadable.push(format!("{p}: {why}")),
+        Err(e) => s.errors.push(format!("{p}: model textures: {e:#}")),
     }
-    Ok(())
+}
+
+/// Parses a texture dictionary (and with `rebuild`, writes it anew) and counts its textures.
+fn check_ytd_entry(a: &Rpf7, id: EntryId, p: &str, rebuild: bool, s: &mut TextureStats) {
+    let dict = match a.read_resource(id).map_err(anyhow::Error::from).and_then(|r| Ok(rage_formats::ytd::parse(&r)?)) {
+        Ok(d) => d,
+        Err(e) => return s.errors.push(format!("{p}: {e:#}")),
+    };
+    s.errors.extend(dict.errors.iter().map(|e| format!("{p}: {e}")));
+    if rebuild && dict.errors.is_empty() {
+        check_ytd_rebuild(&dict, p, s);
+    }
+    for t in &dict.textures {
+        s.textures += 1;
+        match t.to_rgba() {
+            Some(_) => s.decoded += 1,
+            None => *s.undecodable.entry(t.format.name()).or_default() += 1,
+        }
+    }
+}
+
+fn check_ytd_rebuild(dict: &rage_formats::ytd::TextureDictionary, p: &str, s: &mut TextureStats) {
+    let check = rage_formats::ytd_write::rebuild(dict)
+        .and_then(|file| rage_resource::Resource::from_rsc7(&file))
+        .and_then(|res| rage_formats::ytd::parse(&res));
+    match check {
+        Ok(back) => {
+            if textures_differ(dict, &back) || !back.errors.is_empty() {
+                s.errors.push(format!("{p}: rebuilt dictionary differs from the original"));
+            }
+            check_rebuilt_structures(dict, &back, p, s);
+        }
+        Err(e) => s.errors.push(format!("{p}: rebuild failed: {e}")),
+    }
+}
+
+/// Whether two dictionaries hold different textures, by name regardless of order.
+fn textures_differ(a: &rage_formats::ytd::TextureDictionary, b: &rage_formats::ytd::TextureDictionary) -> bool {
+    let mut a: Vec<_> = a.textures.iter().map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data)).collect();
+    let mut b: Vec<_> = b.textures.iter().map(|t| (&t.name, t.width, t.height, t.levels, t.format, &t.data)).collect();
+    a.sort_by(|x, y| x.0.cmp(y.0));
+    b.sort_by(|x, y| x.0.cmp(y.0));
+    a != b
+}
+
+/// Where a texture's structure holds pointers, which differ between a file and its rebuild.
+fn pointer_ranges(layout: rage_formats::ytd::Layout) -> &'static [(usize, usize)] {
+    match layout {
+        rage_formats::ytd::Layout::Legacy => &[(0x28, 0x30), (0x70, 0x78)],
+        rage_formats::ytd::Layout::Enhanced | rage_formats::ytd::Layout::Rdr2 => &[(0x28, 0x40)],
+        rage_formats::ytd::Layout::Gta4 => &[(0x14, 0x18), (0x48, 0x4C)],
+    }
+}
+
+fn masked(t: &[u8], pointers: &[(usize, usize)]) -> Vec<u8> {
+    let mut t = t.to_vec();
+    for &(from, to) in pointers {
+        t[from..to].fill(0);
+    }
+    t
+}
+
+/// Structures must match byte for byte, apart from pointers.
+fn check_rebuilt_structures(
+    dict: &rage_formats::ytd::TextureDictionary,
+    back: &rage_formats::ytd::TextureDictionary,
+    p: &str,
+    s: &mut TextureStats,
+) {
+    let pointers = pointer_ranges(dict.layout);
+    for (t, st) in dict.textures.iter().zip(&dict.stored) {
+        let Some(j) = back.textures.iter().position(|x| x.name == t.name) else { continue };
+        let (x, y) = (masked(&st.template, pointers), masked(&back.stored[j].template, pointers));
+        if x != y {
+            let diffs: Vec<String> =
+                (0..x.len()).filter(|&i| x[i] != y[i]).map(|i| format!("{i:#x}: {:02x}→{:02x}", x[i], y[i])).collect();
+            s.errors.push(format!(
+                "{p}/{}: rebuilt texture structure differs ({}x{} {} mips {}; {})",
+                t.name,
+                t.width,
+                t.height,
+                t.format.name(),
+                t.levels,
+                diffs.join(", ")
+            ));
+            break;
+        }
+    }
 }
 
 pub(crate) fn cmd_verify_media(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
@@ -366,119 +404,194 @@ pub(crate) fn collision_mesh(d: &rage_formats::drawable::Drawable) -> rage_forma
     out
 }
 
+/// Counts of one worker of `cmd_verify_collision_writer`.
+#[derive(Default)]
+struct CollisionCounts {
+    files: usize,
+    /// Game hierarchies checked.
+    hierarchies: usize,
+    /// Collisions written anew and read back the same.
+    written: usize,
+    /// No triangle mesh to copy, or too large.
+    skipped: usize,
+    errors: Vec<String>,
+}
+
+/// Collisions of boxes and spheres only borrow the structure of a triangle mesh.
+type CollisionDonor<'a> = Option<(&'a rage_resource::Resource, bool)>;
+
+/// How far the area per material may differ after the rewrite: relative, plus absolute.
+const AREA_TOLERANCE_RELATIVE: f64 = 0.01;
+const AREA_TOLERANCE_ABSOLUTE: f64 = 0.05;
+/// The bounds may differ by this fraction of their extent, plus a minimum.
+const BOUNDS_SLACK_DIVISOR: f32 = 30000.0;
+const BOUNDS_SLACK_MINIMUM: f32 = 1e-3;
+
+fn triangle_area(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f64 {
+    let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+    let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    0.5 * ((n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) as f64).sqrt()
+}
+
+/// Per material type: triangles and area.
+/// Triangles that lie on the coarser vertex grid of the one new bound can collapse
+/// (slivers), so triangles may get fewer, never more; the area stays.
+fn material_totals(d: &drawable::Drawable) -> std::collections::BTreeMap<u32, (usize, f64)> {
+    let mut t = std::collections::BTreeMap::new();
+    for m in &d.meshes {
+        let e = t.entry(d.shaders[m.shader as usize].name_hash).or_insert((0usize, 0f64));
+        for c in m.indices.as_chunks::<3>().0 {
+            let [a, b, c] = c.map(|i| m.positions[i as usize]);
+            e.0 += 1;
+            e.1 += triangle_area(a, b, c);
+        }
+    }
+    t
+}
+
+fn compare_materials(before: &drawable::Drawable, after: &drawable::Drawable) -> Result<()> {
+    let (x, y) = (material_totals(before), material_totals(after));
+    if x.len() != y.len() {
+        bail!("materials {:?} written as {:?}", x.keys().collect::<Vec<_>>(), y.keys().collect::<Vec<_>>());
+    }
+    for ((m, a), (n, b)) in x.iter().zip(&y) {
+        if m != n || b.0 > a.0 || (a.1 - b.1).abs() > AREA_TOLERANCE_RELATIVE * a.1 + AREA_TOLERANCE_ABSOLUTE {
+            bail!("material {m:x}: {} triangles, area {:.2} written as {} triangles, area {:.2}", a.0, a.1, b.0, b.1);
+        }
+    }
+    Ok(())
+}
+
+fn compare_collisions(before: &drawable::Drawable, after: &drawable::Drawable) -> Result<()> {
+    compare_materials(before, after)?;
+    let slack: Vec<f32> = (0..3)
+        .map(|k| (before.bounds_max[k] - before.bounds_min[k]) / BOUNDS_SLACK_DIVISOR + BOUNDS_SLACK_MINIMUM)
+        .collect();
+    if (0..3).any(|k| {
+        (before.bounds_min[k] - after.bounds_min[k]).abs() > slack[k]
+            || (before.bounds_max[k] - after.bounds_max[k]).abs() > slack[k]
+    }) {
+        bail!(
+            "box {:?}..{:?} written as {:?}..{:?}",
+            before.bounds_min,
+            before.bounds_max,
+            after.bounds_min,
+            after.bounds_max
+        );
+    }
+    Ok(())
+}
+
+/// Writes the collision of `res` anew from `mesh`; returns the written resource and its collision root.
+fn rewrite_collision(
+    res: &rage_resource::Resource,
+    ydr: bool,
+    mesh: &rage_formats::ybn_write::CollisionMesh,
+    donor: CollisionDonor,
+) -> Result<(rage_resource::Resource, u64)> {
+    use rage_formats::ybn_write;
+    let file = ybn_write::replace_collision(res, ydr, mesh, donor)?;
+    let back = rage_resource::Resource::from_rsc7(&file)?;
+    let at = ybn_write::collision_of(&back, ydr)?;
+    for b in ybn_write::bvh_bounds(&back, at) {
+        ybn_write::check_bvh(&back, b).context("the written hierarchy")?;
+    }
+    Ok((back, at))
+}
+
+/// Checks the game's own hierarchies of the collision at `root`.
+fn check_game_hierarchies(res: &rage_resource::Resource, root: u64, c: &mut CollisionCounts) -> Result<()> {
+    use rage_formats::ybn_write;
+    for b in ybn_write::bvh_bounds(res, root) {
+        ybn_write::check_bvh(res, b).context("the game's own hierarchy")?;
+        c.hierarchies += 1;
+    }
+    Ok(())
+}
+
+/// Checks the game's own hierarchies of a collision and reads it.
+fn game_collision(res: &rage_resource::Resource, ydr: bool, c: &mut CollisionCounts) -> Result<drawable::Drawable> {
+    use rage_formats::{ybn, ybn_write};
+    let root = ybn_write::collision_of(res, ydr)?;
+    check_game_hierarchies(res, root, c)?;
+    Ok(ybn::parse_at(res, root)?.0)
+}
+
+/// Writes the collision anew from `mesh` and compares what the reader gets back.
+fn check_written(
+    res: &rage_resource::Resource,
+    ydr: bool,
+    before: &drawable::Drawable,
+    mesh: &rage_formats::ybn_write::CollisionMesh,
+    donor: CollisionDonor,
+) -> Result<()> {
+    let (back, at) = rewrite_collision(res, ydr, mesh, donor)?;
+    let (after, _) = rage_formats::ybn::parse_at(&back, at)?;
+    compare_collisions(before, &after)?;
+    if ydr {
+        let (a, b) = (drawable::parse_ydr(res)?, drawable::parse_ydr(&back)?);
+        if a.meshes.len() != b.meshes.len() {
+            bail!("the drawable's meshes changed");
+        }
+    }
+    Ok(())
+}
+
+fn check_collision(
+    res: &rage_resource::Resource,
+    ydr: bool,
+    donor: CollisionDonor,
+    c: &mut CollisionCounts,
+) -> Result<()> {
+    let before = game_collision(res, ydr, c)?;
+    let mesh = collision_mesh(&before);
+    if mesh.indices.len() / 3 > rage_formats::ybn_write::MAX_TRIANGLES || mesh.indices.is_empty() {
+        c.skipped += 1;
+        return Ok(());
+    }
+    check_written(res, ydr, &before, &mesh, donor)?;
+    c.written += 1;
+    Ok(())
+}
+
 /// Checks the game's collision hierarchies against the writer's reading of
 /// them, then writes every Enhanced `.ybn` and drawable collision anew from
 /// its own triangles (`ybn_write`) and compares what the reader gets back.
 pub(crate) fn cmd_verify_collision_writer(game_dir: &Path, within: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
-    use rage_formats::{drawable, ybn, ybn_write};
     let starts = archive_roots(game_dir, within, keys.clone())?;
     let started = Instant::now();
-    // Per material type: triangles and area.
-    // Triangles that lie on the coarser vertex grid of the one new bound can collapse
-    // (slivers), so triangles may get fewer, never more; the area stays.
-    let totals = |d: &drawable::Drawable| -> std::collections::BTreeMap<u32, (usize, f64)> {
-        let mut t = std::collections::BTreeMap::new();
-        for m in &d.meshes {
-            let e = t.entry(d.shaders[m.shader as usize].name_hash).or_insert((0usize, 0f64));
-            for c in m.indices.as_chunks::<3>().0 {
-                let [a, b, c] = c.map(|i| m.positions[i as usize]);
-                let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
-                let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
-                let area = 0.5 * ((n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) as f64).sqrt();
-                e.0 += 1;
-                e.1 += area;
-            }
-        }
-        t
-    };
-    // (game hierarchies checked, written anew, skipped: no triangle mesh to copy / too large)
-    // Collisions of boxes and spheres only borrow the structure of a triangle mesh.
     let donor = openrage_app::obj::find_collision_donor(game_dir, within, keys.clone());
     let donor = donor.as_ref().map(|(r, y)| (r, *y));
-    let check = |res: &rage_resource::Resource, ydr: bool, s: &mut (usize, usize, usize)| -> Result<()> {
-        let root = ybn_write::collision_of(res, ydr)?;
-        for b in ybn_write::bvh_bounds(res, root) {
-            ybn_write::check_bvh(res, b).context("the game's own hierarchy")?;
-            s.0 += 1;
-        }
-        let (before, _) = ybn::parse_at(res, root)?;
-        let mesh = collision_mesh(&before);
-        if mesh.indices.len() / 3 > ybn_write::MAX_TRIANGLES || mesh.indices.is_empty() {
-            s.2 += 1;
-            return Ok(());
-        }
-        let file = ybn_write::replace_collision(res, ydr, &mesh, donor)?;
-        let back = rage_resource::Resource::from_rsc7(&file)?;
-        let at = ybn_write::collision_of(&back, ydr)?;
-        for b in ybn_write::bvh_bounds(&back, at) {
-            ybn_write::check_bvh(&back, b).context("the written hierarchy")?;
-        }
-        let (after, _) = ybn::parse_at(&back, at)?;
-        let (x, y) = (totals(&before), totals(&after));
-        if x.len() != y.len() {
-            bail!("materials {:?} written as {:?}", x.keys().collect::<Vec<_>>(), y.keys().collect::<Vec<_>>());
-        }
-        for ((m, a), (n, b)) in x.iter().zip(&y) {
-            if m != n || b.0 > a.0 || (a.1 - b.1).abs() > 0.01 * a.1 + 0.05 {
-                bail!(
-                    "material {m:x}: {} triangles, area {:.2} written as {} triangles, area {:.2}",
-                    a.0,
-                    a.1,
-                    b.0,
-                    b.1
-                );
-            }
-        }
-        let slack: Vec<f32> = (0..3).map(|k| (before.bounds_max[k] - before.bounds_min[k]) / 30000.0 + 1e-3).collect();
-        if (0..3).any(|k| {
-            (before.bounds_min[k] - after.bounds_min[k]).abs() > slack[k]
-                || (before.bounds_max[k] - after.bounds_max[k]).abs() > slack[k]
-        }) {
-            bail!(
-                "box {:?}..{:?} written as {:?}..{:?}",
-                before.bounds_min,
-                before.bounds_max,
-                after.bounds_min,
-                after.bounds_max
-            );
-        }
-        if ydr {
-            let (a, b) = (drawable::parse_ydr(res)?, drawable::parse_ydr(&back)?);
-            if a.meshes.len() != b.meshes.len() {
-                bail!("the drawable's meshes changed");
-            }
-        }
-        s.1 += 1;
-        Ok(())
-    };
-    type Counts = (usize, (usize, usize, usize), Vec<String>);
     let (all, nested) = for_each_entry_parallel(
         &starts,
         |e| {
             let name = e.name.to_ascii_lowercase();
             name.ends_with(".ydr") || name.ends_with(".ybn")
         },
-        |a, id, p, (files, s, errors): &mut Counts| {
+        |a, id, p, c: &mut CollisionCounts| {
             let ydr = a.entry(id).name.to_ascii_lowercase().ends_with(".ydr");
             let Ok(res) = a.read_resource(id) else { return };
-            if ydr && (res.version != drawable::VERSION_YDR_ENHANCED || ybn_write::collision_of(&res, true).is_err()) {
+            if ydr
+                && (res.version != drawable::VERSION_YDR_ENHANCED
+                    || rage_formats::ybn_write::collision_of(&res, true).is_err())
+            {
                 return;
             }
-            *files += 1;
-            if let Err(e) = check(&res, ydr, s) {
-                errors.push(format!("{p}: {e:#}"));
+            c.files += 1;
+            if let Err(e) = check_collision(&res, ydr, donor, c) {
+                c.errors.push(format!("{p}: {e:#}"));
             }
         },
     );
-    let sum = |f: fn(&Counts) -> usize| all.iter().map(f).sum::<usize>();
-    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.2).chain(&nested).collect();
+    let sum = |f: fn(&CollisionCounts) -> usize| all.iter().map(f).sum::<usize>();
+    let mut errors: Vec<&String> = all.iter().flat_map(|x| &x.errors).chain(&nested).collect();
     errors.sort();
     outln!(
         "{} collisions ({} game hierarchies as expected), {} written anew and read back the same, {} skipped (no triangles, or over {}), {} errors ({:.1}s)",
-        sum(|x| x.0),
-        sum(|x| x.1.0),
-        sum(|x| x.1.1),
-        sum(|x| x.1.2),
+        sum(|x| x.files),
+        sum(|x| x.hierarchies),
+        sum(|x| x.written),
+        sum(|x| x.skipped),
         rage_formats::ybn_write::MAX_TRIANGLES,
         errors.len(),
         started.elapsed().as_secs_f32()

@@ -37,6 +37,9 @@ use rage_resource::{Resource, ResourceError};
 
 use crate::ytd::{self, TextureDictionary};
 
+mod read;
+use read::{RuleIndex, read_effects, read_models, read_rules, read_textures};
+
 /// Resource type of the effect lists cutscenes use (`gta_core`, the episodes').
 pub const TYPE: u32 = 36;
 
@@ -328,10 +331,62 @@ fn emitter(res: &Resource, at: u64) -> Result<EmitterRule, ResourceError> {
     })
 }
 
-fn particle(res: &Resource, at: u64) -> Result<ParticleRule, ResourceError> {
+/// The particle kind name, lower case.
+fn kind_name(res: &Resource, at: u64) -> Result<String, ResourceError> {
     let kind_bytes = res.bytes(at + 0x128, 16)?;
-    let kind_name: String =
-        kind_bytes.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect::<String>().to_ascii_lowercase();
+    Ok(kind_bytes.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect::<String>().to_ascii_lowercase())
+}
+
+/// The texture name a shader variable points at; `None` for other variables.
+fn texture_variable(res: &Resource, v: u64) -> Result<Option<String>, ResourceError> {
+    if v != 0 && res.u32(v + 0x10)? >> 24 == 6 && ptr(res, v + 0x24)? != 0 {
+        let name = string_at(res, v + 0x24)?;
+        return Ok(Some(ytd::gta4_texture_name(&name).to_owned()));
+    }
+    Ok(None)
+}
+
+/// A sprite's colour texture: the first of the shader's texture variables.
+fn sprite_texture(res: &Resource, shader: u64) -> Result<Option<String>, ResourceError> {
+    let vars = ptr(res, shader + 0x14)?;
+    let count = res.u16(shader + 0x18)? as u64;
+    let mut texture = None;
+    for i in 0..count.min(64) {
+        let name = texture_variable(res, ptr(res, vars + i * 4)?)?;
+        // The colour texture comes first; a normal map may follow.
+        if texture.is_none() {
+            texture = name;
+        }
+    }
+    Ok(texture)
+}
+
+fn sprite_frames(res: &Resource, at: u64) -> Result<Frames, ResourceError> {
+    Ok(Frames {
+        start_max: res.u32(at + 0x174)?,
+        last: res.u32(at + 0x178)?,
+        columns: res.u32(at + 0x17C)?.clamp(1, 64),
+        rows: res.u32(at + 0x180)?.clamp(1, 64),
+    })
+}
+
+/// The fields only sprites have.
+fn read_sprite(res: &Resource, at: u64, rule: &mut ParticleRule) -> Result<(), ResourceError> {
+    rule.additive = res.u32(at + 0x104)? == 7;
+    rule.frames = sprite_frames(res, at)?;
+    for k in 0..24 {
+        let p = at + 0x198 + k * 0x34;
+        rule.properties.push((res.u32(p + 0x28)?, keyframes(res, p)?));
+    }
+    let shader = at + 0x678;
+    rule.shader = string_at(res, shader + 0x04)?;
+    rule.technique = string_at(res, shader + 0x08)?;
+    rule.texture = sprite_texture(res, shader)?;
+    Ok(())
+}
+
+fn particle(res: &Resource, at: u64) -> Result<ParticleRule, ResourceError> {
+    let kind_name = kind_name(res, at)?;
     let mut rule = ParticleRule { name: string_at(res, at + 0x124)?, ..Default::default() };
     match kind_name.as_str() {
         "ptxsprite" => {}
@@ -341,33 +396,7 @@ fn particle(res: &Resource, at: u64) -> Result<ParticleRule, ResourceError> {
         }
         other => return Err(bad(format!("{}: unknown particle kind {other:?}", rule.name))),
     }
-    rule.additive = res.u32(at + 0x104)? == 7;
-    rule.frames = Frames {
-        start_max: res.u32(at + 0x174)?,
-        last: res.u32(at + 0x178)?,
-        columns: res.u32(at + 0x17C)?.clamp(1, 64),
-        rows: res.u32(at + 0x180)?.clamp(1, 64),
-    };
-    for k in 0..24 {
-        let p = at + 0x198 + k * 0x34;
-        rule.properties.push((res.u32(p + 0x28)?, keyframes(res, p)?));
-    }
-    let shader = at + 0x678;
-    rule.shader = string_at(res, shader + 0x04)?;
-    rule.technique = string_at(res, shader + 0x08)?;
-    let vars = ptr(res, shader + 0x14)?;
-    let count = res.u16(shader + 0x18)? as u64;
-    for i in 0..count.min(64) {
-        let v = ptr(res, vars + i * 4)?;
-        if v != 0 && res.u32(v + 0x10)? >> 24 == 6 && ptr(res, v + 0x24)? != 0 {
-            let name = string_at(res, v + 0x24)?;
-            let name = ytd::gta4_texture_name(&name).to_owned();
-            // The colour texture comes first; a normal map may follow.
-            if rule.texture.is_none() {
-                rule.texture = Some(name);
-            }
-        }
-    }
+    read_sprite(res, at, &mut rule)?;
     Ok(rule)
 }
 
@@ -380,72 +409,14 @@ pub fn parse(res: &Resource) -> Result<EffectList, ResourceError> {
         )));
     }
     let mut out = EffectList::default();
-    let txd = ptr(res, ROOT)?;
-    if txd != 0 {
-        match ytd::parse_gta4_at(res, txd) {
-            Ok(t) => out.textures = Some(t),
-            Err(e) => out.errors.push(format!("textures: {e}")),
-        }
-    }
-    let models = ptr(res, ROOT + 0x08)?;
-    if models != 0 {
-        out.models = res.u16(models + 0x1C)? as usize;
-    }
-    let mut particle_at = std::collections::HashMap::new();
-    for p in dictionary(res, ptr(res, ROOT + 0x0C)?)? {
-        match particle(res, p) {
-            Ok(r) => {
-                particle_at.insert(p, out.particles.len());
-                out.particles.push(r);
-            }
-            Err(e) => out.errors.push(format!("particle rule: {e}")),
-        }
-    }
-    let mut emitter_at = std::collections::HashMap::new();
-    for p in dictionary(res, ptr(res, ROOT + 0x14)?)? {
-        match emitter(res, p) {
-            Ok(r) => {
-                emitter_at.insert(p, out.emitters.len());
-                out.emitters.push(r);
-            }
-            Err(e) => out.errors.push(format!("emitter rule: {e}")),
-        }
-    }
-    for p in dictionary(res, ptr(res, ROOT + 0x18)?)? {
-        let mut read = || -> Result<EffectRule, ResourceError> {
-            let mut rule = EffectRule { name: string_at(res, p + 0xF8)?, events: Vec::new() };
-            let list = ptr(res, p + 0x130)?;
-            let count = res.u16(p + 0x134)? as u64;
-            if count > MAX_EVENTS {
-                return Err(bad(format!("{}: implausible {count} events", rule.name)));
-            }
-            for i in 0..count {
-                let ev = ptr(res, list + i * 4)?;
-                // Emitter events point at an emitter and a particle rule of
-                // this list; other events have other fields there.
-                let (em, pr) = (res.u32(ev + 0x48).map(u64::from), res.u32(ev + 0x4C).map(u64::from));
-                let (Some(&emitter), Some(&particle)) =
-                    (em.ok().and_then(|e| emitter_at.get(&e)), pr.ok().and_then(|p| particle_at.get(&p)))
-                else {
-                    out.other_events += 1;
-                    continue;
-                };
-                let pair =
-                    |at: u64| -> Result<[f32; 2], ResourceError> { Ok([f32_at(res, at)?, f32_at(res, at + 4)?]) };
-                rule.events.push(EffectEvent {
-                    emitter,
-                    particle,
-                    playback_rate: pair(ev + 0x20)?,
-                    zoom: pair(ev + 0x28)?,
-                });
-            }
-            Ok(rule)
-        };
-        match read() {
-            Ok(r) => out.effects.push(r),
-            Err(e) => out.errors.push(format!("effect rule: {e}")),
-        }
-    }
+    read_textures(res, &mut out)?;
+    read_models(res, &mut out)?;
+    let particles =
+        read_rules(res, ptr(res, ROOT + 0x0C)?, particle, "particle rule", (&mut out.particles, &mut out.errors))?;
+    let emitters =
+        read_rules(res, ptr(res, ROOT + 0x14)?, emitter, "emitter rule", (&mut out.emitters, &mut out.errors))?;
+    let index = RuleIndex { emitters, particles };
+    read_effects(res, &index, &mut out)?;
     Ok(out)
 }
 

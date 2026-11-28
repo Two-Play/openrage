@@ -136,6 +136,23 @@ fn plain_array_layout(kind: u8) -> R<(usize, u32)> {
     Ok((size, kind as u32))
 }
 
+/// The block, key and item entries and size of the pairs of a map.
+#[derive(Clone, Copy)]
+struct MapLayout {
+    block_name: u32,
+    key: Entry,
+    item: Entry,
+    len: usize,
+}
+
+/// What the pairs of one map share: their layout, the structure that owns the map, their block and the depth.
+struct MapPairs<'a> {
+    layout: MapLayout,
+    info: &'a StructInfo,
+    block: usize,
+    depth: usize,
+}
+
 /// The place of an array's first item and the size of an item.
 #[derive(Clone, Copy)]
 struct ItemsAt {
@@ -374,6 +391,52 @@ impl<'a> Builder<'a> {
         self.structure(pb, poff, actual, node, depth + 1)
     }
 
+    /// The header of a map: `0x01` first, then count and capacity; returns the pairs.
+    fn map_header<'n, 'i>(&mut self, bi: usize, at: usize, node: Node<'n, 'i>) -> R<Vec<Node<'n, 'i>>> {
+        self.put(bi, at, &[1])?;
+        let items: Vec<_> = element_children(node).collect();
+        let count =
+            u16::try_from(items.len()).map_err(|_| format!("{} pairs are more than a map holds", items.len()))?;
+        self.put(bi, at + 16, &count.to_be_bytes())?;
+        self.put(bi, at + 18, &count.to_be_bytes())?;
+        Ok(items)
+    }
+
+    /// GTA V: the pairs are a structure with Key and Item fields, named
+    /// after the block that holds them. RDR2: key at 0 (padded to 8), item at 8.
+    fn map_layout(&self, key_info: Entry, item_info: Entry) -> R<MapLayout> {
+        let same = |a: &Entry, b: &Entry| a.kind == b.kind && a.sub == b.sub && a.key == b.key;
+        let (key_name, item_name) = (names::parse("Key"), names::parse("Item"));
+        let pair = self.pso.pairs.iter().find_map(|(name, st)| {
+            let (key, item) = (st.find(key_name)?, st.find(item_name)?);
+            (same(key, &key_info) && same(item, &item_info)).then_some(MapLayout {
+                block_name: *name,
+                key: *key,
+                item: *item,
+                len: st.length,
+            })
+        });
+        match pair {
+            Some(layout) => Ok(layout),
+            None if self.is_rdr2() => self.rdr2_map_layout(key_info, item_info),
+            None => Err("no structure describes the pairs of this map".into()),
+        }
+    }
+
+    fn rdr2_map_layout(&self, key_info: Entry, item_info: Entry) -> R<MapLayout> {
+        let item_size = match (item_info.kind, item_info.sub) {
+            (ty::STRUCTURE, 0) => self.struct_info(item_info.key)?.length,
+            (ty::STRING, 7 | 8) | (ty::UINT | ty::SINT | ty::ENUM | ty::FLOAT, _) => 4,
+            _ => 8,
+        };
+        Ok(MapLayout {
+            block_name: ARRAYINFO,
+            key: Entry { offset: 0, ..key_info },
+            item: Entry { offset: 8, ..item_info },
+            len: (8 + item_size).next_multiple_of(8),
+        })
+    }
+
     /// A map, mirroring [`Pso::map_node`]: a header (`0x01000000`, pointer
     /// to the pairs, count, capacity) and the key/item pairs in a block.
     fn map(&mut self, bi: usize, at: usize, e: &Entry, info: &StructInfo, node: Node<'_, '_>, depth: usize) -> R<()> {
@@ -382,70 +445,48 @@ impl<'a> Builder<'a> {
         }
         let key_info = *info.entries.get((e.key >> 16) as usize & 0xFFF).ok_or("map Key entry missing")?;
         let item_info = *info.entries.get(e.key as usize & 0xFFF).ok_or("map Item entry missing")?;
-        self.put(bi, at, &[1])?;
-        let items: Vec<_> = element_children(node).collect();
-        let count =
-            u16::try_from(items.len()).map_err(|_| format!("{} pairs are more than a map holds", items.len()))?;
-        self.put(bi, at + 16, &count.to_be_bytes())?;
-        self.put(bi, at + 18, &count.to_be_bytes())?;
+        let items = self.map_header(bi, at, node)?;
         if items.is_empty() {
             return Ok(());
         }
-        // GTA V: the pairs are a structure with Key and Item fields, named
-        // after the block that holds them. RDR2: key at 0 (padded to 8), item at 8.
-        let same = |a: &Entry, b: &Entry| a.kind == b.kind && a.sub == b.sub && a.key == b.key;
-        let (key_name, item_name) = (names::parse("Key"), names::parse("Item"));
-        let pair = self.pso.pairs.iter().find(|(_, st)| {
-            st.find(key_name).is_some_and(|k| same(k, &key_info))
-                && st.find(item_name).is_some_and(|i| same(i, &item_info))
-        });
-        let (block_name, key_entry, item_entry, pair_len) = match pair {
-            Some((name, st)) => {
-                (*name, *st.find(key_name).expect("found"), *st.find(item_name).expect("found"), st.length)
-            }
-            None if self.is_rdr2() => {
-                let item_size = match (item_info.kind, item_info.sub) {
-                    (ty::STRUCTURE, 0) => self.struct_info(item_info.key)?.length,
-                    (ty::STRING, 7 | 8) | (ty::UINT | ty::SINT | ty::ENUM | ty::FLOAT, _) => 4,
-                    _ => 8,
-                };
-                (
-                    ARRAYINFO,
-                    Entry { offset: 0, ..key_info },
-                    Entry { offset: 8, ..item_info },
-                    (8 + item_size).next_multiple_of(8),
-                )
-            }
-            None => return Err("no structure describes the pairs of this map".into()),
-        };
-        let (pb, poff) = self.alloc(block_name, items.len() * pair_len, align_of(pair_len));
+        let layout = self.map_layout(key_info, item_info)?;
+        let (pb, poff) = self.alloc(layout.block_name, items.len() * layout.len, align_of(layout.len));
         self.pointer(bi, at + 8, pb, poff);
+        let pairs = MapPairs { layout, info, block: pb, depth };
         for (i, child) in items.into_iter().enumerate() {
-            let base = poff + i * pair_len;
-            let key = attr(child, "key")?;
-            let key_at = base + key_entry.offset;
-            match key_entry.kind {
-                ty::STRING => self.string(pb, key_at, &key_entry, key)?,
-                ty::ENUM | ty::UINT | ty::SINT => self.put(pb, key_at, &names::parse_value(key).to_be_bytes())?,
-                _ => self.put(pb, key_at, &(int(key)? as u32).to_be_bytes())?,
-            }
-            match item_entry.kind {
-                ty::STRING => self.string(pb, base + item_entry.offset, &item_entry, &text(child))?,
-                ty::STRUCTURE if item_entry.key != 0 && item_entry.sub != 3 => {
-                    self.structure(pb, base + item_entry.offset, item_entry.key, child, depth + 1)?;
-                }
-                ty::STRUCTURE => {
-                    self.pointed_structure(pb, base + item_entry.offset, attr(child, "type")?, child, depth)?;
-                }
-                _ => {
-                    let v = element_children(child)
-                        .find(|c| c.tag_name().name() == "Value")
-                        .ok_or("map item without Value")?;
-                    self.entry(pb, base, &item_entry, info, v, depth + 1)?;
-                }
-            }
+            self.map_pair(&pairs, poff + i * layout.len, child)?;
         }
         Ok(())
+    }
+
+    fn map_key(&mut self, pb: usize, key_at: usize, key_entry: &Entry, key: &str) -> R<()> {
+        match key_entry.kind {
+            ty::STRING => self.string(pb, key_at, key_entry, key),
+            ty::ENUM | ty::UINT | ty::SINT => self.put(pb, key_at, &names::parse_value(key).to_be_bytes()),
+            _ => self.put(pb, key_at, &(int(key)? as u32).to_be_bytes()),
+        }
+    }
+
+    /// One key/item pair of a map at `base` in the pairs' block.
+    fn map_pair(&mut self, m: &MapPairs, base: usize, child: Node<'_, '_>) -> R<()> {
+        let (pb, depth) = (m.block, m.depth);
+        let (key_entry, item_entry) = (m.layout.key, m.layout.item);
+        self.map_key(pb, base + key_entry.offset, &key_entry, attr(child, "key")?)?;
+        let at = base + item_entry.offset;
+        match item_entry.kind {
+            ty::STRING => self.string(pb, at, &item_entry, &text(child)),
+            ty::STRUCTURE if item_entry.key != 0 && item_entry.sub != 3 => {
+                self.structure(pb, at, item_entry.key, child, depth + 1)
+            }
+            ty::STRUCTURE => self.pointed_structure(pb, at, attr(child, "type")?, child, depth),
+            _ => self.map_value_item(m, base, child),
+        }
+    }
+
+    /// A map item written like a structure entry, as the pair's `Value` element.
+    fn map_value_item(&mut self, m: &MapPairs, base: usize, child: Node<'_, '_>) -> R<()> {
+        let v = element_children(child).find(|c| c.tag_name().name() == "Value").ok_or("map item without Value")?;
+        self.entry(m.block, base, &m.layout.item, m.info, v, m.depth + 1)
     }
 
     fn floats(&mut self, bi: usize, at: usize, v: &[f32]) -> R<()> {

@@ -693,236 +693,27 @@ fn ped_expressions(
     out
 }
 
-fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result<LoadedModel> {
-    let (node, _) = rage_mods::resolve(game_dir, vpath, keys.clone())?;
-    if let Node::Rpf8File(rpf, i) = node {
-        return load_rdr2(&rpf, i);
-    }
-    if let Node::Gta4File(archive, id) = node {
-        return load_gta4(&archive, id);
-    }
-    if let Node::Rpf9File(rpf, i) = node {
-        if vpath.to_ascii_lowercase().ends_with(".#bn") {
-            let (system, _) = crate::rpf9::resource(&rpf, i)?;
-            let (collision, stats) = rage_formats::bn6::parse(&system)?;
-            for material in stats.materials {
-                let label = format!("Material {material:04x}");
-                let color = material_color(&label, material as u8);
-                let id = rage_formats::ybn::MATERIAL_BASE + u32::from(material);
-                rage_formats::shaders::register(id, label, color);
-            }
-            return Ok(LoadedModel::from_drawables(vec![("collision".to_owned(), collision)]));
-        }
-        if vpath.to_ascii_lowercase().ends_with(".#nv") {
-            let (mesh, _) = rage_formats::paths::parse_nv6(crate::rpf9::resource(&rpf, i)?.0)?;
-            return Ok(LoadedModel::from_drawables(vec![("nav mesh".to_owned(), mesh)]));
-        }
-        let mut drawables = crate::gta6_models::load(&rpf, i)?;
-        let textures = crate::gta6_textures::for_drawables(game_dir, &drawables);
-        let name = vpath.rsplit('/').next().unwrap_or(vpath);
-        // A dictionary's drawables have skeletons of their own.
-        let worn_on = crate::gta6_models::bind(game_dir, name, &mut drawables);
-        let skeleton = worn_on.or_else(|| match drawables.as_slice() {
-            [(_, d)] => d.skeleton.clone(),
-            _ => None,
-        });
-        let mut model = LoadedModel::from_drawables(drawables);
-        model.skeleton = skeleton;
-        if let Some(textures) = textures {
-            model.add_textures("texture pools".to_owned(), textures);
-        }
-        return Ok(model);
-    }
-    let Node::ArchiveFile(rpf, id) = node else { bail!("{vpath} is not a file inside an archive") };
-    let name = rpf.entry(id).name.clone();
-    let res = rpf.read_resource(id)?;
-    let lower = name.to_ascii_lowercase();
-    let stem = name.split('.').next().unwrap_or(&name).to_owned();
-    let mut external = Vec::new();
-    let (mut drawables, mut parts) = if rage_formats::paths::is_path_file(&lower) {
-        let ext = lower.rsplit('.').next().unwrap_or_default();
-        let (path, _) = rage_formats::paths::parse(&res, ext)?;
-        let part = Part {
-            name: stem.clone(),
-            group: String::new(),
-            drawable: 0,
-            transform: math::IDENTITY,
-            visible: true,
-            bone: None,
-        };
-        (vec![(stem.clone(), path)], vec![part])
-    } else if lower.ends_with(".ybn") {
-        let (collision, stats) = rage_formats::ybn::parse(&res)?;
-        let names = collision_material_names(game_dir, keys.clone());
-        for &m in &stats.materials {
-            let label = names.get(m as usize).cloned().unwrap_or_else(|| format!("Material {m}"));
-            let color = material_color(&label, m);
-            rage_formats::shaders::register(rage_formats::ybn::MATERIAL_BASE + m as u32, label, color);
-        }
-        let part = Part {
-            name: stem.clone(),
-            group: String::new(),
-            drawable: 0,
-            transform: math::IDENTITY,
-            visible: true,
-            bone: None,
-        };
-        (vec![(stem.clone(), collision)], vec![part])
-    } else if lower.ends_with(".ypt") {
-        // Particle models (debris, sparks, …) side by side, textured from the
-        // dictionary inside the file.
-        let ptfx = rage_formats::ypt::parse(&res)?;
-        if ptfx.drawables.is_empty() {
-            bail!("{name} contains no models");
-        }
-        let drawables: Vec<(String, Drawable)> = ptfx
-            .drawables
-            .into_iter()
-            .enumerate()
-            .map(|(i, (hash, d))| {
-                let label = rage_formats::names::value(hash);
-                let label = if hash == 0 || label.starts_with("hash_") { format!("{stem}#{i}") } else { label };
-                (label, d)
-            })
-            .collect();
-        let layout = thumbnail_layout(&drawables);
-        let parts = drawables
-            .iter()
-            .enumerate()
-            .map(|(i, (n, _))| Part {
-                name: n.clone(),
-                group: String::new(),
-                drawable: i,
-                transform: layout[i],
-                visible: true,
-                bone: None,
-            })
-            .collect();
-        if let Some(t) = ptfx.textures {
-            external.push((format!("{stem}.ypt textures"), t));
-        }
-        (drawables, parts)
-    } else if lower.ends_with(".ydd") {
-        let parsed = drawable::parse_ydd(&res)?;
-        let hashes: Vec<u32> = parsed.iter().map(|(h, _)| *h).collect();
-        let drawables: Vec<(String, Drawable)> =
-            dictionary_names(&stem, &hashes).into_iter().zip(parsed).map(|(name, (_, d))| (name, d)).collect();
-        let names: Vec<String> = drawables.iter().map(|(n, _)| n.clone()).collect();
-        // Peds are assembled in place; other dictionaries are laid out in a grid.
-        let layout =
-            if is_ped_dictionary(&names) { vec![math::IDENTITY; drawables.len()] } else { grid_layout(&drawables) };
-        let parts = default_visibility(&names)
-            .into_iter()
-            .enumerate()
-            .map(|(i, visible)| Part {
-                name: names[i].clone(),
-                group: ped_group(&names[i]),
-                drawable: i,
-                transform: layout[i],
-                visible,
-                bone: None,
-            })
-            .collect();
-        (drawables, parts)
-    } else if lower.ends_with(".yft")
-        && let Some(folder) = rpf
-            .find_child(rpf.entry(id).parent.unwrap_or(rage_rpf::Rpf7::ROOT), &stem)
-            .filter(|&f| rpf.entry(f).is_dir())
-    {
-        // A streamed ped (online characters, story characters): the fragment
-        // holds the skeleton, the folder next to it the components.
-        let skeleton = drawable::parse_fragment(&res)?.drawable.skeleton;
-        let (mut drawables, parts, textures) = streamed_ped(&rpf, folder)?;
-        external.extend(textures);
-        if let Some(sk) = &skeleton {
-            fit_to_skeleton(&mut drawables, sk);
-        }
-        let mut model = LoadedModel {
-            drawables,
-            parts,
-            external,
-            materials: Vec::new(),
-            shared: Vec::new(),
-            shader_material: Vec::new(),
-            skeleton,
-            expressions: Vec::new(),
-            ped: None,
-        };
-        model.collect_materials();
-        return Ok(model);
-    } else if lower.ends_with(".yft") {
-        fragment_parts(drawable::parse_fragment(&res)?, &stem)
-    } else if lower.ends_with(".ydr") {
-        let part = Part {
-            name: stem.clone(),
-            group: String::new(),
-            drawable: 0,
-            transform: math::IDENTITY,
-            visible: true,
-            bone: None,
-        };
-        (vec![(stem.clone(), drawable::parse_ydr(&res)?)], vec![part])
-    } else {
-        bail!("{name} is not a model (.ydr, .yft, .ydd, .ypt, .ybn, .ynd, .yvr, .ywr)");
-    };
+/// The drawables of a model, with how they are laid out.
+type Assembled = (Vec<(String, Drawable)>, Vec<Part>);
 
-    if lower.ends_with(".yft") {
-        add_mod_parts(game_dir, keys.clone(), &stem, &mut drawables, &mut parts);
+/// A part showing the only drawable of a model, in place.
+fn whole_part(stem: &str) -> Part {
+    Part {
+        name: stem.to_owned(),
+        group: String::new(),
+        drawable: 0,
+        transform: math::IDENTITY,
+        visible: true,
+        bone: None,
     }
+}
 
-    // Textures usually live next to the model: adder.yft → adder.ytd (+ vehshare.ytd for vehicles).
-    let dir = rpf.entry(id).parent.unwrap_or(rage_rpf::Rpf7::ROOT);
-    let mut candidates = vec![format!("{stem}.ytd"), format!("{stem}+hi.ytd")];
-    if lower.ends_with(".yft") {
-        candidates.push("vehshare.ytd".into());
-    }
-    let total = candidates.len() as u64;
-    for (k, c) in candidates.into_iter().enumerate() {
-        crate::progress::set("Loading textures", k as u64, total);
-        if let Some(tid) = rpf.find_child(dir, &c)
-            && let Ok(dict) = rpf
-                .read_resource(tid)
-                .map_err(anyhow::Error::from)
-                .and_then(|r| rage_formats::ytd::parse(&r).context("texture dictionary"))
-        {
-            external.push((c, dict));
-        }
-    }
-    if lower.ends_with(".yft") {
-        // Vehicles from DLC packs have no vehshare.ytd beside them: use the game's own.
-        let mut shared = Vec::new();
-        if !external.iter().any(|(n, _)| n == "vehshare.ytd") {
-            shared.push("vehshare.ytd".to_owned());
-        }
-        // Interiors come from shared dictionaries named after the texture
-        // (supergt_interior → vehicles_supergt_interior.ytd).
-        for d in drawables.iter().map(|(_, d)| d) {
-            for t in d.shaders.iter().filter_map(|s| s.base_texture()) {
-                let t = t.to_ascii_lowercase();
-                let dict = format!("vehicles_{t}.ytd");
-                if t.ends_with("_interior") && !shared.contains(&dict) {
-                    shared.push(dict);
-                }
-            }
-        }
-        for name in shared {
-            let local = rpf
-                .find_child(dir, &name)
-                .and_then(|tid| rpf.read_resource(tid).ok())
-                .and_then(|r| rage_formats::ytd::parse(&r).ok());
-            if let Some(dict) = local.or_else(|| base_vehicle_textures(game_dir, keys.clone(), &name)) {
-                external.push((name, dict));
-            }
-        }
-    }
-    // Peds keep their skeleton in a fragment next to the drawable dictionary.
-    let skeleton = drawables.iter().find_map(|(_, d)| d.skeleton.clone()).or_else(|| {
-        let tid = rpf.find_child(dir, &format!("{stem}.yft"))?;
-        drawable::parse_fragment(&rpf.read_resource(tid).ok()?).ok()?.drawable.skeleton
-    });
-    if let Some(sk) = &skeleton {
-        fit_to_skeleton(&mut drawables, sk);
-    }
+/// A finished model from its pieces.
+fn assembled_model(
+    (drawables, parts): Assembled,
+    external: Vec<(String, TextureDictionary)>,
+    skeleton: Option<drawable::Skeleton>,
+) -> LoadedModel {
     let mut model = LoadedModel {
         drawables,
         parts,
@@ -935,7 +726,302 @@ fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Resu
         ped: None,
     };
     model.collect_materials();
+    model
+}
+
+fn load_model(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, vpath: &str) -> Result<LoadedModel> {
+    let (node, _) = rage_mods::resolve(game_dir, vpath, keys.clone())?;
+    match node {
+        Node::Rpf8File(rpf, i) => load_rdr2(&rpf, i),
+        Node::Gta4File(archive, id) => load_gta4(&archive, id),
+        Node::Rpf9File(rpf, i) => load_gta6(game_dir, &rpf, i, vpath),
+        Node::ArchiveFile(rpf, id) => load_gta5(game_dir, keys, &rpf, id),
+        _ => bail!("{vpath} is not a file inside an archive"),
+    }
+}
+
+fn gta6_collision(rpf: &rage_rpf::Rpf9, i: usize) -> Result<LoadedModel> {
+    let (system, _) = crate::rpf9::resource(rpf, i)?;
+    let (collision, stats) = rage_formats::bn6::parse(&system)?;
+    for material in stats.materials {
+        let label = format!("Material {material:04x}");
+        let color = material_color(&label, material as u8);
+        let id = rage_formats::ybn::MATERIAL_BASE + u32::from(material);
+        rage_formats::shaders::register(id, label, color);
+    }
+    Ok(LoadedModel::from_drawables(vec![("collision".to_owned(), collision)]))
+}
+
+fn gta6_nav_mesh(rpf: &rage_rpf::Rpf9, i: usize) -> Result<LoadedModel> {
+    let (mesh, _) = rage_formats::paths::parse_nv6(crate::rpf9::resource(rpf, i)?.0)?;
+    Ok(LoadedModel::from_drawables(vec![("nav mesh".to_owned(), mesh)]))
+}
+
+/// A GTA VI model: a collision (`.#bn`), a nav mesh (`.#nv`) or a drawable.
+fn load_gta6(game_dir: &Path, rpf: &rage_rpf::Rpf9, i: usize, vpath: &str) -> Result<LoadedModel> {
+    let lower = vpath.to_ascii_lowercase();
+    if lower.ends_with(".#bn") {
+        return gta6_collision(rpf, i);
+    }
+    if lower.ends_with(".#nv") {
+        return gta6_nav_mesh(rpf, i);
+    }
+    let mut drawables = crate::gta6_models::load(rpf, i)?;
+    let textures = crate::gta6_textures::for_drawables(game_dir, &drawables);
+    let name = vpath.rsplit('/').next().unwrap_or(vpath);
+    // A dictionary's drawables have skeletons of their own.
+    let worn_on = crate::gta6_models::bind(game_dir, name, &mut drawables);
+    let skeleton = worn_on.or_else(|| match drawables.as_slice() {
+        [(_, d)] => d.skeleton.clone(),
+        _ => None,
+    });
+    let mut model = LoadedModel::from_drawables(drawables);
+    model.skeleton = skeleton;
+    if let Some(textures) = textures {
+        model.add_textures("texture pools".to_owned(), textures);
+    }
     Ok(model)
+}
+
+/// The file of a GTA V model being loaded.
+struct Gta5File<'a> {
+    rpf: &'a rage_rpf::Rpf7,
+    id: rage_rpf::EntryId,
+    name: &'a str,
+    lower: &'a str,
+    stem: &'a str,
+    res: &'a rage_resource::Resource,
+}
+
+/// What a GTA V model file makes up.
+enum Gta5Body {
+    /// Drawables and parts, and the dictionaries found inside the file.
+    Parts(Assembled, Vec<(String, TextureDictionary)>),
+    /// A model that is finished already.
+    Model(LoadedModel),
+}
+
+impl Gta5Body {
+    fn plain(assembled: Assembled) -> Self {
+        Self::Parts(assembled, Vec::new())
+    }
+}
+
+fn load_gta5(
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    rpf: &rage_rpf::Rpf7,
+    id: rage_rpf::EntryId,
+) -> Result<LoadedModel> {
+    let name = rpf.entry(id).name.clone();
+    let res = rpf.read_resource(id)?;
+    let lower = name.to_ascii_lowercase();
+    let stem = name.split('.').next().unwrap_or(&name).to_owned();
+    let file = Gta5File { rpf, id, name: &name, lower: &lower, stem: &stem, res: &res };
+    let ((mut drawables, mut parts), mut external) = match gta5_body(game_dir, keys.clone(), &file)? {
+        Gta5Body::Parts(assembled, external) => (assembled, external),
+        Gta5Body::Model(model) => return Ok(model),
+    };
+
+    if lower.ends_with(".yft") {
+        add_mod_parts(game_dir, keys.clone(), &stem, &mut drawables, &mut parts);
+    }
+    let dir = rpf.entry(id).parent.unwrap_or(rage_rpf::Rpf7::ROOT);
+    add_neighbor_textures(&file, dir, &mut external);
+    if lower.ends_with(".yft") {
+        add_shared_textures(game_dir, keys, &file, &drawables, &mut external);
+    }
+    // Peds keep their skeleton in a fragment next to the drawable dictionary.
+    let skeleton = drawables.iter().find_map(|(_, d)| d.skeleton.clone()).or_else(|| {
+        let tid = rpf.find_child(dir, &format!("{stem}.yft"))?;
+        drawable::parse_fragment(&rpf.read_resource(tid).ok()?).ok()?.drawable.skeleton
+    });
+    if let Some(sk) = &skeleton {
+        fit_to_skeleton(&mut drawables, sk);
+    }
+    Ok(assembled_model((drawables, parts), external, skeleton))
+}
+
+/// Builds the drawables and parts of a GTA V model file by its kind.
+fn gta5_body(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, f: &Gta5File) -> Result<Gta5Body> {
+    let lower = f.lower;
+    if rage_formats::paths::is_path_file(lower) {
+        return path_body(f);
+    }
+    if lower.ends_with(".ybn") {
+        return collision_body(game_dir, keys, f);
+    }
+    if lower.ends_with(".ypt") {
+        return particle_body(f);
+    }
+    if lower.ends_with(".ydd") {
+        return dictionary_body(f);
+    }
+    if lower.ends_with(".yft") {
+        return fragment_body(f);
+    }
+    if lower.ends_with(".ydr") {
+        let drawable = (f.stem.to_owned(), drawable::parse_ydr(f.res)?);
+        return Ok(Gta5Body::plain((vec![drawable], vec![whole_part(f.stem)])));
+    }
+    bail!("{} is not a model (.ydr, .yft, .ydd, .ypt, .ybn, .ynd, .yvr, .ywr)", f.name);
+}
+
+fn path_body(f: &Gta5File) -> Result<Gta5Body> {
+    let ext = f.lower.rsplit('.').next().unwrap_or_default();
+    let (path, _) = rage_formats::paths::parse(f.res, ext)?;
+    Ok(Gta5Body::plain((vec![(f.stem.to_owned(), path)], vec![whole_part(f.stem)])))
+}
+
+fn collision_body(game_dir: &Path, keys: Option<Arc<GtaVKeys>>, f: &Gta5File) -> Result<Gta5Body> {
+    let (collision, stats) = rage_formats::ybn::parse(f.res)?;
+    let names = collision_material_names(game_dir, keys);
+    for &m in &stats.materials {
+        let label = names.get(m as usize).cloned().unwrap_or_else(|| format!("Material {m}"));
+        let color = material_color(&label, m);
+        rage_formats::shaders::register(rage_formats::ybn::MATERIAL_BASE + m as u32, label, color);
+    }
+    Ok(Gta5Body::plain((vec![(f.stem.to_owned(), collision)], vec![whole_part(f.stem)])))
+}
+
+/// Particle models (debris, sparks, …) side by side, textured from the
+/// dictionary inside the file.
+fn particle_body(f: &Gta5File) -> Result<Gta5Body> {
+    let ptfx = rage_formats::ypt::parse(f.res)?;
+    if ptfx.drawables.is_empty() {
+        bail!("{} contains no models", f.name);
+    }
+    let stem = f.stem;
+    let drawables: Vec<(String, Drawable)> = ptfx
+        .drawables
+        .into_iter()
+        .enumerate()
+        .map(|(i, (hash, d))| {
+            let label = rage_formats::names::value(hash);
+            let label = if hash == 0 || label.starts_with("hash_") { format!("{stem}#{i}") } else { label };
+            (label, d)
+        })
+        .collect();
+    let layout = thumbnail_layout(&drawables);
+    let parts = drawables
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| Part {
+            name: n.clone(),
+            group: String::new(),
+            drawable: i,
+            transform: layout[i],
+            visible: true,
+            bone: None,
+        })
+        .collect();
+    let external = ptfx.textures.map(|t| (format!("{stem}.ypt textures"), t)).into_iter().collect();
+    Ok(Gta5Body::Parts((drawables, parts), external))
+}
+
+fn dictionary_body(f: &Gta5File) -> Result<Gta5Body> {
+    let parsed = drawable::parse_ydd(f.res)?;
+    let hashes: Vec<u32> = parsed.iter().map(|(h, _)| *h).collect();
+    let drawables: Vec<(String, Drawable)> =
+        dictionary_names(f.stem, &hashes).into_iter().zip(parsed).map(|(name, (_, d))| (name, d)).collect();
+    let names: Vec<String> = drawables.iter().map(|(n, _)| n.clone()).collect();
+    // Peds are assembled in place; other dictionaries are laid out in a grid.
+    let layout =
+        if is_ped_dictionary(&names) { vec![math::IDENTITY; drawables.len()] } else { grid_layout(&drawables) };
+    let parts = default_visibility(&names)
+        .into_iter()
+        .enumerate()
+        .map(|(i, visible)| Part {
+            name: names[i].clone(),
+            group: ped_group(&names[i]),
+            drawable: i,
+            transform: layout[i],
+            visible,
+            bone: None,
+        })
+        .collect();
+    Ok(Gta5Body::plain((drawables, parts)))
+}
+
+fn fragment_body(f: &Gta5File) -> Result<Gta5Body> {
+    let folder = f
+        .rpf
+        .find_child(f.rpf.entry(f.id).parent.unwrap_or(rage_rpf::Rpf7::ROOT), f.stem)
+        .filter(|&folder| f.rpf.entry(folder).is_dir());
+    let Some(folder) = folder else {
+        return Ok(Gta5Body::plain(fragment_parts(drawable::parse_fragment(f.res)?, f.stem)));
+    };
+    // A streamed ped (online characters, story characters): the fragment
+    // holds the skeleton, the folder next to it the components.
+    let skeleton = drawable::parse_fragment(f.res)?.drawable.skeleton;
+    let (mut drawables, parts, textures) = streamed_ped(f.rpf, folder)?;
+    if let Some(sk) = &skeleton {
+        fit_to_skeleton(&mut drawables, sk);
+    }
+    Ok(Gta5Body::Model(assembled_model((drawables, parts), textures, skeleton)))
+}
+
+/// Textures usually live next to the model: adder.yft → adder.ytd (+ vehshare.ytd for vehicles).
+fn add_neighbor_textures(f: &Gta5File, dir: rage_rpf::EntryId, external: &mut Vec<(String, TextureDictionary)>) {
+    let stem = f.stem;
+    let mut candidates = vec![format!("{stem}.ytd"), format!("{stem}+hi.ytd")];
+    if f.lower.ends_with(".yft") {
+        candidates.push("vehshare.ytd".into());
+    }
+    let total = candidates.len() as u64;
+    for (k, c) in candidates.into_iter().enumerate() {
+        crate::progress::set("Loading textures", k as u64, total);
+        if let Some(tid) = f.rpf.find_child(dir, &c)
+            && let Ok(dict) = f
+                .rpf
+                .read_resource(tid)
+                .map_err(anyhow::Error::from)
+                .and_then(|r| rage_formats::ytd::parse(&r).context("texture dictionary"))
+        {
+            external.push((c, dict));
+        }
+    }
+}
+
+/// The shared dictionaries a vehicle needs besides its own.
+fn vehicle_shared_names(drawables: &[(String, Drawable)], external: &[(String, TextureDictionary)]) -> Vec<String> {
+    // Vehicles from DLC packs have no vehshare.ytd beside them: use the game's own.
+    let mut shared = Vec::new();
+    if !external.iter().any(|(n, _)| n == "vehshare.ytd") {
+        shared.push("vehshare.ytd".to_owned());
+    }
+    // Interiors come from shared dictionaries named after the texture
+    // (supergt_interior → vehicles_supergt_interior.ytd).
+    for d in drawables.iter().map(|(_, d)| d) {
+        for t in d.shaders.iter().filter_map(|s| s.base_texture()) {
+            let t = t.to_ascii_lowercase();
+            let dict = format!("vehicles_{t}.ytd");
+            if t.ends_with("_interior") && !shared.contains(&dict) {
+                shared.push(dict);
+            }
+        }
+    }
+    shared
+}
+
+fn add_shared_textures(
+    game_dir: &Path,
+    keys: Option<Arc<GtaVKeys>>,
+    f: &Gta5File,
+    drawables: &[(String, Drawable)],
+    external: &mut Vec<(String, TextureDictionary)>,
+) {
+    let dir = f.rpf.entry(f.id).parent.unwrap_or(rage_rpf::Rpf7::ROOT);
+    for name in vehicle_shared_names(drawables, external) {
+        let local = f
+            .rpf
+            .find_child(dir, &name)
+            .and_then(|tid| f.rpf.read_resource(tid).ok())
+            .and_then(|r| rage_formats::ytd::parse(&r).ok());
+        if let Some(dict) = local.or_else(|| base_vehicle_textures(game_dir, keys.clone(), &name)) {
+            external.push((name, dict));
+        }
+    }
 }
 
 /// Makes the meshes of every drawable use the model's skeleton: blend indices
@@ -1289,26 +1375,81 @@ fn load_gta4(archive: &Arc<rage_rpf::Gta4Archive>, id: rage_rpf::Gta4EntryId) ->
         let skeleton = wdr::parse_wft(&res)?.drawable.skeleton.context("the player has no skeleton")?;
         return gta4_player(archive, skeleton);
     }
-    let (mut drawables, parts) = if lower.ends_with(".wdr") {
-        let part = Part {
-            name: stem.clone(),
-            group: String::new(),
-            drawable: 0,
-            transform: math::IDENTITY,
-            visible: true,
-            bone: None,
-        };
-        (vec![(stem.clone(), wdr::parse_wdr(&res)?)], vec![part])
-    } else if lower.ends_with(".wft") {
-        let (mut drawables, mut parts) = fragment_parts(wdr::parse_wft(&res)?, &stem);
-        // The collision, hidden at first (switch it on under Parts).
-        if let Some(at) = wdr::fragment_bound(&res)
-            && let Ok((collision, stats)) = rage_formats::wbn::parse_bound(&res, at)
-            && !collision.meshes.is_empty()
-        {
-            let bounds = vec![("collision".to_owned(), collision, stats)];
-            register_gta4_materials(archive, &bounds);
-            let (name, d, _) = bounds.into_iter().next().expect("one bound");
+    let (mut drawables, parts) = gta4_parts(archive, &res, &name, &lower, &stem)?;
+    let external = gta4_textures(archive, &drawables, &lower, &stem);
+    let skeleton = gta4_skeleton(archive, &drawables, &stem);
+    if let Some(sk) = &skeleton
+        && lower.ends_with(".wdd")
+    {
+        fit_to_skeleton(&mut drawables, sk);
+    }
+    Ok(assembled_model((drawables, parts), external, skeleton))
+}
+
+fn gta4_textures(
+    archive: &Arc<rage_rpf::Gta4Archive>,
+    drawables: &[(String, Drawable)],
+    lower: &str,
+    stem: &str,
+) -> Vec<(String, TextureDictionary)> {
+    crate::progress::set("Loading textures", 0, 0);
+    let used: Vec<String> =
+        drawables.iter().flat_map(|(_, d)| d.shaders.iter().flat_map(|s| s.textures.iter().cloned())).collect();
+    let vehicle = lower.ends_with(".wft") && archive.display_name().eq_ignore_ascii_case("vehicles.img");
+    let collision = lower.ends_with(".wbn") || lower.ends_with(".wbd");
+    if collision { Vec::new() } else { crate::gta4::model_textures(archive, stem, &used, vehicle) }
+}
+
+/// Peds: the skeleton of the fragment next to the dictionary.
+fn gta4_skeleton(
+    archive: &rage_rpf::Gta4Archive,
+    drawables: &[(String, Drawable)],
+    stem: &str,
+) -> Option<drawable::Skeleton> {
+    drawables.iter().find_map(|(_, d)| d.skeleton.clone()).or_else(|| {
+        let tid = archive.find_child(rage_rpf::Gta4Archive::ROOT, &format!("{stem}.wft"))?;
+        rage_formats::wdr::parse_wft(&archive.read_resource(tid).ok()?).ok()?.drawable.skeleton
+    })
+}
+
+/// Builds the drawables and parts of a GTA IV model file by its kind.
+fn gta4_parts(
+    archive: &rage_rpf::Gta4Archive,
+    res: &rage_resource::Resource,
+    name: &str,
+    lower: &str,
+    stem: &str,
+) -> Result<Assembled> {
+    if lower.ends_with(".wdr") {
+        return Ok((vec![(stem.to_owned(), rage_formats::wdr::parse_wdr(res)?)], vec![whole_part(stem)]));
+    }
+    if lower.ends_with(".wft") {
+        return gta4_fragment_parts(archive, res, stem);
+    }
+    if lower.ends_with(".wdd") {
+        return gta4_dictionary_parts(res, stem);
+    }
+    if lower.ends_with(".wbn") || lower.ends_with(".wbd") {
+        return gta4_bound_parts(archive, res, lower, stem);
+    }
+    bail!("{name} is not a GTA IV model (.wdr, .wdd, .wft) or collision file (.wbn, .wbd)");
+}
+
+fn gta4_fragment_parts(
+    archive: &rage_rpf::Gta4Archive,
+    res: &rage_resource::Resource,
+    stem: &str,
+) -> Result<Assembled> {
+    use rage_formats::wdr;
+    let (mut drawables, mut parts) = fragment_parts(wdr::parse_wft(res)?, stem);
+    // The collision, hidden at first (switch it on under Parts).
+    if let Some(at) = wdr::fragment_bound(res)
+        && let Ok((collision, stats)) = rage_formats::wbn::parse_bound(res, at)
+        && !collision.meshes.is_empty()
+    {
+        let bounds = vec![("collision".to_owned(), collision, stats)];
+        register_gta4_materials(archive, &bounds);
+        for (name, d, _) in bounds {
             parts.push(Part {
                 name: name.clone(),
                 group: "Collision".into(),
@@ -1319,100 +1460,77 @@ fn load_gta4(archive: &Arc<rage_rpf::Gta4Archive>, id: rage_rpf::Gta4EntryId) ->
             });
             drawables.push((name, d));
         }
-        (drawables, parts)
-    } else if lower.ends_with(".wdd") {
-        let drawables: Vec<(String, Drawable)> = wdr::parse_wdd(&res)?
-            .into_iter()
-            .enumerate()
-            .map(|(i, (hash, d))| {
-                let name = match ped_component_names().get(&hash) {
-                    Some(n) => n.clone(),
-                    None if hash != 0 => format!("{stem}#{hash:08x}"),
-                    None => format!("{stem}#{i}"),
-                };
-                (name, d)
-            })
-            .collect();
-        let names: Vec<String> = drawables.iter().map(|(n, _)| n.clone()).collect();
-        let layout =
-            if is_ped_dictionary(&names) { vec![math::IDENTITY; drawables.len()] } else { grid_layout(&drawables) };
-        let parts = default_visibility(&names)
-            .into_iter()
-            .enumerate()
-            .map(|(i, visible)| Part {
-                name: names[i].clone(),
-                group: ped_group(&names[i]),
-                drawable: i,
-                transform: layout[i],
-                visible,
-                bone: None,
-            })
-            .collect();
-        (drawables, parts)
-    } else if lower.ends_with(".wbn") || lower.ends_with(".wbd") {
-        let bounds: Vec<(String, Drawable, rage_formats::ybn::Stats)> = if lower.ends_with(".wbn") {
-            let (d, s) = rage_formats::wbn::parse_wbn(&res)?;
-            vec![(stem.clone(), d, s)]
-        } else {
-            // A map area's dictionary names its bounds after the models they belong to.
-            let index = crate::gta4::game_folder(archive.path()).map(|g| crate::gta4::texture_index(&g));
-            rage_formats::wbn::parse_wbd(&res)?
-                .into_iter()
-                .map(|(hash, d, s)| {
-                    let label =
-                        index.as_ref().and_then(|i| i.model_name(hash)).unwrap_or_else(|| format!("{hash:08x}"));
-                    (label, d, s)
-                })
-                .collect()
-        };
-        register_gta4_materials(archive, &bounds);
-        let drawables: Vec<(String, Drawable)> = bounds.into_iter().map(|(n, d, _)| (n, d)).collect();
-        let layout = if drawables.len() > 1 { grid_layout(&drawables) } else { vec![math::IDENTITY] };
-        let parts = drawables
-            .iter()
-            .enumerate()
-            .map(|(i, (n, _))| Part {
-                name: n.clone(),
-                group: String::new(),
-                drawable: i,
-                transform: layout[i],
-                visible: i < SHOWN_AT_FIRST,
-                bone: None,
-            })
-            .collect();
-        (drawables, parts)
-    } else {
-        bail!("{name} is not a GTA IV model (.wdr, .wdd, .wft) or collision file (.wbn, .wbd)");
-    };
-    crate::progress::set("Loading textures", 0, 0);
-    let used: Vec<String> =
-        drawables.iter().flat_map(|(_, d)| d.shaders.iter().flat_map(|s| s.textures.iter().cloned())).collect();
-    let vehicle = lower.ends_with(".wft") && archive.display_name().eq_ignore_ascii_case("vehicles.img");
-    let collision = lower.ends_with(".wbn") || lower.ends_with(".wbd");
-    let external = if collision { Vec::new() } else { crate::gta4::model_textures(archive, &stem, &used, vehicle) };
-    // Peds: the skeleton of the fragment next to the dictionary.
-    let skeleton = drawables.iter().find_map(|(_, d)| d.skeleton.clone()).or_else(|| {
-        let tid = archive.find_child(rage_rpf::Gta4Archive::ROOT, &format!("{stem}.wft"))?;
-        wdr::parse_wft(&archive.read_resource(tid).ok()?).ok()?.drawable.skeleton
-    });
-    if let Some(sk) = &skeleton
-        && lower.ends_with(".wdd")
-    {
-        fit_to_skeleton(&mut drawables, sk);
     }
-    let mut model = LoadedModel {
-        drawables,
-        parts,
-        external,
-        materials: Vec::new(),
-        shared: Vec::new(),
-        shader_material: Vec::new(),
-        skeleton,
-        expressions: Vec::new(),
-        ped: None,
+    Ok((drawables, parts))
+}
+
+fn gta4_dictionary_parts(res: &rage_resource::Resource, stem: &str) -> Result<Assembled> {
+    let drawables: Vec<(String, Drawable)> = rage_formats::wdr::parse_wdd(res)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, (hash, d))| {
+            let name = match ped_component_names().get(&hash) {
+                Some(n) => n.clone(),
+                None if hash != 0 => format!("{stem}#{hash:08x}"),
+                None => format!("{stem}#{i}"),
+            };
+            (name, d)
+        })
+        .collect();
+    let names: Vec<String> = drawables.iter().map(|(n, _)| n.clone()).collect();
+    let layout =
+        if is_ped_dictionary(&names) { vec![math::IDENTITY; drawables.len()] } else { grid_layout(&drawables) };
+    let parts = default_visibility(&names)
+        .into_iter()
+        .enumerate()
+        .map(|(i, visible)| Part {
+            name: names[i].clone(),
+            group: ped_group(&names[i]),
+            drawable: i,
+            transform: layout[i],
+            visible,
+            bone: None,
+        })
+        .collect();
+    Ok((drawables, parts))
+}
+
+fn gta4_bound_parts(
+    archive: &rage_rpf::Gta4Archive,
+    res: &rage_resource::Resource,
+    lower: &str,
+    stem: &str,
+) -> Result<Assembled> {
+    let bounds: Vec<(String, Drawable, rage_formats::ybn::Stats)> = if lower.ends_with(".wbn") {
+        let (d, s) = rage_formats::wbn::parse_wbn(res)?;
+        vec![(stem.to_owned(), d, s)]
+    } else {
+        // A map area's dictionary names its bounds after the models they belong to.
+        let index = crate::gta4::game_folder(archive.path()).map(|g| crate::gta4::texture_index(&g));
+        rage_formats::wbn::parse_wbd(res)?
+            .into_iter()
+            .map(|(hash, d, s)| {
+                let label = index.as_ref().and_then(|i| i.model_name(hash)).unwrap_or_else(|| format!("{hash:08x}"));
+                (label, d, s)
+            })
+            .collect()
     };
-    model.collect_materials();
-    Ok(model)
+    register_gta4_materials(archive, &bounds);
+    let drawables: Vec<(String, Drawable)> = bounds.into_iter().map(|(n, d, _)| (n, d)).collect();
+    let layout = if drawables.len() > 1 { grid_layout(&drawables) } else { vec![math::IDENTITY] };
+    let parts = drawables
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| Part {
+            name: n.clone(),
+            group: String::new(),
+            drawable: i,
+            transform: layout[i],
+            visible: i < SHOWN_AT_FIRST,
+            bone: None,
+        })
+        .collect();
+    Ok((drawables, parts))
 }
 
 /// Component groups of GTA IV's player shown by default (suits, `suse`, are left out).

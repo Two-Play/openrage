@@ -56,6 +56,135 @@ fn contents(rpf: &Rpf8) -> Vec<(u32, u8, std::result::Result<u64, String>)> {
         .collect()
 }
 
+/// Entries added by the round trip: the table grows over the first entries' data.
+const ADDED_COUNT: usize = 8;
+const ADDED_NAME: &str = "openrage_verify/added.txt";
+const ADDED_DATA: &[u8] = b"openrage verify --rebuild";
+/// Bytes of a stored resource read to find its `RSC8` header.
+const RSC8_HEAD_LEN: u64 = 16;
+/// The compressor field recorded for a stored resource without the `RSC8` magic.
+const NO_RSC8_MAGIC: u32 = 0xFFFF;
+
+/// Counts the compressor field of every stored `RSC8` header.
+fn count_rsc8_fields(before: &Rpf8, entries: &[rage_rpf::rpf8::Entry], tally: &mut Tally) {
+    for e in entries.iter().filter(|e| e.is_resource) {
+        if let Ok(head) = before.read_stored_head(e, RSC8_HEAD_LEN)
+            && head.len() as u64 == RSC8_HEAD_LEN
+        {
+            let magic = u32::from_le_bytes(head[0..4].try_into().unwrap_or_default());
+            let info = u32::from_le_bytes(head[4..8].try_into().unwrap_or_default());
+            let field = if magic == rage_rpf::rpf8::RSC8_MAGIC { info >> 8 & 0x1F } else { NO_RSC8_MAGIC };
+            let kind = format!("{:?}{}", e.compression, if e.is_encrypted() { " encrypted" } else { "" });
+            *tally.rsc8_fields.entry((kind, field)).or_default() += 1;
+        }
+    }
+}
+
+/// What the round trip changed in the copy, and what the archive read as before.
+struct Edited<'a> {
+    before: &'a Rpf8,
+    entries: &'a [rage_rpf::rpf8::Entry],
+    original: &'a [(u32, u8, std::result::Result<u64, String>)],
+    plain: Option<usize>,
+    resource: Option<usize>,
+    new_plain: Option<Vec<u8>>,
+}
+
+impl Edited<'_> {
+    fn name(&self, i: usize) -> String {
+        self.entries[i].display_name(self.before.platform())
+    }
+
+    /// What entry `i` should read as after the edit.
+    fn expected(&self, i: usize, original: &std::result::Result<u64, String>) -> std::result::Result<u64, String> {
+        match (self.plain, &self.new_plain) {
+            (Some(p), Some(d)) if p == i => Ok(digest(d)),
+            _ => original.clone(),
+        }
+    }
+}
+
+/// Replaces a plain file, re-stores a resource from its exported RSC8 file and adds new files.
+/// Returns the new contents of the replaced plain file.
+fn apply_edits(ed: &mut Rpf8Editor, x: &Edited) -> Result<Option<Vec<u8>>> {
+    let new_plain = x.plain.map(|i| {
+        let mut d = x.before.read(&x.entries[i]).unwrap_or_default();
+        d.extend(b"\n-- changed by openrage verify --rebuild --\n");
+        d
+    });
+    if let (Some(i), Some(d)) = (x.plain, &new_plain) {
+        ed.set(&x.name(i), d.clone())?;
+    }
+    if let Some(i) = x.resource {
+        ed.set(&x.name(i), x.before.resource_file(&x.entries[i])?)?;
+    }
+    for k in 0..ADDED_COUNT {
+        ed.set(&format!("{ADDED_NAME}{k}"), ADDED_DATA.to_vec())?;
+    }
+    Ok(new_plain)
+}
+
+/// Checks that one original entry is still there and reads as it should.
+fn check_kept(
+    after: &Rpf8,
+    new_entries: &[rage_rpf::rpf8::Entry],
+    x: &Edited,
+    i: usize,
+) -> std::result::Result<(), String> {
+    let (hash, ext, want) = &x.original[i];
+    let e = new_entries
+        .iter()
+        .find(|e| e.hash == *hash && e.ext_id == *ext)
+        .ok_or_else(|| format!("{} lost", x.name(i)))?;
+    let got = after.read(e).map(|d| digest(&d)).map_err(|x| x.to_string());
+    let want = x.expected(i, want);
+    if got != want {
+        return Err(format!("{} reads differently ({got:?} vs {want:?})", x.name(i)));
+    }
+    if x.resource == Some(i) && (e.size_or_flags != x.entries[i].size_or_flags || !e.is_resource) {
+        return Err(format!("{}: resource flags changed", x.name(i)));
+    }
+    Ok(())
+}
+
+/// Checks the edited archive: plain table, sorted, every old entry intact, the added ones readable.
+fn check_edited(after: &Rpf8, x: &Edited) -> std::result::Result<(), String> {
+    if after.header().is_encrypted() {
+        return Err("the table was not written in plain text".into());
+    }
+    let new_entries = after.entries().ok_or("table unreadable")?;
+    if new_entries.len() != x.entries.len() + ADDED_COUNT {
+        return Err(format!("{} entries, expected {}", new_entries.len(), x.entries.len() + ADDED_COUNT));
+    }
+    if !new_entries.windows(2).all(|w| w[0].hash <= w[1].hash) {
+        return Err("entries not sorted by hash".into());
+    }
+    for i in 0..x.original.len() {
+        check_kept(after, new_entries, x, i)?;
+    }
+    check_added(after, new_entries)
+}
+
+fn check_added(after: &Rpf8, new_entries: &[rage_rpf::rpf8::Entry]) -> std::result::Result<(), String> {
+    let (h, ext) = rage_rpf::rpf8::path_hash(&format!("{ADDED_NAME}0"), after.platform());
+    let e = new_entries.iter().find(|e| e.hash == h && e.ext_id == ext).ok_or("added entry missing")?;
+    if after.read(e).map_err(|x| x.to_string())? != ADDED_DATA {
+        return Err("added entry reads differently".into());
+    }
+    Ok(())
+}
+
+/// Picks what to change: the first readable plain file, the first readable resource.
+fn pick_edits(
+    entries: &[rage_rpf::rpf8::Entry],
+    original: &[(u32, u8, std::result::Result<u64, String>)],
+) -> (Option<usize>, Option<usize>) {
+    let readable = |i: usize| original[i].2.is_ok();
+    let plain = (0..entries.len()).find(|&i| readable(i) && !entries[i].is_resource && entries[i].ext_id != 0);
+    let resource = (0..entries.len()).find(|&i| readable(i) && entries[i].is_resource);
+    (plain, resource)
+}
+
 /// Edits a copy of an archive (replace a file, re-store a resource from its
 /// exported RSC8 file, add a file, so the table grows), checks that every
 /// entry reads back as it should, then undoes the edit and checks that the
@@ -67,97 +196,40 @@ fn round_trip(path: &Path, label: &str, tally: &mut Tally) -> Result<()> {
         tally.skipped.push(format!("{label}: entry table encrypted with a key that is not loaded"));
         return Ok(());
     };
-    for e in entries.iter().filter(|e| e.is_resource) {
-        if let Ok(head) = before.read_stored_head(e, 16)
-            && head.len() == 16
-        {
-            let magic = u32::from_le_bytes(head[0..4].try_into().unwrap_or_default());
-            let info = u32::from_le_bytes(head[4..8].try_into().unwrap_or_default());
-            let field = if magic == rage_rpf::rpf8::RSC8_MAGIC { info >> 8 & 0x1F } else { 0xFFFF };
-            let kind = format!("{:?}{}", e.compression, if e.is_encrypted() { " encrypted" } else { "" });
-            *tally.rsc8_fields.entry((kind, field)).or_default() += 1;
-        }
-    }
+    count_rsc8_fields(&before, entries, tally);
     textures(&before, label, tally);
     let original = contents(&before);
     let original_file = file_digest(path)?;
-    let readable = |i: usize| original[i].2.is_ok();
-
-    // Pick what to change: the first readable plain file, the first readable resource.
-    let plain = (0..entries.len()).find(|&i| readable(i) && !entries[i].is_resource && entries[i].ext_id != 0);
-    let resource = (0..entries.len()).find(|&i| readable(i) && entries[i].is_resource);
+    let (plain, resource) = pick_edits(entries, &original);
     let mut ed = Rpf8Editor::open(path, keys.clone(), None)?;
-    let name = |i: usize| entries[i].display_name(before.platform());
-    let new_plain = plain.map(|i| {
-        let mut d = before.read(&entries[i]).unwrap_or_default();
-        d.extend(b"\n-- changed by openrage verify --rebuild --\n");
-        d
-    });
-    if let (Some(i), Some(d)) = (plain, &new_plain) {
-        ed.set(&name(i), d.clone())?;
-    }
-    if let Some(i) = resource {
-        ed.set(&name(i), before.resource_file(&entries[i])?)?;
-    }
-    let added = b"openrage verify --rebuild".to_vec();
-    let added_name = "openrage_verify/added.txt";
-    // Several new entries: the table grows over the first entries' data.
-    for k in 0..8 {
-        ed.set(&format!("{added_name}{k}"), added.clone())?;
-    }
+    let mut x = Edited { before: &before, entries, original: &original, plain, resource, new_plain: None };
+    x.new_plain = apply_edits(&mut ed, &x)?;
+    let backup = commit_with_backup(ed)?;
+    let after = Rpf8::open_with_keys(path, keys)?;
+    let problems = check_edited(&after, &x);
+    backup.restore(path)?;
+    let restored = file_digest(path)? == original_file;
+    tally.archives += 1;
+    tally.entries += entries.len();
+    record_outcome(tally, label, problems, restored);
+    Ok(())
+}
+
+fn commit_with_backup(ed: Rpf8Editor) -> Result<rage_rpf::editor::Backup> {
     let mut backup = None;
     ed.commit(&mut |b| {
         backup = Some(b.clone());
         Ok(())
     })?;
-    let backup = backup.context("no backup")?;
+    backup.context("no backup")
+}
 
-    let after = Rpf8::open_with_keys(path, keys)?;
-    let problems = (|| -> std::result::Result<(), String> {
-        if after.header().is_encrypted() {
-            return Err("the table was not written in plain text".into());
-        }
-        let new_entries = after.entries().ok_or("table unreadable")?;
-        if new_entries.len() != entries.len() + 8 {
-            return Err(format!("{} entries, expected {}", new_entries.len(), entries.len() + 8));
-        }
-        if !new_entries.windows(2).all(|w| w[0].hash <= w[1].hash) {
-            return Err("entries not sorted by hash".into());
-        }
-        for (i, (hash, ext, want)) in original.iter().enumerate() {
-            let e = new_entries
-                .iter()
-                .find(|e| e.hash == *hash && e.ext_id == *ext)
-                .ok_or_else(|| format!("{} lost", name(i)))?;
-            let got = after.read(e).map(|d| digest(&d)).map_err(|x| x.to_string());
-            let want = match (plain, &new_plain) {
-                (Some(p), Some(d)) if p == i => Ok(digest(d)),
-                _ => want.clone(),
-            };
-            if got != want {
-                return Err(format!("{} reads differently ({got:?} vs {want:?})", name(i)));
-            }
-            if resource == Some(i) && (e.size_or_flags != entries[i].size_or_flags || !e.is_resource) {
-                return Err(format!("{}: resource flags changed", name(i)));
-            }
-        }
-        let (h, x) = rage_rpf::rpf8::path_hash(&format!("{added_name}0"), after.platform());
-        let e = new_entries.iter().find(|e| e.hash == h && e.ext_id == x).ok_or("added entry missing")?;
-        if after.read(e).map_err(|x| x.to_string())? != added {
-            return Err("added entry reads differently".into());
-        }
-        Ok(())
-    })();
-    backup.restore(path)?;
-    let restored = file_digest(path)? == original_file;
-    tally.archives += 1;
-    tally.entries += entries.len();
+fn record_outcome(tally: &mut Tally, label: &str, problems: std::result::Result<(), String>, restored: bool) {
     match (problems, restored) {
         (Ok(()), true) => {}
         (Err(p), _) => tally.failed.push(format!("{label}: {p}")),
         (Ok(()), false) => tally.failed.push(format!("{label}: undo did not restore the original bytes")),
     }
-    Ok(())
 }
 
 /// Writes every texture of every dictionary in the archive in place (first
