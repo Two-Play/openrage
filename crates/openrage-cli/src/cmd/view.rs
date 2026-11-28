@@ -17,7 +17,12 @@ pub(crate) fn cmd_model(
     output: ModelOutput,
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
-    let ModelOutput { export, render, yaw, anim } = output;
+    let ModelOutput {
+        export,
+        render,
+        yaw,
+        anim,
+    } = output;
     let model = match outfit {
         Some(n) => {
             let name = path.rsplit('/').next().unwrap_or(path);
@@ -27,10 +32,16 @@ pub(crate) fn cmd_model(
         None => openrage_app::models::load(game_dir, keys.clone(), path)?,
     };
     print_model(&model);
-    let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("model");
+    let stem = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .split('.')
+        .next()
+        .unwrap_or("model");
     if let Some(out) = export {
-        let glb =
-            openrage_app::models::to_glb(&model, stem, &model.default_look()).context("model has nothing to export")?;
+        let glb = openrage_app::models::to_glb(&model, stem, &model.default_look())
+            .context("model has nothing to export")?;
         fs::write(out, &glb).with_context(|| format!("writing {}", out.display()))?;
         outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
     }
@@ -78,7 +89,11 @@ fn print_model(model: &openrage_app::models::LoadedModel) {
     }
 }
 
-fn print_model_drawable(model: &openrage_app::models::LoadedModel, name: &str, d: &rage_formats::drawable::Drawable) {
+fn print_model_drawable(
+    model: &openrage_app::models::LoadedModel,
+    name: &str,
+    d: &rage_formats::drawable::Drawable,
+) {
     outln!(
         "{name}: {} meshes, {} vertices, {} triangles, {} shaders",
         d.meshes.len(),
@@ -86,10 +101,40 @@ fn print_model_drawable(model: &openrage_app::models::LoadedModel, name: &str, d
         d.triangle_count(),
         d.shaders.len()
     );
+    let decoded: usize = d
+        .meshes
+        .iter()
+        .map(|mesh| mesh.bone_indices.len().min(mesh.bone_weights.len()))
+        .sum();
+    if decoded > 0 {
+        let bones = model
+            .skeleton
+            .as_ref()
+            .or(d.skeleton.as_ref())
+            .map_or(0, |s| s.bones.len());
+        let weighted: usize = d
+            .meshes
+            .iter()
+            .filter(|mesh| rage_formats::gltf::has_skin_weights(mesh, bones))
+            .map(|mesh| mesh.positions.len())
+            .sum();
+        outln!(
+            "  skin weights: {decoded} decoded, {weighted}/{} vertices ready for export",
+            d.vertex_count()
+        );
+    }
     for (i, s) in d.shaders.iter().enumerate() {
         let base = s.base_texture().unwrap_or("-");
-        let found = if base == "-" || model.texture(d, base).is_some() { "" } else { " (not found)" };
-        outln!("  shader {i:>2} {:08x}  base {base}{found}  [{}]", s.name_hash, s.textures.join(", "));
+        let found = if base == "-" || model.texture(d, base).is_some() {
+            ""
+        } else {
+            " (not found)"
+        };
+        outln!(
+            "  shader {i:>2} {:08x}  base {base}{found}  [{}]",
+            s.name_hash,
+            s.textures.join(", ")
+        );
     }
 }
 
@@ -100,19 +145,34 @@ fn anim_skin(
     model: &openrage_app::models::LoadedModel,
     spec: &str,
 ) -> Result<Vec<rage_formats::math::Mat4>> {
-    let (ycd, rest) = spec.rsplit_once(':').context("--anim wants <ycd>:<clip>[@seconds]")?;
+    let (ycd, rest) = spec
+        .rsplit_once(':')
+        .context("--anim wants <ycd>:<clip>[@seconds]")?;
     let (clip, secs) = match rest.split_once('@') {
         Some((c, t)) => (c, t.parse::<f32>().context("bad time")?),
         None => (rest, 0.0),
     };
     // A cutscene (.cut) plays its sections joined into one clip per actor.
     let dict = openrage_app::anim::load_clips(game_dir, keys, ycd)?;
-    let c = dict.clips.iter().find(|c| c.name.eq_ignore_ascii_case(clip)).context("no such clip")?;
+    let c = dict
+        .clips
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(clip))
+        .context("no such clip")?;
     let (_, part, at) = c.part_at(secs).context("clip without animation")?;
     let a = &dict.animations[part.animation];
-    let skel = model.skeleton.as_ref().context("the model has no skeleton")?;
-    let binding = openrage_app::anim::Binding::new(skel, a).with_expressions(skel, a, &model.expressions);
-    outln!("animating {} of {} bones ({:.1} s clip)", binding.animated_bones(), skel.bones.len(), c.duration());
+    let skel = model
+        .skeleton
+        .as_ref()
+        .context("the model has no skeleton")?;
+    let binding =
+        openrage_app::anim::Binding::new(skel, a).with_expressions(skel, a, &model.expressions);
+    outln!(
+        "animating {} of {} bones ({:.1} s clip)",
+        binding.animated_bones(),
+        skel.bones.len(),
+        c.duration()
+    );
     Ok(binding.skin(skel, a, a.frame_at(at)))
 }
 
@@ -125,7 +185,10 @@ fn render_model(
 ) -> Result<()> {
     use openrage_app::render;
     let materials = render::Materials::new(model);
-    let view = render::View { yaw: yaw.to_radians(), ..Default::default() };
+    let view = render::View {
+        yaw: yaw.to_radians(),
+        ..Default::default()
+    };
     let started = Instant::now();
     let look = model.default_look();
     let skin = match anim {
@@ -152,17 +215,31 @@ pub(crate) fn cmd_map(
 ) -> Result<()> {
     use openrage_app::world;
     let started = Instant::now();
-    let Some(scene) = load_map_scene(game_dir, path, check, keys, started)? else { return Ok(()) };
+    let Some(scene) = load_map_scene(game_dir, path, check, keys, started)? else {
+        return Ok(());
+    };
     let path = path.unwrap_or("map");
     eprintln!();
     print_map_summary(path, &scene, started);
-    let looks: Vec<openrage_app::models::Look> = scene.models.iter().map(|(_, m, _)| m.default_look()).collect();
-    let items: Vec<(&openrage_app::models::LoadedModel, &openrage_app::models::Look, &[rage_formats::math::Mat4])> =
-        scene.models.iter().zip(&looks).map(|((_, m, t), l)| (m, l, t.as_slice())).collect();
+    let looks: Vec<openrage_app::models::Look> = scene
+        .models
+        .iter()
+        .map(|(_, m, _)| m.default_look())
+        .collect();
+    let items: Vec<(
+        &openrage_app::models::LoadedModel,
+        &openrage_app::models::Look,
+        &[rage_formats::math::Mat4],
+    )> = scene
+        .models
+        .iter()
+        .zip(&looks)
+        .map(|((_, m, t), l)| (m, l, t.as_slice()))
+        .collect();
     let (lo, hi) = world::scene_bounds(&items).context("nothing to show")?;
     let center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, lo[2]];
     outln!(
-        "extent {:.0} × {:.0} × {:.0} m around ({:.0}, {:.0}, {:.0})",
+        "extent {:.0} Ã— {:.0} Ã— {:.0} m around ({:.0}, {:.0}, {:.0})",
         hi[0] - lo[0],
         hi[1] - lo[1],
         hi[2] - lo[2],
@@ -170,9 +247,16 @@ pub(crate) fn cmd_map(
         center[1],
         center[2]
     );
-    let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("map");
+    let stem = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .split('.')
+        .next()
+        .unwrap_or("map");
     if let Some(out) = export {
-        let glb = openrage_app::models::scene_to_glb(stem, &items, center).context("nothing to export")?;
+        let glb = openrage_app::models::scene_to_glb(stem, &items, center)
+            .context("nothing to export")?;
         fs::write(out, &glb)?;
         outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
     }
@@ -201,8 +285,9 @@ fn load_map_scene(
         return Ok(None);
     }
     let path = path.context("which map file? (or --check for all)")?;
-    let scene =
-        world::load_map(&w, &files, game_dir, keys, path, &|done, total| show_progress("loading models", done, total))?;
+    let scene = world::load_map(&w, &files, game_dir, keys, path, &|done, total| {
+        show_progress("loading models", done, total)
+    })?;
     Ok(Some(scene))
 }
 
@@ -212,12 +297,21 @@ fn show_progress(what: &str, done: usize, total: usize) {
     }
 }
 
-fn gta6_map_scene(game_dir: &Path, path: Option<&str>, check: bool) -> Result<openrage_app::world::MapScene> {
+fn gta6_map_scene(
+    game_dir: &Path,
+    path: Option<&str>,
+    check: bool,
+) -> Result<openrage_app::world::MapScene> {
     if check {
         bail!("--check is not supported for GTA VI yet");
     }
     match path {
-        Some(path) => openrage_app::gta6_world::place(game_dir, path, openrage_app::gta6_world::AROUND, &show_progress),
+        Some(path) => openrage_app::gta6_world::place(
+            game_dir,
+            path,
+            openrage_app::gta6_world::AROUND,
+            &show_progress,
+        ),
         None => openrage_app::gta6_world::overview(game_dir, &show_progress),
     }
 }
@@ -233,7 +327,7 @@ fn print_map_summary(path: &str, scene: &openrage_app::world::MapScene, started:
         started.elapsed().as_secs_f32()
     );
     for (name, n) in scene.missing.iter().take(10) {
-        outln!("  no model: {n:>3} × {name}");
+        outln!("  no model: {n:>3} Ã— {name}");
     }
 }
 
@@ -246,14 +340,31 @@ fn render_map(
     yaw: f32,
 ) -> Result<()> {
     use openrage_app::render;
-    let materials: Vec<render::Materials> = scene.models.iter().map(|(_, m, _)| render::Materials::new(m)).collect();
+    let materials: Vec<render::Materials> = scene
+        .models
+        .iter()
+        .map(|(_, m, _)| render::Materials::new(m))
+        .collect();
     let mut soft = Vec::new();
     for (((_, m, ts), l), mat) in scene.models.iter().zip(looks).zip(&materials) {
         for t in ts {
-            soft.push(render::SceneItem { model: m, look: l, materials: mat, transform: *t, skin: None });
+            soft.push(render::SceneItem {
+                model: m,
+                look: l,
+                materials: mat,
+                transform: *t,
+                skin: None,
+            });
         }
     }
-    let camera = render::orbit_camera(lo, hi, render::View { yaw: yaw.to_radians(), ..Default::default() });
+    let camera = render::orbit_camera(
+        lo,
+        hi,
+        render::View {
+            yaw: yaw.to_radians(),
+            ..Default::default()
+        },
+    );
     let rgba = render::render_scene(&soft, &camera, 1280, 800);
     fs::write(out, rage_formats::png(1280, 800, &rgba)?)?;
     outln!("Rendered {}", out.display());
@@ -291,15 +402,27 @@ pub(crate) fn cmd_map_gta4(
         started.elapsed().as_secs_f32()
     );
     for (name, n) in scene.missing.iter().take(10) {
-        outln!("  no model: {n:>3} × {name}");
+        outln!("  no model: {n:>3} Ã— {name}");
     }
-    let looks: Vec<openrage_app::models::Look> = scene.models.iter().map(|(_, m, _)| m.default_look()).collect();
-    let items: Vec<(&openrage_app::models::LoadedModel, &openrage_app::models::Look, &[rage_formats::math::Mat4])> =
-        scene.models.iter().zip(&looks).map(|((_, m, t), l)| (m, l, t.as_slice())).collect();
+    let looks: Vec<openrage_app::models::Look> = scene
+        .models
+        .iter()
+        .map(|(_, m, _)| m.default_look())
+        .collect();
+    let items: Vec<(
+        &openrage_app::models::LoadedModel,
+        &openrage_app::models::Look,
+        &[rage_formats::math::Mat4],
+    )> = scene
+        .models
+        .iter()
+        .zip(&looks)
+        .map(|((_, m, t), l)| (m, l, t.as_slice()))
+        .collect();
     let (lo, hi) = openrage_app::world::scene_bounds(&items).context("nothing to show")?;
     let center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, lo[2]];
     outln!(
-        "extent {:.0} × {:.0} × {:.0} m around ({:.0}, {:.0}, {:.0})",
+        "extent {:.0} Ã— {:.0} Ã— {:.0} m around ({:.0}, {:.0}, {:.0})",
         hi[0] - lo[0],
         hi[1] - lo[1],
         hi[2] - lo[2],
@@ -307,23 +430,46 @@ pub(crate) fn cmd_map_gta4(
         center[1],
         center[2]
     );
-    let stem = path.rsplit('/').next().unwrap_or(path).split('.').next().unwrap_or("map");
+    let stem = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .split('.')
+        .next()
+        .unwrap_or("map");
     if let Some(out) = export {
-        let glb = openrage_app::models::scene_to_glb(stem, &items, center).context("nothing to export")?;
+        let glb = openrage_app::models::scene_to_glb(stem, &items, center)
+            .context("nothing to export")?;
         fs::write(out, &glb)?;
         outln!("Wrote {} ({})", out.display(), human(glb.len() as u64));
     }
     if let Some(out) = render {
         use openrage_app::render;
-        let materials: Vec<render::Materials> =
-            scene.models.iter().map(|(_, m, _)| render::Materials::new(m)).collect();
+        let materials: Vec<render::Materials> = scene
+            .models
+            .iter()
+            .map(|(_, m, _)| render::Materials::new(m))
+            .collect();
         let mut soft = Vec::new();
         for (((_, m, ts), l), mat) in scene.models.iter().zip(&looks).zip(&materials) {
             for t in ts {
-                soft.push(render::SceneItem { model: m, look: l, materials: mat, transform: *t, skin: None });
+                soft.push(render::SceneItem {
+                    model: m,
+                    look: l,
+                    materials: mat,
+                    transform: *t,
+                    skin: None,
+                });
             }
         }
-        let camera = render::orbit_camera(lo, hi, render::View { yaw: yaw.to_radians(), ..Default::default() });
+        let camera = render::orbit_camera(
+            lo,
+            hi,
+            render::View {
+                yaw: yaw.to_radians(),
+                ..Default::default()
+            },
+        );
         let rgba = render::render_scene(&soft, &camera, 1280, 800);
         fs::write(out, rage_formats::png(1280, 800, &rgba)?)?;
         outln!("Rendered {}", out.display());
@@ -340,7 +486,11 @@ pub(crate) fn check_maps_gta4(game_dir: &Path, started: Instant) -> Result<()> {
     let mut disk = Vec::new();
     collect_archives(game_dir, &["wpl"], &mut disk);
     for p in disk {
-        let rel = p.strip_prefix(game_dir).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+        let rel = p
+            .strip_prefix(game_dir)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .replace('\\', "/");
         files.push((rel, fs::read(&p)?));
     }
     let (starts, _) = gta4_starts(game_dir, "")?;
@@ -364,7 +514,9 @@ pub(crate) fn check_maps_gta4(game_dir: &Path, started: Instant) -> Result<()> {
         }
     };
     for (_, data) in &files {
-        let Ok(wpl) = rage_formats::wpl::parse(data) else { continue };
+        let Ok(wpl) = rage_formats::wpl::parse(data) else {
+            continue;
+        };
         for i in &wpl.instances {
             // An interior: the objects inside it.
             if let Some(inside) = index.mlo_entities(i.model_hash) {
@@ -384,7 +536,7 @@ pub(crate) fn check_maps_gta4(game_dir: &Path, started: Instant) -> Result<()> {
     let mut missing: Vec<(String, usize)> = missing.into_iter().collect();
     missing.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (name, n) in missing.iter().take(15) {
-        outln!("  no model file: {n:>4} × {name}");
+        outln!("  no model file: {n:>4} Ã— {name}");
     }
     outln!(
         "{} placement files, {objects} objects ({interiors} interiors expanded): {} with a model, {unnamed} with an unknown model name, {no_file} whose model was not found ({:.1}s)",
@@ -449,28 +601,51 @@ pub(crate) fn check_maps(
     let mut top: Vec<(String, usize)> = missing.into_iter().collect();
     top.sort_by_key(|t| std::cmp::Reverse(t.1));
     for (name, n) in top.iter().take(15) {
-        outln!("  {n:>5} × {name}");
+        outln!("  {n:>5} Ã— {name}");
     }
     eprintln!("{:.1} s", started.elapsed().as_secs_f32());
     Ok(())
 }
 
-pub(crate) fn cmd_clips(game_dir: &Path, path: &str, clip: Option<&str>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+pub(crate) fn cmd_clips(
+    game_dir: &Path,
+    path: &str,
+    clip: Option<&str>,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
     let dict = openrage_app::anim::load_clips(game_dir, keys, path)?;
-    outln!("{} clips, {} animations", dict.clips.len(), dict.animations.len());
+    outln!(
+        "{} clips, {} animations",
+        dict.clips.len(),
+        dict.animations.len()
+    );
     for c in &dict.clips {
         let parts: Vec<String> = c
             .parts
             .iter()
             .map(|p| {
                 let a = &dict.animations[p.animation];
-                format!("anim {} ({} frames, {} tracks)", p.animation, a.frames, a.tracks.len())
+                format!(
+                    "anim {} ({} frames, {} tracks)",
+                    p.animation,
+                    a.frames,
+                    a.tracks.len()
+                )
             })
             .collect();
-        outln!("  {:<40} {:>6.2}s  {}", c.name, c.duration(), parts.join(", "));
+        outln!(
+            "  {:<40} {:>6.2}s  {}",
+            c.name,
+            c.duration(),
+            parts.join(", ")
+        );
     }
     if let Some(name) = clip {
-        let c = dict.clips.iter().find(|c| c.name.eq_ignore_ascii_case(name)).context("no such clip")?;
+        let c = dict
+            .clips
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .context("no such clip")?;
         let a = &dict.animations[c.parts.first().context("clip without animation")?.animation];
         let mut worst_norm = 0f32;
         let mut worst_jump = 0f32;
@@ -483,7 +658,9 @@ pub(crate) fn cmd_clips(game_dir: &Path, path: &str, clip: Option<&str>, keys: O
                 }
             }
             for w in vals.windows(2) {
-                let d = (0..3).map(|i| (w[1][i] - w[0][i]).abs()).fold(0.0, f32::max);
+                let d = (0..3)
+                    .map(|i| (w[1][i] - w[0][i]).abs())
+                    .fold(0.0, f32::max);
                 worst_jump = worst_jump.max(d);
             }
             if t < 12 {
@@ -519,9 +696,19 @@ pub(crate) fn cmd_clips(game_dir: &Path, path: &str, clip: Option<&str>, keys: O
     Ok(())
 }
 
-pub(crate) fn cmd_audio(game_dir: &Path, path: &str, export: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+pub(crate) fn cmd_audio(
+    game_dir: &Path,
+    path: &str,
+    export: Option<&Path>,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
     let awc = openrage_app::audio::load(game_dir, keys, path)?;
-    outln!("flags {:#06x}, {} streams{}", awc.flags, awc.streams.len(), if awc.encrypted { ", encrypted" } else { "" });
+    outln!(
+        "flags {:#06x}, {} streams{}",
+        awc.flags,
+        awc.streams.len(),
+        if awc.encrypted { ", encrypted" } else { "" }
+    );
     if let Some(f) = &awc.stream_format {
         outln!(
             "multi-channel stream: {} channels, {} blocks of {}",
@@ -537,24 +724,41 @@ pub(crate) fn cmd_audio(game_dir: &Path, path: &str, export: Option<&Path>, keys
             s.duration_secs(),
             s.sample_rate,
             s.codec.name(),
-            s.channel.map(|c| format!("  channel {c}")).unwrap_or_default()
+            s.channel
+                .map(|c| format!("  channel {c}"))
+                .unwrap_or_default()
         );
     }
     for (i, (id, chunks)) in awc.streams.iter().enumerate().take(4) {
         for c in chunks {
             let head = &awc.data[c.offset..(c.offset + 32).min(c.offset + c.size)];
-            outln!("  stream {i} {id:08x} chunk {:02x} {:>8} @ {:>8}: {}", c.kind, c.size, c.offset, hex(head));
+            outln!(
+                "  stream {i} {id:08x} chunk {:02x} {:>8} @ {:>8}: {}",
+                c.kind,
+                c.size,
+                c.offset,
+                hex(head)
+            );
         }
     }
     if let Some(dir) = export {
         fs::create_dir_all(dir)?;
-        let stem = path.rsplit('/').next().unwrap_or(path).trim_end_matches(".awc");
+        let stem = path
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+            .trim_end_matches(".awc");
         let started = Instant::now();
         if awc.stream_format.is_some() {
             let pcm = awc.decode_stream()?;
             let out = dir.join(format!("{stem}.wav"));
             fs::write(&out, pcm.to_wav())?;
-            outln!("Wrote {} ({:.1}s, {} channels)", out.display(), pcm.duration_secs(), pcm.channels);
+            outln!(
+                "Wrote {} ({:.1}s, {} channels)",
+                out.display(),
+                pcm.duration_secs(),
+                pcm.channels
+            );
         } else {
             for (i, s) in awc.sounds.iter().enumerate() {
                 let pcm = awc.decode_sound(i)?;
@@ -601,12 +805,19 @@ pub(crate) fn cmd_ttpf(
                 dir.join(format!("{index:06}.png")),
                 rage_formats::png(texture.width, texture.height, &rgba)?,
             )?,
-            None => *skipped.entry(format!("no decoder for format {}", texture.format.name())).or_default() += 1,
+            None => {
+                *skipped
+                    .entry(format!("no decoder for format {}", texture.format.name()))
+                    .or_default() += 1
+            }
         }
     }
-    outln!("Read: {read} ({full} at full size) in {} ms", started.elapsed().as_millis());
+    outln!(
+        "Read: {read} ({full} at full size) in {} ms",
+        started.elapsed().as_millis()
+    );
     for (reason, n) in skipped {
-        outln!("Not read: {n} — {reason}");
+        outln!("Not read: {n} â€” {reason}");
     }
     Ok(())
 }
@@ -618,7 +829,7 @@ pub(crate) fn cmd_xml(
     tree: bool,
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
-    // Names of models, textures, … from the search index, so hashes read as names.
+    // Names of models, textures, â€¦ from the search index, so hashes read as names.
     if let Ok(names) = open_index(game_dir).and_then(|i| Ok(i.known_names()?)) {
         rage_formats::names::register(names);
     }
@@ -630,7 +841,7 @@ pub(crate) fn cmd_xml(
         fn print(n: &openrage_app::xmltree::Node, depth: usize) {
             outln!("{}{}", "  ".repeat(depth), n.label);
             for (k, v) in &n.fields {
-                outln!("{}  · {k}: {v}", "  ".repeat(depth));
+                outln!("{}  Â· {k}: {v}", "  ".repeat(depth));
             }
             for c in &n.children {
                 print(c, depth + 1);
@@ -655,7 +866,11 @@ pub(crate) fn cmd_xml(
                 file.display(),
                 xml.encoding.name(),
                 xml.root.as_deref().unwrap_or("?"),
-                if xml.errors.is_empty() { String::new() } else { format!(", {} problems", xml.errors.len()) }
+                if xml.errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} problems", xml.errors.len())
+                }
             );
         }
         None => outln!("{}", xml.text.trim_end()),
@@ -708,7 +923,11 @@ fn read_media_file(node: Node, path: &str) -> Result<Vec<u8>> {
 }
 
 fn read_rpf8_entry(rpf: &rage_rpf::Rpf8, i: usize) -> Result<Vec<u8>> {
-    Ok(rpf.read(rpf.entries().and_then(|e| e.get(i)).context("archive table not readable")?)?)
+    Ok(rpf.read(
+        rpf.entries()
+            .and_then(|e| e.get(i))
+            .context("archive table not readable")?,
+    )?)
 }
 
 fn write_bink_frames(data: &[u8], dir: &Path, every: usize) -> Result<()> {
@@ -719,10 +938,17 @@ fn write_bink_frames(data: &[u8], dir: &Path, every: usize) -> Result<()> {
         player.advance().with_context(|| format!("frame {i}"))?;
         if i % every.max(1) == 0 {
             let f = player.frame();
-            fs::write(dir.join(format!("{i:05}.png")), rage_formats::png(f.width, f.height, &f.rgba())?)?;
+            fs::write(
+                dir.join(format!("{i:05}.png")),
+                rage_formats::png(f.width, f.height, &f.rgba())?,
+            )?;
         }
     }
-    outln!("Wrote {} of {total} frames to {}", total.div_ceil(every.max(1)), dir.display());
+    outln!(
+        "Wrote {} of {total} frames to {}",
+        total.div_ceil(every.max(1)),
+        dir.display()
+    );
     Ok(())
 }
 
@@ -732,8 +958,14 @@ fn write_bink_sound(data: &[u8], path: &str, out: &Path) -> Result<()> {
         bail!("{path} has no sound");
     }
     for i in 0..video.tracks.len() {
-        let Some(pcm) = video.sound(data, i) else { continue };
-        let file = if i == 0 { out.to_path_buf() } else { out.with_extension(format!("{}.wav", i + 1)) };
+        let Some(pcm) = video.sound(data, i) else {
+            continue;
+        };
+        let file = if i == 0 {
+            out.to_path_buf()
+        } else {
+            out.with_extension(format!("{}.wav", i + 1))
+        };
         fs::write(&file, pcm?.to_wav())?;
         outln!("Wrote {}", file.display());
     }
@@ -764,7 +996,9 @@ pub(crate) fn cmd_script(
         }
         return Ok(());
     }
-    let Node::ArchiveFile(rpf, id) = node else { bail!("{path} is not a file inside an archive") };
+    let Node::ArchiveFile(rpf, id) = node else {
+        bail!("{path} is not a file inside an archive")
+    };
     let s = rage_formats::ysc::parse(&rpf.read_resource(id)?)?;
     let text = if strings {
         s.all_strings().join("\n") + "\n"
@@ -776,9 +1010,14 @@ pub(crate) fn cmd_script(
             s.natives.len(),
             s.statics.len(),
             s.all_strings().len(),
-            s.table.map_or("unknown (jumps do not line up)".to_owned(), |t| format!("{t:?}"))
+            s.table
+                .map_or("unknown (jumps do not line up)".to_owned(), |t| format!(
+                    "{t:?}"
+                ))
         );
-        header + &s.listing(openrage_app::natives::name).map_err(|e| anyhow::anyhow!(e))?
+        header
+            + &s.listing(openrage_app::natives::name)
+                .map_err(|e| anyhow::anyhow!(e))?
     };
     match out {
         Some(file) => {
@@ -790,12 +1029,18 @@ pub(crate) fn cmd_script(
     Ok(())
 }
 
-pub(crate) fn cmd_particles(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+pub(crate) fn cmd_particles(
+    game_dir: &Path,
+    path: &str,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
     if path.to_ascii_lowercase().ends_with(".wpfl") {
         return gta4_particles(game_dir, path);
     }
     let (node, _) = rage_mods::resolve(game_dir, path, keys)?;
-    let Node::ArchiveFile(rpf, id) = node else { bail!("{path} is not a file inside an archive") };
+    let Node::ArchiveFile(rpf, id) = node else {
+        bail!("{path} is not a file inside an archive")
+    };
     let p = rage_formats::ypt::parse(&rpf.read_resource(id)?)?;
     outln!(
         "{}: {} effects, {} emitters, {} particle rules",
@@ -829,7 +1074,11 @@ fn gta4_particles(game_dir: &Path, path: &str) -> Result<()> {
         _ => bail!("{path} is not a file"),
     };
     let list = wpfl::parse(&rage_resource::Resource::from_rsc5(&data)?)?;
-    let sprites = list.particles.iter().filter(|p| p.kind == ParticleKind::Sprite).count();
+    let sprites = list
+        .particles
+        .iter()
+        .filter(|p| p.kind == ParticleKind::Sprite)
+        .count();
     outln!(
         "{} effects, {} emitters, {} particle rules ({sprites} sprites, {} models), {} textures, {} models",
         list.effects.len(),
@@ -840,7 +1089,10 @@ fn gta4_particles(game_dir: &Path, path: &str) -> Result<()> {
         list.models
     );
     if list.other_events > 0 {
-        outln!("{} events start other effects (not shown)", list.other_events);
+        outln!(
+            "{} events start other effects (not shown)",
+            list.other_events
+        );
     }
     for e in &list.errors {
         outln!("problem: {e}");
@@ -859,7 +1111,7 @@ fn gta4_particles(game_dir: &Path, path: &str) -> Result<()> {
             };
             let life = em.life.at(0.0);
             outln!(
-                "            {}: {:.2}s{}, life {:.2}–{:.2}s, {what}",
+                "            {}: {:.2}s{}, life {:.2}â€“{:.2}s, {what}",
                 em.name,
                 em.duration,
                 if em.one_shot { " once" } else { "" },
@@ -871,16 +1123,27 @@ fn gta4_particles(game_dir: &Path, path: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_text(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+pub(crate) fn cmd_text(
+    game_dir: &Path,
+    path: &str,
+    out: Option<&Path>,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
     if path.to_ascii_lowercase().ends_with(".wpl") {
         return text_wpl(game_dir, path, out, keys);
     }
     text_table(game_dir, path, out, keys)
 }
 
-fn text_table(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+fn text_table(
+    game_dir: &Path,
+    path: &str,
+    out: Option<&Path>,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
     use openrage_app::texttable::{self, Kind};
-    let kind = Kind::of(path).context("not a text table (.gxt2, .nametable, .gxt) or placement file (.wpl)")?;
+    let kind = Kind::of(path)
+        .context("not a text table (.gxt2, .nametable, .gxt) or placement file (.wpl)")?;
     if let Ok(names) = open_index(game_dir).and_then(|i| Ok(i.known_names()?)) {
         rage_formats::names::register(names);
     }
@@ -900,7 +1163,12 @@ fn read_text_source(game_dir: &Path, path: &str, keys: Option<Arc<GtaVKeys>>) ->
 }
 
 /// A GTA IV placement file as text.
-fn text_wpl(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<GtaVKeys>>) -> Result<()> {
+fn text_wpl(
+    game_dir: &Path,
+    path: &str,
+    out: Option<&Path>,
+    keys: Option<Arc<GtaVKeys>>,
+) -> Result<()> {
     let data = match rage_mods::resolve(game_dir, path, keys)?.0 {
         Node::Gta4File(a, id) => a.read(id)?,
         Node::PlainFile(p) => fs::read(p)?,
@@ -911,7 +1179,12 @@ fn text_wpl(game_dir: &Path, path: &str, out: Option<&Path>, keys: Option<Arc<Gt
 }
 
 /// Writes the text to `out`, or prints it.
-fn write_or_print(out: Option<&Path>, text: &str, count: impl std::fmt::Display, noun: &str) -> Result<()> {
+fn write_or_print(
+    out: Option<&Path>,
+    text: &str,
+    count: impl std::fmt::Display,
+    noun: &str,
+) -> Result<()> {
     match out {
         Some(file) => {
             fs::write(file, text)?;
@@ -921,3 +1194,4 @@ fn write_or_print(out: Option<&Path>, text: &str, count: impl std::fmt::Display,
     }
     Ok(())
 }
+
