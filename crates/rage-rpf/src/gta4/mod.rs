@@ -14,6 +14,9 @@
 //! stored as RSC5 files and are returned exactly as stored, which is also the
 //! form OpenIV exports.
 
+pub mod img_editor;
+pub mod rpf_editor;
+
 use std::fs::File;
 use std::io::Read;
 use std::ops::Range;

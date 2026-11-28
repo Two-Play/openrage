@@ -19,30 +19,21 @@
 //! `Rpf8::open_with_keys`) and need not touch the registries.
 #![forbid(unsafe_code)]
 
-pub mod editor;
 mod error;
 pub mod gta4;
-pub mod gta4_editor;
-pub mod gta4_rpf_editor;
-mod rpf7;
+pub mod rpf7;
 #[cfg(feature = "rdr2")]
 pub mod rpf8;
-#[cfg(feature = "rdr2")]
-pub mod rpf8_editor;
-#[cfg(feature = "rdr2")]
-pub mod rpf8_exe;
-#[cfg(feature = "rdr2")]
-pub mod rpf8_keys;
-#[cfg(feature = "rdr2")]
-pub mod rpf8_names;
 pub mod rpf9;
-mod rpf9_cipher;
-pub mod rpf9_index;
-pub mod rpf9_names;
-mod rpf9_native;
-mod toc;
 pub mod vfs;
-pub mod writer;
+
+// The modules had flat names before they were grouped by archive version;
+// these keep `rage_rpf::rpf8_names` and the like working.
+pub use gta4::{img_editor as gta4_editor, rpf_editor as gta4_rpf_editor};
+pub use rpf7::{editor, writer};
+#[cfg(feature = "rdr2")]
+pub use rpf8::{editor as rpf8_editor, exe as rpf8_exe, keys as rpf8_keys, names as rpf8_names};
+pub use rpf9::{index as rpf9_index, names as rpf9_names};
 
 /// How deep archives may be nested in each other. The game nests at most a
 /// few levels; a crafted archive that contains itself would recurse forever.
@@ -62,14 +53,14 @@ pub(crate) fn word(b: &[u8], at: usize) -> u32 {
     b.u32_at(at).unwrap_or(0)
 }
 
-pub use editor::{ArchiveEditor, Backup, CommitStats};
 pub use error::RpfError;
 pub use gta4::{Gta4Archive, Gta4Entry, Gta4EntryId, Gta4EntryKind, Gta4Format};
+pub use rpf7::editor::{ArchiveEditor, Backup, CommitStats};
+pub use rpf7::writer::{ArchiveWriter, RawEntry, entry_for, file_entry, resource_entry};
 pub use rpf7::{Encryption, Entry, EntryId, EntryKind, Rpf7};
 #[cfg(feature = "rdr2")]
 pub use rpf8::Rpf8;
 pub use rpf9::Rpf9;
-pub use writer::{ArchiveWriter, RawEntry, entry_for, file_entry, resource_entry};
 
 /// Runs something parallel that others wait for, on threads of its own. The
 /// shared ones may all be waiting for it; and one that waited for it there

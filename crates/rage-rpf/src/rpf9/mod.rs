@@ -29,6 +29,11 @@
 //! [`encode_index`] and [`decode_index`] store it, and a program can
 //! register a loader with [`set_indexer`] that [`Rpf9::entries`] then uses.
 
+pub(crate) mod cipher;
+pub mod index;
+pub mod names;
+pub(crate) mod native;
+
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -39,9 +44,9 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use rayon::prelude::*;
 
 use crate::RpfError;
-use crate::rpf9_index::{NativeEntry, Storage};
-use crate::rpf9_native::NativeArchive;
-pub use crate::rpf9_native::add_names;
+use crate::rpf9::index::{NativeEntry, Storage};
+use crate::rpf9::native::NativeArchive;
+pub use crate::rpf9::native::add_names;
 
 const MAGIC: u32 = 0x5250_4639;
 /// Length of the header in front of the table of contents.

@@ -6,7 +6,7 @@
 //! game data); the 4-byte XOR values carry no fingerprint and are read next
 //! to their masks. All archive keys start with the same 32 bytes, whose
 //! fingerprint is in the list too: every place in a memory dump that starts
-//! that way is a key candidate, which [`crate::rpf8_keys::identify`] then
+//! that way is a key candidate, which [`crate::rpf8::keys::identify`] then
 //! confirms by decrypting the user's archives.
 
 use std::collections::{HashMap, HashSet};
@@ -16,7 +16,7 @@ use std::path::Path;
 use rage_tfit2::{CONTEXT_LEN, IV_LEN, KEY_LEN};
 use sha2::{Digest, Sha256};
 
-const FINGERPRINTS: &str = include_str!("rpf8_fingerprints.txt");
+const FINGERPRINTS: &str = include_str!("fingerprints.txt");
 /// Pieces of the tables (565), then the IV, then the shared key start.
 const TABLE_PIECES: usize = 565;
 const KEY_START_LEN: usize = 32;

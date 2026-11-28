@@ -8,6 +8,10 @@
 //! `0x7FFFFF00` marks a directory, a set top bit marks a resource
 //! (RSC7 container), everything else is a plain binary file.
 
+pub mod editor;
+pub(crate) mod toc;
+pub mod writer;
+
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -472,8 +476,8 @@ impl Rpf7 {
 
     /// Returns an entry's stored bytes unchanged (still compressed/encrypted),
     /// for copying it into another archive.
-    pub fn read_raw_entry(&self, id: EntryId) -> Result<crate::writer::RawEntry, RpfError> {
-        use crate::writer::RawEntry;
+    pub fn read_raw_entry(&self, id: EntryId) -> Result<crate::rpf7::writer::RawEntry, RpfError> {
+        use crate::rpf7::writer::RawEntry;
         match self.entries[id].kind {
             EntryKind::Directory { .. } => Err(RpfError::NotFound(self.path_of(id))),
             EntryKind::Binary { offset, stored_size, size, encrypted } => {
