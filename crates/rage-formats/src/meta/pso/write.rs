@@ -914,6 +914,9 @@ impl Pso {
 }
 
 #[cfg(test)]
+mod write_tests;
+
+#[cfg(test)]
 mod tests {
     use rage_core::hash::{jenkins_bytes, joaat};
 

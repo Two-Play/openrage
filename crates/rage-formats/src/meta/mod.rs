@@ -974,6 +974,9 @@ impl Meta {
 }
 
 #[cfg(test)]
+mod read_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -1116,6 +1116,11 @@ impl Pso {
 }
 
 #[cfg(test)]
+mod read_tests;
+#[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

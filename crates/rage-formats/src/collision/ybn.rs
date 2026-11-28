@@ -347,13 +347,4 @@ pub fn material_names(materials_dat: &str) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reads_material_names() {
-        let dat = "12.00\n# comment\nDEFAULT\t\t\tDefault\t\tVOID\tNONE\tNONE\tNONE\t0.5\t0.1\t1.0\t1.0\n\
-                   CONCRETE\t\tConcrete\tCONCRETE\tNONE\tNONE\tNONE\t0.7\t0.1\t2.0\t1.0\n";
-        assert_eq!(material_names(dat), vec!["DEFAULT", "CONCRETE"]);
-    }
-}
+mod tests;

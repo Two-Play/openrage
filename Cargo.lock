@@ -4050,6 +4050,7 @@ dependencies = [
  "clap",
  "openrage-app",
  "openrage-plugins",
+ "rage-core",
  "rage-crypto",
  "rage-formats",
  "rage-index",
