@@ -86,6 +86,17 @@ fn print_model_drawable(model: &openrage_app::models::LoadedModel, name: &str, d
         d.triangle_count(),
         d.shaders.len()
     );
+    let decoded: usize = d.meshes.iter().map(|mesh| mesh.bone_indices.len().min(mesh.bone_weights.len())).sum();
+    if decoded > 0 {
+        let bones = model.skeleton.as_ref().or(d.skeleton.as_ref()).map_or(0, |s| s.bones.len());
+        let weighted: usize = d
+            .meshes
+            .iter()
+            .filter(|mesh| rage_formats::gltf::has_skin_weights(mesh, bones))
+            .map(|mesh| mesh.positions.len())
+            .sum();
+        outln!("  skin weights: {decoded} decoded, {weighted}/{} vertices ready for export", d.vertex_count());
+    }
     for (i, s) in d.shaders.iter().enumerate() {
         let base = s.base_texture().unwrap_or("-");
         let found = if base == "-" || model.texture(d, base).is_some() { "" } else { " (not found)" };
@@ -162,7 +173,7 @@ pub(crate) fn cmd_map(
     let (lo, hi) = world::scene_bounds(&items).context("nothing to show")?;
     let center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, lo[2]];
     outln!(
-        "extent {:.0} × {:.0} × {:.0} m around ({:.0}, {:.0}, {:.0})",
+        "extent {:.0} Ã— {:.0} Ã— {:.0} m around ({:.0}, {:.0}, {:.0})",
         hi[0] - lo[0],
         hi[1] - lo[1],
         hi[2] - lo[2],
@@ -233,7 +244,7 @@ fn print_map_summary(path: &str, scene: &openrage_app::world::MapScene, started:
         started.elapsed().as_secs_f32()
     );
     for (name, n) in scene.missing.iter().take(10) {
-        outln!("  no model: {n:>3} × {name}");
+        outln!("  no model: {n:>3} Ã— {name}");
     }
 }
 
@@ -291,7 +302,7 @@ pub(crate) fn cmd_map_gta4(
         started.elapsed().as_secs_f32()
     );
     for (name, n) in scene.missing.iter().take(10) {
-        outln!("  no model: {n:>3} × {name}");
+        outln!("  no model: {n:>3} Ã— {name}");
     }
     let looks: Vec<openrage_app::models::Look> = scene.models.iter().map(|(_, m, _)| m.default_look()).collect();
     let items: Vec<(&openrage_app::models::LoadedModel, &openrage_app::models::Look, &[rage_formats::math::Mat4])> =
@@ -299,7 +310,7 @@ pub(crate) fn cmd_map_gta4(
     let (lo, hi) = openrage_app::world::scene_bounds(&items).context("nothing to show")?;
     let center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, lo[2]];
     outln!(
-        "extent {:.0} × {:.0} × {:.0} m around ({:.0}, {:.0}, {:.0})",
+        "extent {:.0} Ã— {:.0} Ã— {:.0} m around ({:.0}, {:.0}, {:.0})",
         hi[0] - lo[0],
         hi[1] - lo[1],
         hi[2] - lo[2],
@@ -384,7 +395,7 @@ pub(crate) fn check_maps_gta4(game_dir: &Path, started: Instant) -> Result<()> {
     let mut missing: Vec<(String, usize)> = missing.into_iter().collect();
     missing.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (name, n) in missing.iter().take(15) {
-        outln!("  no model file: {n:>4} × {name}");
+        outln!("  no model file: {n:>4} Ã— {name}");
     }
     outln!(
         "{} placement files, {objects} objects ({interiors} interiors expanded): {} with a model, {unnamed} with an unknown model name, {no_file} whose model was not found ({:.1}s)",
@@ -449,7 +460,7 @@ pub(crate) fn check_maps(
     let mut top: Vec<(String, usize)> = missing.into_iter().collect();
     top.sort_by_key(|t| std::cmp::Reverse(t.1));
     for (name, n) in top.iter().take(15) {
-        outln!("  {n:>5} × {name}");
+        outln!("  {n:>5} Ã— {name}");
     }
     eprintln!("{:.1} s", started.elapsed().as_secs_f32());
     Ok(())
@@ -606,7 +617,7 @@ pub(crate) fn cmd_ttpf(
     }
     outln!("Read: {read} ({full} at full size) in {} ms", started.elapsed().as_millis());
     for (reason, n) in skipped {
-        outln!("Not read: {n} — {reason}");
+        outln!("Not read: {n} â€” {reason}");
     }
     Ok(())
 }
@@ -618,7 +629,7 @@ pub(crate) fn cmd_xml(
     tree: bool,
     keys: Option<Arc<GtaVKeys>>,
 ) -> Result<()> {
-    // Names of models, textures, … from the search index, so hashes read as names.
+    // Names of models, textures, â€¦ from the search index, so hashes read as names.
     if let Ok(names) = open_index(game_dir).and_then(|i| Ok(i.known_names()?)) {
         rage_formats::names::register(names);
     }
@@ -630,7 +641,7 @@ pub(crate) fn cmd_xml(
         fn print(n: &openrage_app::xmltree::Node, depth: usize) {
             outln!("{}{}", "  ".repeat(depth), n.label);
             for (k, v) in &n.fields {
-                outln!("{}  · {k}: {v}", "  ".repeat(depth));
+                outln!("{}  Â· {k}: {v}", "  ".repeat(depth));
             }
             for c in &n.children {
                 print(c, depth + 1);
@@ -859,7 +870,7 @@ fn gta4_particles(game_dir: &Path, path: &str) -> Result<()> {
             };
             let life = em.life.at(0.0);
             outln!(
-                "            {}: {:.2}s{}, life {:.2}–{:.2}s, {what}",
+                "            {}: {:.2}s{}, life {:.2}â€“{:.2}s, {what}",
                 em.name,
                 em.duration,
                 if em.one_shot { " once" } else { "" },
@@ -921,3 +932,4 @@ fn write_or_print(out: Option<&Path>, text: &str, count: impl std::fmt::Display,
     }
     Ok(())
 }
+
